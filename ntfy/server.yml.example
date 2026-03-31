@@ -8,7 +8,7 @@ base-url: "http://YOUR-MAC-IP-OR-HOSTNAME:8080"
 # The container listens on port 80 internally; Docker maps 8080 -> 80.
 listen-http: ":80"
 
-# Persistent cache is required so iPhone can fetch message contents after a poll request.
+# Persistent cache is required so a paired device can fetch message contents after a poll request.
 cache-file: "/var/lib/ntfy/cache.db"
 
 # User, ACL, and token database. Created automatically if it does not exist.
@@ -19,7 +19,7 @@ auth-default-access: "deny-all"
 enable-login: true
 enable-signup: false
 
-# Needed for near-instant iPhone delivery on a self-hosted server.
+# Needed for near-instant mobile delivery on a self-hosted server.
 # Only a poll request is forwarded upstream, not your real message body.
 upstream-base-url: "https://ntfy.sh"
 

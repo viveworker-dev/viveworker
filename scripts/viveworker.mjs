@@ -1336,10 +1336,24 @@ async function installMkcertForMac(progress, locale) {
   }
 
   progress?.update("cli.setup.progress.installMkcert");
-  await execCommand([brewPath, "install", "mkcert"], {
-    streamOutput: true,
-    beforeStreamOutput: () => progress?.clear(),
-  });
+  try {
+    await execCommand([brewPath, "install", "mkcert"], {
+      streamOutput: true,
+      beforeStreamOutput: () => progress?.clear(),
+    });
+  } catch (error) {
+    const rawMessage = String(error?.message || error || "");
+    const permissionIssue =
+      /not writable/iu.test(rawMessage) &&
+      (/homebrew/iu.test(rawMessage) || /\/opt\/homebrew/iu.test(rawMessage) || /\/usr\/local/iu.test(rawMessage));
+    throw new Error(
+      [
+        t(locale, permissionIssue ? "cli.setup.error.mkcertInstallPermission" : "cli.setup.error.mkcertInstallFailed"),
+        t(locale, "cli.setup.error.mkcertInstallNext"),
+        t(locale, "cli.setup.error.mkcertInstallExample"),
+      ].join("\n")
+    );
+  }
   const mkcertPath = await findExecutable("mkcert");
   if (!mkcertPath) {
     throw new Error("mkcert installation finished, but the mkcert executable is still not available.");

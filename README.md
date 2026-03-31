@@ -5,12 +5,12 @@
 [![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-`viveworker` brings Codex Desktop to your iPhone.
+`viveworker` brings Codex Desktop to your phone.
 
 When Codex needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
 
 Think of it as a local companion for Codex on your Mac:
-your Mac keeps building, and your iPhone keeps you in the loop.
+your Mac keeps building, and your device keeps you in the loop.
 
 ## Why It Feels Good
 
@@ -29,13 +29,13 @@ keep Codex moving, keep context close, and keep your momentum.
 
 `viveworker` works best with:
 
-- Mac + iPhone
+- Mac + mobile device
 - the same Wi-Fi or LAN
 - a trusted local network
 - the Home Screen web app with Web Push enabled
 
 It gets even more fun with a Mac mini.
-Leave Codex running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your iPhone handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
+Leave Codex running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your device handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
 
 `viveworker` is designed for local use only.
 It is not intended for Internet exposure.
@@ -48,7 +48,7 @@ You can use it as:
 
 - an always-on Codex station that stays running in the background
 - a way to keep approvals and plan checks moving even when you are away from your desk
-- a lightweight monitor for long-running coding or research tasks, where your iPhone only surfaces what needs your attention
+- a lightweight monitor for long-running coding or research tasks, where your device only surfaces what needs your attention
 - a small local AI appliance for your home or office
 - a quick way to review a completion and send “do this next” back into the latest thread from your phone
 
@@ -79,10 +79,10 @@ npx viveworker setup --port 8820
 
 1. Run `npx viveworker setup --install-mkcert` on your Mac
 2. If macOS asks, allow the local CA install
-3. On your iPhone, open the printed `rootCA.pem` URL
-4. Install the certificate profile and trust it in iPhone certificate trust settings
-5. Open the printed pairing URL in Safari
-6. Pair your iPhone with the code if needed
+3. On your device, open the printed `rootCA.pem` URL
+4. If your device requires local CA trust, install the certificate profile and trust it
+5. Open the printed pairing URL on your device
+6. Pair your device with the code if needed
 7. Add `viveworker` to your Home Screen
 8. Open the Home Screen app
 9. In `Settings`, tap `Enable Notifications`
@@ -128,7 +128,7 @@ Useful options:
 
 `--pair` reissues only the short-lived pairing code and pairing URL.
 It does not change the main app URL, port, session secret, TLS, or Web Push settings.
-Use it only when you want to add another trusted iPhone or browser.
+Use it only when you want to add another trusted device or browser.
 
 ## Questions and Limits
 
@@ -156,7 +156,7 @@ If you later want a second wake-up notification path, you can add `ntfy` alongsi
 
 - If the `.local` URL does not open, use the printed IP-based URL
 - If pairing has expired, run `npx viveworker setup --pair`
-- If notifications do not appear, make sure you opened the Home Screen app, not just a Safari tab
+- If notifications do not appear, make sure you opened the Home Screen app, not just a browser tab
 - If Web Push is enabled, make sure you are opening the HTTPS URL
 - If you are stuck, run:
 
@@ -171,13 +171,13 @@ npx viveworker doctor
 - Web Push still depends on the browser/platform push service
 - `--install-mkcert` can automate the Mac-side `mkcert` install and `mkcert -install`
 - macOS may still show an administrator prompt while installing the local CA
-- iPhone trust is still manual: you need to trust the local CA profile on the device
+- On some devices, local CA trust is still manual before HTTPS works reliably
 - Web Push supports approvals, plans, multiple-choice questions, and completions
 
 ## Roadmap
 
 Planned next steps include:
 
-- Android support
 - Windows support
+- ✅ ~~Android support~~ (Apr 1, 2026)
 - ✅ ~~image attachment support from mobile~~ (Mar 26, 2026)

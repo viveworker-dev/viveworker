@@ -85,8 +85,16 @@ const state = await loadState(config.stateFile);
 const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
 const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
-runtime.recentHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
-runtime.recentTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
+const initialHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
+const initialTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
+const normalizedHistoryStateChanged =
+  JSON.stringify(initialHistoryItems) !== JSON.stringify(Array.isArray(state.recentHistoryItems) ? state.recentHistoryItems : []);
+const normalizedTimelineStateChanged =
+  JSON.stringify(initialTimelineEntries) !== JSON.stringify(Array.isArray(state.recentTimelineEntries) ? state.recentTimelineEntries : []);
+runtime.recentHistoryItems = initialHistoryItems;
+runtime.recentTimelineEntries = initialTimelineEntries;
+state.recentHistoryItems = initialHistoryItems;
+state.recentTimelineEntries = initialTimelineEntries;
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
 const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
@@ -1791,7 +1799,11 @@ function normalizeHistoryItem(raw) {
 
   const stableId = cleanText(raw.stableId ?? raw.id ?? "");
   const kind = cleanText(raw.kind ?? "");
-  const title = cleanText(raw.title ?? "");
+  const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
+  const rawThreadLabel = cleanText(raw.threadLabel ?? "");
+  const threadLabel = preferTitleOnlyJsonThreadLabel(rawThreadLabel, threadId, raw.messageText, raw.summary, raw.detailText, raw.message);
+  const title =
+    cleanText(raw.title ?? "") || (threadLabel ? formatTitle(kindTitle(DEFAULT_LOCALE, kind), threadLabel) : kindTitle(DEFAULT_LOCALE, kind));
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
   const summary = normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "";
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
@@ -1805,9 +1817,9 @@ function normalizeHistoryItem(raw) {
     stableId,
     token: cleanText(raw.token ?? "") || historyToken(stableId),
     kind,
-    threadId: cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? ""),
+    threadId,
     title,
-    threadLabel: cleanText(raw.threadLabel ?? ""),
+    threadLabel,
     summary,
     messageText,
     imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
@@ -1922,6 +1934,7 @@ function normalizeTimelineEntry(raw) {
     return null;
   }
 
+  const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
   const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
   const diffText = normalizeTimelineDiffText(raw.diffText ?? "");
@@ -1932,7 +1945,14 @@ function normalizeTimelineEntry(raw) {
     formatNotificationBody(messageText, 180) ||
     (kind === "file_event" ? "" : cleanText(raw.title ?? "")) ||
     "";
-  const threadLabel = cleanText(raw.threadLabel ?? "");
+  const threadLabel = preferTitleOnlyJsonThreadLabel(
+    cleanText(raw.threadLabel ?? ""),
+    threadId,
+    raw.messageText,
+    raw.summary,
+    raw.detailText,
+    raw.message
+  );
   const title =
     cleanText(raw.title ?? "") ||
     (kind === "file_event" ? fileEventTitle(DEFAULT_LOCALE, fileEventType) : "") ||
@@ -1944,7 +1964,7 @@ function normalizeTimelineEntry(raw) {
     stableId,
     token: cleanText(raw.token ?? "") || historyToken(stableId),
     kind,
-    threadId: cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? ""),
+    threadId,
     threadLabel,
     title,
     summary,
@@ -12477,6 +12497,22 @@ function extractRolloutMessageText(content) {
   );
 }
 
+function extractTitleOnlyJsonTitleFromRolloutContent(content) {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  for (const entry of content) {
+    if (!isPlainObject(entry) || (entry.type !== "input_text" && entry.type !== "output_text")) {
+      continue;
+    }
+    const title = extractTitleOnlyJsonTitle(entry.text ?? "");
+    if (title) {
+      return title;
+    }
+  }
+  return "";
+}
+
 function rolloutContentHasImages(content) {
   if (!Array.isArray(content)) {
     return false;
@@ -12586,6 +12622,22 @@ async function extractRolloutThreadMetadata(filePath) {
 
       if (!metadata.titleCandidate && entry.payload?.type === "message" && entry.payload?.role === "user") {
         const titleCandidate = deriveRolloutThreadTitleCandidate(extractRolloutMessageText(entry.payload.content));
+        if (titleCandidate) {
+          metadata.titleCandidate = titleCandidate;
+          if (metadata.threadId) {
+            break;
+          }
+        }
+      } else if (!metadata.titleCandidate && entry.payload?.type === "message" && entry.payload?.role === "assistant") {
+        const titleCandidate = truncate(cleanText(extractTitleOnlyJsonTitleFromRolloutContent(entry.payload.content)), 90);
+        if (titleCandidate) {
+          metadata.titleCandidate = titleCandidate;
+          if (metadata.threadId) {
+            break;
+          }
+        }
+      } else if (!metadata.titleCandidate && entry.type === "event_msg" && entry.payload?.type === "task_complete") {
+        const titleCandidate = truncate(cleanText(extractTitleOnlyJsonTitle(entry.payload.last_agent_message ?? "")), 90);
         if (titleCandidate) {
           metadata.titleCandidate = titleCandidate;
           if (metadata.threadId) {
@@ -12768,11 +12820,12 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
       if (!conversationId) {
         return item;
       }
-      const threadLabel = getNativeThreadLabel({
+      const nativeThreadLabel = getNativeThreadLabel({
         runtime,
         conversationId,
         cwd: "",
       });
+      const threadLabel = preferTitleOnlyJsonThreadLabel(nativeThreadLabel, conversationId, item.messageText, item.summary);
       const title = formatTitle(kindTitle(config.defaultLocale, item.kind), threadLabel);
       if (threadLabel === item.threadLabel && title === item.title) {
         return item;
@@ -12802,11 +12855,12 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
       if (!threadId) {
         return entry;
       }
-      const threadLabel = getNativeThreadLabel({
+      const nativeThreadLabel = getNativeThreadLabel({
         runtime,
         conversationId: threadId,
         cwd: "",
       });
+      const threadLabel = preferTitleOnlyJsonThreadLabel(nativeThreadLabel, threadId, entry.messageText, entry.summary);
       const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
       if (threadLabel === entry.threadLabel && title === entry.title) {
         return entry;
@@ -12836,11 +12890,12 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
       if (!threadId) {
         return entry;
       }
-      const threadLabel = getNativeThreadLabel({
+      const nativeThreadLabel = getNativeThreadLabel({
         runtime,
         conversationId: threadId,
         cwd: "",
       });
+      const threadLabel = preferTitleOnlyJsonThreadLabel(nativeThreadLabel, threadId, entry.messageText, entry.summary);
       const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
       if (threadLabel === entry.threadLabel && title === entry.title) {
         return entry;
@@ -12902,6 +12957,10 @@ function summarizeNotificationText(value) {
 }
 
 function normalizeLongText(value) {
+  const titleOnlyJsonTitle = extractTitleOnlyJsonTitle(value);
+  if (titleOnlyJsonTitle) {
+    return titleOnlyJsonTitle;
+  }
   return String(stripEnvironmentContextBlocks(stripMarkdownLinks(value)) || "")
     .replace(/\r\n/gu, "\n")
     .replace(/[ \t]+\n/gu, "\n")
@@ -13011,6 +13070,53 @@ function safeJsonParse(value) {
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/gu, " ").trim();
+}
+
+function extractTitleOnlyJsonTitle(value) {
+  const rawText = String(value ?? "").trim();
+  if (!rawText) {
+    return "";
+  }
+  const parsed = safeJsonParse(rawText);
+  if (!isPlainObject(parsed) || typeof parsed.title !== "string") {
+    return "";
+  }
+  const meaningfulExtraKeys = Object.entries(parsed).filter(([key, entryValue]) => {
+    if (key === "title") {
+      return false;
+    }
+    if (entryValue == null) {
+      return false;
+    }
+    if (typeof entryValue === "string" && cleanText(entryValue) === "") {
+      return false;
+    }
+    if (Array.isArray(entryValue) && entryValue.length === 0) {
+      return false;
+    }
+    if (isPlainObject(entryValue) && Object.keys(entryValue).length === 0) {
+      return false;
+    }
+    return true;
+  });
+  if (meaningfulExtraKeys.length > 0) {
+    return "";
+  }
+  return cleanText(parsed.title || "");
+}
+
+function preferTitleOnlyJsonThreadLabel(rawThreadLabel, conversationId, ...candidates) {
+  const preferredThreadLabel = sanitizeResolvedThreadLabel(rawThreadLabel, conversationId);
+  if (preferredThreadLabel) {
+    return preferredThreadLabel;
+  }
+  for (const candidate of candidates) {
+    const titleOnlyJsonTitle = truncate(cleanText(extractTitleOnlyJsonTitle(candidate)), 90);
+    if (titleOnlyJsonTitle) {
+      return titleOnlyJsonTitle;
+    }
+  }
+  return cleanText(rawThreadLabel || "");
 }
 
 function stripMarkdownLinks(value) {
@@ -13227,6 +13333,8 @@ async function main() {
     }
 
     if (
+      normalizedHistoryStateChanged ||
+      normalizedTimelineStateChanged ||
       migratedPairedDevicesStateChanged ||
       restoredPendingPlanStateChanged ||
       restoredTimelineImagePathsStateChanged ||
