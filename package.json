@@ -1,6 +1,6 @@
 {
   "name": "viveworker",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Local device companion for Codex Desktop approvals, plan checks, questions, and notifications on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
