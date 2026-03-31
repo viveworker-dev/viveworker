@@ -328,6 +328,17 @@ function fileEventDetailCopy(locale, fileEventType) {
   }
 }
 
+function diffThreadDetailCopy(locale, sourceMode, count) {
+  switch (cleanText(sourceMode || "")) {
+    case "git_current":
+      return t(locale, "detail.diffThread.copy.current", { count });
+    case "non_git_latest":
+      return t(locale, "detail.diffThread.copy.latest", { count });
+    default:
+      return t(locale, "detail.diffThread.copy", { count });
+  }
+}
+
 function inferTimelineOutcome(kind, summary = "", messageText = "") {
   const normalizedKind = cleanText(kind || "");
   if (!normalizedKind) {
@@ -1762,6 +1773,205 @@ function resolveCurrentChangeOwner(change, candidates) {
     }
   }
   return null;
+}
+
+function normalizeCodeFallbackFileRef({ fileRef, cwd = "" }) {
+  const normalizedFileRef = cleanTimelineFileRef(fileRef);
+  if (!normalizedFileRef) {
+    return "";
+  }
+  if (path.isAbsolute(normalizedFileRef)) {
+    return resolvePath(normalizedFileRef);
+  }
+  const normalizedCwd = resolvePath(cleanText(cwd || ""));
+  if (!normalizedCwd) {
+    return normalizedFileRef;
+  }
+  return resolvePath(path.resolve(normalizedCwd, normalizedFileRef));
+}
+
+function buildNonGitCodeChangeEntries(item) {
+  const changeType = normalizeTimelineFileEventType(item?.fileEventType || "");
+  if (!["write", "create", "delete", "rename"].includes(changeType)) {
+    return [];
+  }
+
+  const normalizedCwd = cleanText(item?.cwd || "");
+  const normalizedFileRefs = normalizeTimelineFileRefs(item?.fileRefs ?? []).map((fileRef) =>
+    normalizeCodeFallbackFileRef({ fileRef, cwd: normalizedCwd })
+  );
+  const normalizedPreviousFileRefs = normalizeTimelineFileRefs(item?.previousFileRefs ?? []).map((fileRef) =>
+    normalizeCodeFallbackFileRef({ fileRef, cwd: normalizedCwd })
+  );
+  const sections = splitUnifiedDiffTextByFile(item?.diffText ?? "");
+  const rawChanges = [];
+
+  if (changeType === "rename") {
+    const pairCount = Math.max(normalizedFileRefs.length, normalizedPreviousFileRefs.length);
+    for (let index = 0; index < pairCount; index += 1) {
+      const newFileRef = cleanTimelineFileRef(normalizedFileRefs[index] || "");
+      const oldFileRef = cleanTimelineFileRef(normalizedPreviousFileRefs[index] || "");
+      if (!newFileRef && !oldFileRef) {
+        continue;
+      }
+      rawChanges.push({
+        changeType,
+        fileRef: newFileRef || oldFileRef,
+        oldFileRef,
+        newFileRef: newFileRef || oldFileRef,
+      });
+    }
+  } else {
+    const targetRefs =
+      normalizedFileRefs.length > 0
+        ? normalizedFileRefs
+        : changeType === "delete"
+          ? normalizedPreviousFileRefs
+          : [];
+    for (const fileRef of targetRefs) {
+      const normalizedFileRef = cleanTimelineFileRef(fileRef || "");
+      if (!normalizedFileRef) {
+        continue;
+      }
+      rawChanges.push({
+        changeType,
+        fileRef: normalizedFileRef,
+        oldFileRef: changeType === "delete" ? normalizedFileRef : "",
+        newFileRef: changeType === "delete" ? "" : normalizedFileRef,
+      });
+    }
+  }
+
+  const allowWholeItemDiff = sections.length === 0 && rawChanges.length <= 1;
+  const baseDiffSource = normalizeTimelineDiffSource(item?.diffSource ?? "");
+  const baseAddedLines = Math.max(0, Number(item?.diffAddedLines) || 0);
+  const baseRemovedLines = Math.max(0, Number(item?.diffRemovedLines) || 0);
+  const threadId = cleanText(item?.threadId || "");
+  const threadLabel = cleanText(item?.threadLabel || "");
+  const createdAtMs = Number(item?.createdAtMs) || 0;
+
+  return rawChanges.map((change) => {
+    const section = findMatchingCurrentDiffSection(sections, change);
+    const diffText = normalizeTimelineDiffText(section?.diffText || (allowWholeItemDiff ? item?.diffText ?? "" : ""));
+    const counts = diffText
+      ? diffLineCounts(diffText)
+      : {
+          addedLines: allowWholeItemDiff ? baseAddedLines : 0,
+          removedLines: allowWholeItemDiff ? baseRemovedLines : 0,
+        };
+    return {
+      threadId,
+      threadLabel,
+      createdAtMs,
+      changeType,
+      fileRef: cleanTimelineFileRef(change.fileRef || change.newFileRef || change.oldFileRef || ""),
+      oldFileRef: cleanTimelineFileRef(change.oldFileRef || ""),
+      newFileRef: cleanTimelineFileRef(change.newFileRef || change.fileRef || ""),
+      diffText,
+      diffAvailable: item?.diffAvailable === true || Boolean(diffText),
+      diffSource: baseDiffSource,
+      diffAddedLines: counts.addedLines,
+      diffRemovedLines: counts.removedLines,
+    };
+  });
+}
+
+function nonGitCodeChangeIdentity(change) {
+  const anchorFileRef = cleanTimelineFileRef(change?.newFileRef || change?.fileRef || change?.oldFileRef || "");
+  return anchorFileRef ? `file:${anchorFileRef}` : "";
+}
+
+function mergeDiffThreadSourceMode(currentMode, nextMode) {
+  const normalizedCurrentMode = cleanText(currentMode || "");
+  const normalizedNextMode = cleanText(nextMode || "");
+  if (!normalizedCurrentMode) {
+    return normalizedNextMode;
+  }
+  if (!normalizedNextMode || normalizedCurrentMode === normalizedNextMode) {
+    return normalizedCurrentMode;
+  }
+  return "mixed";
+}
+
+function ensureDiffThreadGroup(groupsByThread, { threadId = "", threadLabel = "", fallbackKey = "", sourceMode = "" }) {
+  const normalizedThreadId = cleanText(threadId || "");
+  const normalizedThreadLabel = cleanText(threadLabel || "");
+  const normalizedFallbackKey = cleanText(fallbackKey || "");
+  const threadKey = normalizedThreadId || `unknown:${normalizedThreadLabel || normalizedFallbackKey || "thread"}`;
+  let threadGroup = groupsByThread.get(threadKey);
+  if (!threadGroup) {
+    threadGroup = {
+      kind: "diff_thread",
+      token: diffThreadToken(normalizedThreadId, normalizedThreadLabel),
+      threadId: normalizedThreadId,
+      threadLabel: normalizedThreadLabel,
+      sourceMode: cleanText(sourceMode || ""),
+      filesByRef: new Map(),
+    };
+    groupsByThread.set(threadKey, threadGroup);
+    return threadGroup;
+  }
+
+  if (!threadGroup.threadLabel && normalizedThreadLabel) {
+    threadGroup.threadLabel = normalizedThreadLabel;
+  }
+  threadGroup.sourceMode = mergeDiffThreadSourceMode(threadGroup.sourceMode, sourceMode);
+  return threadGroup;
+}
+
+function addChangeToDiffThreadGroup({ groupsByThread, threadId, threadLabel, fallbackKey = "", sourceMode = "", change, createdAtMs }) {
+  const normalizedChangeType = normalizeTimelineFileEventType(change?.changeType || "");
+  const normalizedFileRef = cleanTimelineFileRef(change?.fileRef || change?.newFileRef || change?.oldFileRef || "");
+  const normalizedOldFileRef = cleanTimelineFileRef(change?.oldFileRef || "");
+  const normalizedNewFileRef = cleanTimelineFileRef(change?.newFileRef || normalizedFileRef);
+  if (!normalizedChangeType || !(normalizedFileRef || normalizedOldFileRef || normalizedNewFileRef)) {
+    return;
+  }
+
+  const group = ensureDiffThreadGroup(groupsByThread, {
+    threadId,
+    threadLabel,
+    fallbackKey: normalizedFileRef || normalizedNewFileRef || normalizedOldFileRef || fallbackKey,
+    sourceMode,
+  });
+
+  const fileGroupKey = `file:${normalizedNewFileRef || normalizedFileRef || normalizedOldFileRef}`;
+  if (!fileGroupKey) {
+    return;
+  }
+
+  const latestChangedAtMs = Number(createdAtMs) || 0;
+  const fileGroup = {
+    fileRef: normalizedFileRef || normalizedNewFileRef || normalizedOldFileRef,
+    oldFileRef: normalizedOldFileRef,
+    newFileRef: normalizedNewFileRef || normalizedFileRef,
+    fileLabel:
+      path.basename(
+        normalizedChangeType === "delete"
+          ? normalizedOldFileRef || normalizedFileRef
+          : normalizedNewFileRef || normalizedFileRef || normalizedOldFileRef
+      ) ||
+      normalizedNewFileRef ||
+      normalizedOldFileRef ||
+      normalizedFileRef,
+    changeType: normalizedChangeType,
+    fileEventTypes: [normalizedChangeType],
+    addedLines: Math.max(0, Number(change?.diffAddedLines) || 0),
+    removedLines: Math.max(0, Number(change?.diffRemovedLines) || 0),
+    latestChangedAtMs,
+    sections: [
+      {
+        createdAtMs: latestChangedAtMs,
+        diffText: normalizeTimelineDiffText(change?.diffText ?? ""),
+        diffAvailable: change?.diffAvailable === true || Boolean(change?.diffText),
+        diffSource: normalizeTimelineDiffSource(change?.diffSource ?? ""),
+        addedLines: Math.max(0, Number(change?.diffAddedLines) || 0),
+        removedLines: Math.max(0, Number(change?.diffRemovedLines) || 0),
+        fileEventType: normalizedChangeType,
+      },
+    ],
+  };
+  group.filesByRef.set(fileGroupKey, fileGroup);
 }
 
 function handleSignal() {
@@ -6772,6 +6982,90 @@ function getNativeThreadLabel({ runtime, conversationId, cwd }) {
   return shortId(normalizedConversationId) || "Codex task";
 }
 
+function threadStateArchiveStatus(threadState) {
+  if (!isPlainObject(threadState)) {
+    return "";
+  }
+
+  const booleanCandidates = [
+    threadState.archived,
+    threadState.isArchived,
+    threadState.hidden,
+    threadState.isHidden,
+    threadState.deleted,
+    threadState.isDeleted,
+    threadState.closed,
+    threadState.isClosed,
+    threadState.thread?.archived,
+    threadState.thread?.isArchived,
+    threadState.thread?.hidden,
+    threadState.thread?.isHidden,
+    threadState.thread?.deleted,
+    threadState.thread?.isDeleted,
+    threadState.metadata?.archived,
+    threadState.metadata?.isArchived,
+    threadState.metadata?.hidden,
+    threadState.metadata?.isHidden,
+    threadState.metadata?.deleted,
+    threadState.metadata?.isDeleted,
+  ];
+  if (booleanCandidates.some((value) => value === true)) {
+    return "archived";
+  }
+
+  const statusCandidates = [
+    threadState.status,
+    threadState.state,
+    threadState.visibility,
+    threadState.lifecycle,
+    threadState.thread?.status,
+    threadState.thread?.state,
+    threadState.thread?.visibility,
+    threadState.metadata?.status,
+    threadState.metadata?.state,
+    threadState.metadata?.visibility,
+  ]
+    .map((value) => cleanText(value || "").toLowerCase())
+    .filter(Boolean);
+
+  for (const status of statusCandidates) {
+    if (["archived", "hidden", "deleted", "closed"].includes(status)) {
+      return status;
+    }
+  }
+
+  return "";
+}
+
+function shouldExcludeCodeThread(runtime, threadId) {
+  const normalizedThreadId = cleanText(threadId || "");
+  if (!normalizedThreadId) {
+    return false;
+  }
+
+  const threadState = runtime.threadStates.get(normalizedThreadId) ?? null;
+  if (threadStateArchiveStatus(threadState)) {
+    return true;
+  }
+
+  const currentSessionHasThread = Array.isArray(runtime.knownFiles)
+    ? runtime.knownFiles.some((filePath) => extractThreadIdFromRolloutPath(filePath) === normalizedThreadId)
+    : false;
+  if (currentSessionHasThread) {
+    return false;
+  }
+
+  if (threadState) {
+    return false;
+  }
+
+  if (runtime.sessionIndex instanceof Map && runtime.sessionIndex.size > 0) {
+    return runtime.sessionIndex.has(normalizedThreadId);
+  }
+
+  return false;
+}
+
 async function findRolloutThreadCwd(runtime, conversationId) {
   const normalizedConversationId = cleanText(conversationId || "");
   if (!normalizedConversationId) {
@@ -8447,6 +8741,7 @@ async function buildDiffInboxItems(runtime, state, config, locale) {
     token: group.token,
     threadId: group.threadId,
     threadLabel: group.threadLabel || "",
+    sourceMode: cleanText(group.sourceMode || ""),
     title: cleanText(group.threadLabel || "") || kindTitle(locale, "diff_thread"),
     summary: t(locale, "diff.threadSummary", { count: group.changedFileCount }),
     changedFileCount: group.changedFileCount,
@@ -8487,10 +8782,12 @@ async function buildDiffThreadGroups(runtime, state, config) {
     .slice()
     .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
   const candidatesByRepoRoot = new Map();
+  const nonGitRelevantItems = [];
 
   for (const item of relevantItems) {
     const repoRoot = await resolveCodeEventRepoRoot(item, repoRootCache);
     if (!repoRoot) {
+      nonGitRelevantItems.push(item);
       continue;
     }
     const candidates = expandCodeEventOwnershipCandidates(item, repoRoot);
@@ -8512,110 +8809,40 @@ async function buildDiffThreadGroups(runtime, state, config) {
         continue;
       }
 
-      const threadId = cleanText(owner.threadId || "");
-      const threadLabel = cleanText(owner.threadLabel || "");
-      const threadKey = threadId || `unknown:${threadLabel || cleanText(change.fileRef || change.newFileRef || change.oldFileRef || "")}`;
-      let threadGroup = groupsByThread.get(threadKey);
-      if (!threadGroup) {
-        threadGroup = {
-          kind: "diff_thread",
-          token: diffThreadToken(threadId, threadLabel),
-          threadId,
-          threadLabel,
-          changedFileCount: 0,
-          latestChangedAtMs: 0,
-          latestChangedAtMsForSummary: 0,
-          latestChangeType: "",
-          latestChangeFileRefs: [],
-          diffAddedLines: 0,
-          diffRemovedLines: 0,
-          filesByRef: new Map(),
-        };
-        groupsByThread.set(threadKey, threadGroup);
-      } else if (!threadGroup.threadLabel && threadLabel) {
-        threadGroup.threadLabel = threadLabel;
-      }
+      addChangeToDiffThreadGroup({
+        groupsByThread,
+        threadId: cleanText(owner.threadId || ""),
+        threadLabel: cleanText(owner.threadLabel || ""),
+        fallbackKey: cleanText(change.fileRef || change.newFileRef || change.oldFileRef || ""),
+        sourceMode: "git_current",
+        change,
+        createdAtMs: Number(owner.createdAtMs) || 0,
+      });
+    }
+  }
 
-      const fileGroupKey =
-        normalizeTimelineFileEventType(change.changeType) === "rename"
-          ? codeOwnershipKeyForRename(change.oldFileRef || "", change.newFileRef || change.fileRef || "")
-          : `${normalizeTimelineFileEventType(change.changeType)}:${cleanTimelineFileRef(change.fileRef || change.newFileRef || change.oldFileRef || "")}`;
-      if (!fileGroupKey) {
+  const latestNonGitChangesByIdentity = new Map();
+  for (const item of nonGitRelevantItems) {
+    const changes = buildNonGitCodeChangeEntries(item);
+    for (const change of changes) {
+      const identity = nonGitCodeChangeIdentity(change);
+      if (!identity || latestNonGitChangesByIdentity.has(identity)) {
         continue;
       }
-
-      const latestOwnerChangeAtMs = Number(owner.createdAtMs) || 0;
-      const normalizedFileRef = cleanTimelineFileRef(change.fileRef || change.newFileRef || change.oldFileRef || "");
-      const normalizedOldFileRef = cleanTimelineFileRef(change.oldFileRef || "");
-      const normalizedNewFileRef = cleanTimelineFileRef(change.newFileRef || normalizedFileRef);
-      let fileGroup = threadGroup.filesByRef.get(fileGroupKey);
-      if (!fileGroup) {
-        fileGroup = {
-          fileRef: normalizedFileRef,
-          oldFileRef: normalizedOldFileRef,
-          newFileRef: normalizedNewFileRef,
-          fileLabel:
-            path.basename(
-              normalizeTimelineFileEventType(change.changeType) === "delete"
-                ? normalizedOldFileRef || normalizedFileRef
-                : normalizedNewFileRef || normalizedFileRef
-            ) ||
-            normalizedNewFileRef ||
-            normalizedOldFileRef ||
-            normalizedFileRef,
-          changeType: normalizeTimelineFileEventType(change.changeType),
-          fileEventTypes: new Set(),
-          addedLines: 0,
-          removedLines: 0,
-          latestChangedAtMs: latestOwnerChangeAtMs,
-          sections: [],
-        };
-        threadGroup.filesByRef.set(fileGroupKey, fileGroup);
-      }
-
-      const changeType = normalizeTimelineFileEventType(change.changeType);
-      if (changeType) {
-        fileGroup.fileEventTypes.add(changeType);
-      }
-      fileGroup.changeType = changeType || fileGroup.changeType;
-      fileGroup.addedLines = Math.max(0, Number(change.diffAddedLines) || 0);
-      fileGroup.removedLines = Math.max(0, Number(change.diffRemovedLines) || 0);
-      fileGroup.latestChangedAtMs = latestOwnerChangeAtMs;
-      fileGroup.fileRef = normalizedFileRef;
-      fileGroup.oldFileRef = normalizedOldFileRef;
-      fileGroup.newFileRef = normalizedNewFileRef;
-      fileGroup.sections = [
-        {
-          createdAtMs: latestOwnerChangeAtMs,
-          diffText: normalizeTimelineDiffText(change.diffText ?? ""),
-          diffAvailable: change.diffAvailable === true || Boolean(change.diffText),
-          diffSource: normalizeTimelineDiffSource(change.diffSource ?? ""),
-          addedLines: Math.max(0, Number(change.diffAddedLines) || 0),
-          removedLines: Math.max(0, Number(change.diffRemovedLines) || 0),
-          fileEventType: changeType,
-        },
-      ];
-
-      threadGroup.latestChangedAtMs = Math.max(threadGroup.latestChangedAtMs, latestOwnerChangeAtMs);
-      threadGroup.diffAddedLines += Math.max(0, Number(change.diffAddedLines) || 0);
-      threadGroup.diffRemovedLines += Math.max(0, Number(change.diffRemovedLines) || 0);
-
-      if (latestOwnerChangeAtMs > threadGroup.latestChangedAtMsForSummary) {
-        threadGroup.latestChangedAtMsForSummary = latestOwnerChangeAtMs;
-        threadGroup.latestChangeType = changeType || "";
-        threadGroup.latestChangeFileRefs = [normalizedFileRef || normalizedNewFileRef || normalizedOldFileRef];
-      } else if (latestOwnerChangeAtMs === (threadGroup.latestChangedAtMsForSummary || 0)) {
-        if (changeType && threadGroup.latestChangeType && threadGroup.latestChangeType !== changeType) {
-          threadGroup.latestChangeType = "";
-        } else if (!threadGroup.latestChangeType && changeType && threadGroup.latestChangeFileRefs.length === 0) {
-          threadGroup.latestChangeType = changeType;
-        }
-        const latestFileRef = normalizedFileRef || normalizedNewFileRef || normalizedOldFileRef;
-        if (latestFileRef && !threadGroup.latestChangeFileRefs.includes(latestFileRef)) {
-          threadGroup.latestChangeFileRefs.push(latestFileRef);
-        }
-      }
+      latestNonGitChangesByIdentity.set(identity, change);
     }
+  }
+
+  for (const change of latestNonGitChangesByIdentity.values()) {
+    addChangeToDiffThreadGroup({
+      groupsByThread,
+      threadId: cleanText(change.threadId || ""),
+      threadLabel: cleanText(change.threadLabel || ""),
+      fallbackKey: cleanText(change.fileRef || change.newFileRef || change.oldFileRef || ""),
+      sourceMode: "non_git_latest",
+      change,
+      createdAtMs: Number(change.createdAtMs) || 0,
+    });
   }
 
   return [...groupsByThread.values()]
@@ -8627,7 +8854,9 @@ async function buildDiffThreadGroups(runtime, state, config) {
           newFileRef: fileGroup.newFileRef,
           fileLabel: fileGroup.fileLabel,
           changeType: normalizeTimelineFileEventType(fileGroup.changeType),
-          fileEventTypes: [...fileGroup.fileEventTypes.values()],
+          fileEventTypes: Array.isArray(fileGroup.fileEventTypes)
+            ? fileGroup.fileEventTypes
+            : [...fileGroup.fileEventTypes.values()],
           addedLines: fileGroup.addedLines,
           removedLines: fileGroup.removedLines,
           latestChangedAtMs: fileGroup.latestChangedAtMs,
@@ -8635,20 +8864,33 @@ async function buildDiffThreadGroups(runtime, state, config) {
         }))
         .sort((left, right) => Number(right.latestChangedAtMs ?? 0) - Number(left.latestChangedAtMs ?? 0));
 
+      const latestChangedAtMs = Math.max(0, ...files.map((fileGroup) => Number(fileGroup.latestChangedAtMs) || 0));
+      const latestFiles = files.filter((fileGroup) => Number(fileGroup.latestChangedAtMs || 0) === latestChangedAtMs);
+      const latestChangeTypes = [...new Set(latestFiles.map((fileGroup) => normalizeTimelineFileEventType(fileGroup.changeType)).filter(Boolean))];
+      const latestChangeFileRefs = normalizeTimelineFileRefs(
+        latestFiles
+          .map((fileGroup) => cleanTimelineFileRef(fileGroup.fileRef || fileGroup.newFileRef || fileGroup.oldFileRef || ""))
+          .filter(Boolean)
+      );
+      const diffAddedLines = files.reduce((sum, fileGroup) => sum + Math.max(0, Number(fileGroup.addedLines) || 0), 0);
+      const diffRemovedLines = files.reduce((sum, fileGroup) => sum + Math.max(0, Number(fileGroup.removedLines) || 0), 0);
+
       return {
         kind: "diff_thread",
         token: group.token,
         threadId: group.threadId,
         threadLabel: group.threadLabel,
+        sourceMode: cleanText(group.sourceMode || ""),
         changedFileCount: files.length,
-        latestChangedAtMs: group.latestChangedAtMs,
-        latestChangeType: group.latestChangeType,
-        latestChangeFileRefs: normalizeTimelineFileRefs(group.latestChangeFileRefs),
-        diffAddedLines: group.diffAddedLines,
-        diffRemovedLines: group.diffRemovedLines,
+        latestChangedAtMs,
+        latestChangeType: latestChangeTypes.length === 1 ? latestChangeTypes[0] : "",
+        latestChangeFileRefs,
+        diffAddedLines,
+        diffRemovedLines,
         files,
       };
     })
+    .filter((group) => !shouldExcludeCodeThread(runtime, group.threadId))
     .filter((group) => group.changedFileCount > 0)
     .sort((left, right) => Number(right.latestChangedAtMs ?? 0) - Number(left.latestChangedAtMs ?? 0));
 }
@@ -9165,18 +9407,20 @@ function buildTimelineFileEventDetail(entry, locale) {
 }
 
 function buildDiffThreadDetail(group, locale) {
+  const changedFileCount = Math.max(0, Number(group.changedFileCount) || 0);
   return {
     kind: "diff_thread",
     token: group.token,
     threadId: cleanText(group.threadId || ""),
     title: cleanText(group.threadLabel || "") || kindTitle(locale, "diff_thread"),
     threadLabel: group.threadLabel || "",
+    sourceMode: cleanText(group.sourceMode || ""),
     createdAtMs: Number(group.latestChangedAtMs) || 0,
-    changedFileCount: Math.max(0, Number(group.changedFileCount) || 0),
+    changedFileCount,
     diffAddedLines: Math.max(0, Number(group.diffAddedLines) || 0),
     diffRemovedLines: Math.max(0, Number(group.diffRemovedLines) || 0),
     messageHtml: renderMessageHtml(
-      t(locale, "detail.diffThread.copy", { count: Math.max(0, Number(group.changedFileCount) || 0) }),
+      diffThreadDetailCopy(locale, group.sourceMode, changedFileCount),
       `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`
     ),
     files: Array.isArray(group.files)
