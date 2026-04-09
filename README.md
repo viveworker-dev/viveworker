@@ -5,25 +5,25 @@
 [![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-`viveworker` brings Codex Desktop to your phone.
+`viveworker` brings Codex Desktop and Claude Desktop to your phone.
 
-When Codex needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
+When your AI desktop session needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
 
-Think of it as a local companion for Codex on your Mac:
+Think of it as a local companion for Codex or Claude on your Mac:
 your Mac keeps building, and your device keeps you in the loop.
 
 ## Why It Feels Good
 
 With `viveworker`, you can:
 
-- approve or reject actions the moment Codex asks
+- approve or reject actions the moment Codex or Claude asks
 - respond to `Implement this plan?` without walking back to your desk
 - answer multiple-choice questions quickly from your phone
 - review completions and jump back into the latest thread
-- get a Home Screen notification when Codex needs you
+- get a Home Screen notification when your AI tool needs you
 
 The point is simple:
-keep Codex moving, keep context close, and keep your momentum.
+keep your AI session moving, keep context close, and keep your momentum.
 
 ## Best Fit
 
@@ -35,7 +35,7 @@ keep Codex moving, keep context close, and keep your momentum.
 - the Home Screen web app with Web Push enabled
 
 It gets even more fun with a Mac mini.
-Leave Codex running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your device handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
+Leave Codex or Claude running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your device handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
 
 `viveworker` is designed for local use only.
 It is not intended for Internet exposure.
@@ -46,7 +46,7 @@ It is not intended for Internet exposure.
 
 You can use it as:
 
-- an always-on Codex station that stays running in the background
+- an always-on Codex or Claude station that stays running in the background
 - a way to keep approvals and plan checks moving even when you are away from your desk
 - a lightweight monitor for long-running coding or research tasks, where your device only surfaces what needs your attention
 - a small local AI appliance for your home or office
@@ -129,6 +129,25 @@ Useful options:
 `--pair` reissues only the short-lived pairing code and pairing URL.
 It does not change the main app URL, port, session secret, TLS, or Web Push settings.
 Use it only when you want to add another trusted device or browser.
+
+## Claude Desktop Integration
+
+`viveworker` auto-detects Claude Desktop. If `~/.claude/` exists on your Mac when you run `npx viveworker setup`, `viveworker` installs hook entries into `~/.claude/settings.json` (`UserPromptSubmit`, `Notification`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionEnd`). No extra flag is needed — Codex Desktop and Claude Desktop are supported from the same `setup` command. If you do not have Claude Desktop installed, `viveworker` prints a skip notice and leaves your system untouched.
+
+Advanced: pass `--claude-settings-file <path>` to target a non-default Claude settings file.
+
+### Sync Mode (for Claude plans and questions)
+
+Claude Desktop exposes approval hooks but has no native IPC for answering `ExitPlanMode` / `AskUserQuestion` prompts remotely. To let you answer plans and questions from your paired device, `viveworker` offers **Sync mode** (toggle in `Settings`, formerly "Away mode"):
+
+- **Sync mode OFF** (default): plans and questions are answered on the Mac in the native Claude Desktop dialog; your device only receives notifications.
+- **Sync mode ON**: when Claude fires a plan or question, the hook intercepts it, `viveworker` opens a small mobile-sized popup window in your habitually-running Chromium browser (Brave → Arc → Chrome → Edge → Vivaldi, preferring whichever is already running so your session cookie matches) on the top-right of your screen, and you can answer from **either** the PC popup **or** the paired device — first answer wins. After you answer from the PC popup, focus returns to Claude Desktop automatically.
+
+Approvals (`Bash` / `Write` / `Edit` / …) always support PC + device dual-answer regardless of Sync mode.
+
+### macOS Permissions on First Run
+
+Because the Claude hook opens browser windows and returns focus to Claude Desktop via AppleScript, macOS will prompt for **Automation** permission (and possibly **Accessibility**) the first time a plan or question fires in Sync mode. Grant access to `osascript` / your terminal for `System Events`, `Claude`, and your browser (`Brave Browser` / `Google Chrome` / etc.) in `System Settings > Privacy & Security > Automation`. This is in addition to the `mkcert` admin prompt during CA install.
 
 ## Questions and Limits
 

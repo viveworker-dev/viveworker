@@ -8,6 +8,7 @@ node_modules/
 *.pid
 *.log
 .logs/
+docs/
 
 # Local databases and caches
 *.db

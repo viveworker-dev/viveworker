@@ -25,6 +25,7 @@ const state = {
   inboxSubtab: "pending",
   timelineThreadFilter: "all",
   timelineKindFilter: "all",
+  providerFilter: "all",
   timelineKindFilterOpen: false,
   diffThreadFilter: "all",
   completedThreadFilter: "all",
@@ -42,6 +43,7 @@ const state = {
   detailDiffExpanded: {},
   choiceLocalDrafts: {},
   completionReplyDrafts: {},
+  pendingActionUrls: new Set(),
   pairError: "",
   pairNotice: "",
   pushStatus: null,
@@ -69,6 +71,7 @@ const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
 const initialPairToken = params.get("pairToken") || "";
+const initialFocusPending = params.get("focusPending") || "";
 let didReloadForServiceWorker = false;
 let lastViewportMode = isDesktopLayout();
 
@@ -138,6 +141,15 @@ async function boot() {
   await consumePendingNotificationIntent();
   await syncDetectedLocalePreference();
   await refreshAuthenticatedState();
+  // `?focusPending=claude` marks this tab as the Claude-hook-opened popup:
+  // auto-navigate to the newest unresolved Claude pending (plan/question)
+  // detail view — but only when the user is not already in the middle of
+  // answering another pending item. Handled by `maybeAutoFocusClaudePending`
+  // both on boot and on every polling refresh below.
+  if (initialFocusPending === "claude" && !state.currentItem) {
+    state.claudePopupMode = true;
+  }
+  maybeAutoFocusClaudePending();
   ensureCurrentSelection();
   await renderShell();
 
@@ -150,6 +162,7 @@ async function boot() {
       return;
     }
     await refreshAuthenticatedState();
+    maybeAutoFocusClaudePending();
     if (!shouldDeferRenderForActiveInteraction()) {
       await renderShell();
     }
@@ -362,9 +375,17 @@ function ensureCurrentSelection() {
   const allEntries = allSelectableEntries();
   const preferredEntries = listEntriesForCurrentTab();
   const previousItem = state.currentItem ? { ...state.currentItem } : null;
-  const hasCurrent = state.currentItem
-    ? allEntries.some((entry) => isSameItemRef(state.currentItem, entry.item))
-    : false;
+  const currentEntry = state.currentItem
+    ? allEntries.find((entry) => isSameItemRef(state.currentItem, entry.item))
+    : null;
+  const currentStatus = currentEntry?.status || null;
+  if (state.currentItem && currentStatus && state.currentItemStatus && currentStatus !== state.currentItemStatus) {
+    // Status transitioned (e.g. pending → completed because PC user answered).
+    // Drop the cached detail so the next render fetches the updated view.
+    state.currentDetail = null;
+  }
+  state.currentItemStatus = currentStatus;
+  const hasCurrent = Boolean(currentEntry);
   const hasCurrentInPreferred = state.currentItem
     ? preferredEntries.some((entry) => isSameItemRef(state.currentItem, entry.item))
     : false;
@@ -403,6 +424,59 @@ function allInboxEntries() {
     ...(Array.isArray(state.inbox.diff) ? state.inbox.diff.map((item) => ({ item, status: "diff" })) : []),
     ...state.inbox.completed.map((item) => ({ item, status: "completed" })),
   ];
+}
+
+function pickNewestClaudePendingItem() {
+  const pending = Array.isArray(state.inbox?.pending) ? state.inbox.pending : [];
+  let best = null;
+  let bestTs = -Infinity;
+  for (const item of pending) {
+    if (normalizeProviderClient(item?.provider) !== "claude") continue;
+    const kind = normalizeClientText(item?.kind);
+    if (kind !== "approval" && kind !== "question") continue;
+    const ts = Number(item?.createdAtMs) || 0;
+    if (ts > bestTs) {
+      best = item;
+      bestTs = ts;
+    }
+  }
+  return best;
+}
+
+// True when the user is currently viewing the detail of an item that still
+// exists in `state.inbox.pending` — i.e. they are actively answering it. In
+// that case we must not yank them to a different pending.
+function isViewingUnresolvedPendingItem() {
+  if (!state.currentItem || !state.detailOpen) return false;
+  const pending = Array.isArray(state.inbox?.pending) ? state.inbox.pending : [];
+  return pending.some(
+    (item) =>
+      normalizeClientText(item?.kind) === normalizeClientText(state.currentItem?.kind) &&
+      normalizeClientText(item?.token) === normalizeClientText(state.currentItem?.token)
+  );
+}
+
+// Claude-hook popup mode: auto-navigate to the newest unresolved Claude
+// pending item whenever a new one appears, but only when the user is idle on
+// the list/completed view (so we never disturb an in-progress answer).
+function maybeAutoFocusClaudePending() {
+  if (!state.claudePopupMode) return;
+  const newest = pickNewestClaudePendingItem();
+  if (!newest) return;
+  const ts = Number(newest.createdAtMs) || 0;
+  if (ts <= (state.lastSeenClaudePendingTs || 0)) return;
+  // Preserve the user's current answer-in-progress view. Do NOT record
+  // `lastSeenClaudePendingTs` here, so the next polling cycle re-evaluates
+  // once the user finishes their current item.
+  if (isViewingUnresolvedPendingItem()) return;
+  state.lastSeenClaudePendingTs = ts;
+  state.currentItem = { kind: newest.kind, token: newest.token };
+  state.currentTab = tabForItemKind(newest.kind, state.currentTab);
+  if (state.currentTab === "inbox") {
+    state.inboxSubtab = inboxSubtabForItemKind(newest.kind);
+  }
+  state.detailOpen = true;
+  syncCurrentItemUrl(state.currentItem);
 }
 
 function allTimelineEntries() {
@@ -445,7 +519,25 @@ function listInboxEntries() {
   if (state.inboxSubtab === "completed") {
     return filteredCompletedEntries().map((item) => ({ item, status: "completed" }));
   }
-  return state.inbox.pending.map((item) => ({ item, status: "pending" }));
+  return state.inbox.pending
+    .filter((item) => entryMatchesProviderFilter(item))
+    .map((item) => ({ item, status: "pending" }));
+}
+
+function normalizeProviderClient(value) {
+  const normalized = String(value || "").toLowerCase();
+  return normalized === "claude" ? "claude" : "codex";
+}
+
+function providerDisplayName(provider) {
+  return L(normalizeProviderClient(provider) === "claude" ? "common.claude" : "common.codex");
+}
+
+function entryMatchesProviderFilter(item) {
+  if (!state.providerFilter || state.providerFilter === "all") {
+    return true;
+  }
+  return normalizeProviderClient(item?.provider) === state.providerFilter;
 }
 
 function filteredTimelineEntries() {
@@ -457,6 +549,7 @@ function filteredTimelineEntries() {
   if (state.timelineThreadFilter && state.timelineThreadFilter !== "all") {
     filtered = filtered.filter((entry) => entry.threadId === state.timelineThreadFilter);
   }
+  filtered = filtered.filter((entry) => entryMatchesProviderFilter(entry));
   if (!state.timelineKindFilter || state.timelineKindFilter === "all") {
     return filtered;
   }
@@ -468,10 +561,11 @@ function filteredCompletedEntries() {
   if (!entries.length) {
     return [];
   }
+  let filtered = entries.filter((entry) => entryMatchesProviderFilter(entry));
   if (!state.completedThreadFilter || state.completedThreadFilter === "all") {
-    return entries;
+    return filtered;
   }
-  return entries.filter((entry) => entry.threadId === state.completedThreadFilter);
+  return filtered.filter((entry) => entry.threadId === state.completedThreadFilter);
 }
 
 function filteredDiffEntries() {
@@ -1088,7 +1182,11 @@ function syncCompletionReplyComposerLiveState(replyForm, draft) {
   if (submitButton) {
     submitButton.disabled = normalizedDraft.sending === true || !normalizeClientText(normalizedDraft.text);
     if (!normalizedDraft.sending) {
-      submitButton.textContent = L(normalizedDraft.confirmOverride ? "reply.sendConfirm" : "reply.send");
+      const providerAttr = replyForm.getAttribute("data-provider") || "";
+      submitButton.textContent = L(
+        normalizedDraft.confirmOverride ? "reply.sendConfirm" : "reply.send",
+        { provider: providerDisplayName(providerAttr) },
+      );
     }
   }
 
@@ -1347,10 +1445,11 @@ function buildActionOutcomeDetail({ kind, title, message }) {
   };
 }
 
-function approvalOutcomeMessage(actionUrl) {
+function approvalOutcomeMessage(actionUrl, provider) {
+  const vars = { provider: providerDisplayName(provider) };
   return /\/accept$/u.test(String(actionUrl || ""))
-    ? L("server.message.approvalAccepted")
-    : L("server.message.approvalRejected");
+    ? L("server.message.approvalAccepted", vars)
+    : L("server.message.approvalRejected", vars);
 }
 
 function renderDesktopWorkspace(detail) {
@@ -1456,6 +1555,7 @@ function renderListPanel({ tab, entries, desktop }) {
 function renderInboxPanel({ entries, desktop }) {
   const meta = tabMeta("inbox");
   const subtabControls = renderInboxSubtabs();
+  const providerFilterHtml = renderProviderFilter();
   const threadFilterHtml = state.inboxSubtab === "completed" ? renderCompletedThreadDropdown() : "";
   const bodyHtml = entries.length
     ? `<div class="card-list ${desktop ? "card-list--desktop" : ""}">
@@ -1471,6 +1571,7 @@ function renderInboxPanel({ entries, desktop }) {
           <span class="count-chip">${entries.length}</span>
         </div>
         ${subtabControls}
+        ${providerFilterHtml}
         ${threadFilterHtml}
         ${bodyHtml}
       </div>
@@ -1488,6 +1589,7 @@ function renderInboxPanel({ entries, desktop }) {
       </div>
       <p class="screen-copy">${escapeHtml(meta.description)}</p>
       ${subtabControls}
+      ${providerFilterHtml}
       ${threadFilterHtml}
       ${bodyHtml}
     </div>
@@ -1543,6 +1645,49 @@ function renderInboxEmptyState() {
   `;
 }
 
+function providerBadgeMeta(provider) {
+  const normalized = normalizeProviderClient(provider);
+  if (normalized === "claude") {
+    return { id: "claude", label: L("common.claude"), glyph: "C" };
+  }
+  return { id: "codex", label: L("common.codex"), glyph: "X" };
+}
+
+function renderProviderBadge(provider) {
+  const meta = providerBadgeMeta(provider);
+  return `<span class="provider-badge provider-badge--${escapeHtml(meta.id)}" aria-label="${escapeHtml(meta.label)}" title="${escapeHtml(meta.label)}"><span class="provider-badge__icon" aria-hidden="true">${escapeHtml(meta.glyph)}</span><span class="provider-badge__label">${escapeHtml(meta.label)}</span></span>`;
+}
+
+function providerFilterOptions() {
+  return [
+    { id: "all", label: L("timeline.allThreads") },
+    { id: "codex", label: L("common.codex") },
+    { id: "claude", label: L("common.claude") },
+  ];
+}
+
+function renderProviderFilter() {
+  const options = providerFilterOptions();
+  const current = state.providerFilter || "all";
+  return `
+    <div class="provider-filter" role="tablist" aria-label="Provider filter">
+      ${options
+        .map(
+          (option) => `
+            <button
+              type="button"
+              class="provider-filter__button ${current === option.id ? "is-active" : ""}"
+              data-provider-filter="${escapeHtml(option.id)}"
+              role="tab"
+              aria-selected="${current === option.id ? "true" : "false"}"
+            >${escapeHtml(option.label)}</button>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
 function renderItemCard(entry, sourceTab, desktop) {
   if (entry.status === "completed" && entry.item.kind === "completion") {
     return renderCompletedCompletionCard(entry, sourceTab);
@@ -1550,7 +1695,7 @@ function renderItemCard(entry, sourceTab, desktop) {
   const kindInfo = kindMeta(entry.item.kind);
   const cardTitle = cardTitleForEntry(entry);
   const statusText = entry.status === "completed" ? L("common.completed") : L("common.actionNeeded");
-  const intentText = itemIntentText(entry.item.kind, entry.status);
+  const intentText = itemIntentText(entry.item.kind, entry.status, entry.item.provider);
   const showCompletedTimestamp = entry.status === "completed" && sourceTab === "completed";
   const timestampLabel = showCompletedTimestamp ? formatTimelineTimestamp(entry.item.createdAtMs) : "";
   return `
@@ -1563,6 +1708,7 @@ function renderItemCard(entry, sourceTab, desktop) {
       <div class="item-card__header">
         <div class="item-card__meta">
           <span class="type-pill type-pill--${escapeHtml(kindInfo.tone)}">${escapeHtml(kindInfo.label)}</span>
+          ${renderProviderBadge(entry.item.provider)}
           ${
             desktop && sourceTab === "inbox"
               ? `<span class="status-pill status-pill--${escapeHtml(entry.status)}">${escapeHtml(statusText)}</span>`
@@ -1580,7 +1726,7 @@ function renderItemCard(entry, sourceTab, desktop) {
           <span class="item-card__intent-icon" aria-hidden="true">${renderIcon(kindInfo.icon)}</span>
           <span>${escapeHtml(intentText)}</span>
         </p>
-        <p class="item-card__summary">${escapeHtml(entry.item.summary || fallbackSummaryForKind(entry.item.kind, entry.status))}</p>
+        <p class="item-card__summary">${escapeHtml(entry.item.summary || fallbackSummaryForKind(entry.item.kind, entry.status, entry.item.provider))}</p>
         ${
           !desktop && sourceTab === "inbox"
             ? `<p class="item-card__status-note">${escapeHtml(statusText)}</p>`
@@ -1616,7 +1762,7 @@ function cardTitleForEntry(entry) {
 function renderCompletedCompletionCard(entry, sourceTab) {
   const item = entry.item;
   const kindInfo = kindMeta(item.kind);
-  const summaryText = item.summary || fallbackSummaryForKind(item.kind, entry.status);
+  const summaryText = item.summary || fallbackSummaryForKind(item.kind, entry.status, item.provider);
   const threadLabel = timelineEntryThreadLabel(item, true);
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
 
@@ -1631,6 +1777,7 @@ function renderCompletedCompletionCard(entry, sourceTab) {
       <div class="item-card__header">
         <div class="item-card__meta">
           <span class="type-pill type-pill--completion">${escapeHtml(L("common.task"))}</span>
+          ${renderProviderBadge(item.provider)}
         </div>
         <div class="item-card__header-right">
           ${timestampLabel ? `<span class="item-card__timestamp">${escapeHtml(timestampLabel)}</span>` : ""}
@@ -1648,6 +1795,7 @@ function renderCompletedCompletionCard(entry, sourceTab) {
 function renderTimelinePanel({ entries, desktop }) {
   const meta = tabMeta("timeline");
   const listClassName = desktop ? "timeline-list timeline-list--desktop" : "timeline-list";
+  const providerFilterHtml = renderProviderFilter();
   const threadsHtml = renderTimelineThreadDropdown();
   const bodyHtml = entries.length
     ? `<div class="${listClassName}">${entries.map((entry) => renderTimelineEntry(entry, { desktop })).join("")}</div>`
@@ -1660,6 +1808,7 @@ function renderTimelinePanel({ entries, desktop }) {
           <p class="screen-copy">${escapeHtml(meta.description)}</p>
           <span class="count-chip">${entries.length}</span>
         </div>
+        ${providerFilterHtml}
         ${threadsHtml}
         ${bodyHtml}
       </div>
@@ -1676,6 +1825,7 @@ function renderTimelinePanel({ entries, desktop }) {
         <span class="count-chip">${entries.length}</span>
       </div>
       <p class="screen-copy">${escapeHtml(meta.description)}</p>
+      ${providerFilterHtml}
       ${threadsHtml}
       ${bodyHtml}
     </div>
@@ -1857,6 +2007,7 @@ function renderTimelineEntry(entry, { desktop }) {
         <span class="timeline-entry__kind">
           <span class="timeline-entry__kind-icon" aria-hidden="true">${renderIcon(kindInfo.icon)}</span>
           <span>${escapeHtml(kindInfo.label)}</span>
+          ${renderProviderBadge(item.provider)}
         </span>
         <span class="timeline-entry__meta-right">
           <span class="timeline-entry__time">${escapeHtml(timestampLabel)}</span>
@@ -1998,11 +2149,11 @@ function timelineEntryThreadLabel(item, isMessage) {
 
 function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileEvent = false } = {}) {
   if (isMessageLike) {
-    return item.summary || fallbackSummaryForKind(item.kind, status);
+    return item.summary || fallbackSummaryForKind(item.kind, status, item.provider);
   }
 
   if (isFileEvent) {
-    return fileEventTimelineCountLabel(item) || fallbackSummaryForKind(item.kind, status);
+    return fileEventTimelineCountLabel(item) || fallbackSummaryForKind(item.kind, status, item.provider);
   }
 
   return timelineDisplayTitleWithoutThread(item, { allowFallbackSummary: true }) || L("common.untitledItem");
@@ -2013,7 +2164,7 @@ function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike =
     return "";
   }
 
-  const summaryText = normalizeClientText(item.summary || fallbackSummaryForKind(item.kind, status));
+  const summaryText = normalizeClientText(item.summary || fallbackSummaryForKind(item.kind, status, item.provider));
   if (!summaryText || summaryText === normalizeClientText(primaryText || "")) {
     return "";
   }
@@ -2667,6 +2818,13 @@ function settingsPageMeta(page) {
         description: L("settings.technical.copy"),
         icon: "settings",
       };
+    case "awayMode":
+      return {
+        id: "awayMode",
+        title: L("settings.awayMode.title"),
+        description: L("settings.awayMode.copy"),
+        icon: "settings",
+      };
     default:
       return settingsPageMeta("notifications");
   }
@@ -2695,6 +2853,12 @@ function renderSettingsRoot(context, { mobile }) {
           value: L(context.setupState.install.labelKey),
         })
       : "",
+    renderSettingsNavRow({
+      page: "awayMode",
+      icon: "settings",
+      title: L("settings.awayMode.title"),
+      value: state.session?.claudeAwayMode === true ? L("settings.claudeAway.on") : L("settings.claudeAway.off"),
+    }),
   ].filter(Boolean);
   const deviceRows = [
     renderSettingsNavRow({
@@ -2769,6 +2933,9 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "advanced":
       content = renderSettingsAdvancedPage(context);
+      break;
+    case "awayMode":
+      content = renderSettingsAwayModePage();
       break;
     default:
       content = "";
@@ -2962,6 +3129,29 @@ function renderSettingsNavRow({ page, icon, title, subtitle, value }) {
   `;
 }
 
+function renderSettingsAwayModePage() {
+  const enabled = state.session?.claudeAwayMode === true;
+  const stateLabel = enabled ? L("settings.claudeAway.on") : L("settings.claudeAway.off");
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup("", [`
+        <label class="reply-mode-switch" data-claude-away-toggle>
+          <input type="checkbox" class="reply-mode-switch__input" ${enabled ? "checked" : ""} data-claude-away-checkbox />
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.claudeAway.title"))}</span>
+              <span class="reply-mode-switch__state">${escapeHtml(stateLabel)}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.claudeAway.description"))}</span>
+          </span>
+        </label>
+      `])}
+      <p class="settings-page-copy muted">${escapeHtml(L("settings.awayMode.codexNote"))}</p>
+    </div>
+  `;
+}
+
 function renderSettingsInfoRow(label, value, options = {}) {
   const rowClassName = ["settings-info-row", options.rowClassName || ""].filter(Boolean).join(" ");
   const valueClassName = ["settings-info-row__value", options.valueClassName || ""].filter(Boolean).join(" ");
@@ -3086,6 +3276,8 @@ function renderStandardDetailDesktop(detail) {
             </section>
           `
       }
+      ${renderClaudePlanSection(detail)}
+      ${renderClaudeQuestionSection(detail)}
       ${renderDetailImageGallery(detail)}
       ${renderDetailDiffPanel(detail)}
       ${renderDetailDiffThreadGroups(detail)}
@@ -3117,6 +3309,8 @@ function renderStandardDetailMobile(detail) {
                 </section>
               `
           }
+          ${renderClaudePlanSection(detail, { mobile: true })}
+          ${renderClaudeQuestionSection(detail, { mobile: true })}
           ${renderDetailImageGallery(detail, { mobile: true })}
           ${renderDetailDiffPanel(detail, { mobile: true })}
           ${renderDetailDiffThreadGroups(detail, { mobile: true })}
@@ -3451,6 +3645,116 @@ function diffLineClassName(line) {
   return "detail-diff-line--context";
 }
 
+function renderClaudePlanSection(detail, options = {}) {
+  if (detail?.kind !== "approval") return "";
+  if (normalizeClientText(detail?.approvalKind || "") !== "plan") return "";
+  const planText = String(detail.planText || "");
+  if (!planText) return "";
+  const planHtml = String(detail.planHtml || "");
+  const provider = providerDisplayName(detail.provider);
+  const readOnlyNotice = detail.readOnly
+    ? `<p class="claude-question-notice">${escapeHtml(L("claudeAway.notifyOnly.notice", { provider }))}</p>`
+    : "";
+  const bodyHtml = planHtml
+    ? `<div class="detail-body detail-body--message markdown">${planHtml}</div>`
+    : `<pre class="detail-body detail-body--message" style="white-space: pre-wrap; word-break: break-word;">${escapeHtml(planText)}</pre>`;
+  return `
+    <section class="detail-card detail-card--body ${options.mobile ? "detail-card--mobile" : ""}">
+      <h3 class="detail-section-title">${escapeHtml(L("claudePlan.title", { provider }))}</h3>
+      ${bodyHtml}
+      ${readOnlyNotice}
+    </section>
+  `;
+}
+
+function renderClaudeQuestionSection(detail, options = {}) {
+  if (detail?.kind !== "approval") return "";
+  if (normalizeClientText(detail?.approvalKind || "") !== "question") return "";
+  const questions = Array.isArray(detail.questions) ? detail.questions : [];
+  if (questions.length === 0) return "";
+  const provider = providerDisplayName(detail.provider);
+  const token = detail.token || "";
+  const draft = getClaudeQuestionDraft(token);
+  const isReadOnly = detail.readOnly === true;
+  const isSent = Boolean(draft.sent) || isReadOnly;
+
+  const questionsHtml = questions
+    .map((q, qi) => {
+      const inputType = q.multiSelect ? "checkbox" : "radio";
+      const options = Array.isArray(q.options) ? q.options : [];
+      const selected = new Set((draft.answers?.[qi]?.optionIndices) || []);
+      const optionsHtml = options
+        .map((opt, oi) => {
+          const checked = selected.has(oi) ? "checked" : "";
+          return `
+            <label class="claude-question-option">
+              <input type="${inputType}" name="q-${qi}" value="${oi}" ${checked} ${isSent ? "disabled" : ""} data-claude-question-input data-q-index="${qi}" data-o-index="${oi}" />
+              <span class="claude-question-option__label"><strong>${escapeHtml(String(opt.label || ""))}</strong></span>
+              ${opt.description ? `<span class="claude-question-option__desc">${escapeHtml(String(opt.description))}</span>` : ""}
+            </label>
+          `;
+        })
+        .join("");
+      const noteValue = String(draft.answers?.[qi]?.note || "");
+      return `
+        <div class="claude-question-item">
+          <p class="claude-question-text"><strong>${escapeHtml(String(q.question || ""))}</strong></p>
+          <div class="claude-question-options">${optionsHtml}</div>
+          <textarea
+            class="claude-question-note"
+            data-claude-question-note
+            data-q-index="${qi}"
+            placeholder="${escapeHtml(L("claudeQuestion.notePlaceholder"))}"
+            rows="2"
+            ${isSent ? "disabled" : ""}
+          >${escapeHtml(noteValue)}</textarea>
+        </div>
+      `;
+    })
+    .join("");
+
+  const noticeHtml = isReadOnly
+    ? `<p class="claude-question-notice">${escapeHtml(L("claudeAway.notifyOnly.notice", { provider }))}</p>`
+    : draft.notice
+      ? `<p class="claude-question-notice">${escapeHtml(draft.notice)}</p>`
+      : "";
+  const errorHtml = draft.error
+    ? `<p class="claude-question-error">${escapeHtml(draft.error)}</p>`
+    : "";
+  const sendLabel = L("claudeQuestion.send", { provider });
+
+  return `
+    <section class="detail-card detail-card--body ${options.mobile ? "detail-card--mobile" : ""}">
+      <h3 class="detail-section-title">${escapeHtml(L("claudeQuestion.title", { provider }))}</h3>
+      <form data-claude-question-form data-token="${escapeHtml(token)}" data-answer-url="${escapeHtml(detail.answerUrl || "")}">
+        ${questionsHtml}
+        ${errorHtml}
+        ${noticeHtml}
+        ${isReadOnly ? "" : `
+          <div class="claude-question-actions">
+            <button type="submit" class="action-button action-button--primary" ${isSent || draft.sending ? "disabled" : ""}>
+              ${escapeHtml(draft.sending ? L("claudeQuestion.send", { provider }) + "…" : sendLabel)}
+            </button>
+          </div>
+        `}
+      </form>
+    </section>
+  `;
+}
+
+const claudeQuestionDrafts = new Map();
+function getClaudeQuestionDraft(token) {
+  if (!claudeQuestionDrafts.has(token)) {
+    claudeQuestionDrafts.set(token, { answers: {}, sending: false, sent: false, notice: "", error: "" });
+  }
+  return claudeQuestionDrafts.get(token);
+}
+function setClaudeQuestionDraft(token, partial) {
+  const next = { ...getClaudeQuestionDraft(token), ...partial };
+  claudeQuestionDrafts.set(token, next);
+  return next;
+}
+
 function renderCompletionReplyComposer(detail, options = {}) {
   if (detail.kind !== "completion" || detail.reply?.enabled !== true) {
     return "";
@@ -3458,11 +3762,12 @@ function renderCompletionReplyComposer(detail, options = {}) {
 
   const draft = getCompletionReplyDraft(detail.token);
   const planMode = draft.mode === "plan";
+  const providerVars = { provider: providerDisplayName(detail?.provider) };
   const sendLabel = draft.sending
     ? L("reply.sendSending")
     : draft.confirmOverride
       ? L("reply.sendConfirm")
-      : L("reply.send");
+      : L("reply.send", providerVars);
   const disabled = draft.sending || !normalizeClientText(draft.text);
   const warningTimestamp = draft.warning?.createdAtMs ? formatTimelineTimestamp(draft.warning.createdAtMs) : "";
   const showCollapsedState =
@@ -3474,8 +3779,8 @@ function renderCompletionReplyComposer(detail, options = {}) {
       <div class="reply-composer">
         <div class="reply-composer__copy">
           <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("reply.eyebrow"))}</span>
-          <h3 class="reply-composer__title">${escapeHtml(L("reply.title"))}</h3>
-          <p class="muted reply-composer__description">${escapeHtml(L("reply.copy"))}</p>
+          <h3 class="reply-composer__title">${escapeHtml(L("reply.title", providerVars))}</h3>
+          <p class="muted reply-composer__description">${escapeHtml(L("reply.copy", providerVars))}</p>
         </div>
         ${draft.notice ? `<p class="inline-alert inline-alert--success">${escapeHtml(draft.notice)}</p>` : ""}
         ${draft.error ? `<p class="inline-alert inline-alert--danger">${escapeHtml(draft.error)}</p>` : ""}
@@ -3521,7 +3826,7 @@ function renderCompletionReplyComposer(detail, options = {}) {
               </div>
             `
             : `
-              <form class="reply-composer__form" data-completion-reply-form data-token="${escapeHtml(detail.token)}">
+              <form class="reply-composer__form" data-completion-reply-form data-token="${escapeHtml(detail.token)}" data-provider="${escapeHtml(normalizeProviderClient(detail?.provider))}">
                 <label class="field reply-field">
                   <span class="field-label">${escapeHtml(L("reply.fieldLabel"))}</span>
                   <div class="reply-field__shell">
@@ -3529,7 +3834,7 @@ function renderCompletionReplyComposer(detail, options = {}) {
                       class="reply-field__input"
                       name="text"
                       rows="4"
-                      placeholder="${escapeHtml(L("reply.placeholder"))}"
+                      placeholder="${escapeHtml(L("reply.placeholder", providerVars))}"
                       data-completion-reply-textarea
                       data-reply-token="${escapeHtml(detail.token)}"
                     >${escapeHtml(draft.text)}</textarea>
@@ -3776,20 +4081,24 @@ function renderActionButtons(actions, options = {}) {
   if (!actions.length) {
     return "";
   }
+  const pendingUrl = actions.find((a) => state.pendingActionUrls.has(a.url))?.url ?? null;
   const actionsHtml = `
     <div class="actions actions--stack ${options.mobileSticky ? "actions--sticky" : ""}">
       ${actions
-        .map(
-          (action) => `
+        .map((action) => {
+          const isPending = pendingUrl === action.url;
+          const isDisabled = pendingUrl !== null;
+          return `
             <button
-              class="${escapeHtml(actionClassForTone(action.tone))}"
+              class="${escapeHtml(actionClassForTone(action.tone))}${isPending ? " is-loading" : ""}"
               data-action-url="${escapeHtml(action.url)}"
               data-action-body='${escapeHtml(JSON.stringify(action.body || {}))}'
+              ${isDisabled ? 'disabled aria-busy="true"' : ""}
             >
-              ${escapeHtml(action.label)}
+              ${isPending ? `<span class="action-spinner" aria-hidden="true"></span><span>${escapeHtml(action.label)}</span>` : escapeHtml(action.label)}
             </button>
-          `
-        )
+          `;
+        })
         .join("")}
     </div>
   `;
@@ -4087,6 +4396,19 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-provider-filter]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const next = button.dataset.providerFilter || "all";
+      if (state.providerFilter === next) {
+        return;
+      }
+      state.providerFilter = next;
+      alignCurrentItemToVisibleEntries();
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-timeline-kind-filter-toggle]")) {
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -4199,26 +4521,62 @@ function bindShellInteractions() {
 
   for (const button of document.querySelectorAll("[data-action-url]")) {
     button.addEventListener("click", async () => {
+      const actionUrl = button.dataset.actionUrl;
+      if (state.pendingActionUrls.has(actionUrl)) {
+        return;
+      }
       const body = button.dataset.actionBody ? JSON.parse(button.dataset.actionBody) : {};
       const activeItem = state.currentItem ? { ...state.currentItem } : null;
       const keepDetailOpen = shouldKeepDetailAfterAction(activeItem);
-      await apiPost(button.dataset.actionUrl, body);
-      if (keepDetailOpen && activeItem?.kind === "approval") {
-        pinActionOutcomeDetail(
-          activeItem,
-          buildActionOutcomeDetail({
-            kind: "approval",
-            title: state.currentDetail?.title,
-            message: approvalOutcomeMessage(button.dataset.actionUrl),
-          })
-        );
+
+      // Mark as pending in state so re-renders during the request also show loading
+      state.pendingActionUrls.add(actionUrl);
+
+      // Visual feedback on current DOM nodes (before any re-render)
+      const siblingButtons = button.parentElement
+        ? Array.from(button.parentElement.querySelectorAll("[data-action-url]"))
+        : [button];
+      const originalLabels = new Map();
+      for (const sibling of siblingButtons) {
+        originalLabels.set(sibling, sibling.innerHTML);
+        sibling.disabled = true;
+        sibling.setAttribute("aria-busy", "true");
       }
-      await refreshAuthenticatedState();
-      if (!keepDetailOpen && !isDesktopLayout()) {
-        state.detailOpen = false;
-        syncCurrentItemUrl(null);
+      button.classList.add("is-loading");
+      button.innerHTML = `<span class="action-spinner" aria-hidden="true"></span><span>${escapeHtml(L("reply.sendSending"))}</span>`;
+
+      try {
+        await apiPost(actionUrl, body);
+        if (keepDetailOpen && activeItem?.kind === "approval") {
+          pinActionOutcomeDetail(
+            activeItem,
+            buildActionOutcomeDetail({
+              kind: "approval",
+              title: state.currentDetail?.title,
+              message: approvalOutcomeMessage(actionUrl, activeItem?.provider),
+            })
+          );
+        }
+        await refreshAuthenticatedState();
+        if (!keepDetailOpen && !isDesktopLayout()) {
+          state.detailOpen = false;
+          syncCurrentItemUrl(null);
+        }
+        await renderShell();
+        state.pendingActionUrls.delete(actionUrl);
+      } catch (error) {
+        state.pendingActionUrls.delete(actionUrl);
+        // Restore buttons on failure so the user can retry
+        for (const sibling of siblingButtons) {
+          if (originalLabels.has(sibling)) {
+            sibling.innerHTML = originalLabels.get(sibling);
+          }
+          sibling.disabled = false;
+          sibling.removeAttribute("aria-busy");
+        }
+        button.classList.remove("is-loading");
+        throw error;
       }
-      await renderShell();
     });
   }
 
@@ -4375,6 +4733,22 @@ function bindShellInteractions() {
     });
   }
 
+  for (const checkbox of document.querySelectorAll("[data-claude-away-checkbox]")) {
+    checkbox.addEventListener("change", async () => {
+      const next = checkbox.checked === true;
+      try {
+        const result = await apiPost("/api/settings/claude-away-mode", { enabled: next });
+        if (state.session) {
+          state.session.claudeAwayMode = result?.enabled === true;
+        }
+        await refreshAuthenticatedState();
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-locale-option]")) {
     button.addEventListener("click", async () => {
       state.pushError = "";
@@ -4424,7 +4798,7 @@ function bindShellInteractions() {
             buildActionOutcomeDetail({
               kind: "choice",
               title: state.currentDetail?.title,
-              message: L("server.message.choiceSubmitted"),
+              message: L("server.message.choiceSubmitted", { provider: providerDisplayName(activeItem?.provider) }),
             })
           );
         } else if (!isDesktopLayout()) {
@@ -4458,6 +4832,7 @@ function bindShellInteractions() {
 
     replyForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const replyProvider = replyForm.dataset.provider || "";
       const draft = getCompletionReplyDraft(token);
       const text = normalizeClientText(new FormData(replyForm).get("text"));
       if (!text) {
@@ -4500,7 +4875,7 @@ function bindShellInteractions() {
           mode: draft.mode,
           sending: false,
           error: "",
-          notice: L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault"),
+          notice: L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault", { provider: providerDisplayName(replyProvider) }),
           warning: null,
           confirmOverride: false,
           collapsedAfterSend: true,
@@ -4541,7 +4916,93 @@ function bindShellInteractions() {
     });
   }
 
+  bindClaudeQuestionForm(renderShell);
   bindSharedUi(renderShell);
+}
+
+function bindClaudeQuestionForm(renderShell) {
+  const form = document.querySelector("[data-claude-question-form]");
+  if (!form) return;
+  const token = form.dataset.token || "";
+  const answerUrl = form.dataset.answerUrl || "";
+
+  const updateAnswerForInput = (input) => {
+    const draft = getClaudeQuestionDraft(token);
+    const qi = Number(input.dataset.qIndex || 0);
+    const oi = Number(input.dataset.oIndex || 0);
+    const answers = { ...(draft.answers || {}) };
+    const existing = answers[qi] || { optionIndices: [], note: "" };
+    let optionIndices = Array.isArray(existing.optionIndices) ? [...existing.optionIndices] : [];
+    if (input.type === "radio") {
+      optionIndices = input.checked ? [oi] : [];
+    } else if (input.type === "checkbox") {
+      if (input.checked) {
+        if (!optionIndices.includes(oi)) optionIndices.push(oi);
+      } else {
+        optionIndices = optionIndices.filter((idx) => idx !== oi);
+      }
+    }
+    answers[qi] = { ...existing, optionIndices };
+    setClaudeQuestionDraft(token, { answers });
+  };
+
+  for (const input of form.querySelectorAll("[data-claude-question-input]")) {
+    input.addEventListener("change", () => updateAnswerForInput(input));
+  }
+  for (const note of form.querySelectorAll("[data-claude-question-note]")) {
+    note.addEventListener("input", () => {
+      const draft = getClaudeQuestionDraft(token);
+      const qi = Number(note.dataset.qIndex || 0);
+      const answers = { ...(draft.answers || {}) };
+      const existing = answers[qi] || { optionIndices: [], note: "" };
+      answers[qi] = { ...existing, note: note.value };
+      setClaudeQuestionDraft(token, { answers });
+    });
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!answerUrl) return;
+    const draft = getClaudeQuestionDraft(token);
+    const answersMap = draft.answers || {};
+    const answersArr = [];
+    const totalQuestions = form.querySelectorAll(".claude-question-item").length;
+    let allAnswered = true;
+    for (let i = 0; i < totalQuestions; i++) {
+      const a = answersMap[i] || { optionIndices: [], note: "" };
+      const hasSelection = Array.isArray(a.optionIndices) && a.optionIndices.length > 0;
+      const hasNote = typeof a.note === "string" && a.note.trim().length > 0;
+      if (!hasSelection && !hasNote) {
+        allAnswered = false;
+      }
+      answersArr.push({ questionIndex: i, optionIndices: a.optionIndices || [], note: a.note || "" });
+    }
+    if (!allAnswered) {
+      setClaudeQuestionDraft(token, { error: L("claudeQuestion.requireAll"), notice: "" });
+      await renderShell();
+      return;
+    }
+
+    setClaudeQuestionDraft(token, { sending: true, error: "", notice: "" });
+    await renderShell();
+
+    try {
+      await apiPost(answerUrl, { answers: answersArr });
+      setClaudeQuestionDraft(token, {
+        sending: false,
+        sent: true,
+        notice: L("claudeQuestion.sent", { provider: providerDisplayName("claude") }),
+        error: "",
+      });
+      await refreshAuthenticatedState();
+    } catch (error) {
+      setClaudeQuestionDraft(token, {
+        sending: false,
+        error: error.message || String(error),
+      });
+    }
+    await renderShell();
+  });
 }
 
 function bindSharedUi(renderFn) {
@@ -4840,7 +5301,8 @@ function renderTypePillContent(kindInfo) {
   `;
 }
 
-function itemIntentText(kind, status = "pending") {
+function itemIntentText(kind, status = "pending", provider) {
+  const vars = { provider: providerDisplayName(provider) };
   if (kind === "diff_thread") {
     return L("intent.diffThread");
   }
@@ -4854,7 +5316,7 @@ function itemIntentText(kind, status = "pending") {
     return L("intent.assistantCommentary");
   }
   if (kind === "assistant_final") {
-    return L("intent.assistantFinal");
+    return L("intent.assistantFinal", vars);
   }
   if (status === "completed") {
     return L("intent.completed");
@@ -4863,9 +5325,9 @@ function itemIntentText(kind, status = "pending") {
     case "approval":
       return L("intent.approval");
     case "plan":
-      return L("intent.plan");
+      return L("intent.plan", vars);
     case "choice":
-      return L("intent.choice");
+      return L("intent.choice", vars);
     case "completion":
       return L("intent.completed");
     default:
@@ -4874,19 +5336,20 @@ function itemIntentText(kind, status = "pending") {
 }
 
 function detailIntentText(detail) {
+  const provider = detail?.provider;
   if (detail.kind === "diff_thread") {
-    return itemIntentText(detail.kind, "diff");
+    return itemIntentText(detail.kind, "diff", provider);
   }
   if (detail.kind === "file_event") {
-    return itemIntentText(detail.kind, "timeline");
+    return itemIntentText(detail.kind, "timeline", provider);
   }
   if (TIMELINE_MESSAGE_KINDS.has(detail.kind)) {
-    return itemIntentText(detail.kind, "timeline");
+    return itemIntentText(detail.kind, "timeline", provider);
   }
   if (detail.readOnly) {
     return L("intent.completed");
   }
-  return itemIntentText(detail.kind, "pending");
+  return itemIntentText(detail.kind, "pending", provider);
 }
 
 function detailDisplayTitle(detail) {
@@ -4928,7 +5391,8 @@ function detailDisplayTitle(detail) {
   return title;
 }
 
-function fallbackSummaryForKind(kind, status) {
+function fallbackSummaryForKind(kind, status, provider) {
+  const vars = { provider: providerDisplayName(provider) };
   if (status === "completed") {
     return L("summary.completed");
   }
@@ -4936,20 +5400,20 @@ function fallbackSummaryForKind(kind, status) {
     case "diff_thread":
       return L("summary.diffThread");
     case "file_event":
-      return L("summary.fileEvent");
+      return L("summary.fileEvent", vars);
     case "user_message":
       return L("summary.userMessage");
     case "assistant_commentary":
-      return L("summary.assistantCommentary");
+      return L("summary.assistantCommentary", vars);
     case "assistant_final":
-      return L("summary.assistantFinal");
+      return L("summary.assistantFinal", vars);
     case "approval":
-      return L("summary.approval");
+      return L("summary.approval", vars);
     case "plan":
     case "plan_ready":
-      return L("summary.plan");
+      return L("summary.plan", vars);
     case "choice":
-      return L("summary.choice");
+      return L("summary.choice", vars);
     default:
       return L("summary.default");
   }

@@ -285,6 +285,73 @@ async function runSetup(cliOptions) {
     console.log(t(locale, "cli.setup.qrCaDownload"));
     await printQrCode(caDownloadIpUrl);
   }
+
+  const claudeSettingsPath = resolvePath(
+    cliOptions.claudeSettingsFile || path.join(os.homedir(), ".claude", "settings.json")
+  );
+  const claudeHomeExists = await fileExists(path.dirname(claudeSettingsPath));
+  if (cliOptions.claudeSettingsFile || claudeHomeExists) {
+    await installClaudeHooks({
+      envFile,
+      claudeSettingsFile: cliOptions.claudeSettingsFile,
+      sessionSecret,
+    });
+  } else {
+    console.log("");
+    console.log(t(locale, "cli.setup.claudeHooksSkipped"));
+  }
+}
+
+async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret }) {
+  const hookScript = path.join(packageRoot, "scripts", "viveworker-claude-hook.mjs");
+  const nodePath = process.execPath;
+  const settingsFile = resolvePath(
+    claudeSettingsFile || path.join(os.homedir(), ".claude", "settings.json")
+  );
+
+  const hookCommand = `'${nodePath}' '${hookScript}' --env-file '${envFile}'`;
+
+  let settings = {};
+  try {
+    const raw = await fs.readFile(settingsFile, "utf8");
+    settings = JSON.parse(raw);
+  } catch {
+    // File missing or invalid — start fresh
+  }
+
+  if (!settings.hooks) {
+    settings.hooks = {};
+  }
+
+  const hookEntry = (timeout) => ({
+    hooks: [{ type: "command", command: hookCommand, timeout }],
+  });
+
+  const fileToolMatcher = "Write|Edit|MultiEdit";
+  const approvalMatcher = "Bash|WebFetch|WebSearch|Write|Edit|MultiEdit";
+  const interactiveMatcher = "ExitPlanMode|AskUserQuestion";
+
+  settings.hooks.UserPromptSubmit = [hookEntry(15)];
+  settings.hooks.Notification = [hookEntry(15)];
+  settings.hooks.Stop = [hookEntry(15)];
+  settings.hooks.PermissionRequest = [{ ...hookEntry(900), matcher: approvalMatcher }];
+  settings.hooks.PreToolUse = [
+    { ...hookEntry(30), matcher: fileToolMatcher },
+    { ...hookEntry(900), matcher: interactiveMatcher },
+  ];
+  settings.hooks.PostToolUse = [
+    { ...hookEntry(30), matcher: `Read|${approvalMatcher}|${interactiveMatcher}` },
+  ];
+  settings.hooks.PostToolUseFailure = [
+    { ...hookEntry(15), matcher: `${approvalMatcher}|${interactiveMatcher}` },
+  ];
+  settings.hooks.SessionEnd = [hookEntry(15)];
+
+  await fs.mkdir(path.dirname(settingsFile), { recursive: true });
+  await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2) + "\n", "utf8");
+
+  console.log("");
+  console.log(`Claude hooks installed: ${settingsFile}`);
 }
 
 async function runStart(cliOptions) {
@@ -533,6 +600,7 @@ function parseArgs(argv) {
     vapidPrivateKey: "",
     locale: "",
     mkcertTrustStores: "",
+    claudeSettingsFile: "",
   };
 
   if (argv[0] && !argv[0].startsWith("-")) {
@@ -611,6 +679,9 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === "--pair") {
       parsed.pair = true;
+    } else if (arg === "--claude-settings-file") {
+      parsed.claudeSettingsFile = next;
+      index += 1;
     } else if (arg === "--help" || arg === "-h") {
       parsed.command = "help";
     } else {

@@ -64,6 +64,12 @@ const runtime = {
   threadOwnerClientIds: new Map(),
   nativeApprovalsByToken: new Map(),
   nativeApprovalsByRequestKey: new Map(),
+  claudeApprovalWaiters: new Map(),
+  claudeKnownFiles: [],
+  lastClaudeScanAt: 0,
+  claudeFileStates: new Map(),
+  claudeSessionTitles: new Map(),
+  lastClaudeSessionTitleScanAt: 0,
   fileApprovalDeltasById: new Map(),
   planRequestsByToken: new Map(),
   planRequestsByRequestKey: new Map(),
@@ -82,6 +88,7 @@ const runtime = {
   stopping: false,
 };
 const state = await loadState(config.stateFile);
+await syncClaudeAwayModeSentinel(config, state.claudeAwayMode === true);
 const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
 const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
@@ -204,6 +211,7 @@ function buildSessionLocalePayload(config, state, deviceId) {
     defaultLocale: defaultLocale(config),
     deviceDetectedLocale: resolved.detectedLocale || null,
     deviceOverrideLocale: resolved.overrideLocale || null,
+    claudeAwayMode: state?.claudeAwayMode === true,
   };
 }
 
@@ -311,18 +319,19 @@ function fileEventTitle(locale, fileEventType) {
   }
 }
 
-function fileEventDetailCopy(locale, fileEventType) {
+function fileEventDetailCopy(locale, fileEventType, provider) {
+  const vars = { provider: providerDisplayName(locale, provider) };
   switch (normalizeTimelineFileEventType(fileEventType)) {
     case "read":
-      return t(locale, "detail.fileEvent.read");
+      return t(locale, "detail.fileEvent.read", vars);
     case "write":
-      return t(locale, "detail.fileEvent.write");
+      return t(locale, "detail.fileEvent.write", vars);
     case "create":
-      return t(locale, "detail.fileEvent.create");
+      return t(locale, "detail.fileEvent.create", vars);
     case "delete":
-      return t(locale, "detail.fileEvent.delete");
+      return t(locale, "detail.fileEvent.delete", vars);
     case "rename":
-      return t(locale, "detail.fileEvent.rename");
+      return t(locale, "detail.fileEvent.rename", vars);
     default:
       return t(locale, "detail.detailUnavailable");
   }
@@ -1978,6 +1987,15 @@ function handleSignal() {
   runtime.stopping = true;
 }
 
+function normalizeProvider(value) {
+  const normalized = String(value || "").toLowerCase();
+  return normalized === "claude" ? "claude" : "codex";
+}
+
+function providerDisplayName(locale, provider) {
+  return t(locale, normalizeProvider(provider) === "claude" ? "common.claude" : "common.codex");
+}
+
 function normalizeHistoryItems(rawItems, maxItems) {
   if (!Array.isArray(rawItems)) {
     return [];
@@ -2044,6 +2062,7 @@ function normalizeHistoryItem(raw) {
     readOnly: raw.readOnly !== false,
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
     tone: cleanText(raw.tone ?? "") || "secondary",
+    provider: normalizeProvider(raw.provider),
   };
 }
 
@@ -2196,6 +2215,7 @@ function normalizeTimelineEntry(raw) {
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
     tone: cleanText(raw.tone ?? "") || "secondary",
     cwd: resolvePath(cleanText(raw.cwd || "")),
+    provider: normalizeProvider(raw.provider),
   };
 }
 
@@ -2421,6 +2441,7 @@ function recordActionHistoryItem({
   diffAddedLines = 0,
   diffRemovedLines = 0,
   outcome = "",
+  provider = "codex",
 }) {
   const item = {
     stableId,
@@ -2438,6 +2459,7 @@ function recordActionHistoryItem({
     diffAddedLines,
     diffRemovedLines,
     outcome,
+    provider: normalizeProvider(provider),
     createdAtMs: Date.now(),
     readOnly: true,
     primaryLabel: "詳細",
@@ -2724,6 +2746,21 @@ async function scanOnce({ config, runtime, state }) {
   }
 
   if (config.webUiEnabled) {
+    if (now - runtime.lastClaudeScanAt >= config.directoryScanIntervalMs) {
+      runtime.claudeKnownFiles = await listClaudeTranscriptFiles(config.claudeProjectsDir);
+      runtime.lastClaudeScanAt = now;
+    }
+    if (now - runtime.lastClaudeSessionTitleScanAt >= config.directoryScanIntervalMs) {
+      await refreshClaudeSessionTitles(runtime);
+      runtime.lastClaudeSessionTitleScanAt = now;
+    }
+    for (const filePath of runtime.claudeKnownFiles) {
+      const changed = await processClaudeTranscriptFile({ filePath, config, runtime, state, now });
+      dirty = dirty || changed;
+    }
+  }
+
+  if (config.webUiEnabled) {
     const sqliteTimelineChanged = await processSqliteTimelineLog({
       config,
       runtime,
@@ -2943,6 +2980,230 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
 function fileEventCallIdFromStableId(stableId) {
   const match = cleanText(stableId || "").match(/^file_event:(?:read|write|create):[^:]+:(call_[^:]+)$/u);
   return match ? cleanText(match[1]) : "";
+}
+
+async function refreshClaudeSessionTitles(runtime) {
+  // Read ~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json
+  // Each file maps cliSessionId → title (auto-generated by Claude Desktop).
+  const baseDir = path.join(
+    os.homedir(),
+    "Library",
+    "Application Support",
+    "Claude",
+    "claude-code-sessions"
+  );
+  try {
+    const topEntries = await fs.readdir(baseDir, { withFileTypes: true });
+    for (const top of topEntries) {
+      if (!top.isDirectory()) continue;
+      const topPath = path.join(baseDir, top.name);
+      let midEntries;
+      try {
+        midEntries = await fs.readdir(topPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const mid of midEntries) {
+        if (!mid.isDirectory()) continue;
+        const midPath = path.join(topPath, mid.name);
+        let files;
+        try {
+          files = await fs.readdir(midPath, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const file of files) {
+          if (!file.isFile() || !file.name.startsWith("local_") || !file.name.endsWith(".json")) continue;
+          try {
+            const raw = await fs.readFile(path.join(midPath, file.name), "utf8");
+            const data = JSON.parse(raw);
+            const cliSessionId = cleanText(data?.cliSessionId || "");
+            const title = cleanText(data?.title || "");
+            if (cliSessionId && title) {
+              runtime.claudeSessionTitles.set(cliSessionId, title);
+            }
+          } catch {
+            // skip unreadable/invalid
+          }
+        }
+      }
+    }
+  } catch {
+    // base dir missing — Claude Desktop not installed
+  }
+}
+
+async function listClaudeTranscriptFiles(claudeProjectsDir) {
+  try {
+    const result = [];
+    const entries = await fs.readdir(claudeProjectsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const projectPath = path.join(claudeProjectsDir, entry.name);
+      try {
+        const files = await fs.readdir(projectPath, { withFileTypes: true });
+        for (const file of files) {
+          if (!file.isFile() || !file.name.endsWith(".jsonl")) continue;
+          result.push(path.join(projectPath, file.name));
+        }
+      } catch {
+        // skip unreadable project dirs
+      }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+async function processClaudeTranscriptFile({ filePath, config, runtime, state, now }) {
+  let fileState = runtime.claudeFileStates.get(filePath);
+  if (!fileState) {
+    // Derive a default threadLabel from the project directory path
+    // e.g. ~/.claude/projects/-Users-y-hoshino-Work-kanade/session.jsonl → "kanade"
+    const projectDirName = path.basename(path.dirname(filePath));
+    const decodedProjectDir = projectDirName.replace(/^-/u, "").replace(/-/gu, "/");
+    const defaultThreadLabel = path.basename(decodedProjectDir) || "";
+
+    // On startup, use the same "recent only" strategy as processRolloutFile to avoid
+    // re-processing old entries that would be immediately discarded by the 250-entry limit.
+    let initialOffset = 0;
+    let startupCutoffMs = 0;
+    try {
+      const stat = await fs.stat(filePath);
+      const shouldReplayRecent = stat.mtimeMs >= now - config.replaySeconds * 1000;
+      if (shouldReplayRecent) {
+        // Recently active transcript: start from near the end and apply a time cutoff
+        initialOffset = Math.max(0, stat.size - config.maxReadBytes);
+        startupCutoffMs = now - config.replaySeconds * 1000;
+      } else {
+        // Inactive transcript: skip to end, only process future appends
+        initialOffset = stat.size;
+      }
+    } catch {
+      // stat failed — start from beginning with no cutoff
+    }
+
+    fileState = { offset: initialOffset, threadId: "", threadLabel: defaultThreadLabel, cwd: "", startupCutoffMs, remainder: "" };
+    runtime.claudeFileStates.set(filePath, fileState);
+  }
+
+  let fileContent;
+  let newOffset;
+  try {
+    const stat = await fs.stat(filePath);
+    if (stat.size <= fileState.offset) return false;
+    if (stat.size - fileState.offset > config.maxReadBytes) {
+      fileState.offset = Math.max(0, stat.size - config.maxReadBytes);
+      fileState.remainder = "";
+    }
+    const readLen = stat.size - fileState.offset;
+    const buf = Buffer.alloc(readLen);
+    const fh = await fs.open(filePath, "r");
+    try {
+      const { bytesRead } = await fh.read(buf, 0, readLen, fileState.offset);
+      fileContent = buf.slice(0, bytesRead).toString("utf8");
+    } finally {
+      await fh.close();
+    }
+    newOffset = stat.size;
+  } catch {
+    return false;
+  }
+
+  const merged = (fileState.remainder || "") + fileContent;
+  const lines = merged.split("\n");
+  // Last element is the in-progress partial line (or "" if file ends with \n).
+  // Stash it as the next remainder so a future scan can complete it.
+  fileState.remainder = lines.pop() ?? "";
+  fileState.offset = newOffset;
+  let dirty = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let record;
+    try {
+      record = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    // Apply startup cutoff: skip entries older than replaySeconds on first scan
+    if (fileState.startupCutoffMs && record.timestamp) {
+      const recordMs = Date.parse(record.timestamp);
+      if (recordMs && recordMs < fileState.startupCutoffMs) {
+        // Still update threadId/cwd state so later entries inherit correct context
+        if (record.sessionId) fileState.threadId = record.sessionId;
+        if (record.cwd) {
+          fileState.cwd = record.cwd;
+          fileState.threadLabel = path.basename(record.cwd);
+        }
+        continue;
+      }
+    }
+
+    if (record.sessionId) fileState.threadId = record.sessionId;
+    if (record.cwd) {
+      fileState.cwd = record.cwd;
+      fileState.threadLabel = path.basename(record.cwd);
+    }
+
+    // Only process Claude Desktop sessions
+    if (record.entrypoint !== "claude-desktop") continue;
+
+    const type = record.type;
+    if (type !== "user" && type !== "assistant") continue;
+    // Skip Claude Code's meta records (e.g. Stop hook feedback injected as a
+    // synthetic user message). They are not real user input.
+    if (record.isMeta === true) continue;
+
+    const msg = record.message || {};
+    const content = msg.content;
+    const uuid = cleanText(record.uuid || "");
+    const createdAtMs = record.timestamp ? Date.parse(record.timestamp) : now;
+    const threadId = cleanText(fileState.threadId || record.sessionId || "");
+    // Prefer Claude Desktop's auto-generated session title (e.g. "Sync Codex app from Mac to iPhone")
+    // when available; fall back to the cwd-derived basename (e.g. "viveworker").
+    const claudeTitle = threadId ? runtime.claudeSessionTitles.get(threadId) || "" : "";
+    const threadLabel = claudeTitle || fileState.threadLabel || "";
+
+    let text = "";
+    if (typeof content === "string") {
+      text = content;
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block?.type === "text" && block.text) text += block.text;
+      }
+    }
+    text = cleanText(text);
+    if (!text) continue;
+
+    const kind = type === "user" ? "user_message" : "assistant_final";
+    const stableId = `${kind}:${threadId}:${uuid}`;
+    const entry = normalizeTimelineEntry({
+      stableId,
+      token: historyToken(stableId),
+      kind,
+      threadId,
+      threadLabel,
+      title: threadLabel || "Claude",
+      summary: truncate(singleLine(text), 180),
+      messageText: text,
+      createdAtMs,
+      readOnly: true,
+      cwd: fileState.cwd,
+      provider: "claude",
+    });
+    if (entry) {
+      dirty = recordTimelineEntry({ config, runtime, state, entry }) || dirty;
+    }
+  }
+
+  // Clear startup cutoff after first scan so subsequent incremental reads are unfiltered
+  fileState.startupCutoffMs = 0;
+  return dirty;
 }
 
 async function processSqliteCompletionLog({ config, runtime, state, now }) {
@@ -3702,8 +3963,13 @@ async function copyTimelineAttachmentToPersistentDir(config, sourcePath) {
     config.timelineAttachmentsDir,
     `${Date.now()}-${crypto.randomUUID()}${extension}`
   );
-  await fs.copyFile(normalizedSourcePath, destinationPath);
-  return destinationPath;
+  try {
+    await fs.copyFile(normalizedSourcePath, destinationPath);
+    return destinationPath;
+  } catch (error) {
+    console.warn(`[timeline-image-copy-skipped] ${error?.message || error}`);
+    return "";
+  }
 }
 
 async function normalizePersistedTimelineImagePaths({ config, state, imagePaths = [] }) {
@@ -3746,7 +4012,7 @@ async function normalizePersistedTimelineImagePaths({ config, state, imagePaths 
 
     let persistentPath = existingSourcePath;
     if (!existingSourcePath.startsWith(`${config.timelineAttachmentsDir}${path.sep}`)) {
-      persistentPath = await copyTimelineAttachmentToPersistentDir(config, existingSourcePath);
+      persistentPath = await copyTimelineAttachmentToPersistentDir(config, existingSourcePath) || existingSourcePath;
     }
 
     aliases[normalizedPath] = persistentPath;
@@ -4287,7 +4553,7 @@ function buildRolloutEvent({ record, filePath, fileState, sessionIndex, config, 
     const message = formatMessage(
       [
         t(config.defaultLocale, "server.message.approveOnMac"),
-        justification || t(config.defaultLocale, "server.message.approvalNeededInCodex"),
+        justification || t(config.defaultLocale, "server.message.approvalNeededInCodex", { provider: providerDisplayName(config.defaultLocale, "codex") }),
         cmd ? t(config.defaultLocale, "server.message.commandPrefix", { command: cmd }) : null,
         approval.extraCount > 0 ? t(config.defaultLocale, "server.message.extraApprovals", { count: approval.extraCount }) : null,
       ],
@@ -4804,6 +5070,7 @@ async function createNativeApproval({ config, runtime, conversationId, request, 
     createdAtMs: now,
     resolved: false,
     resolving: false,
+    provider: "codex",
   };
 }
 
@@ -6979,7 +7246,7 @@ function getNativeThreadLabel({ runtime, conversationId, cwd }) {
   if (cwd) {
     return truncate(cleanText(path.basename(cwd)), 90) || shortId(normalizedConversationId);
   }
-  return shortId(normalizedConversationId) || "Codex task";
+  return shortId(normalizedConversationId) || t(DEFAULT_LOCALE, "server.fallback.codexTask", { provider: providerDisplayName(DEFAULT_LOCALE, "codex") });
 }
 
 function threadStateArchiveStatus(threadState) {
@@ -8667,6 +8934,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       summary: formatNotificationBody(approval.messageText, 100) || approval.messageText,
       primaryLabel: t(locale, "server.action.review"),
       createdAtMs: Number(approval.createdAtMs) || now,
+      provider: normalizeProvider(approval.provider),
     });
   }
 
@@ -8686,6 +8954,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       summary: formatNotificationBody(planRequest.messageText, 100) || planRequest.messageText,
       primaryLabel: t(locale, "server.action.review"),
       createdAtMs: Number(planRequest.createdAtMs) || now,
+      provider: "codex",
     });
   }
 
@@ -8709,6 +8978,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       summary: userInputRequest.notificationText || formatNotificationBody(userInputRequest.messageText, 100),
       primaryLabel: t(locale, userInputRequest.supported ? "server.action.select" : "server.action.detail"),
       createdAtMs: Number(userInputRequest.createdAtMs) || now,
+      provider: "codex",
     });
   }
 
@@ -8732,6 +9002,7 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
       fileRefs: normalizeTimelineFileRefs(item.fileRefs ?? []),
       primaryLabel: t(locale, "server.action.detail"),
       createdAtMs: item.createdAtMs,
+      provider: normalizeProvider(item.provider),
     }));
 }
 
@@ -8923,6 +9194,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         messageText: approval.messageText,
         outcome: "pending",
         createdAtMs: Number(approval.createdAtMs) || now,
+        provider: normalizeProvider(approval.provider),
       })
     );
   }
@@ -8946,6 +9218,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         messageText: planRequest.messageText,
         outcome: "pending",
         createdAtMs: Number(planRequest.createdAtMs) || now,
+        provider: "codex",
       })
     );
   }
@@ -8973,6 +9246,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         messageText: userInputRequest.messageText,
         outcome: "pending",
         createdAtMs: Number(userInputRequest.createdAtMs) || now,
+        provider: "codex",
       })
     );
   }
@@ -8993,6 +9267,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         messageText: historyItem.messageText,
         outcome: historyItem.outcome,
         createdAtMs: historyItem.createdAtMs,
+        provider: normalizeProvider(historyItem.provider),
       })
     );
   }
@@ -9031,7 +9306,7 @@ function buildTimelineThreads(entries, config) {
     }
     const preferredLabel =
       sanitizeTimelineThreadFilterLabel(entry.threadLabel || "", threadId) ||
-      t(DEFAULT_LOCALE, "server.fallback.codexTask");
+      t(DEFAULT_LOCALE, "server.fallback.codexTask", { provider: providerDisplayName(DEFAULT_LOCALE, entry?.provider) });
     const existing = byThread.get(threadId);
     if (!existing) {
       byThread.set(threadId, {
@@ -9080,6 +9355,7 @@ function buildTimelineResponse(runtime, state, config, locale) {
     diffRemovedLines: Math.max(0, Number(entry.diffRemovedLines) || 0),
     outcome: entry.outcome || "",
     createdAtMs: entry.createdAtMs,
+    provider: normalizeProvider(entry.provider),
   }));
 
   return {
@@ -9090,9 +9366,11 @@ function buildTimelineResponse(runtime, state, config, locale) {
 
 function buildPendingApprovalDetail(runtime, approval, locale) {
   const previousContext = buildPreviousApprovalContext(runtime, approval);
-  return {
+  const approvalKind = cleanText(approval.kind || "");
+  const detail = {
     kind: "approval",
-    approvalKind: cleanText(approval.kind || ""),
+    approvalKind,
+    provider: normalizeProvider(approval.provider),
     token: approval.token,
     title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
     threadLabel: approval.threadLabel || "",
@@ -9105,12 +9383,28 @@ function buildPendingApprovalDetail(runtime, approval, locale) {
     diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
     diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
     previousContext,
-    readOnly: false,
-    actions: [
-      { label: t(locale, "server.action.approve"), tone: "primary", url: `/api/items/approval/${encodeURIComponent(approval.token)}/accept`, body: {} },
-      { label: t(locale, "server.action.reject"), tone: "danger", url: `/api/items/approval/${encodeURIComponent(approval.token)}/decline`, body: {} },
-    ],
+    readOnly: approval.readOnly === true,
+    actions: approval.readOnly === true
+      ? []
+      : [
+          { label: t(locale, "server.action.approve"), tone: "primary", url: `/api/items/approval/${encodeURIComponent(approval.token)}/accept`, body: {} },
+          { label: t(locale, "server.action.reject"), tone: "danger", url: `/api/items/approval/${encodeURIComponent(approval.token)}/decline`, body: {} },
+        ],
   };
+  if (approvalKind === "plan") {
+    const planText = String(approval.planText || "");
+    detail.planText = planText;
+    detail.planHtml = planText
+      ? renderMessageHtml(planText, `<p>${escapeHtml(t(locale, "detail.planReady"))}</p>`)
+      : "";
+  }
+  if (approvalKind === "question") {
+    detail.questions = Array.isArray(approval.questions) ? approval.questions : [];
+    detail.answerUrl = `/api/items/question/${encodeURIComponent(approval.token)}/answer`;
+    // Question answers are submitted via answerUrl; remove approve/reject actions.
+    detail.actions = [];
+  }
+  return detail;
 }
 
 function buildPreviousApprovalContext(runtime, approval) {
@@ -9393,7 +9687,7 @@ function buildTimelineFileEventDetail(entry, locale) {
     threadLabel: entry.threadLabel || "",
     fileEventType,
     createdAtMs: Number(entry.createdAtMs) || 0,
-    messageHtml: renderMessageHtml(fileEventDetailCopy(locale, fileEventType), `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    messageHtml: renderMessageHtml(fileEventDetailCopy(locale, fileEventType, entry?.provider), `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousFileRefs: normalizeTimelineFileRefs(entry.previousFileRefs ?? []),
     diffAvailable: Boolean(entry.diffAvailable),
@@ -9522,7 +9816,7 @@ async function submitGenericUserInputDecision({ config, runtime, state, userInpu
     title: userInputRequest.title,
     messageText: userInputRequest.testRequest
       ? `${t(config.defaultLocale, "server.message.choiceSubmittedTest")}\n\n${buildChoiceHistoryText(userInputRequest, submittedAnswers)}`
-      : `${t(config.defaultLocale, "server.message.choiceSubmitted")}\n\n${buildChoiceHistoryText(userInputRequest, submittedAnswers)}`,
+      : `${t(config.defaultLocale, "server.message.choiceSubmitted", { provider: providerDisplayName(config.defaultLocale, "codex") })}\n\n${buildChoiceHistoryText(userInputRequest, submittedAnswers)}`,
     summary: userInputRequest.testRequest
       ? t(config.defaultLocale, "server.message.choiceSummaryReceivedTest")
       : t(config.defaultLocale, "server.message.choiceSummarySubmitted"),
@@ -9960,8 +10254,98 @@ async function handlePlanDecision({ config, runtime, state, planRequest, decisio
   console.log(`[plan-decision] ${planRequest.requestKey} | ${decision} | ${decisionTransport}`);
 }
 
+function claudeToolFingerprint(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (toolName === "Bash") {
+    return String(toolInput.command || "").slice(0, 500);
+  }
+  if (toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit") {
+    return String(toolInput.file_path || toolInput.path || "");
+  }
+  if (toolName === "AskUserQuestion") {
+    // PostToolUse may include the user's `answers` in toolInput, which would
+    // change a naive JSON.stringify fingerprint. Hash only the question texts.
+    try {
+      const qs = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      return JSON.stringify(qs.map((q) => String(q?.question || q?.header || ""))).slice(0, 500);
+    } catch {
+      return "";
+    }
+  }
+  if (toolName === "ExitPlanMode") {
+    return String(toolInput.plan || "").slice(0, 500);
+  }
+  try {
+    return JSON.stringify(toolInput).slice(0, 500);
+  } catch {
+    return "";
+  }
+}
+
+function formatClaudeQuestionAnswers(questions, answers) {
+  if (!Array.isArray(questions) || !Array.isArray(answers)) return "";
+  const lines = [];
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i] || {};
+    const ans = answers[i] || {};
+    const questionText = String(q.question || q.header || "").trim();
+    if (!questionText) continue;
+    const options = Array.isArray(q.options) ? q.options : [];
+    const optionIndices = Array.isArray(ans.optionIndices) ? ans.optionIndices : [];
+    const labels = optionIndices
+      .map((idx) => options[idx]?.label)
+      .filter((label) => typeof label === "string" && label.length > 0);
+    const note = typeof ans.note === "string" ? ans.note.trim() : "";
+    let answerLine = "";
+    if (labels.length > 0) {
+      answerLine = labels.join(", ");
+    }
+    if (note) {
+      answerLine = answerLine ? `${answerLine} (note: ${note})` : note;
+    }
+    if (!answerLine) {
+      answerLine = "(no answer)";
+    }
+    lines.push(`Q${i + 1}: ${questionText}`);
+    lines.push(`A: ${answerLine}`);
+  }
+  return lines.join("\n");
+}
+
+function findClaudePendingApprovalForTool(runtime, threadId, toolName, fingerprint) {
+  let match = null;
+  for (const approval of runtime.nativeApprovalsByToken.values()) {
+    if (approval.resolved) continue;
+    if (approval.conversationId !== threadId) continue;
+    if (approval.claudeToolName && toolName && approval.claudeToolName !== toolName) continue;
+    if (approval.claudeToolFingerprint && fingerprint && approval.claudeToolFingerprint !== fingerprint) continue;
+    if (!match || approval.createdAtMs > match.createdAtMs) match = approval;
+  }
+  return match;
+}
+
 async function handleNativeApprovalDecision({ config, runtime, state, approval, decision }) {
-  await runtime.ipcClient?.sendApprovalDecision(approval, decision);
+  if (approval.resolveClaudeWaiter) {
+    if (approval.provider === "claude" && approval.kind === "plan") {
+      // ExitPlanMode cannot be truly auto-approved via permissionDecision: "allow"
+      // (Claude still shows the native PC plan dialog). Instead, deny the tool
+      // call with a reason that tells Claude the user already decided on mobile.
+      approval.resolveClaudeWaiter({
+        permissionDecision: "deny",
+        permissionDecisionReason:
+          decision === "accept"
+            ? "User approved the plan via the viveworker mobile app. Proceed with implementing the plan exactly as proposed and do not call ExitPlanMode again."
+            : "User rejected the plan via the viveworker mobile app. Revise the plan based on the conversation context before calling ExitPlanMode again.",
+      });
+    } else {
+      approval.resolveClaudeWaiter(decision);
+    }
+  } else if (approval.provider === "claude") {
+    // notifyOnly Claude approvals have no long-poll waiter and no ipcClient
+    // back-channel — the desktop user already answered. Nothing to send.
+  } else {
+    await runtime.ipcClient?.sendApprovalDecision(approval, decision);
+  }
   approval.resolved = true;
   approval.resolving = false;
   runtime.nativeApprovalsByToken.delete(approval.token);
@@ -9975,8 +10359,8 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     token: approval.token,
     title: approval.title,
     threadLabel: approval.threadLabel || "",
-    messageText: `${approvalDecisionMessage(decision, config.defaultLocale)}\n\n${approval.messageText}`,
-    summary: approvalDecisionMessage(decision, config.defaultLocale),
+    messageText: `${approvalDecisionMessage(decision, config.defaultLocale, approval.provider)}\n\n${approval.messageText}`,
+    summary: approvalDecisionMessage(decision, config.defaultLocale, approval.provider),
     fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
     diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
     diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
@@ -9984,6 +10368,7 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
     diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
     outcome: decision === "accept" ? "approved" : "rejected",
+    provider: approval.provider || "codex",
   });
   if (stateChanged) {
     await saveState(config.stateFile, state);
@@ -10394,6 +10779,26 @@ function createNativeApprovalServer({ config, runtime, state }) {
         });
       }
 
+      if (url.pathname === "/api/settings/claude-away-mode" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        let payload;
+        try {
+          payload = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const enabled = payload?.enabled === true;
+        if (state.claudeAwayMode !== enabled) {
+          state.claudeAwayMode = enabled;
+          await saveState(config.stateFile, state);
+        }
+        await syncClaudeAwayModeSentinel(config, enabled);
+        return writeJson(res, 200, { ok: true, enabled });
+      }
+
       if (url.pathname === "/api/push/status" && req.method === "GET") {
         const session = requireApiSession(req, res, config, state);
         if (!session) {
@@ -10512,6 +10917,221 @@ function createNativeApprovalServer({ config, runtime, state }) {
           ok: true,
           deviceId,
           currentDeviceRevoked,
+        });
+      }
+
+      if (url.pathname === "/api/providers/claude/events" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+
+        const eventType = String(body.eventType || body.hookEventName || "");
+
+        if (eventType === "Stop" || eventType === "SessionEnd") {
+          // Agent turn ended — any still-pending native approvals for this
+          // session were not resolved by PostToolUse, meaning the user
+          // denied them on PC. Resolve as deny so iPhone clears them.
+          const threadId = String(body.threadId || body.sessionId || "");
+          console.log(`[claude-stop] threadId=${threadId} pendingTotal=${runtime.nativeApprovalsByToken.size}`);
+          if (threadId) {
+            const pending = [];
+            for (const approval of runtime.nativeApprovalsByToken.values()) {
+              if (!approval.resolved && approval.conversationId === threadId) {
+                pending.push(approval);
+              }
+            }
+            console.log(`[claude-stop] matched=${pending.length}`);
+            for (const approval of pending) {
+              try {
+                await handleNativeApprovalDecision({ config, runtime, state, approval, decision: "reject" });
+              } catch (error) {
+                console.error(`[claude-stop-resolve-error] ${approval.requestKey} | ${error.message}`);
+              }
+            }
+          }
+          return writeJson(res, 200, {});
+        }
+
+        if (eventType === "file_event") {
+          const threadId = String(body.threadId || body.sessionId || "");
+          const filePath = String(body.filePath || "");
+          const fileEventType = String(body.fileEventType || "");
+          if (!threadId || !filePath || !fileEventType) {
+            return writeJson(res, 200, {});
+          }
+          const eventCwd = String(body.cwd || "");
+          const createdAtMs = Number(body.createdAtMs) || Date.now();
+          const threadLabel =
+            runtime.claudeSessionTitles.get(threadId) ||
+            getNativeThreadLabel({ runtime, conversationId: threadId, cwd: eventCwd }) ||
+            (eventCwd ? path.basename(eventCwd) : "") ||
+            threadId.slice(0, 40);
+          const stableId = `file_event:${fileEventType}:${threadId}:${historyToken(`${threadId}:${createdAtMs}:${filePath}`)}`;
+          const token = historyToken(`file_event:${fileEventType}:${threadId}:${createdAtMs}:${filePath}`);
+          const entry = {
+            stableId,
+            token,
+            kind: "file_event",
+            fileEventType,
+            threadId,
+            threadLabel,
+            title: fileEventTitle(DEFAULT_LOCALE, fileEventType),
+            summary: "",
+            fileRefs: [filePath],
+            diffText: String(body.diffText || ""),
+            diffSource: "claude-hook",
+            diffAvailable: body.diffAvailable === true || Boolean(body.diffText),
+            diffAddedLines: Math.max(0, Number(body.diffAddedLines) || 0),
+            diffRemovedLines: Math.max(0, Number(body.diffRemovedLines) || 0),
+            createdAtMs,
+            cwd: eventCwd,
+            readOnly: true,
+            provider: "claude",
+          };
+          const changed = recordTimelineEntry({ config, runtime, state, entry });
+          if (changed) {
+            try {
+              await saveState(config.stateFile, state);
+            } catch (error) {
+              console.error(`[claude-file-event-save] ${error.message}`);
+            }
+          }
+          return writeJson(res, 200, { ok: true });
+        }
+
+        if (eventType === "PostToolUse" || eventType === "PostToolUseFailure") {
+          // The tool actually ran on PC — resolve any pending native approval
+          // for this session/tool as accepted (so iPhone moves it to completed).
+          const threadId = String(body.threadId || body.sessionId || "");
+          const toolName = String(body.toolName || "");
+          const fingerprint = claudeToolFingerprint(toolName, body.toolInput);
+          console.log(`[claude-post-tool] threadId=${threadId} tool=${toolName} fp=${fingerprint.slice(0, 80)} pendingTotal=${runtime.nativeApprovalsByToken.size}`);
+          const match = findClaudePendingApprovalForTool(runtime, threadId, toolName, fingerprint);
+          console.log(`[claude-post-tool] match=${match ? match.requestKey : "none"}`);
+          if (match) {
+            try {
+              await handleNativeApprovalDecision({ config, runtime, state, approval: match, decision: "accept" });
+            } catch (error) {
+              console.error(`[claude-post-tool-resolve-error] ${match.requestKey} | ${error.message}`);
+            }
+          }
+          return writeJson(res, 200, {});
+        }
+
+        if (eventType !== "approval_request") {
+          // Non-approval events (Notification, Stop, etc.) — acknowledge immediately
+          return writeJson(res, 200, {});
+        }
+
+        // Approval request — register in shared map so UI can display it,
+        // then long-poll until user decides (or 10 min timeout)
+        const token = crypto.randomBytes(18).toString("hex");
+        const threadId = String(body.threadId || "");
+        const requestId = String(body.requestId || crypto.randomUUID());
+        const requestKey = `${threadId}:${requestId}`;
+
+        const approval = {
+          token,
+          requestKey,
+          conversationId: threadId,
+          requestId,
+          ownerClientId: null,
+          kind: String(body.approvalKind || "command"),
+          threadLabel:
+            runtime.claudeSessionTitles.get(threadId) ||
+            (body.cwd ? path.basename(String(body.cwd))  : "") ||
+            String(body.threadId || "").slice(0, 40),
+          title: config.approvalTitle,
+          messageText: String(body.messageText || ""),
+          fileRefs: Array.isArray(body.fileRefs) ? body.fileRefs : [],
+          previousFileRefs: [],
+          diffText: String(body.diffText || ""),
+          diffAvailable: Boolean(body.diffAvailable),
+          diffSource: String(body.diffSource || "claude_permission_request"),
+          diffAddedLines: Math.max(0, Number(body.diffAddedLines) || 0),
+          diffRemovedLines: Math.max(0, Number(body.diffRemovedLines) || 0),
+          createdAtMs: Number(body.createdAtMs) || Date.now(),
+          resolved: false,
+          resolving: false,
+          resolveClaudeWaiter: null,
+          claudeToolName: String(body.toolName || ""),
+          claudeToolFingerprint: claudeToolFingerprint(String(body.toolName || ""), body.toolInput),
+          provider: "claude",
+          planText: String(body.planText || ""),
+          questions: Array.isArray(body.questions) ? body.questions : [],
+          notifyOnly: body.notifyOnly === true,
+          readOnly: body.notifyOnly === true,
+        };
+
+        runtime.nativeApprovalsByToken.set(token, approval);
+        runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
+
+        deliverWebPushItem({
+          config,
+          state,
+          kind: "approval",
+          token: approval.token,
+          stableId: pendingApprovalStableId(approval),
+          title: approval.title,
+          body: approval.messageText,
+          buildLocalizedContent: ({ locale }) => ({
+            title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+            body: approval.messageText,
+          }),
+        }).catch(() => {});
+
+        // Notify-only path: phone gets a read-only entry + push, but the
+        // hook does not block on a decision. The PostToolUse handler will
+        // clean it up once the desktop user finishes the tool call.
+        if (approval.notifyOnly) {
+          return writeJson(res, 200, { ok: true, notifyOnly: true });
+        }
+
+        const CLAUDE_APPROVAL_WAIT_MS = 600_000; // 10 min
+
+        const decisionPromise = new Promise((resolve) => {
+          approval.resolveClaudeWaiter = resolve;
+        });
+
+        const timeoutPromise = new Promise((resolve) => {
+          setTimeout(() => resolve("deny"), CLAUDE_APPROVAL_WAIT_MS);
+        });
+
+        const decision = await Promise.race([decisionPromise, timeoutPromise]);
+
+        // Clean up if timed out (waiter was never called)
+        if (!approval.resolved) {
+          approval.resolved = true;
+          approval.resolving = false;
+          runtime.nativeApprovalsByToken.delete(token);
+          runtime.nativeApprovalsByRequestKey.delete(requestKey);
+        }
+
+        // The waiter may resolve with either a string ("accept" / "reject" /
+        // "deny") or an object { permissionDecision, permissionDecisionReason }.
+        // The latter is used by the AskUserQuestion answer flow so the user's
+        // chosen text is fed back to Claude.
+        if (decision && typeof decision === "object") {
+          const responseBody = {
+            permissionDecision:
+              decision.permissionDecision === "allow" ? "allow" : "deny",
+          };
+          if (typeof decision.permissionDecisionReason === "string" && decision.permissionDecisionReason) {
+            responseBody.permissionDecisionReason = decision.permissionDecisionReason;
+          }
+          return writeJson(res, 200, responseBody);
+        }
+
+        return writeJson(res, 200, {
+          permissionDecision: decision === "accept" ? "allow" : "deny",
         });
       }
 
@@ -10658,7 +11278,89 @@ function createNativeApprovalServer({ config, runtime, state }) {
         approval.resolving = true;
         try {
           await handleNativeApprovalDecision({ config, runtime, state, approval, decision });
+          if (approval.provider === "claude") {
+            activateClaudeDesktopIfMac(req);
+          }
           return writeJson(res, 200, { ok: true, decision });
+        } catch (error) {
+          approval.resolving = false;
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const apiQuestionAnswerMatch = url.pathname.match(/^\/api\/items\/question\/([^/]+)\/answer$/u);
+      if (apiQuestionAnswerMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiQuestionAnswerMatch[1]);
+        const approval = runtime.nativeApprovalsByToken.get(token);
+        if (!approval) {
+          return writeJson(res, 404, { error: "question-not-found" });
+        }
+        if (approval.kind !== "question") {
+          return writeJson(res, 409, { error: "not-a-question" });
+        }
+        if (approval.resolved || approval.resolving) {
+          return writeJson(res, 409, { error: "question-already-handled" });
+        }
+
+        let payload;
+        try {
+          payload = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+
+        const answers = Array.isArray(payload?.answers) ? payload.answers : [];
+        const reasonText = formatClaudeQuestionAnswers(approval.questions, answers);
+        if (!reasonText) {
+          return writeJson(res, 400, { error: "no-answers" });
+        }
+
+        approval.resolving = true;
+        try {
+          if (approval.resolveClaudeWaiter) {
+            approval.resolveClaudeWaiter({
+              permissionDecision: "deny",
+              permissionDecisionReason: reasonText,
+            });
+          }
+          approval.resolved = true;
+          approval.resolving = false;
+          runtime.nativeApprovalsByToken.delete(approval.token);
+          runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+
+          const stateChanged = recordActionHistoryItem({
+            config,
+            runtime,
+            state,
+            kind: "approval",
+            stableId: `approval:${approval.requestKey}:${Date.now()}`,
+            token: approval.token,
+            title: approval.title,
+            threadLabel: approval.threadLabel || "",
+            messageText: reasonText,
+            summary: t(config.defaultLocale, "server.message.questionAnswered", {
+              provider: providerDisplayName(config.defaultLocale, approval.provider),
+            }),
+            fileRefs: [],
+            diffText: "",
+            diffSource: "",
+            diffAvailable: false,
+            diffAddedLines: 0,
+            diffRemovedLines: 0,
+            outcome: "answered",
+            provider: approval.provider || "claude",
+          });
+          if (stateChanged) {
+            await saveState(config.stateFile, state);
+          }
+          console.log(`[claude-question-answer] ${approval.requestKey}`);
+          activateClaudeDesktopIfMac(req);
+          return writeJson(res, 200, { ok: true });
         } catch (error) {
           approval.resolving = false;
           return writeJson(res, 500, { error: error.message });
@@ -10942,7 +11644,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
                 title: userInputRequest.title,
                 body: userInputRequest.testRequest
                   ? `${t(config.defaultLocale, "server.message.choiceSubmittedTest")}\n\n${formatSubmittedTestAnswers(userInputRequest, userInputRequest.draftAnswers)}`
-                  : t(config.defaultLocale, "server.message.choiceSubmitted"),
+                  : t(config.defaultLocale, "server.message.choiceSubmitted", { provider: providerDisplayName(config.defaultLocale, "codex") }),
                 tone: "ok",
               })
             );
@@ -11455,6 +12157,28 @@ function writeJson(res, statusCode, body) {
   res.end(`${JSON.stringify(body)}\n`);
 }
 
+// Return focus to the Claude Desktop app when a Mac client just submitted a
+// plan / question / approval decision, so the user can resume in Claude
+// without manually switching apps. iOS / Android paired devices are skipped
+// (UA match). If Claude is not running, we do nothing — the AppleScript
+// `exists (process "Claude")` guard prevents an unwanted launch.
+function activateClaudeDesktopIfMac(req) {
+  try {
+    const ua = String(req?.headers?.["user-agent"] || "");
+    if (/iPhone|iPad|iPod|Android/iu.test(ua)) return;
+    if (!/Macintosh|Mac OS X/iu.test(ua)) return;
+    const script = `tell application "System Events"
+  if exists (processes where name is "Claude") then
+    tell application "Claude" to activate
+  end if
+end tell`;
+    const child = spawn("osascript", ["-e", script], { stdio: "ignore" });
+    child.unref();
+  } catch {
+    // Best effort.
+  }
+}
+
 function writeHtml(res, statusCode, html) {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -11477,7 +12201,7 @@ function stopHttpServer(server) {
   });
 }
 
-function renderApprovalPage({ eyebrow, title, messageText, token, basePath, actions, locale = DEFAULT_LOCALE }) {
+function renderApprovalPage({ eyebrow, title, messageText, token, basePath, actions, locale = DEFAULT_LOCALE, provider = "codex" }) {
   const messageHtml = renderMessageHtml(messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`);
   const actionsHtml = actions
     .map(
@@ -11582,7 +12306,7 @@ function renderApprovalPage({ eyebrow, title, messageText, token, basePath, acti
         <div class="message">
           ${messageHtml}
         </div>
-        <p class="hint">${escapeHtml(t(locale, "summary.approval"))}</p>
+        <p class="hint">${escapeHtml(t(locale, "summary.approval", { provider: providerDisplayName(locale, provider) }))}</p>
         <div class="actions">
           ${actionsHtml}
           <a class="button link" href="#" onclick="history.back(); return false;">${escapeHtml(t(locale, "common.back"))}</a>
@@ -11965,7 +12689,7 @@ function renderMessagePage({ eyebrow, title, messageText, locale = DEFAULT_LOCAL
 </html>`;
 }
 
-function renderStatusPage({ title, body, tone }) {
+function renderStatusPage({ title, body, tone, provider = "codex", locale = DEFAULT_LOCALE }) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -12028,7 +12752,7 @@ function renderStatusPage({ title, body, tone }) {
   </head>
   <body>
     <section class="card">
-      <span class="chip">Codex</span>
+      <span class="chip">${escapeHtml(providerDisplayName(locale, provider))}</span>
       <h1>${escapeHtml(title)}</h1>
       <p>${escapeHtml(body)}</p>
       <p class="muted">このページは閉じて大丈夫です。</p>
@@ -12115,16 +12839,18 @@ function markdownMessageStyles() {
       }`;
 }
 
-function approvalDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+function approvalDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE, provider = "codex") {
+  const vars = { provider: providerDisplayName(locale, provider) };
   if (decision === "accept") {
-    return t(locale, "server.message.approvalAccepted");
+    return t(locale, "server.message.approvalAccepted", vars);
   }
-  return t(locale, "server.message.approvalRejected");
+  return t(locale, "server.message.approvalRejected", vars);
 }
 
-function planDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+function planDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE, provider = "codex") {
+  const vars = { provider: providerDisplayName(locale, provider) };
   if (decision === "implement") {
-    return t(locale, "server.message.planImplemented");
+    return t(locale, "server.message.planImplemented", vars);
   }
   return t(locale, "server.message.planDismissed");
 }
@@ -12140,14 +12866,15 @@ function decisionLabel(decision, locale = config?.defaultLocale || DEFAULT_LOCAL
   return decision === "accept" ? t(locale, "server.action.approve") : t(locale, "server.action.reject");
 }
 
-function approvalDecisionConfirm(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+function approvalDecisionConfirm(decision, locale = config?.defaultLocale || DEFAULT_LOCALE, provider = "codex") {
+  const vars = { provider: providerDisplayName(locale, provider) };
   if (decision === "implement") {
     return t(locale, "server.confirm.planImplement");
   }
   if (decision === "accept") {
-    return t(locale, "server.confirm.approve");
+    return t(locale, "server.confirm.approve", vars);
   }
-  return t(locale, "server.confirm.reject");
+  return t(locale, "server.confirm.reject", vars);
 }
 
 function resolvePlanDecisionAnswer(planRequest, decision) {
@@ -12406,6 +13133,7 @@ function buildConfig(cli) {
     pairingToken: process.env.PAIRING_TOKEN || "",
     pairingExpiresAtMs: numberEnv("PAIRING_EXPIRES_AT_MS", 0),
     sessionSecret: process.env.SESSION_SECRET || "",
+    claudeProjectsDir: resolvePath(process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), ".claude", "projects")),
   };
 }
 
@@ -12588,6 +13316,7 @@ async function loadState(stateFile) {
       historyFileSourceFile: cleanText(parsed.historyFileSourceFile ?? ""),
       pairingConsumedAt: Number(parsed.pairingConsumedAt) || 0,
       pairingConsumedCredential: cleanText(parsed.pairingConsumedCredential ?? ""),
+      claudeAwayMode: parsed.claudeAwayMode === true,
     };
   } catch {
     return {
@@ -12614,7 +13343,27 @@ async function loadState(stateFile) {
       historyFileSourceFile: "",
       pairingConsumedAt: 0,
       pairingConsumedCredential: "",
+      claudeAwayMode: false,
     };
+  }
+}
+
+function claudeAwayModeSentinelPath(config) {
+  const dir = config?.configDir || path.join(os.homedir(), ".viveworker");
+  return path.join(dir, "claude-away-mode");
+}
+
+async function syncClaudeAwayModeSentinel(config, enabled) {
+  const sentinel = claudeAwayModeSentinelPath(config);
+  try {
+    if (enabled) {
+      await fs.mkdir(path.dirname(sentinel), { recursive: true });
+      await fs.writeFile(sentinel, "on\n", "utf8");
+    } else {
+      await fs.unlink(sentinel).catch(() => {});
+    }
+  } catch (error) {
+    console.error(`[claude-away-mode-sentinel-error] ${error.message}`);
   }
 }
 
@@ -13016,7 +13765,7 @@ function getThreadName(sessionIndex, rolloutThreadLabels, threadId, cwd, filePat
 }
 
 function describeContext({ threadName }) {
-  const threadLabel = truncate(cleanText(threadName || ""), 90) || "Codex task";
+  const threadLabel = truncate(cleanText(threadName || ""), 90) || t(DEFAULT_LOCALE, "server.fallback.codexTask", { provider: providerDisplayName(DEFAULT_LOCALE, "codex") });
   return { threadLabel };
 }
 
@@ -13099,10 +13848,11 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
       if (!threadId) {
         return entry;
       }
-      const nativeThreadLabel = getNativeThreadLabel({
+      const claudeTitle = runtime.claudeSessionTitles.get(threadId) || "";
+      const nativeThreadLabel = claudeTitle || getNativeThreadLabel({
         runtime,
         conversationId: threadId,
-        cwd: "",
+        cwd: cleanText(entry.cwd || ""),
       });
       const threadLabel = preferTitleOnlyJsonThreadLabel(nativeThreadLabel, threadId, entry.messageText, entry.summary);
       const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
@@ -13134,10 +13884,11 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
       if (!threadId) {
         return entry;
       }
-      const nativeThreadLabel = getNativeThreadLabel({
+      const claudeTitle = runtime.claudeSessionTitles.get(threadId) || "";
+      const nativeThreadLabel = claudeTitle || getNativeThreadLabel({
         runtime,
         conversationId: threadId,
-        cwd: "",
+        cwd: cleanText(entry.cwd || ""),
       });
       const threadLabel = preferTitleOnlyJsonThreadLabel(nativeThreadLabel, threadId, entry.messageText, entry.summary);
       const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
@@ -13545,7 +14296,7 @@ async function main() {
 
   console.log(
     [
-      "Codex ntfy bridge",
+      "viveworker bridge",
       `dryRun=${config.dryRun}`,
       `once=${config.once}`,
       `codexHome=${config.codexHome}`,

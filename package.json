@@ -1,12 +1,14 @@
 {
   "name": "viveworker",
   "version": "0.1.11",
-  "description": "Local device companion for Codex Desktop approvals, plan checks, questions, and notifications on your LAN.",
+  "description": "Local mobile companion for Codex Desktop and Claude Desktop approvals, questions, completions, and code review on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
   "keywords": [
     "codex",
     "codex-desktop",
+    "claude",
+    "claude-desktop",
     "macos",
     "mobile",
     "ios",
@@ -15,6 +17,8 @@
     "web-push",
     "notifications",
     "approvals",
+    "questions",
+    "code-review",
     "lan",
     "companion-app",
     "vivecoding"
@@ -28,6 +32,7 @@
   "files": [
     "scripts/viveworker.mjs",
     "scripts/viveworker-bridge.mjs",
+    "scripts/viveworker-claude-hook.mjs",
     "scripts/lib",
     "web",
     "README.md",
