@@ -3347,6 +3347,10 @@ button[data-action-url][aria-busy="true"]:not(.is-loading) {
   color: #f5a45a;
   background: rgba(245, 164, 90, 0.1);
 }
+.provider-badge--moltbook {
+  color: #e07a5f;
+  background: rgba(224, 122, 95, 0.12);
+}
 
 .provider-filter {
   display: inline-flex;

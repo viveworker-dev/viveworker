@@ -27,7 +27,22 @@ const defaultLabel = "io.viveworker.app";
 const defaultTlsDir = path.join(defaultConfigDir, "tls");
 const defaultServerPort = 8810;
 
-const cli = parseArgs(process.argv.slice(2));
+const rawArgs = process.argv.slice(2);
+
+// `viveworker moltbook <cmd> ...` bypasses the strict parseArgs so that
+// free-form flags like `--text "hello"` reach the Moltbook CLI untouched.
+if (rawArgs[0] === "moltbook") {
+  const { runMoltbookCli } = await import("./moltbook-cli.mjs");
+  try {
+    await runMoltbookCli(rawArgs.slice(1));
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+  }
+}
+
+const cli = parseArgs(rawArgs);
 
 try {
   await main(cli);
@@ -300,6 +315,89 @@ async function runSetup(cliOptions) {
     console.log("");
     console.log(t(locale, "cli.setup.claudeHooksSkipped"));
   }
+
+  if (cliOptions.moltbook) {
+    try {
+      await installMoltbookWatcher({ cliOptions, sessionSecret, port });
+    } catch (error) {
+      console.log("");
+      console.log(`Moltbook watcher install failed: ${error.message}`);
+    }
+  }
+}
+
+async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
+  if (!cliOptions.moltbookApiKey || !cliOptions.moltbookAgentId) {
+    throw new Error(
+      "--moltbook requires --moltbook-api-key and --moltbook-agent-id"
+    );
+  }
+  const moltbookDir = path.join(os.homedir(), ".viveworker");
+  const moltbookEnvFile = path.join(moltbookDir, "moltbook.env");
+  await fs.mkdir(moltbookDir, { recursive: true });
+  const envLines = [
+    `MOLTBOOK_API_KEY=${cliOptions.moltbookApiKey}`,
+    `MOLTBOOK_AGENT_ID=${cliOptions.moltbookAgentId}`,
+    cliOptions.moltbookAgentName ? `MOLTBOOK_AGENT_NAME=${cliOptions.moltbookAgentName}` : "",
+    `VIVEWORKER_HOOK_SECRET=${sessionSecret}`,
+    `VIVEWORKER_BASE_URL=https://127.0.0.1:${port}`,
+    "",
+  ].filter((line) => line !== null);
+  await fs.writeFile(moltbookEnvFile, envLines.join("\n"), { mode: 0o600 });
+  await fs.chmod(moltbookEnvFile, 0o600);
+
+  const plistLabel = "com.viveworker.moltbook-watcher";
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${plistLabel}.plist`);
+  const watcherScript = path.join(packageRoot, "scripts", "moltbook-watcher.mjs");
+  const nodePath = process.execPath;
+  const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${plistLabel}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>set -a; . "${moltbookEnvFile}"; set +a; exec "${nodePath}" "${watcherScript}"</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/tmp/viveworker-moltbook-watcher.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/viveworker-moltbook-watcher.err.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+`;
+  await fs.mkdir(path.dirname(plistPath), { recursive: true });
+  await fs.writeFile(plistPath, plistBody, "utf8");
+
+  // Reload the agent if launchctl is available
+  try {
+    const { spawn } = await import("node:child_process");
+    await new Promise((resolve) => {
+      const unload = spawn("launchctl", ["unload", plistPath], { stdio: "ignore" });
+      unload.on("exit", () => resolve());
+      unload.on("error", () => resolve());
+    });
+    await new Promise((resolve, reject) => {
+      const load = spawn("launchctl", ["load", plistPath], { stdio: "ignore" });
+      load.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`launchctl load exited ${code}`))));
+      load.on("error", reject);
+    });
+  } catch (error) {
+    console.log("");
+    console.log(`Moltbook watcher plist written but launchctl load failed: ${error.message}`);
+    console.log(`Run manually: launchctl load ${plistPath}`);
+    return;
+  }
+
+  console.log("");
+  console.log(`Moltbook watcher installed.`);
+  console.log(`  env:  ${moltbookEnvFile}`);
+  console.log(`  plist: ${plistPath}`);
+  console.log(`  logs: /tmp/viveworker-moltbook-watcher.{out,err}.log`);
 }
 
 async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret }) {
@@ -601,6 +699,10 @@ function parseArgs(argv) {
     locale: "",
     mkcertTrustStores: "",
     claudeSettingsFile: "",
+    moltbook: false,
+    moltbookApiKey: "",
+    moltbookAgentId: "",
+    moltbookAgentName: "",
   };
 
   if (argv[0] && !argv[0].startsWith("-")) {
@@ -681,6 +783,19 @@ function parseArgs(argv) {
       parsed.pair = true;
     } else if (arg === "--claude-settings-file") {
       parsed.claudeSettingsFile = next;
+      index += 1;
+    } else if (arg === "--moltbook") {
+      parsed.moltbook = true;
+    } else if (arg === "--moltbook-api-key") {
+      parsed.moltbook = true;
+      parsed.moltbookApiKey = next;
+      index += 1;
+    } else if (arg === "--moltbook-agent-id") {
+      parsed.moltbook = true;
+      parsed.moltbookAgentId = next;
+      index += 1;
+    } else if (arg === "--moltbook-agent-name") {
+      parsed.moltbookAgentName = next;
       index += 1;
     } else if (arg === "--help" || arg === "-h") {
       parsed.command = "help";

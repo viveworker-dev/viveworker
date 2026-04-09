@@ -181,7 +181,13 @@ async function handlePermissionRequest() {
   }
 
   const result = await postEvent("PermissionRequest", body, APPROVAL_TIMEOUT_MS);
-  const behavior = String(result?.permissionDecision || "deny") === "allow" ? "allow" : "deny";
+  // If the bridge is unreachable, postEvent resolves to {} with no
+  // permissionDecision field. Distinguish that from an explicit deny and
+  // fall back to Claude Code's default permission flow instead of blocking.
+  if (!result || typeof result.permissionDecision !== "string") {
+    return;
+  }
+  const behavior = result.permissionDecision === "allow" ? "allow" : "deny";
   const reason = typeof result?.permissionDecisionReason === "string" ? result.permissionDecisionReason : "";
 
   const decision = { behavior };

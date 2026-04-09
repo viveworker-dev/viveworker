@@ -26,7 +26,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -79,6 +79,7 @@ const runtime = {
   userInputRequestsByToken: new Map(),
   userInputRequestsByRequestKey: new Map(),
   completionDetailsByToken: new Map(),
+  moltbookItemsByToken: new Map(),
   planDetailsByToken: new Map(),
   recentHistoryItems: [],
   recentTimelineEntries: [],
@@ -212,6 +213,7 @@ function buildSessionLocalePayload(config, state, deviceId) {
     deviceDetectedLocale: resolved.detectedLocale || null,
     deviceOverrideLocale: resolved.overrideLocale || null,
     claudeAwayMode: state?.claudeAwayMode === true,
+    moltbookEnabled: Boolean(config.moltbookApiKey),
   };
 }
 
@@ -1989,11 +1991,16 @@ function handleSignal() {
 
 function normalizeProvider(value) {
   const normalized = String(value || "").toLowerCase();
-  return normalized === "claude" ? "claude" : "codex";
+  if (normalized === "claude") return "claude";
+  if (normalized === "moltbook") return "moltbook";
+  return "codex";
 }
 
 function providerDisplayName(locale, provider) {
-  return t(locale, normalizeProvider(provider) === "claude" ? "common.claude" : "common.codex");
+  const p = normalizeProvider(provider);
+  if (p === "claude") return t(locale, "common.claude");
+  if (p === "moltbook") return "Moltbook";
+  return t(locale, "common.codex");
 }
 
 function normalizeHistoryItems(rawItems, maxItems) {
@@ -2174,14 +2181,18 @@ function normalizeTimelineEntry(raw) {
     formatNotificationBody(messageText, 180) ||
     (kind === "file_event" ? "" : cleanText(raw.title ?? "")) ||
     "";
-  const threadLabel = preferTitleOnlyJsonThreadLabel(
-    cleanText(raw.threadLabel ?? ""),
-    threadId,
-    raw.messageText,
-    raw.summary,
-    raw.detailText,
-    raw.message
-  );
+  const rawProvider = normalizeProvider(raw.provider);
+  const threadLabel =
+    rawProvider === "moltbook"
+      ? cleanText(raw.threadLabel ?? "")
+      : preferTitleOnlyJsonThreadLabel(
+          cleanText(raw.threadLabel ?? ""),
+          threadId,
+          raw.messageText,
+          raw.summary,
+          raw.detailText,
+          raw.message
+        );
   const title =
     cleanText(raw.title ?? "") ||
     (kind === "file_event" ? fileEventTitle(DEFAULT_LOCALE, fileEventType) : "") ||
@@ -8982,6 +8993,10 @@ function buildPendingInboxItems(runtime, state, config, locale) {
     });
   }
 
+  // Moltbook items intentionally do not appear in the unhandled list.
+  // Reply drafting is delegated to Codex/Claude Desktop via the
+  // `viveworker moltbook` CLI, so they live in the timeline only.
+
   return items.sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
 }
 
@@ -10414,6 +10429,40 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
     return historicalChoice ? buildHistoryDetail(historicalChoice, locale, runtime) : null;
   }
 
+  if (kind === "moltbook_reply") {
+    const item = runtime.moltbookItemsByToken.get(token);
+    // Fall back to the persisted timeline entry so that items which have
+    // been resolved (removed from the pending map) still render their
+    // detail view from history.
+    const entry = item
+      ? null
+      : runtime.recentTimelineEntries.find((e) => e.kind === "moltbook_reply" && e.token === token);
+    const source = item || entry;
+    if (!source) return null;
+    const contextText = item
+      ? item.contextText || item.summary || ""
+      : entry.messageText || entry.summary || "";
+    const contextHtml = escapeHtml(contextText)
+      .split("\n")
+      .map((line) => `<p>${line}</p>`)
+      .join("");
+    return {
+      kind: "moltbook_reply",
+      token,
+      threadId: source.threadId || "",
+      threadLabel: source.threadLabel || "Moltbook",
+      title: source.title || "Moltbook reply",
+      summary: source.summary || "",
+      messageHtml: contextHtml,
+      provider: "moltbook",
+      draftReply: item?.draftReply || "",
+      createdAtMs: source.createdAtMs || Date.now(),
+      readOnly: !item,
+      actions: [],
+      moltbookReplyEnabled: Boolean(item),
+    };
+  }
+
   const historyItem = historyItemByToken(runtime, kind, token);
   return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
 }
@@ -11133,6 +11182,129 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, {
           permissionDecision: decision === "accept" ? "allow" : "deny",
         });
+      }
+
+      if (url.pathname === "/api/providers/moltbook/events" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const sourceId = cleanText(body.sourceId || "");
+        if (!sourceId) {
+          return writeJson(res, 400, { error: "missing-sourceId" });
+        }
+        const eventType = String(body.eventType || "reply_request");
+        if (eventType === "resolve") {
+          const token = historyToken(`moltbook:${sourceId}`);
+          runtime.moltbookItemsByToken.delete(token);
+          return writeJson(res, 200, { ok: true });
+        }
+        const token = historyToken(`moltbook:${sourceId}`);
+        const item = {
+          token,
+          sourceId,
+          threadId: cleanText(body.threadId || sourceId),
+          threadLabel: cleanText(body.threadLabel || "Moltbook"),
+          title: cleanText(body.title || "Moltbook reply"),
+          summary: cleanText(body.summary || ""),
+          contextText: cleanText(body.contextText || ""),
+          draftReply: cleanText(body.draftReply || ""),
+          callbackUrl: cleanText(body.callbackUrl || ""),
+          createdAtMs: Number(body.createdAtMs) || Date.now(),
+          resolved: false,
+        };
+        runtime.moltbookItemsByToken.set(token, item);
+        try {
+          recordTimelineEntry({
+            config,
+            runtime,
+            state,
+            entry: {
+              stableId: `moltbook_reply:${sourceId}`,
+              token,
+              kind: "moltbook_reply",
+              threadId: item.threadId,
+              threadLabel: item.threadLabel,
+              title: item.title,
+              summary: item.summary,
+              messageText: item.contextText,
+              createdAtMs: item.createdAtMs,
+              readOnly: false,
+              provider: "moltbook",
+            },
+          });
+          await saveState(config.stateFile, state);
+        } catch (error) {
+          console.error(`[moltbook-timeline-save] ${error.message}`);
+        }
+        try {
+          await deliverWebPushItem({
+            config,
+            state,
+            kind: "moltbook_reply",
+            token,
+            stableId: `moltbook_reply:${item.sourceId}`,
+            title: item.title,
+            body: item.summary,
+          });
+        } catch (error) {
+          console.error(`[moltbook-push-error] ${error.message}`);
+        }
+        return writeJson(res, 200, { ok: true, token });
+      }
+
+      const apiMoltbookReplyMatch = url.pathname.match(/^\/api\/items\/moltbook\/([^/]+)\/reply$/u);
+      if (apiMoltbookReplyMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const token = decodeURIComponent(apiMoltbookReplyMatch[1]);
+        const item = runtime.moltbookItemsByToken.get(token);
+        if (!item) {
+          return writeJson(res, 404, { error: "item-not-found" });
+        }
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const action = String(body.action || "send");
+        const text = cleanText(body.text || "");
+        if (action === "send" && !text) {
+          return writeJson(res, 400, { error: "empty-reply" });
+        }
+        if (item.callbackUrl) {
+          try {
+            const callbackRes = await fetch(item.callbackUrl, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-viveworker-hook-secret": config.sessionSecret || "",
+              },
+              body: JSON.stringify({
+                sourceId: item.sourceId,
+                action,
+                text,
+              }),
+            });
+            if (!callbackRes.ok) {
+              return writeJson(res, 502, { error: `callback-failed-${callbackRes.status}` });
+            }
+          } catch (error) {
+            return writeJson(res, 502, { error: `callback-error: ${error.message}` });
+          }
+        }
+        item.resolved = true;
+        runtime.moltbookItemsByToken.delete(token);
+        return writeJson(res, 200, { ok: true, action });
       }
 
       if (url.pathname === "/api/inbox" && req.method === "GET") {
@@ -13044,6 +13216,23 @@ function isLoopbackHostname(value) {
   return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
 }
 
+function readMoltbookEnvKey() {
+  // Fall back to the standalone watcher's env file so the bridge can detect
+  // a configured Moltbook integration without requiring MOLTBOOK_API_KEY to
+  // be duplicated into its launchd plist.
+  try {
+    const envPath = path.join(os.homedir(), ".viveworker", "moltbook.env");
+    const raw = readFileSync(envPath, "utf8");
+    for (const line of raw.split(/\r?\n/u)) {
+      const m = line.match(/^\s*MOLTBOOK_API_KEY\s*=\s*(.+?)\s*$/u);
+      if (m) return m[1].replace(/^['"]|['"]$/gu, "");
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
 function buildConfig(cli) {
   const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
   const stateFile = resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json"));
@@ -13051,6 +13240,7 @@ function buildConfig(cli) {
     dryRun: cli.dryRun || truthy(process.env.DRY_RUN),
     once: cli.once,
     codexHome,
+    moltbookApiKey: cleanText(process.env.MOLTBOOK_API_KEY || readMoltbookEnvKey() || ""),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
     webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
@@ -13844,6 +14034,12 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
 
   const nextTimelineEntries = normalizeTimelineEntries(
     runtime.recentTimelineEntries.map((entry) => {
+      // Moltbook entries carry their own author-provided title/threadLabel
+      // (e.g. "@broanbot commented"). Skip the native-thread relabel pass so
+      // we don't overwrite them with the UUID-head fallback.
+      if (normalizeProvider(entry.provider) === "moltbook") {
+        return entry;
+      }
       const threadId = cleanText(entry.threadId || "");
       if (!threadId) {
         return entry;

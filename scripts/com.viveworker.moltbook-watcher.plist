@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for viveworker's Moltbook watcher.
+
+  Install:
+    1. Copy this file to ~/Library/LaunchAgents/com.viveworker.moltbook-watcher.plist
+    2. Edit the placeholders below (USER, paths, env file path).
+    3. Create ~/.viveworker/moltbook.env with:
+         MOLTBOOK_API_KEY=moltbook_sk_...
+         MOLTBOOK_AGENT_ID=...
+         VIVEWORKER_HOOK_SECRET=...        # same as the bridge sessionSecret
+         VIVEWORKER_BASE_URL=http://127.0.0.1:8765
+    4. chmod 600 ~/.viveworker/moltbook.env
+    5. launchctl load ~/Library/LaunchAgents/com.viveworker.moltbook-watcher.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.viveworker.moltbook-watcher.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.viveworker.moltbook-watcher</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>set -a; . "$HOME/.viveworker/moltbook.env"; set +a; exec /usr/local/bin/node "$HOME/path/to/viveworker/scripts/moltbook-watcher.mjs"</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/viveworker-moltbook-watcher.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/viveworker-moltbook-watcher.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -526,11 +526,16 @@ function listInboxEntries() {
 
 function normalizeProviderClient(value) {
   const normalized = String(value || "").toLowerCase();
-  return normalized === "claude" ? "claude" : "codex";
+  if (normalized === "claude") return "claude";
+  if (normalized === "moltbook") return "moltbook";
+  return "codex";
 }
 
 function providerDisplayName(provider) {
-  return L(normalizeProviderClient(provider) === "claude" ? "common.claude" : "common.codex");
+  const p = normalizeProviderClient(provider);
+  if (p === "claude") return L("common.claude");
+  if (p === "moltbook") return "Moltbook";
+  return L("common.codex");
 }
 
 function entryMatchesProviderFilter(item) {
@@ -1650,6 +1655,9 @@ function providerBadgeMeta(provider) {
   if (normalized === "claude") {
     return { id: "claude", label: L("common.claude"), glyph: "C" };
   }
+  if (normalized === "moltbook") {
+    return { id: "moltbook", label: "Moltbook", glyph: "M" };
+  }
   return { id: "codex", label: L("common.codex"), glyph: "X" };
 }
 
@@ -1659,11 +1667,15 @@ function renderProviderBadge(provider) {
 }
 
 function providerFilterOptions() {
-  return [
+  const options = [
     { id: "all", label: L("timeline.allThreads") },
     { id: "codex", label: L("common.codex") },
     { id: "claude", label: L("common.claude") },
   ];
+  if (state.session?.moltbookEnabled === true) {
+    options.push({ id: "moltbook", label: "Moltbook" });
+  }
+  return options;
 }
 
 function renderProviderFilter() {
@@ -3267,6 +3279,7 @@ function renderStandardDetailDesktop(detail) {
       ${detail.readOnly || detail.kind === "approval" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
+      ${renderMoltbookReplyComposer(detail)}
       ${
         plainIntro
           ? plainIntro
@@ -3299,6 +3312,7 @@ function renderStandardDetailMobile(detail) {
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
           ${renderPreviousContextCard(detail, { mobile: true })}
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
+          ${renderMoltbookReplyComposer(detail, { mobile: true })}
           ${
             plainIntro
               ? plainIntro
@@ -3753,6 +3767,26 @@ function setClaudeQuestionDraft(token, partial) {
   const next = { ...getClaudeQuestionDraft(token), ...partial };
   claudeQuestionDrafts.set(token, next);
   return next;
+}
+
+function renderMoltbookReplyComposer(detail, options = {}) {
+  if (detail.kind !== "moltbook_reply") return "";
+  // Reply drafting is delegated to the Codex/Claude Desktop CLI, so the
+  // mobile UI is read-only. Surface the commenter's handle instead.
+  const rawTitle = normalizeClientText(detail.title || "");
+  const match = rawTitle.match(/^@([^\s]+)/u);
+  const authorHandle = match ? match[1] : "";
+  if (!authorHandle) return "";
+  return `
+    <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="reply-composer reply-composer--readonly">
+        <div class="reply-composer__copy">
+          <span class="eyebrow-pill eyebrow-pill--quiet">Moltbook</span>
+          <p class="reply-composer__author">from <strong>@${escapeHtml(authorHandle)}</strong></p>
+        </div>
+      </div>
+    </section>
+  `;
 }
 
 function renderCompletionReplyComposer(detail, options = {}) {
@@ -4808,6 +4842,37 @@ function bindShellInteractions() {
       }
       await refreshAuthenticatedState();
       await renderShell();
+    });
+  }
+
+  const moltbookForm = document.querySelector("[data-moltbook-reply-form]");
+  if (moltbookForm) {
+    const token = moltbookForm.dataset.token || "";
+    let submittedAction = "send";
+    moltbookForm.querySelectorAll("button[type='submit']").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        submittedAction = btn.dataset.action || "send";
+      });
+    });
+    moltbookForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = normalizeClientText(new FormData(moltbookForm).get("text"));
+      try {
+        const res = await fetch(`/api/items/moltbook/${encodeURIComponent(token)}/reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ action: submittedAction, text }),
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          alert(`Moltbook reply failed: ${errBody.error || res.status}`);
+          return;
+        }
+        await renderShell();
+      } catch (error) {
+        alert(`Moltbook reply error: ${error.message}`);
+      }
     });
   }
 
