@@ -1,6 +1,10 @@
 # OS / editor noise
 .DS_Store
 
+# Local tool state
+.claude/
+.tmp-claude-test/
+
 # Dependencies
 node_modules/
 

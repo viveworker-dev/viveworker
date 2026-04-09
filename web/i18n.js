@@ -1012,7 +1012,7 @@ const translations = {
     "cli.setup.webPushEnabled": "Web Push: enabled (HTTPS)",
     "cli.setup.webPushDisabled": "Web Push: disabled",
     "cli.setup.claudeHooksSkipped": "Claude hooks はスキップしました（~/.claude ディレクトリが見つかりません）。Claude Desktop をインストール後に `viveworker setup` を再実行すると Claude 連携が有効になります。",
-    "cli.setup.completePending": "viveworker の setup は完了しましたが、まだ health 応答は確認できていません。
+    "cli.setup.completePending": "viveworker の setup は完了しましたが、まだ health 応答は確認できていません。",
     "cli.setup.caFlow.title": "端末で viveworker を開く前に、必要ならローカルの証明書をインストールしてください:",
     "cli.setup.caFlow.step1": "1. 下の CA download URL を開くか QR を読み取り、端末で rootCA.pem を取得します。",
     "cli.setup.caFlow.step2": "2. rootCA.pem をインストールし、必要なら端末側でその証明書を信頼します。",
