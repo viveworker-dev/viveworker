@@ -3,7 +3,9 @@
 
 # Local tool state
 .claude/
+assets/source/
 .tmp-claude-test/
+scripts/build-*
 
 # Dependencies
 node_modules/
