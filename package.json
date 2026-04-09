@@ -1,6 +1,6 @@
 {
   "name": "viveworker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local mobile companion for Codex Desktop and Claude Desktop approvals, questions, completions, and code review on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
