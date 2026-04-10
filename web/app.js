@@ -47,6 +47,7 @@ const state = {
   pairError: "",
   pairNotice: "",
   pushStatus: null,
+  moltbookScoutStatus: null,
   pushNotice: "",
   pushError: "",
   deviceNotice: "",
@@ -212,6 +213,7 @@ async function refreshAuthenticatedState() {
   await refreshTimeline();
   await refreshDevices();
   await refreshPushStatus();
+  await fetchMoltbookScoutStatus();
   ensureCurrentSelection();
 }
 
@@ -314,6 +316,18 @@ async function refreshPushStatus() {
       vapidPublicKey: "",
       error: error.message || String(error),
     };
+  }
+}
+
+async function fetchMoltbookScoutStatus() {
+  if (!state.session?.moltbookEnabled) {
+    state.moltbookScoutStatus = null;
+    return;
+  }
+  try {
+    state.moltbookScoutStatus = await apiGet("/api/moltbook/scout-status");
+  } catch {
+    state.moltbookScoutStatus = null;
   }
 }
 
@@ -638,6 +652,16 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
   }
 }
 
+function isMoltbookThreadId(threadId, item) {
+  if (threadId === "moltbook") return true;
+  if (typeof threadId === "string" && threadId.startsWith("draft:")) return true;
+  const kind = normalizeClientText(item?.kind || "");
+  if (kind === "moltbook_draft" || kind === "moltbook_reply") return true;
+  const label = normalizeClientText(item?.threadLabel || "").toLowerCase();
+  if (label === "moltbook") return true;
+  return false;
+}
+
 function completedThreads() {
   const items = Array.isArray(state.inbox?.completed) ? state.inbox.completed : [];
   if (!items.length) {
@@ -646,7 +670,7 @@ function completedThreads() {
   const byThread = new Map();
   for (const item of items) {
     const threadId = normalizeClientText(item.threadId || "");
-    if (!threadId) {
+    if (!threadId || isMoltbookThreadId(threadId, item)) {
       continue;
     }
     const latestAtMs = Number(item.createdAtMs || 0);
@@ -671,7 +695,7 @@ function diffThreads() {
   const byThread = new Map();
   for (const item of items) {
     const threadId = normalizeClientText(item.threadId || "");
-    if (!threadId) {
+    if (!threadId || isMoltbookThreadId(threadId, item)) {
       continue;
     }
     const latestAtMs = Number(item.createdAtMs || 0);
@@ -935,6 +959,27 @@ function shouldDeferRenderForActiveInteraction() {
     activeElement instanceof HTMLTextAreaElement &&
     activeElement.matches("[data-completion-reply-textarea]") &&
     normalizeClientText(activeElement.dataset.replyToken) === normalizeClientText(state.currentItem?.token)
+  ) {
+    return true;
+  }
+  if (
+    activeElement instanceof HTMLTextAreaElement &&
+    activeElement.matches("[data-moltbook-draft-textarea]")
+  ) {
+    return true;
+  }
+  if (state.currentDetail?.kind === "moltbook_draft") {
+    return true;
+  }
+  if (
+    activeElement instanceof HTMLTextAreaElement &&
+    activeElement.matches("[data-claude-question-note]")
+  ) {
+    return true;
+  }
+  if (
+    activeElement instanceof HTMLInputElement &&
+    activeElement.matches("[data-moltbook-draft-title]")
   ) {
     return true;
   }
@@ -2691,6 +2736,7 @@ function buildSettingsContext() {
       supportsPushValue,
       serverEnabled,
     }),
+    moltbookScout: state.moltbookScoutStatus,
   };
 }
 
@@ -2837,6 +2883,13 @@ function settingsPageMeta(page) {
         description: L("settings.awayMode.copy"),
         icon: "settings",
       };
+    case "moltbook":
+      return {
+        id: "moltbook",
+        title: L("settings.moltbook.title"),
+        description: L("settings.moltbook.copy"),
+        icon: "item",
+      };
     default:
       return settingsPageMeta("notifications");
   }
@@ -2906,6 +2959,15 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
+      ${state.session?.moltbookEnabled ? renderSettingsGroup(L("common.sns"), [
+        renderSettingsNavRow({
+          page: "moltbook",
+          icon: "item",
+          title: L("settings.moltbook.title"),
+          subtitle: L("settings.moltbook.subtitle"),
+          value: context.moltbookScout?.enabled ? `${context.moltbookScout.sentToday} / ${context.moltbookScout.maxDaily}` : "",
+        }),
+      ]) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
       ${renderSettingsGroup(L("settings.group.advanced"), advancedRows)}
     </div>
@@ -2949,6 +3011,9 @@ function renderSettingsSubpage(context, { mobile }) {
     case "awayMode":
       content = renderSettingsAwayModePage();
       break;
+    case "moltbook":
+      content = renderSettingsMoltbookPage(context);
+      break;
     default:
       content = "";
   }
@@ -2967,7 +3032,7 @@ function renderSettingsNotificationsPage(context) {
   const statusRows = [
     renderSettingsInfoRow(L("settings.row.status"), L(context.setupState.notifications.labelKey)),
     renderSettingsInfoRow(L("settings.row.notificationPermission"), permission),
-    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), push.serverSubscribed ? L("common.yes") : L("common.no")),
+    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
     push.lastSuccessfulDeliveryAtMs
       ? renderSettingsInfoRow(
           L("settings.row.lastSuccessfulDelivery"),
@@ -2979,10 +3044,10 @@ function renderSettingsNotificationsPage(context) {
     <div class="settings-page">
       ${renderSettingsGroup("", statusRows)}
       ${renderSettingsGroup(L("settings.group.advanced"), [
-        renderSettingsInfoRow(L("settings.row.serverWebPush"), serverEnabled ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.secureContext"), secureContext ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), standalone ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), supportsPushValue ? L("common.yes") : L("common.no")),
+        renderSettingsInfoRow(L("settings.row.serverWebPush"), serverEnabled ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.secureContext"), secureContext ? L("common.supported") : L("common.notSupported")),
+        renderSettingsInfoRow(L("settings.row.homeScreenApp"), standalone ? L("common.supported") : L("common.notSupported")),
+        renderSettingsInfoRow(L("settings.row.browserSupport"), supportsPushValue ? L("common.supported") : L("common.notSupported")),
       ])}
       ${state.pushNotice ? `<p class="inline-alert inline-alert--success">${escapeHtml(state.pushNotice)}</p>` : ""}
       ${state.pushError ? `<p class="inline-alert inline-alert--danger">${escapeHtml(state.pushError)}</p>` : ""}
@@ -3074,12 +3139,12 @@ function renderSettingsAdvancedPage(context) {
     <div class="settings-page">
       ${context.diagnostics.map((message) => `<p class="inline-alert">${escapeHtml(message)}</p>`).join("")}
       ${renderSettingsGroup("", [
-        renderSettingsInfoRow(L("settings.row.serverWebPush"), context.serverEnabled ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.yes") : L("common.no")),
+        renderSettingsInfoRow(L("settings.row.serverWebPush"), context.serverEnabled ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.supported") : L("common.notSupported")),
+        renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.supported") : L("common.notSupported")),
         renderSettingsInfoRow(L("settings.row.notificationPermission"), context.permission),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.yes") : L("common.no")),
-        renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.serverSubscribed ? L("common.yes") : L("common.no")),
+        renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.supported") : L("common.notSupported")),
+        renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
         context.push.lastSuccessfulDeliveryAtMs
           ? renderSettingsInfoRow(
               L("settings.row.lastSuccessfulDelivery"),
@@ -3164,6 +3229,37 @@ function renderSettingsAwayModePage() {
   `;
 }
 
+function renderSettingsMoltbookPage(context) {
+  const scout = context.moltbookScout;
+  if (!scout?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.moltbook.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const batchRows = scout.batch ? [
+    renderSettingsInfoRow(L("settings.row.moltbookBatchCandidates"), String(scout.batch.candidateCount)),
+    renderSettingsInfoRow(L("settings.row.moltbookBatchTopScore"), String(scout.batch.topScore)),
+    renderSettingsInfoRow(L("settings.row.moltbookBatchRemaining"), `${Math.floor(scout.batch.remainingSeconds / 60)}:${String(scout.batch.remainingSeconds % 60).padStart(2, "0")}`),
+  ] : [];
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup("", [
+        renderSettingsInfoRow(L("settings.row.moltbookQuota"), `${scout.sentToday} / ${scout.maxDaily}`),
+        renderSettingsInfoRow(L("settings.row.moltbookComposed"), `${scout.composedToday || 0} / 3`),
+        renderSettingsInfoRow(L("settings.row.moltbookSlots"), (scout.composeSlotsAttempted || []).join(", ") || "—"),
+        renderSettingsInfoRow(L("settings.row.moltbookDate"), scout.day),
+        renderSettingsInfoRow(L("settings.row.moltbookSeenPosts"), String(scout.seenPostCount)),
+      ])}
+      ${batchRows.length ? renderSettingsGroup(L("settings.moltbook.batchTitle"), batchRows) : ""}
+      ${Array.isArray(scout.recentComposeTitles) && scout.recentComposeTitles.length
+        ? renderSettingsGroup(L("settings.row.moltbookRecentTitles"), scout.recentComposeTitles.map((t) => renderSettingsInfoRow("", t)))
+        : ""}
+    </div>
+  `;
+}
+
 function renderSettingsInfoRow(label, value, options = {}) {
   const rowClassName = ["settings-info-row", options.rowClassName || ""].filter(Boolean).join(" ");
   const valueClassName = ["settings-info-row__value", options.valueClassName || ""].filter(Boolean).join(" ");
@@ -3205,7 +3301,7 @@ function renderDeviceSection(title, devices, emptyMessage) {
 
 function renderTrustedDeviceCard(device) {
   const localeLabel = localeDisplayName(device.locale, state.locale) || device.locale || L("common.unavailable");
-  const pushLabel = device.pushSubscribed ? L("common.yes") : L("common.no");
+  const pushLabel = device.pushSubscribed ? L("common.enabled") : L("common.disabled");
   const badge = device.currentDevice
     ? `<span class="device-card__badge">${escapeHtml(L("settings.device.thisDevice"))}</span>`
     : "";
@@ -3276,14 +3372,17 @@ function renderStandardDetailDesktop(detail) {
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
       <h2 class="detail-title detail-title--desktop">${escapeHtml(detailDisplayTitle(detail))}</h2>
-      ${detail.readOnly || detail.kind === "approval" ? "" : renderDetailLead(detail, kindInfo)}
+      ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
       ${renderMoltbookReplyComposer(detail)}
+      ${renderMoltbookDraftComposer(detail)}
       ${
-        plainIntro
-          ? plainIntro
-          : `
+        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply"
+          ? ""
+          : plainIntro
+            ? plainIntro
+            : `
             <section class="detail-card detail-card--body ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
               <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
             </section>
@@ -3313,10 +3412,13 @@ function renderStandardDetailMobile(detail) {
           ${renderPreviousContextCard(detail, { mobile: true })}
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
           ${renderMoltbookReplyComposer(detail, { mobile: true })}
+          ${renderMoltbookDraftComposer(detail, { mobile: true })}
           ${
-            plainIntro
-              ? plainIntro
-              : `
+            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply"
+              ? ""
+              : plainIntro
+                ? plainIntro
+                : `
                 <section class="detail-card detail-card--body detail-card--mobile ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
                   ${detail.readOnly || detail.kind === "approval" ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
                   <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
@@ -3341,7 +3443,8 @@ function renderDetailPlainIntro(detail, options = {}) {
   if (!["approval", "diff_thread", "file_event"].includes(detail?.kind || "")) {
     return "";
   }
-  if (detail?.kind === "approval" && normalizeClientText(detail?.approvalKind || "") !== "file") {
+  const ak = normalizeClientText(detail?.approvalKind || "");
+  if (detail?.kind === "approval" && ak !== "file" && ak !== "plan" && ak !== "question") {
     return "";
   }
   if (!detail?.messageHtml) {
@@ -3746,7 +3849,7 @@ function renderClaudeQuestionSection(detail, options = {}) {
         ${noticeHtml}
         ${isReadOnly ? "" : `
           <div class="claude-question-actions">
-            <button type="submit" class="action-button action-button--primary" ${isSent || draft.sending ? "disabled" : ""}>
+            <button type="submit" class="primary primary--wide" ${isSent || draft.sending ? "disabled" : ""}>
               ${escapeHtml(draft.sending ? L("claudeQuestion.send", { provider }) + "…" : sendLabel)}
             </button>
           </div>
@@ -3771,20 +3874,82 @@ function setClaudeQuestionDraft(token, partial) {
 
 function renderMoltbookReplyComposer(detail, options = {}) {
   if (detail.kind !== "moltbook_reply") return "";
-  // Reply drafting is delegated to the Codex/Claude Desktop CLI, so the
-  // mobile UI is read-only. Surface the commenter's handle instead.
   const rawTitle = normalizeClientText(detail.title || "");
   const match = rawTitle.match(/^@([^\s]+)/u);
-  const authorHandle = match ? match[1] : "";
-  if (!authorHandle) return "";
+  const authorHandle = match ? match[1] : detail.commentAuthor || "";
+  const postUrl = detail.postUrl || "";
+  const postLink = postUrl
+    ? `<p class="reply-composer__author"><a href="${escapeHtml(postUrl)}" target="_blank" rel="noopener">${escapeHtml(postUrl)}</a></p>`
+    : "";
+  const bodyHtml = detail.messageHtml
+    ? `<div class="reply-composer__context-body markdown">${detail.messageHtml}</div>`
+    : "";
   return `
     <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
       <div class="reply-composer reply-composer--readonly">
         <div class="reply-composer__copy">
           <span class="eyebrow-pill eyebrow-pill--quiet">Moltbook</span>
-          <p class="reply-composer__author">from <strong>@${escapeHtml(authorHandle)}</strong></p>
+          ${authorHandle ? `<p class="reply-composer__author">from <strong>@${escapeHtml(authorHandle)}</strong></p>` : ""}
+          ${postLink}
         </div>
+        ${bodyHtml}
       </div>
+    </section>
+  `;
+}
+
+function renderMoltbookDraftComposer(detail, options = {}) {
+  if (detail.kind !== "moltbook_draft") return "";
+  const enabled = detail.moltbookDraftEnabled !== false && detail.readOnly !== true;
+  const draftText = detail.draftText || "";
+  const isOriginalPost = detail.draftType === "original_post";
+  const postAuthorLine = !isOriginalPost && detail.postAuthor
+    ? `<p class="reply-composer__author-meta muted">@${escapeHtml(detail.postAuthor)}</p>`
+    : "";
+  const postLink = !isOriginalPost && detail.postUrl
+    ? `<p class="reply-composer__author"><a href="${escapeHtml(detail.postUrl)}" target="_blank" rel="noopener">${escapeHtml(detail.postTitle || detail.postUrl)}</a></p>`
+    : "";
+  const postBodyBlock = !isOriginalPost && detail.postBody
+    ? `<details class="reply-composer__context"><summary>元の投稿</summary><div class="reply-composer__context-body">${escapeHtml(detail.postBody).replace(/\n/g, "<br>")}</div></details>`
+    : "";
+  const intentBlock = detail.intent
+    ? `<div class="reply-composer__intent"><span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("moltbook.draft.intent"))}</span><p>${escapeHtml(detail.intent).replace(/\n/g, "<br>")}</p></div>`
+    : "";
+  const titleInput = isOriginalPost && enabled
+    ? `<label class="field reply-field reply-field--title"><span class="field-label">${escapeHtml(L("moltbook.draft.titleLabel"))}</span><input type="text" name="title" class="reply-field__input" value="${escapeHtml(detail.postTitle || "")}" data-moltbook-draft-title /></label>`
+    : isOriginalPost
+      ? `<p class="reply-composer__title-display"><strong>${escapeHtml(detail.postTitle || "")}</strong></p>`
+      : "";
+  const submoltBadge = isOriginalPost && detail.submoltName
+    ? `<span class="eyebrow-pill eyebrow-pill--subtle">${escapeHtml(detail.submoltName)}</span>`
+    : "";
+  const eyebrowLabel = isOriginalPost ? L("moltbook.draft.eyebrowPost") : L("moltbook.draft.eyebrowReply");
+  const approveLabel = isOriginalPost ? L("moltbook.draft.approvePost") : L("moltbook.draft.approveReply");
+  const buttons = enabled
+    ? `
+      <div class="actions actions--stack${options.mobile ? " actions--sticky" : ""}">
+        <button type="submit" data-action="approve" class="primary primary--wide">${escapeHtml(approveLabel)}</button>
+        <button type="submit" data-action="deny" class="danger danger--wide">Deny</button>
+      </div>
+    `
+    : `<p class="muted reply-composer__description">${escapeHtml(L("moltbook.draft.resolved"))}</p>`;
+  const buttonsWrapped = enabled && options.mobile ? `<div class="detail-action-bar">${buttons}</div>` : buttons;
+  return `
+    <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
+      <form class="reply-composer" data-moltbook-draft-form data-token="${escapeHtml(detail.token || "")}" ${isOriginalPost ? 'data-draft-type="original_post"' : ""}>
+        <div class="reply-composer__copy">
+          <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(eyebrowLabel)}</span>
+          ${submoltBadge}
+          ${postLink}
+          ${postAuthorLine}
+          ${titleInput}
+          ${postBodyBlock}
+          ${intentBlock}
+          <p class="muted reply-composer__description">${escapeHtml(L("moltbook.draft.editHint"))}</p>
+        </div>
+        <textarea name="text" class="reply-composer__textarea" data-moltbook-draft-textarea rows="8" ${enabled ? "" : "readonly"}>${escapeHtml(draftText)}</textarea>
+        ${buttonsWrapped}
+      </form>
     </section>
   `;
 }
@@ -4845,33 +5010,73 @@ function bindShellInteractions() {
     });
   }
 
-  const moltbookForm = document.querySelector("[data-moltbook-reply-form]");
-  if (moltbookForm) {
-    const token = moltbookForm.dataset.token || "";
-    let submittedAction = "send";
-    moltbookForm.querySelectorAll("button[type='submit']").forEach((btn) => {
+  const moltbookDraftForm = document.querySelector("[data-moltbook-draft-form]");
+  if (moltbookDraftForm) {
+    const token = moltbookDraftForm.dataset.token || "";
+    let submittedAction = "approve";
+    moltbookDraftForm.querySelectorAll("button[type='submit']").forEach((btn) => {
       btn.addEventListener("click", () => {
-        submittedAction = btn.dataset.action || "send";
+        submittedAction = btn.dataset.action || "approve";
       });
     });
-    moltbookForm.addEventListener("submit", async (event) => {
+    moltbookDraftForm.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const text = normalizeClientText(new FormData(moltbookForm).get("text"));
+      if (moltbookDraftForm.dataset.submitting === "1") return;
+      moltbookDraftForm.dataset.submitting = "1";
+      const buttons = moltbookDraftForm.querySelectorAll("button[type='submit']");
+      const textarea = moltbookDraftForm.querySelector("textarea");
+      const labelCache = new Map();
+      buttons.forEach((btn) => {
+        labelCache.set(btn, btn.innerHTML);
+        btn.disabled = true;
+        if (btn.dataset.action === submittedAction) {
+          btn.innerHTML = submittedAction === "approve" ? "送信中…" : "処理中…";
+          btn.classList.add("is-loading");
+        } else {
+          btn.classList.add("is-dimmed");
+        }
+      });
+      if (textarea) textarea.readOnly = true;
+      const editedText = normalizeClientText(new FormData(moltbookDraftForm).get("text"));
+      const titleInput = moltbookDraftForm.querySelector("[data-moltbook-draft-title]");
+      const editedTitle = titleInput ? normalizeClientText(titleInput.value) : "";
       try {
-        const res = await fetch(`/api/items/moltbook/${encodeURIComponent(token)}/reply`, {
+        const decisionBody = { action: submittedAction, editedText };
+        if (editedTitle) decisionBody.editedTitle = editedTitle;
+        const res = await fetch(`/api/items/moltbook-draft/${encodeURIComponent(token)}/decision`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           credentials: "same-origin",
-          body: JSON.stringify({ action: submittedAction, text }),
+          body: JSON.stringify(decisionBody),
         });
         if (!res.ok) {
           const errBody = await res.json().catch(() => ({}));
-          alert(`Moltbook reply failed: ${errBody.error || res.status}`);
+          alert(`Moltbook draft ${submittedAction} failed: ${errBody.error || res.status}`);
+          buttons.forEach((btn) => {
+            btn.disabled = false;
+            btn.classList.remove("is-loading", "is-dimmed");
+            btn.innerHTML = labelCache.get(btn);
+          });
+          if (textarea) textarea.readOnly = false;
+          moltbookDraftForm.dataset.submitting = "";
           return;
         }
+        // Mark local detail as resolved so re-render shows "already resolved" immediately.
+        if (state.currentDetail?.kind === "moltbook_draft") {
+          state.currentDetail.moltbookDraftEnabled = false;
+          state.currentDetail.readOnly = true;
+        }
+        await refreshAuthenticatedState();
         await renderShell();
       } catch (error) {
-        alert(`Moltbook reply error: ${error.message}`);
+        alert(`Moltbook draft error: ${error.message}`);
+        buttons.forEach((btn) => {
+          btn.disabled = false;
+          btn.classList.remove("is-loading", "is-dimmed");
+          btn.innerHTML = labelCache.get(btn);
+        });
+        if (textarea) textarea.readOnly = false;
+        moltbookDraftForm.dataset.submitting = "";
       }
     });
   }
@@ -5354,6 +5559,9 @@ function kindMeta(kind) {
       return { label: L("common.diff"), tone: "neutral", icon: "diff" };
     case "file_event":
       return { label: L("common.fileEvent"), tone: "neutral", icon: "file-event" };
+    case "moltbook_reply":
+    case "moltbook_draft":
+      return { label: L("common.sns"), tone: "neutral", icon: "item" };
     default:
       return { label: L("common.item"), tone: "neutral", icon: "item" };
   }

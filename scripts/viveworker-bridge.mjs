@@ -26,7 +26,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -80,6 +80,7 @@ const runtime = {
   userInputRequestsByRequestKey: new Map(),
   completionDetailsByToken: new Map(),
   moltbookItemsByToken: new Map(),
+  moltbookDraftsByToken: new Map(),
   planDetailsByToken: new Map(),
   recentHistoryItems: [],
   recentTimelineEntries: [],
@@ -2227,6 +2228,19 @@ function normalizeTimelineEntry(raw) {
     tone: cleanText(raw.tone ?? "") || "secondary",
     cwd: resolvePath(cleanText(raw.cwd || "")),
     provider: normalizeProvider(raw.provider),
+    // Moltbook-specific fields — preserved for detail view fallback after
+    // the in-memory draft/item expires.
+    ...(raw.draftText != null ? { draftText: cleanText(raw.draftText) } : {}),
+    ...(raw.intent != null ? { intent: cleanText(raw.intent) } : {}),
+    ...(raw.postId != null ? { postId: cleanText(raw.postId) } : {}),
+    ...(raw.postUrl != null ? { postUrl: cleanText(raw.postUrl) } : {}),
+    ...(raw.postTitle != null ? { postTitle: cleanText(raw.postTitle) } : {}),
+    ...(raw.postAuthor != null ? { postAuthor: cleanText(raw.postAuthor) } : {}),
+    ...(raw.postBody != null ? { postBody: cleanText(raw.postBody) } : {}),
+    ...(raw.commentAuthor != null ? { commentAuthor: cleanText(raw.commentAuthor) } : {}),
+    ...(raw.contextText != null ? { contextText: cleanText(raw.contextText) } : {}),
+    ...(raw.draftType != null ? { draftType: cleanText(raw.draftType) } : {}),
+    ...(raw.submoltName != null ? { submoltName: cleanText(raw.submoltName) } : {}),
   };
 }
 
@@ -8993,7 +9007,23 @@ function buildPendingInboxItems(runtime, state, config, locale) {
     });
   }
 
-  // Moltbook items intentionally do not appear in the unhandled list.
+  for (const draft of runtime.moltbookDraftsByToken.values()) {
+    if (draft.decision) continue;
+    const title = draft.postTitle ? `draft → ${draft.postTitle}` : "Moltbook draft";
+    items.push({
+      kind: "moltbook_draft",
+      token: draft.token,
+      threadId: "moltbook",
+      threadLabel: "Moltbook",
+      title,
+      summary: draft.contextSummary || String(draft.draftText || "").slice(0, 160),
+      primaryLabel: t(locale, "server.action.review"),
+      createdAtMs: Number(draft.createdAtMs) || now,
+      provider: "moltbook",
+    });
+  }
+
+  // Moltbook reply items intentionally do not appear in the unhandled list.
   // Reply drafting is delegated to Codex/Claude Desktop via the
   // `viveworker moltbook` CLI, so they live in the timeline only.
 
@@ -9316,7 +9346,7 @@ function buildTimelineThreads(entries, config) {
   const byThread = new Map();
   for (const entry of entries) {
     const threadId = cleanText(entry.threadId || "");
-    if (!threadId) {
+    if (!threadId || threadId === "moltbook" || threadId.startsWith("draft:") || (entry.kind || "").startsWith("moltbook_")) {
       continue;
     }
     const preferredLabel =
@@ -10454,12 +10484,52 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
       title: source.title || "Moltbook reply",
       summary: source.summary || "",
       messageHtml: contextHtml,
+      postUrl: source.postUrl || "",
+      commentAuthor: source.commentAuthor || "",
       provider: "moltbook",
       draftReply: item?.draftReply || "",
       createdAtMs: source.createdAtMs || Date.now(),
       readOnly: !item,
       actions: [],
       moltbookReplyEnabled: Boolean(item),
+    };
+  }
+
+  if (kind === "moltbook_draft") {
+    const draft = runtime.moltbookDraftsByToken.get(token);
+    const entry = draft
+      ? null
+      : runtime.recentTimelineEntries.find((e) => e.kind === "moltbook_draft" && e.token === token);
+    const source = draft || entry;
+    if (!source) return null;
+    const draftText = draft ? draft.draftText : entry.draftText || entry.messageText || "";
+    const contextSummary = draft ? draft.contextSummary || "" : entry.summary || "";
+    const messageHtml = escapeHtml(contextSummary)
+      .split("\n")
+      .map((line) => `<p>${line}</p>`)
+      .join("");
+    return {
+      kind: "moltbook_draft",
+      token,
+      threadId: "moltbook",
+      threadLabel: "Moltbook",
+      title: source.title || "Moltbook draft",
+      summary: source.summary || contextSummary || "",
+      messageHtml,
+      provider: "moltbook",
+      draftText,
+      postId: draft?.postId || entry?.postId || "",
+      postUrl: draft?.postUrl || entry?.postUrl || "",
+      postTitle: draft?.postTitle || entry?.postTitle || "",
+      postAuthor: draft?.postAuthor || entry?.postAuthor || "",
+      postBody: draft?.postBody || entry?.postBody || "",
+      draftType: draft?.draftType || entry?.draftType || "reply",
+      submoltName: draft?.submoltName || entry?.submoltName || "",
+      intent: draft?.intent || entry?.intent || "",
+      createdAtMs: source.createdAtMs || Date.now(),
+      readOnly: !draft || Boolean(draft?.decision),
+      actions: [],
+      moltbookDraftEnabled: Boolean(draft) && !draft.decision,
     };
   }
 
@@ -10848,6 +10918,96 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, { ok: true, enabled });
       }
 
+      if (url.pathname === "/api/moltbook/scout-status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        if (!config.moltbookApiKey) {
+          return writeJson(res, 200, { enabled: false });
+        }
+        try {
+          const { readScoutState, rollScoutDayIfNeeded } = await import("./moltbook-api.mjs");
+          const scoutState = rollScoutDayIfNeeded(await readScoutState());
+          const batch = scoutState.batch;
+          const batchInfo = batch && batch.candidates?.length ? {
+            collecting: true,
+            candidateCount: batch.candidates.length,
+            topScore: Math.max(...batch.candidates.map((c) => c.score || 0)),
+            remainingSeconds: Math.max(0, Math.round(((batch.startedAt || 0) + (batch.windowMs || 1800000) - Date.now()) / 1000)),
+          } : null;
+          return writeJson(res, 200, {
+            enabled: true,
+            day: scoutState.day,
+            sentToday: scoutState.sentToday,
+            maxDaily: 5,
+            seenPostCount: Object.keys(scoutState.seenPostIds || {}).length,
+            batch: batchInfo,
+            composedToday: scoutState.composedToday || 0,
+            composeSlotsAttempted: Array.isArray(scoutState.composeSlotsAttempted) ? scoutState.composeSlotsAttempted : [],
+            recentComposeTitles: Array.isArray(scoutState.recentComposeTitles) ? scoutState.recentComposeTitles : [],
+          });
+        } catch {
+          return writeJson(res, 200, { enabled: true, day: "", sentToday: 0, maxDaily: 5, seenPostCount: 0 });
+        }
+      }
+
+      // Activity summary for compose (original post) drafting.
+      // Supports ?slot=morning|noon|evening and ?date=YYYY-MM-DD for
+      // time-slot-based compose.  Defaults to full-day today.
+      if (url.pathname === "/api/providers/moltbook/activity-summary" && req.method === "GET") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 403, { error: "forbidden" });
+        }
+        const slot = String(url.searchParams.get("slot") || "").toLowerCase();
+        const dateParam = String(url.searchParams.get("date") || "");
+        const now = new Date();
+        const localHour = now.getHours();
+
+        // Determine time range based on slot.
+        let rangeStart, rangeEnd, rangeDate;
+        if (slot === "morning" && dateParam) {
+          // Morning slot: previous day's activities (dateParam = yesterday).
+          const d = new Date(dateParam + "T00:00:00");
+          rangeStart = d.getTime();
+          rangeEnd = rangeStart + 24 * 60 * 60 * 1000;
+          rangeDate = dateParam;
+        } else if (slot === "noon") {
+          // Noon slot: today 00:00 – 12:00 local.
+          const d = new Date(now); d.setHours(0, 0, 0, 0);
+          rangeStart = d.getTime();
+          const noon = new Date(now); noon.setHours(12, 0, 0, 0);
+          rangeEnd = noon.getTime();
+          rangeDate = d.toISOString().slice(0, 10);
+        } else if (slot === "evening") {
+          // Evening slot: today full day.
+          const d = new Date(now); d.setHours(0, 0, 0, 0);
+          rangeStart = d.getTime();
+          rangeEnd = Date.now();
+          rangeDate = d.toISOString().slice(0, 10);
+        } else {
+          // Default: today full day (UTC midnight to now).
+          const d = new Date(now);
+          d.setUTCHours(0, 0, 0, 0);
+          rangeStart = d.getTime();
+          rangeEnd = Date.now();
+          rangeDate = d.toISOString().slice(0, 10);
+        }
+
+        const relevantKinds = new Set(["file_event", "completion", "plan_ready", "assistant_final"]);
+        const entries = (runtime.recentTimelineEntries || [])
+          .filter((e) => e.createdAtMs >= rangeStart && e.createdAtMs < rangeEnd && relevantKinds.has(e.kind))
+          .map((e) => ({
+            kind: e.kind,
+            title: e.title || "",
+            summary: e.summary || "",
+            threadLabel: e.threadLabel || "",
+            createdAtMs: e.createdAtMs,
+          }));
+        return writeJson(res, 200, { date: rangeDate, slot: slot || "full", entries });
+      }
+
       if (url.pathname === "/api/push/status" && req.method === "GET") {
         const session = requireApiSession(req, res, config, state);
         if (!session) {
@@ -11209,13 +11369,15 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const item = {
           token,
           sourceId,
-          threadId: cleanText(body.threadId || sourceId),
+          threadId: cleanText(body.threadId || "moltbook"),
           threadLabel: cleanText(body.threadLabel || "Moltbook"),
           title: cleanText(body.title || "Moltbook reply"),
           summary: cleanText(body.summary || ""),
           contextText: cleanText(body.contextText || ""),
           draftReply: cleanText(body.draftReply || ""),
           callbackUrl: cleanText(body.callbackUrl || ""),
+          postUrl: cleanText(body.postUrl || ""),
+          commentAuthor: cleanText(body.commentAuthor || ""),
           createdAtMs: Number(body.createdAtMs) || Date.now(),
           resolved: false,
         };
@@ -11304,6 +11466,184 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         item.resolved = true;
         runtime.moltbookItemsByToken.delete(token);
+        return writeJson(res, 200, { ok: true, action });
+      }
+
+      // ---------------------------------------------------------------
+      // Moltbook scout draft channel
+      //
+      // The standalone scout CLI (`viveworker moltbook propose`) submits
+      // a draft reply via POST /api/providers/moltbook/draft, then long-
+      // polls /api/providers/moltbook/draft/:token/decision until the
+      // phone responds via POST /api/items/moltbook-draft/:token/decision.
+      // ---------------------------------------------------------------
+
+      if (url.pathname === "/api/providers/moltbook/draft" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const sourceId = cleanText(body.sourceId || "");
+        const postId = cleanText(body.postId || "");
+        const draftText = cleanText(body.draftText || "");
+        const draftType = cleanText(body.draftType || "reply");
+        const submoltName = cleanText(body.submoltName || "");
+        if (!sourceId || !draftText) {
+          return writeJson(res, 400, { error: "missing-sourceId-or-draftText" });
+        }
+        if (draftType === "reply" && !postId) {
+          return writeJson(res, 400, { error: "missing-postId-for-reply" });
+        }
+        const token = historyToken(`moltbook_draft:${sourceId}`);
+        const postTitle = cleanText(body.postTitle || "");
+        const postUrl = cleanText(body.postUrl || `https://www.moltbook.com/post/${postId}`);
+        const contextSummary = cleanText(body.contextSummary || "");
+        const postAuthor = cleanText(body.postAuthor || "");
+        const postBody = typeof body.postBody === "string" ? body.postBody : "";
+        const intent = typeof body.intent === "string" ? body.intent : "";
+        const draft = {
+          token,
+          sourceId,
+          postId,
+          postTitle,
+          postAuthor,
+          postBody,
+          postUrl,
+          parentCommentId: cleanText(body.parentCommentId || ""),
+          draftText,
+          draftType,
+          submoltName,
+          intent,
+          contextSummary,
+          createdAtMs: Date.now(),
+          decisionWaiters: [],
+          decision: null,
+        };
+        runtime.moltbookDraftsByToken.set(token, draft);
+        try {
+          recordTimelineEntry({
+            config,
+            runtime,
+            state,
+            entry: {
+              stableId: `moltbook_draft:${sourceId}`,
+              token,
+              kind: "moltbook_draft",
+              threadId: "moltbook",
+              threadLabel: "Moltbook",
+              title: draftType === "original_post"
+                ? (postTitle || "Moltbook new post")
+                : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
+              summary: contextSummary || String(draftText).slice(0, 160),
+              messageText: contextSummary || draftText,
+              draftText,
+              draftType,
+              submoltName,
+              intent,
+              postId,
+              postUrl,
+              postTitle,
+              postAuthor,
+              postBody,
+              createdAtMs: draft.createdAtMs,
+              readOnly: false,
+              provider: "moltbook",
+            },
+          });
+          await saveState(config.stateFile, state);
+        } catch (error) {
+          console.error(`[moltbook-draft-timeline-save] ${error.message}`);
+        }
+        try {
+          await deliverWebPushItem({
+            config,
+            state,
+            kind: "moltbook_draft",
+            token,
+            stableId: `moltbook_draft:${sourceId}`,
+            title: draftType === "original_post"
+              ? (postTitle || "Moltbook new post")
+              : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
+            body: String(draftText).slice(0, 160),
+          });
+        } catch (error) {
+          console.error(`[moltbook-draft-push-error] ${error.message}`);
+        }
+        return writeJson(res, 200, { ok: true, token });
+      }
+
+      const apiMoltbookDraftDecisionGet = url.pathname.match(
+        /^\/api\/providers\/moltbook\/draft\/([^/]+)\/decision$/u
+      );
+      if (apiMoltbookDraftDecisionGet && req.method === "GET") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+        const token = decodeURIComponent(apiMoltbookDraftDecisionGet[1]);
+        const draft = runtime.moltbookDraftsByToken.get(token);
+        if (!draft) return writeJson(res, 404, { error: "draft-not-found" });
+        if (draft.decision) {
+          return writeJson(res, 200, { status: "decided", ...draft.decision });
+        }
+        const waitParam = Number(url.searchParams.get("wait")) || 25;
+        const waitMs = Math.min(Math.max(waitParam, 1), 60) * 1000;
+        const decided = await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            const idx = draft.decisionWaiters.indexOf(resolve);
+            if (idx !== -1) draft.decisionWaiters.splice(idx, 1);
+            resolve(null);
+          }, waitMs);
+          draft.decisionWaiters.push((d) => {
+            clearTimeout(timer);
+            resolve(d);
+          });
+        });
+        if (decided) return writeJson(res, 200, { status: "decided", ...decided });
+        return writeJson(res, 200, { status: "pending" });
+      }
+
+      const apiMoltbookDraftDecide = url.pathname.match(
+        /^\/api\/items\/moltbook-draft\/([^/]+)\/decision$/u
+      );
+      if (apiMoltbookDraftDecide && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        const token = decodeURIComponent(apiMoltbookDraftDecide[1]);
+        const draft = runtime.moltbookDraftsByToken.get(token);
+        if (!draft) return writeJson(res, 404, { error: "draft-not-found" });
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const action = String(body.action || "") === "approve" ? "approve" : "deny";
+        const editedText = cleanText(body.editedText || "");
+        const editedTitle = cleanText(body.editedTitle || "");
+        const decision = {
+          action,
+          text: action === "approve" ? editedText || draft.draftText : "",
+          title: action === "approve" ? editedTitle || draft.postTitle : "",
+          decidedAtMs: Date.now(),
+        };
+        draft.decision = decision;
+        for (const waiter of draft.decisionWaiters.splice(0)) {
+          try {
+            waiter(decision);
+          } catch {
+            // ignore
+          }
+        }
+        // Keep the entry in moltbookDraftsByToken briefly so a slow long-
+        // poll can still pick it up; sweeper below removes it after 2min.
+        setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120 * 1000).unref?.();
         return writeJson(res, 200, { ok: true, action });
       }
 

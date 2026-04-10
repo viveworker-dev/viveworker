@@ -9,6 +9,7 @@ export const API_BASE = "https://www.moltbook.com/api/v1";
 
 export const DEFAULT_ENV_FILE = path.join(os.homedir(), ".viveworker", "moltbook.env");
 export const DEFAULT_INBOX_DIR = path.join(os.homedir(), ".viveworker", "moltbook-inbox");
+export const DEFAULT_SCOUT_STATE_FILE = path.join(os.homedir(), ".viveworker", "moltbook-scout-state.json");
 
 export async function loadMoltbookEnv(envFile = DEFAULT_ENV_FILE) {
   const env = {};
@@ -104,6 +105,80 @@ export async function updateInboxStatus(commentId, status, extra = {}, dir = DEF
   const updated = { ...existing, ...extra, status, updatedAt: new Date().toISOString() };
   await writeInboxItem(updated, dir);
   return updated;
+}
+
+// ---------- Scout state ----------
+//
+// Tracks per-day usage of the Moltbook scouting loop so we can enforce a
+// simple daily quota and avoid re-proposing drafts against the same post.
+
+export async function readScoutState(file = DEFAULT_SCOUT_STATE_FILE) {
+  try {
+    const raw = await fs.readFile(file, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return defaultScoutState();
+    return {
+      day: String(parsed.day || ""),
+      sentToday: Number(parsed.sentToday) || 0,
+      seenPostIds: parsed.seenPostIds && typeof parsed.seenPostIds === "object" ? parsed.seenPostIds : {},
+      batch: parsed.batch && typeof parsed.batch === "object" ? parsed.batch : null,
+      lastComposeDay: String(parsed.lastComposeDay || ""),
+      composedToday: Number(parsed.composedToday) || 0,
+      composeSlotsAttempted: Array.isArray(parsed.composeSlotsAttempted) ? parsed.composeSlotsAttempted : [],
+      recentComposeTitles: Array.isArray(parsed.recentComposeTitles) ? parsed.recentComposeTitles : [],
+    };
+  } catch {
+    return defaultScoutState();
+  }
+}
+
+export async function writeScoutState(state, file = DEFAULT_SCOUT_STATE_FILE) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+export function defaultScoutState() {
+  return { day: todayKey(), sentToday: 0, seenPostIds: {}, batch: null, lastComposeDay: "", composedToday: 0, composeSlotsAttempted: [], recentComposeTitles: [] };
+}
+
+export function todayKey() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function rollScoutDayIfNeeded(state) {
+  const today = todayKey();
+  if (state.day !== today) {
+    state.day = today;
+    state.sentToday = 0;
+    state.composedToday = 0;
+    state.composeSlotsAttempted = [];
+  }
+  // Evict seenPostIds entries older than 30 days to keep the file small.
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  for (const [id, entry] of Object.entries(state.seenPostIds)) {
+    // Support both legacy (bare timestamp) and new ({ ts, outcome }) formats.
+    const ts = typeof entry === "number" ? entry : (entry?.ts ?? 0);
+    if (!Number.isFinite(ts) || ts < cutoff) delete state.seenPostIds[id];
+  }
+  return state;
+}
+
+export function recordComposeAttempt(state, title) {
+  state.composedToday = (state.composedToday || 0) + 1;
+  state.lastComposeDay = todayKey();
+  if (!Array.isArray(state.recentComposeTitles)) state.recentComposeTitles = [];
+  state.recentComposeTitles.unshift(String(title || ""));
+  if (state.recentComposeTitles.length > 10) state.recentComposeTitles.length = 10;
+  return state;
+}
+
+export function markPostSeen(state, postId, outcome = "seen") {
+  state.seenPostIds[String(postId)] = { ts: Date.now(), outcome };
+  return state;
 }
 
 export async function listInboxItems(dir = DEFAULT_INBOX_DIR) {

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SAMPLE launchd agent for the Moltbook scouting loop.
+
+  This is provider-neutral: the cron command invokes whichever agent CLI
+  you use. Customize the inner command to call `codex exec`, `claude -p`,
+  a small Anthropic SDK script, or whatever produces drafts for you.
+
+  Install:
+    1. Copy this file to ~/Library/LaunchAgents/com.viveworker.moltbook-scout.plist
+    2. Replace the placeholders (PATH/TO/VIVEWORKER, your agent CLI line)
+    3. Make sure ~/.viveworker/moltbook.env is populated (same file the
+       watcher uses) and that VIVEWORKER_HOOK_SECRET matches the bridge.
+    4. launchctl load ~/Library/LaunchAgents/com.viveworker.moltbook-scout.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.viveworker.moltbook-scout</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <!--
+      Example for a Codex Desktop user with `codex exec`:
+
+        set -a; . "$HOME/.viveworker/moltbook.env"; set +a;
+        cd "$HOME/path/to/viveworker";
+        codex exec "Run scripts/moltbook-scout-run.sh. If it prints a
+        candidate (status: 'candidate'), draft a 2-3 paragraph reply in
+        viveworker voice (informal lowercase, technically substantive,
+        no signature) and run: node scripts/viveworker.mjs moltbook
+        propose <postId> --text \"<your draft>\" --timeout 900. If
+        scout prints anything else, exit quietly."
+
+      Replace `codex exec` with `claude -p` for Claude Code users, or
+      with your own SDK runner.
+    -->
+    <string>set -a; . "$HOME/.viveworker/moltbook.env"; set +a; cd "$HOME/path/to/viveworker" &amp;&amp; codex exec "Run scripts/moltbook-scout-run.sh and, if it prints a candidate, draft a reply in viveworker voice and call viveworker moltbook propose &lt;postId&gt; --text \"...\" --timeout 900."</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>120</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/viveworker-moltbook-scout.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/viveworker-moltbook-scout.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

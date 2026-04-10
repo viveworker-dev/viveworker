@@ -1932,7 +1932,7 @@ code {
 
 .detail-page-copy--approval {
   margin: 0.78rem 0 0.48rem;
-  padding: 0.06rem 0;
+  padding: 0.25rem 0.4rem;
   display: grid;
   gap: 0;
   line-height: 1.24;
@@ -2259,11 +2259,81 @@ code {
 
 .reply-composer__description {
   margin: 0;
+  padding: 0.75rem 1rem;
 }
 
 .reply-composer__form {
   display: grid;
   gap: 0.8rem;
+}
+
+.reply-composer__context {
+  margin: 0.4rem 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+  font-size: 0.9rem;
+}
+.reply-composer__context summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.reply-composer__context-body {
+  margin-top: 0.5rem;
+  line-height: 1.55;
+  color: var(--text);
+}
+.reply-composer__intent {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: 12px;
+  background: rgba(110, 168, 255, 0.08);
+  border: 1px solid rgba(110, 168, 255, 0.25);
+}
+.reply-composer__intent p {
+  margin: 0.35rem 0 0;
+  line-height: 1.5;
+}
+.reply-composer__author-meta {
+  margin: 0.1rem 0 0.4rem;
+  font-size: 0.85rem;
+}
+.reply-composer__textarea {
+  width: 100%;
+  min-height: 14rem;
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(7, 12, 16, 0.96);
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.reply-composer__textarea:focus {
+  outline: none;
+  border-color: var(--accent, #6ea8ff);
+}
+
+.reply-field--title {
+  margin-bottom: 0.5rem;
+}
+.reply-field--title .reply-field__input {
+  min-height: auto;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(7, 12, 16, 0.96);
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.reply-composer__title-display {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 1.05rem;
 }
 
 .reply-field {

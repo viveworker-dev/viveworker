@@ -324,6 +324,169 @@ async function runSetup(cliOptions) {
       console.log(`Moltbook watcher install failed: ${error.message}`);
     }
   }
+
+  if (cliOptions.autoScoutUninstall) {
+    await uninstallMoltbookScout();
+  } else if (cliOptions.autoScout) {
+    try {
+      await installMoltbookScout({ cliOptions });
+    } catch (error) {
+      console.log("");
+      console.log(`Moltbook auto-scout install failed: ${error.message}`);
+    }
+  }
+}
+
+async function detectScoutHarness(preferred) {
+  const { spawn } = await import("node:child_process");
+  const which = (cmd) =>
+    new Promise((resolve) => {
+      const p = spawn("command", ["-v", cmd], { shell: "/bin/bash", stdio: ["ignore", "pipe", "ignore"] });
+      let out = "";
+      p.stdout.on("data", (d) => (out += d.toString()));
+      p.on("exit", (code) => resolve(code === 0 ? out.trim() : ""));
+      p.on("error", () => resolve(""));
+    });
+  if (preferred === "codex") return { kind: "codex", bin: (await which("codex")) || "codex" };
+  if (preferred === "claude") return { kind: "claude", bin: (await which("claude")) || "claude" };
+  if (preferred === "manual") return { kind: "manual", bin: "" };
+  const codex = await which("codex");
+  if (codex) return { kind: "codex", bin: codex };
+  const claude = await which("claude");
+  if (claude) return { kind: "claude", bin: claude };
+  return { kind: "manual", bin: "" };
+}
+
+async function uninstallMoltbookScout() {
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${"com.viveworker.moltbook-scout"}.plist`);
+  const { spawn } = await import("node:child_process");
+  await new Promise((resolve) => {
+    const p = spawn("launchctl", ["bootout", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
+    p.on("exit", () => resolve());
+    p.on("error", () => resolve());
+  });
+  try {
+    await fs.unlink(plistPath);
+    console.log("");
+    console.log(`Moltbook auto-scout uninstalled (removed ${plistPath}).`);
+  } catch {
+    console.log("");
+    console.log(`No auto-scout plist found at ${plistPath}.`);
+  }
+}
+
+async function installMoltbookScout({ cliOptions }) {
+  const moltbookEnvFile = path.join(os.homedir(), ".viveworker", "moltbook.env");
+  try {
+    await fs.access(moltbookEnvFile);
+  } catch {
+    throw new Error(
+      `${moltbookEnvFile} not found. Run --moltbook --moltbook-api-key ... --moltbook-agent-id ... first.`
+    );
+  }
+  const harness = await detectScoutHarness(cliOptions.autoScoutHarness || "auto");
+  const interval = Number(cliOptions.autoScoutInterval) || 120;
+  const scoutRunScript = path.join(packageRoot, "scripts", "moltbook-scout-run.sh");
+  const viveworkerJs = path.join(packageRoot, "scripts", "viveworker.mjs");
+  const submoltsFlag = cliOptions.autoScoutSubmolts
+    ? ` --submolts ${cliOptions.autoScoutSubmolts}`
+    : "";
+  const maxDailyFlag = cliOptions.autoScoutMaxDaily
+    ? ` --max-daily ${cliOptions.autoScoutMaxDaily}`
+    : "";
+
+  const personaPath = path.join(os.homedir(), ".viveworker", "moltbook-persona.md");
+  let hasPersona = false;
+  try {
+    const personaText = await fs.readFile(personaPath, "utf8");
+    hasPersona = Boolean(personaText.trim());
+  } catch {
+    // no persona file
+  }
+
+  // Ensure node (and harness CLI) is on PATH inside launchd's minimal env.
+  const nodeBinDir = path.dirname(process.execPath);
+  const pathPrefix = `export PATH="${nodeBinDir}:$PATH"`;
+  const autoScript = path.join(packageRoot, "scripts", "moltbook-scout-auto.sh");
+
+  let inner;
+  if (harness.kind === "manual") {
+    // Manual fallback: just run scout and log the candidate. No drafting.
+    inner =
+      `${pathPrefix}; set -a; . "${moltbookEnvFile}"; set +a; cd "${packageRoot}" && ` +
+      `"${scoutRunScript}"${submoltsFlag}${maxDailyFlag} || true`;
+  } else {
+    // Use the auto script which runs scout (no LLM), then drafts via harness, then proposes.
+    const envVars = [
+      `SCOUT_HARNESS=${harness.kind}`,
+      submoltsFlag ? `SCOUT_FLAGS="${submoltsFlag.trim()}${maxDailyFlag}"` : maxDailyFlag ? `SCOUT_FLAGS="${maxDailyFlag.trim()}"` : "",
+    ].filter(Boolean).join(" ");
+    inner =
+      `${pathPrefix}; set -a; . "${moltbookEnvFile}"; set +a; ${envVars ? envVars + " " : ""}` +
+      `"${autoScript}"`;
+  }
+
+  const userShell = process.env.SHELL || "/bin/zsh";
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${"com.viveworker.moltbook-scout"}.plist`);
+  const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${"com.viveworker.moltbook-scout"}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escapeXml(userShell)}</string>
+    <string>-lc</string>
+    <string>${escapeXml(inner)}</string>
+  </array>
+  <key>StartInterval</key><integer>${interval}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/tmp/viveworker-moltbook-scout.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/viveworker-moltbook-scout.err.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+`;
+  await fs.mkdir(path.dirname(plistPath), { recursive: true });
+  await fs.writeFile(plistPath, plistBody, "utf8");
+
+  const { spawn } = await import("node:child_process");
+  await new Promise((resolve) => {
+    const p = spawn("launchctl", ["bootout", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
+    p.on("exit", () => resolve());
+    p.on("error", () => resolve());
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      const p = spawn("launchctl", ["bootstrap", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
+      p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`launchctl bootstrap exited ${code}`))));
+      p.on("error", reject);
+    });
+  } catch (error) {
+    console.log("");
+    console.log(`Moltbook scout plist written but launchctl bootstrap failed: ${error.message}`);
+    console.log(`Run manually: launchctl bootstrap gui/$(id -u) ${plistPath}`);
+  }
+
+  console.log("");
+  console.log(`Moltbook auto-scout installed (${harness.kind}).`);
+  console.log(`  plist:    ${plistPath}`);
+  console.log(`  interval: ${interval}s`);
+  if (harness.kind === "manual") {
+    console.log(
+      `  note:     Neither 'codex' nor 'claude' CLI was found. The scheduled task will only run scout and print candidates to the log. Install Codex CLI (npm i -g @openai/codex) or Claude Code CLI to enable automated drafting.`
+    );
+  } else {
+    console.log(`  harness:  ${harness.bin}`);
+  }
+  console.log(`  logs:     /tmp/viveworker-moltbook-scout.{out,err}.log`);
+  if (!hasPersona) {
+    console.log(
+      `  tip:      No persona file found. Run 'npx viveworker moltbook persona init' to describe your agent — draft quality improves a lot.`
+    );
+  } else {
+    console.log(`  persona:  ${personaPath}`);
+  }
 }
 
 async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
@@ -350,6 +513,8 @@ async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
   const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${plistLabel}.plist`);
   const watcherScript = path.join(packageRoot, "scripts", "moltbook-watcher.mjs");
   const nodePath = process.execPath;
+  const watcherShell = process.env.SHELL || "/bin/zsh";
+  const watcherNodeDir = path.dirname(nodePath);
   const plistBody = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -357,9 +522,9 @@ async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
   <key>Label</key><string>${plistLabel}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
+    <string>${escapeXml(watcherShell)}</string>
     <string>-lc</string>
-    <string>set -a; . "${moltbookEnvFile}"; set +a; exec "${nodePath}" "${watcherScript}"</string>
+    <string>export PATH="${watcherNodeDir}:$PATH"; set -a; . "${moltbookEnvFile}"; set +a; exec "${nodePath}" "${watcherScript}"</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
@@ -703,6 +868,12 @@ function parseArgs(argv) {
     moltbookApiKey: "",
     moltbookAgentId: "",
     moltbookAgentName: "",
+    autoScout: false,
+    autoScoutUninstall: false,
+    autoScoutInterval: 120,
+    autoScoutHarness: "auto",
+    autoScoutSubmolts: "",
+    autoScoutMaxDaily: 0,
   };
 
   if (argv[0] && !argv[0].startsWith("-")) {
@@ -796,6 +967,22 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === "--moltbook-agent-name") {
       parsed.moltbookAgentName = next;
+      index += 1;
+    } else if (arg === "--auto-scout") {
+      parsed.autoScout = true;
+    } else if (arg === "--auto-scout-uninstall") {
+      parsed.autoScoutUninstall = true;
+    } else if (arg === "--auto-scout-interval") {
+      parsed.autoScoutInterval = Number(next) || 120;
+      index += 1;
+    } else if (arg === "--auto-scout-harness") {
+      parsed.autoScoutHarness = next;
+      index += 1;
+    } else if (arg === "--auto-scout-submolts") {
+      parsed.autoScoutSubmolts = next;
+      index += 1;
+    } else if (arg === "--auto-scout-max-daily") {
+      parsed.autoScoutMaxDaily = Number(next) || 0;
       index += 1;
     } else if (arg === "--help" || arg === "-h") {
       parsed.command = "help";
