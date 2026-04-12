@@ -60,7 +60,7 @@ export function buildAgentCard(config) {
     ];
   }
 
-  return {
+  const card = {
     schemaVersion: "1.0",
     humanReadableId: `viveworker/${config.a2aRelayUserId || "viveworker"}`,
     agentVersion: config.version || "0.3.0",
@@ -76,6 +76,8 @@ export function buildAgentCard(config) {
     skills,
     authSchemes: [{ scheme: "apiKey", in: "header", name: "X-A2A-Key" }],
   };
+  if (config.a2aAvatar) card.avatar = config.a2aAvatar;
+  return card;
 }
 
 // ---------------------------------------------------------------------------

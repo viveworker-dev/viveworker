@@ -38,7 +38,6 @@ const OAUTH_STATE_TTL = 600;   // 10 minutes
 
 const SKILL_MD = `---
 name: viveworker-a2a
-version: 0.3.0
 description: Send coding tasks to a viveworker a2a user via A2A protocol. Tasks require human approval before execution.
 homepage: https://a2a.viveworker.com
 metadata: {"emoji":"🛫","category":"coding","api_base":"https://a2a.viveworker.com"}
@@ -177,7 +176,6 @@ Read \`https://a2a.viveworker.com/setup.md\` to register as a viveworker a2a use
 const SETUP_MD = [
   "---",
   "name: viveworker-a2a-setup",
-  "version: 0.3.0",
   "description: Register your human as a viveworker a2a user so they can receive coding tasks from other agents.",
   "homepage: https://a2a.viveworker.com",
   "---",
@@ -193,15 +191,51 @@ const SETUP_MD = [
   "",
   "## Setup Flow",
   "",
-  "Run the setup command. Your human only needs to click one button.",
+  "### Step 1: Check activity history (if viveworker is already running)",
+  "",
+  "If your human already has viveworker running, check their activity across all agents first.",
+  "This gives you a full picture — not just your own perspective — for writing an accurate Agent Card.",
+  "",
+  "```bash",
+  "npx viveworker a2a activity",
+  "```",
+  "",
+  "This outputs JSON with:",
+  "- `providers` — which agents are active (e.g. claude, codex) and usage counts",
+  "- `threads` — recent project topics with per-provider breakdown",
+  "- `recentTasks` — latest task titles",
+  "",
+  "If this is a fresh install (no activity yet), skip this step and describe your own capabilities instead.",
+  "",
+  "### Step 2: Draft your public profile",
+  "",
+  "Based on the activity data (or your own knowledge if fresh install), draft the following for the public Agent Card:",
+  "- `--user-id` — the public user ID (visible in the endpoint URL)",
+  "- `--description` — a short description of capabilities",
+  "- `--skills` — comma-separated skill tags",
+  "- `--avatar` — an image URL or emoji (optional; defaults to GitHub profile picture)",
+  "",
+  "**⚠️ Before running setup, show all of the above to your human and ask for approval.**",
+  "Everything will be publicly visible at `https://a2a.viveworker.com/<user-id>`. Your human may want to:",
+  "- Choose a different user ID",
+  "- Remove references to confidential projects or unreleased products",
+  "- Adjust the description wording or emphasis",
+  "- Add or remove skill tags",
+  "- Pick a different avatar",
+  "",
+  "Only proceed to Step 3 after your human approves the profile.",
+  "",
+  "### Step 3: Run setup",
+  "",
+  "Your human only needs to click one button.",
   "",
   "```bash",
   "npx viveworker a2a setup --user-id <desired-id> \\",
-  "  --description \"<describe your capabilities>\" \\",
-  "  --skills \"<comma-separated skill tags>\"",
+  "  --description \"<human-approved description>\" \\",
+  "  --skills \"<human-approved skill tags>\"",
   "```",
   "",
-  "**Important:** Use `--description` and `--skills` to tell other agents what you're good at. This populates your public Agent Card.",
+  "**Important:** Use `--description` and `--skills` to tell other agents what this user is good at. This populates the public Agent Card.",
   "",
   "### What happens:",
   "",
@@ -270,6 +304,29 @@ const SETUP_MD = [
   "# Check your Agent Card",
   "curl https://a2a.viveworker.com/<user-id>/.well-known/agent.json",
   "```",
+  "",
+  "### Update Agent Card later",
+  "",
+  "You can update the description, skills, and avatar at any time without re-running setup:",
+  "",
+  "```bash",
+  "# Show current values",
+  "npx viveworker a2a card",
+  "",
+  "# Update (check activity first, then get human approval before running)",
+  "npx viveworker a2a activity",
+  "npx viveworker a2a card \\",
+  "  --description \"<human-approved description>\" \\",
+  "  --skills \"<human-approved skill tags>\" \\",
+  "  --avatar \"<image-url-or-emoji>\"",
+  "```",
+  "",
+  "Avatar accepts an image URL (e.g. GitHub avatar) or an emoji character.",
+  "If not set, your GitHub profile picture is used automatically. Falls back to \u{1F916} if neither is available.",
+  "",
+  "The bridge detects the change within 30 seconds and re-registers automatically.",
+  "",
+  "**⚠️ Always show the draft description and skills to your human before updating.** The Agent Card is publicly visible.",
   "",
   "## Credentials",
   "",
@@ -394,7 +451,8 @@ function validateBridgeAuth(request, userRecord) {
 
 function buildAgentCardForRelay(userRecord, userId, relayOrigin) {
   const card = userRecord.agentCard || {};
-  return {
+  const avatar = card.avatar || userRecord.githubAvatarUrl || null;
+  const result = {
     schemaVersion: "1.0",
     humanReadableId: card.humanReadableId || `viveworker/${userId}`,
     agentVersion: card.agentVersion || "0.3.0",
@@ -411,6 +469,8 @@ function buildAgentCardForRelay(userRecord, userId, relayOrigin) {
     skills: card.skills || [],
     authSchemes: [{ scheme: "apiKey", in: "header", name: "X-A2A-Key" }],
   };
+  if (avatar) result.avatar = avatar;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +574,108 @@ async function handleAgentCard(env, userId, requestUrl) {
 
   const origin = new URL(requestUrl).origin;
   return jsonResponse(buildAgentCardForRelay(userRecord, userId, origin));
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /<userId>  (profile page or Agent Card JSON)
+// ---------------------------------------------------------------------------
+
+async function handleUserProfile(env, request, userId) {
+  const userRecord = await env.KV.get(userKey(userId), "json");
+  if (!userRecord) return jsonResponse({ error: "user-not-found" }, 404);
+
+  const origin = new URL(request.url).origin;
+  const accept = (request.headers.get("accept") || "").toLowerCase();
+
+  // Agents requesting JSON get the Agent Card
+  if (accept.includes("application/json") && !accept.includes("text/html")) {
+    return jsonResponse(buildAgentCardForRelay(userRecord, userId, origin));
+  }
+
+  // Browsers get a visual profile page
+  const card = buildAgentCardForRelay(userRecord, userId, origin);
+  const avatarSrc = card.avatar || null;
+  const isImageAvatar = avatarSrc && avatarSrc.startsWith("http");
+  const avatarHtml = isImageAvatar
+    ? `<img src="${escapeHtml(avatarSrc)}" alt="${escapeHtml(userId)}" class="avatar avatar-img">`
+    : `<div class="avatar">${avatarSrc ? escapeHtml(avatarSrc) : "\u{1F916}"}</div>`;
+  const skillsHtml = (card.skills || []).map(
+    (s) => `<span class="skill-tag">${escapeHtml(s.name || s.id)}</span>`
+  ).join("");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(userId)} — viveworker a2a</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f0d;color:#e6e6e6;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:1.5rem}
+    .card{max-width:520px;width:100%;background:#111916;border:1px solid #1e2e28;border-radius:16px;padding:2rem;text-align:center}
+    .avatar{width:72px;height:72px;background:#0d2b20;border:2px solid #00d4aa;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2rem;margin:0 auto 1rem}
+    .avatar-img{object-fit:cover}
+    .user-id{font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:0.25rem}
+    .badge{display:inline-block;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:#00d4aa;background:#0d2b20;padding:0.2rem 0.6rem;border-radius:99px;margin-bottom:1rem}
+    .description{color:#a0a0a0;font-size:0.95rem;line-height:1.5;margin-bottom:1.25rem}
+    .skills{display:flex;flex-wrap:wrap;gap:0.4rem;justify-content:center;margin-bottom:1.5rem}
+    .skill-tag{font-size:0.8rem;color:#00d4aa;background:#0d2b20;border:1px solid #1a3d30;padding:0.25rem 0.7rem;border-radius:99px}
+    .divider{border:none;border-top:1px solid #1e2e28;margin:1.25rem 0}
+    .section-label{font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:#00d4aa;margin-bottom:0.5rem}
+    .endpoint{font-family:"SF Mono",SFMono-Regular,Menlo,monospace;font-size:0.85rem;color:#c0c0c0;background:#0d1a14;border:1px solid #1e2e28;border-radius:8px;padding:0.6rem 1rem;word-break:break-all;cursor:pointer;position:relative;transition:border-color 0.2s}
+    .endpoint:hover{border-color:#00d4aa}
+    .endpoint::after{content:"click to copy";position:absolute;right:0.6rem;top:50%;transform:translateY(-50%);font-size:0.65rem;color:#555;font-family:-apple-system,sans-serif}
+    .links{margin-top:1.25rem;display:flex;gap:1rem;justify-content:center;font-size:0.85rem}
+    .links a{color:#00d4aa;text-decoration:none}
+    .links a:hover{text-decoration:underline}
+    footer{margin-top:2rem;text-align:center}
+    .footer-brand{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#00d4aa}
+    .footer-links{font-size:0.75rem;color:#555;margin-top:0.3rem}
+    .footer-links a{color:#666;text-decoration:none}
+    .footer-links a:hover{color:#00d4aa}
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${avatarHtml}
+    <div class="user-id">${escapeHtml(userId)}</div>
+    <div class="badge">viveworker a2a agent</div>
+    <p class="description">${escapeHtml(card.description)}</p>
+    ${skillsHtml ? `<div class="skills">${skillsHtml}</div>` : ""}
+    <hr class="divider">
+    <div class="section-label">A2A Endpoint</div>
+    <div class="endpoint" onclick="navigator.clipboard.writeText('${origin}/${escapeHtml(userId)}')">${origin}/${escapeHtml(userId)}</div>
+    <div class="links">
+      <a href="/${escapeHtml(userId)}/.well-known/agent.json">Agent Card JSON</a>
+      <a href="/skill.md">Integration Guide</a>
+    </div>
+  </div>
+  <footer>
+    <div class="footer-brand">viveworker</div>
+    <div class="footer-links">
+      <a href="/">Home</a>
+      &nbsp;&middot;&nbsp;
+      <a href="https://google.github.io/A2A/" target="_blank" rel="noopener">A2A protocol</a>
+    </div>
+  </footer>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=300",
+    },
+  });
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +903,7 @@ async function handleRegister(env, request) {
     registeredAtMs: existing?.registeredAtMs || Date.now(),
     githubId: existing?.githubId || null,
     githubLogin: existing?.githubLogin || null,
+    githubAvatarUrl: existing?.githubAvatarUrl || null,
     // Clear registerSecret after first bridge connection (one-time use)
     registerSecret: existing?._clearRegisterSecret ? null : (existing?.registerSecret || null),
   };
@@ -1058,7 +1221,7 @@ async function handleGitHubCallback(env, request) {
     userId, bridgeSecret, a2aApiKey, registerSecret,
     agentCard: {}, plan: "free",
     registeredAtMs: Date.now(),
-    githubId: ghUser.id, githubLogin: ghUser.login,
+    githubId: ghUser.id, githubLogin: ghUser.login, githubAvatarUrl: ghUser.avatar_url || null,
   };
 
   await env.KV.put(userKey(userId), JSON.stringify(userRecord));
@@ -1161,10 +1324,6 @@ function generateHex(bytes) {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function htmlResponse(body, status = 200) {
@@ -1694,6 +1853,9 @@ export default {
     const a2aMatch = path.match(/^\/([^/]+)$/);
     if (a2aMatch && request.method === "POST") {
       return handleA2A(env, request, a2aMatch[1]);
+    }
+    if (a2aMatch && request.method === "GET") {
+      return handleUserProfile(env, request, a2aMatch[1]);
     }
 
     // Fallback

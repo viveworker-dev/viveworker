@@ -13789,6 +13789,7 @@ function buildConfig(cli) {
     a2aPublicUrl: cleanText(process.env.A2A_PUBLIC_URL || ""),
     a2aDescription: cleanText(process.env.A2A_DESCRIPTION || ""),
     a2aSkills: cleanText(process.env.A2A_SKILLS || ""),
+    a2aAvatar: cleanText(process.env.A2A_AVATAR || ""),
     a2aRelayUrl: cleanText(process.env.A2A_RELAY_URL || ""),
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
@@ -15194,31 +15195,52 @@ async function main() {
         console.error(`[scan-error] ${error.message}`);
       }
 
-      // Hot-reload: detect a2a.env changes and auto-start relay
+      // Hot-reload: detect a2a.env changes (new config or updated card)
       const now = Date.now();
-      if (!config.a2aRelayUrl && now - lastA2aEnvCheckAt > A2A_ENV_CHECK_INTERVAL_MS) {
+      if (now - lastA2aEnvCheckAt > A2A_ENV_CHECK_INTERVAL_MS) {
         lastA2aEnvCheckAt = now;
         try {
           loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
           const newRelayUrl = cleanText(process.env.A2A_RELAY_URL || "");
           const newRelayUserId = cleanText(process.env.A2A_RELAY_USER_ID || "");
           const newRelayRegisterSecret = cleanText(process.env.A2A_RELAY_REGISTER_SECRET || "");
+          const newDescription = cleanText(process.env.A2A_DESCRIPTION || "");
+          const newSkills = cleanText(process.env.A2A_SKILLS || "");
+          const newAvatar = cleanText(process.env.A2A_AVATAR || "");
+
           if (newRelayUrl && newRelayUserId) {
-            config.a2aRelayUrl = newRelayUrl;
-            config.a2aRelayUserId = newRelayUserId;
-            config.a2aRelayRegisterSecret = newRelayRegisterSecret;
-            config.a2aApiKey = cleanText(process.env.A2A_API_KEY || config.a2aApiKey || "");
-            console.log(`[a2a-relay] Detected new relay config, registering...`);
-            const regResult = await registerWithRelay({ config, buildAgentCard });
-            if (regResult.ok) {
-              startRelayPolling({
-                config,
-                runtime,
-                state,
-                helpers: { recordTimelineEntry, deliverWebPushItem, saveState, historyToken, cleanText },
-              });
-            } else {
-              console.error(`[a2a-relay] Registration failed: ${regResult.error}`);
+            // Check if this is a first-time connect or a card update
+            const isNew = !config.a2aRelayUrl;
+            const cardChanged = config.a2aDescription !== newDescription || config.a2aSkills !== newSkills || config.a2aAvatar !== newAvatar;
+
+            if (isNew || cardChanged) {
+              config.a2aRelayUrl = newRelayUrl;
+              config.a2aRelayUserId = newRelayUserId;
+              config.a2aRelayRegisterSecret = newRelayRegisterSecret;
+              config.a2aApiKey = cleanText(process.env.A2A_API_KEY || config.a2aApiKey || "");
+              config.a2aDescription = newDescription;
+              config.a2aSkills = newSkills;
+              config.a2aAvatar = newAvatar;
+
+              if (isNew) {
+                console.log(`[a2a-relay] Detected new relay config, registering...`);
+              } else {
+                console.log(`[a2a-relay] Agent Card changed, re-registering...`);
+              }
+
+              const regResult = await registerWithRelay({ config, buildAgentCard });
+              if (regResult.ok) {
+                if (isNew) {
+                  startRelayPolling({
+                    config,
+                    runtime,
+                    state,
+                    helpers: { recordTimelineEntry, deliverWebPushItem, saveState, historyToken, cleanText },
+                  });
+                }
+              } else {
+                console.error(`[a2a-relay] Registration failed: ${regResult.error}`);
+              }
             }
           }
         } catch (error) {
