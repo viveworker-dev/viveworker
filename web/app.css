@@ -2318,6 +2318,25 @@ code {
   border-color: var(--accent, #6ea8ff);
 }
 
+.compose-greeting {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0.6rem 0 0.4rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 12px;
+  border-left: 3px solid var(--completion, #d2aa63);
+  background: rgba(210, 170, 99, 0.10);
+}
+.compose-greeting__icon {
+  font-size: 1.25rem;
+  line-height: 1;
+}
+.compose-greeting__text {
+  font-size: 0.92rem;
+  color: var(--text);
+  font-weight: 500;
+}
 .reply-field--title {
   margin-bottom: 0.5rem;
 }
@@ -3421,6 +3440,10 @@ button[data-action-url][aria-busy="true"]:not(.is-loading) {
   color: #e07a5f;
   background: rgba(224, 122, 95, 0.12);
 }
+.provider-badge--a2a {
+  color: #81c784;
+  background: rgba(129, 199, 132, 0.12);
+}
 
 .provider-filter {
   display: inline-flex;
@@ -3431,18 +3454,22 @@ button[data-action-url][aria-busy="true"]:not(.is-loading) {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 999px;
-  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .provider-filter__button {
   appearance: none;
   background: transparent;
   color: var(--text-muted, #9aa6b2);
   border: 0;
-  padding: 0.3rem 0.85rem;
+  padding: 0.3rem 0.65rem;
   font-size: 0.78rem;
   font-weight: 600;
   border-radius: 999px;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .provider-filter__button:hover {

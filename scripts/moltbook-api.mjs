@@ -142,10 +142,13 @@ export function defaultScoutState() {
 }
 
 export function todayKey() {
-  const d = new Date();
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
+  // Use local timezone with AM 5:00 as the day boundary — hours before 5am
+  // count as the previous day so late-night work doesn't consume the next
+  // day's quota.
+  const d = new Date(Date.now() - 5 * 60 * 60 * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
 
@@ -167,11 +170,13 @@ export function rollScoutDayIfNeeded(state) {
   return state;
 }
 
-export function recordComposeAttempt(state, title) {
+export function recordComposeAttempt(state, title, postId) {
   state.composedToday = (state.composedToday || 0) + 1;
   state.lastComposeDay = todayKey();
   if (!Array.isArray(state.recentComposeTitles)) state.recentComposeTitles = [];
-  state.recentComposeTitles.unshift(String(title || ""));
+  state.recentComposeTitles.unshift(
+    postId ? { title: String(title || ""), postId: String(postId) } : String(title || "")
+  );
   if (state.recentComposeTitles.length > 10) state.recentComposeTitles.length = 10;
   return state;
 }

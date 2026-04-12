@@ -22,6 +22,10 @@ docs/
 *.sqlite3
 .ntfy-data/
 
+# Cloudflare Wrangler local state
+.wrangler/
+worker/.wrangler/
+
 # Local TLS / certificate material
 *.pem
 *.crt

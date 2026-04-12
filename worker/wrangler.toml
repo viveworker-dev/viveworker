@@ -1,0 +1,19 @@
+name = "viveworker-a2a-relay"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+# Custom domain: a2a.viveworker.com
+routes = [
+  { pattern = "a2a.viveworker.com", zone_name = "viveworker.com" },
+  { pattern = "a2a.viveworker.com/*", zone_name = "viveworker.com" },
+]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "edf93b80de6048ed9a68fad679473d57"
+preview_id = "06279d9087ea4242a2a3055ea6f57583"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "viveworker_a2a_events"

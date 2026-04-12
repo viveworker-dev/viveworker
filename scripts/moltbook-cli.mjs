@@ -589,6 +589,14 @@ async function cmdPropose(postId, flags) {
     )
   );
 
+  // Bump sentToday counter immediately after posting (before verification),
+  // because the comment is already created and rate-limits are consumed
+  // regardless of verification outcome.
+  const state = rollScoutDayIfNeeded(await readScoutState());
+  state.sentToday += 1;
+  markPostSeen(state, postId, "published");
+  await writeScoutState(state);
+
   if (!verification) {
     console.log("propose: no verification challenge returned — done");
     return;
@@ -651,12 +659,6 @@ async function cmdPropose(postId, flags) {
   }
   console.log(JSON.stringify({ ok: true, verify: verifyRes, answer }, null, 2));
 
-  // 5. Bump sentToday counter on success.
-  const state = rollScoutDayIfNeeded(await readScoutState());
-  state.sentToday += 1;
-  markPostSeen(state, postId, "published");
-  await writeScoutState(state);
-
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
 }
 
@@ -667,10 +669,15 @@ async function solvePuzzleWithLLM(challengeText) {
   const prompt =
     `The following text is an obfuscated arithmetic word problem from Moltbook (an AI social network). ` +
     `The text has random capitalization, doubled letters, and stray punctuation — ignore all of that. ` +
-    `Extract the numbers (written as words like "thirty five" = 35), determine the operation ` +
-    `(usually addition for "total", "combined", "new velocity"; subtraction for "difference", "minus"; ` +
-    `multiplication for "times", "product"), compute the result, and output ONLY the number with ` +
-    `exactly 2 decimal places (e.g. "58.00"). No other text.\n\n` +
+    `CRITICAL: ALL symbols (/, *, ^, ~, [, ], etc.) are NOISE, NOT arithmetic operators. ` +
+    `The operation is ALWAYS expressed in natural language words only. ` +
+    `Extract the numbers (written as words like "thirty five" = 35), determine the operation from WORDS ONLY ` +
+    `(addition: "total", "combined", "and", "plus", "gains", "new velocity"; ` +
+    `subtraction: "difference", "minus", "less", "loses"; ` +
+    `multiplication: "times", "product", "multiplied"; ` +
+    `division: "divided by", "ratio", "per"). ` +
+    `If no operation word is found, default to addition. ` +
+    `Compute the result and output ONLY the number with exactly 2 decimal places (e.g. "58.00"). No other text.\n\n` +
     `Puzzle: ${challengeText}`;
 
   // Try claude first, then codex.
@@ -714,8 +721,12 @@ async function solvePuzzleWithLLM(challengeText) {
 // `null` if it can't confidently solve — caller falls back to manual.
 function solveVerificationPuzzle(challengeText) {
   if (!challengeText) return null;
+  // Strip ALL symbolic characters as noise — operations are expressed in
+  // natural language only ("and", "times", "divided by", etc.).  Previous
+  // regex missed `*` and `@` which caused `/` or `*` to be mistaken for
+  // arithmetic operators.
   const cleaned = String(challengeText)
-    .replace(/[\[\]|\\\/^\-\.~,;:!?'"(){}]/g, " ")
+    .replace(/[^a-zA-Z0-9\s]/g, " ")
     .toLowerCase();
   const numberWords = {
     zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
@@ -729,12 +740,42 @@ function solveVerificationPuzzle(challengeText) {
   // so try matching both the raw word and a version with collapsed runs.
   // We can't blindly collapse because natural doubles exist ("three" has "ee").
   const collapseRuns = (w) => w.replace(/([a-z])\1+/g, "$1");
-  const rawWords = cleaned
+  const rawTokens = cleaned
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter(Boolean);
+
+  // The obfuscator inserts spaces mid-word (e.g. "th ree" → "three",
+  // "to tal" → "total"). Greedily merge adjacent tokens if the combined
+  // form (raw or collapsed) matches a known number word or operation keyword.
+  const operationWords = new Set([
+    "total", "combined", "force", "velocity", "speed", "gains", "plus", "and",
+    "subtract", "minus", "less", "difference", "decreased", "loses", "lost", "slower", "slows", "slowed",
+    "multiply", "times", "product", "multiplied",
+    "divide", "divided", "ratio",
+    "how", "much", "what", "exerts", "new",
+  ]);
+  const isKnown = (w) => numberWords[w] != null || numberWords[collapseRuns(w)] != null || operationWords.has(w) || operationWords.has(collapseRuns(w));
+  const merged = [];
+  let ti = 0;
+  while (ti < rawTokens.length) {
+    // Try merging up to 4 consecutive tokens.
+    let best = rawTokens[ti];
+    let bestLen = 1;
+    let candidate = rawTokens[ti];
+    for (let span = 2; span <= Math.min(4, rawTokens.length - ti); span++) {
+      candidate += rawTokens[ti + span - 1];
+      if (isKnown(candidate) || isKnown(collapseRuns(candidate))) {
+        best = candidate;
+        bestLen = span;
+      }
+    }
+    merged.push(best);
+    ti += bestLen;
+  }
+
   // For each word, prefer the raw form if it's in the dictionary; otherwise try collapsed.
-  const words = rawWords.map((w) => {
+  const words = merged.map((w) => {
     if (/^\d+$/.test(w)) return w;
     if (numberWords[w] != null) return w;
     const collapsed = collapseRuns(w);
@@ -776,11 +817,11 @@ function solveVerificationPuzzle(challengeText) {
   const hasWord = (w) => words.includes(w);
   const hasAny = (...ws) => ws.some(hasWord);
   let result;
-  if (hasAny("subtract", "minus", "less", "difference", "decreased", "loses", "lost", "slower")) {
+  if (hasAny("subtract", "minus", "less", "difference", "decreased", "loses", "lost", "slower", "slows", "slowed")) {
     result = a - b;
   } else if (hasAny("multiply", "times", "product", "multiplied")) {
     result = a * b;
-  } else if (hasAny("divide", "divided", "ratio", "per")) {
+  } else if (hasAny("divide", "divided", "ratio")) {
     result = b !== 0 ? a / b : a;
   } else {
     // Default to addition — the Moltbook puzzles overwhelmingly ask for
@@ -1111,6 +1152,7 @@ async function cmdComposePropose(flags) {
   const content = typeof flags.content === "string" ? flags.content : "";
   const submolt = typeof flags.submolt === "string" ? flags.submolt : "general";
   const intent = typeof flags.intent === "string" ? flags.intent : "";
+  const slot = typeof flags.slot === "string" ? flags.slot : "";
   const timeoutSec = Number(flags.timeout) || 900;
   if (!title.trim()) fail("--title is required");
   if (!content.trim()) fail("--content is required");
@@ -1139,6 +1181,7 @@ async function cmdComposePropose(flags) {
         draftType: "original_post",
         submoltName: submolt,
         intent,
+        slot,
         contextSummary: truncate(intent || content, 160),
       }),
     });
@@ -1202,10 +1245,19 @@ async function cmdComposePropose(flags) {
   if (!verification) {
     console.log("compose-propose: no verification — done");
   } else {
-    // Solve verification puzzle inline.
+    // Solve verification puzzle inline (try naive solver, then LLM fallback, retry once on wrong answer).
     let answer = solveVerificationPuzzle(verification.challenge_text);
-    if (answer == null) answer = await solvePuzzleWithLLM(verification.challenge_text);
-    if (answer != null) {
+    const source = answer != null ? "solver" : "skip";
+    console.log(`compose-propose: verification puzzle — solver answer: ${answer ?? "(null)"}`);
+
+    if (answer == null) {
+      answer = await solvePuzzleWithLLM(verification.challenge_text);
+      if (answer) console.log(`compose-propose: LLM fallback answer: ${answer}`);
+    }
+
+    if (answer == null) {
+      console.log(`VERIFICATION REQUIRED (solver + LLM both failed):\n  verification_code: ${verification.verification_code}\n  challenge_text: ${verification.challenge_text}`);
+    } else {
       try {
         const verifyRes = await mb(`/verify`, {
           method: "POST",
@@ -1213,16 +1265,34 @@ async function cmdComposePropose(flags) {
         });
         console.log(JSON.stringify({ ok: true, verify: verifyRes, answer }, null, 2));
       } catch (verifyError) {
-        console.log(`compose-propose: verify failed: ${verifyError.message}`);
+        const isWrongAnswer = /incorrect/i.test(verifyError.message);
+        if (isWrongAnswer && source === "solver") {
+          console.log(`compose-propose: solver answer ${answer} was wrong, trying LLM fallback`);
+          const llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
+          if (llmAnswer && llmAnswer !== answer) {
+            console.log(`compose-propose: LLM retry answer: ${llmAnswer}`);
+            try {
+              const verifyRes2 = await mb(`/verify`, {
+                method: "POST",
+                body: JSON.stringify({ verification_code: verification.verification_code, answer: llmAnswer }),
+              });
+              console.log(JSON.stringify({ ok: true, verify: verifyRes2, answer: llmAnswer }, null, 2));
+            } catch (retryError) {
+              console.log(`compose-propose: LLM retry also failed: ${retryError.message}`);
+            }
+          } else {
+            console.log(`compose-propose: LLM couldn't produce a different answer`);
+          }
+        } else {
+          console.log(`compose-propose: verify failed: ${verifyError.message}`);
+        }
       }
-    } else {
-      console.log(`VERIFICATION REQUIRED:\n  verification_code: ${verification.verification_code}\n  challenge_text: ${verification.challenge_text}`);
     }
   }
 
   // 4. Bump compose counter.
   const state = rollScoutDayIfNeeded(await readScoutState());
-  recordComposeAttempt(state, finalTitle);
+  recordComposeAttempt(state, finalTitle, post?.id);
   await writeScoutState(state);
 
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";

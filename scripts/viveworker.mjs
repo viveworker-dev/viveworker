@@ -42,6 +42,17 @@ if (rawArgs[0] === "moltbook") {
   }
 }
 
+if (rawArgs[0] === "a2a") {
+  const { runA2ACli } = await import("./a2a-cli.mjs");
+  try {
+    await runA2ACli(rawArgs.slice(1));
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+  }
+}
+
 const cli = parseArgs(rawArgs);
 
 try {

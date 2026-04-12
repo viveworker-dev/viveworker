@@ -542,6 +542,7 @@ function normalizeProviderClient(value) {
   const normalized = String(value || "").toLowerCase();
   if (normalized === "claude") return "claude";
   if (normalized === "moltbook") return "moltbook";
+  if (normalized === "a2a") return "a2a";
   return "codex";
 }
 
@@ -549,6 +550,7 @@ function providerDisplayName(provider) {
   const p = normalizeProviderClient(provider);
   if (p === "claude") return L("common.claude");
   if (p === "moltbook") return "Moltbook";
+  if (p === "a2a") return "A2A";
   return L("common.codex");
 }
 
@@ -1703,6 +1705,9 @@ function providerBadgeMeta(provider) {
   if (normalized === "moltbook") {
     return { id: "moltbook", label: "Moltbook", glyph: "M" };
   }
+  if (normalized === "a2a") {
+    return { id: "a2a", label: "A2A", glyph: "A" };
+  }
   return { id: "codex", label: L("common.codex"), glyph: "X" };
 }
 
@@ -1719,6 +1724,9 @@ function providerFilterOptions() {
   ];
   if (state.session?.moltbookEnabled === true) {
     options.push({ id: "moltbook", label: "Moltbook" });
+  }
+  if (state.session?.a2aEnabled === true) {
+    options.push({ id: "a2a", label: "A2A" });
   }
   return options;
 }
@@ -3031,7 +3039,7 @@ function renderSettingsNotificationsPage(context) {
   const { push, permission, secureContext, standalone, supportsPushValue, serverEnabled } = context;
   const statusRows = [
     renderSettingsInfoRow(L("settings.row.status"), L(context.setupState.notifications.labelKey)),
-    renderSettingsInfoRow(L("settings.row.notificationPermission"), permission),
+    renderSettingsInfoRow(L("settings.row.notificationPermission"), L(`settings.permission.${permission}`) || permission),
     renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
     push.lastSuccessfulDeliveryAtMs
       ? renderSettingsInfoRow(
@@ -3142,7 +3150,7 @@ function renderSettingsAdvancedPage(context) {
         renderSettingsInfoRow(L("settings.row.serverWebPush"), context.serverEnabled ? L("common.enabled") : L("common.disabled")),
         renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.supported") : L("common.notSupported")),
         renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.notificationPermission"), context.permission),
+        renderSettingsInfoRow(L("settings.row.notificationPermission"), L(`settings.permission.${context.permission}`) || context.permission),
         renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.supported") : L("common.notSupported")),
         renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
         context.push.lastSuccessfulDeliveryAtMs
@@ -3248,13 +3256,18 @@ function renderSettingsMoltbookPage(context) {
       ${renderSettingsGroup("", [
         renderSettingsInfoRow(L("settings.row.moltbookQuota"), `${scout.sentToday} / ${scout.maxDaily}`),
         renderSettingsInfoRow(L("settings.row.moltbookComposed"), `${scout.composedToday || 0} / 3`),
-        renderSettingsInfoRow(L("settings.row.moltbookSlots"), (scout.composeSlotsAttempted || []).join(", ") || "—"),
-        renderSettingsInfoRow(L("settings.row.moltbookDate"), scout.day),
         renderSettingsInfoRow(L("settings.row.moltbookSeenPosts"), String(scout.seenPostCount)),
       ])}
       ${batchRows.length ? renderSettingsGroup(L("settings.moltbook.batchTitle"), batchRows) : ""}
       ${Array.isArray(scout.recentComposeTitles) && scout.recentComposeTitles.length
-        ? renderSettingsGroup(L("settings.row.moltbookRecentTitles"), scout.recentComposeTitles.map((t) => renderSettingsInfoRow("", t)))
+        ? renderSettingsGroup(L("settings.row.moltbookRecentTitles"), scout.recentComposeTitles.map((t) => {
+            const title = typeof t === "string" ? t : (t.title || "");
+            const postId = typeof t === "object" ? t.postId : "";
+            const display = postId
+              ? `<a href="https://www.moltbook.com/post/${escapeHtml(postId)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
+              : escapeHtml(title);
+            return renderSettingsInfoRow("", display, { rawValue: true, rowClassName: "settings-info-row--stacked" });
+          }))
         : ""}
     </div>
   `;
@@ -3263,10 +3276,11 @@ function renderSettingsMoltbookPage(context) {
 function renderSettingsInfoRow(label, value, options = {}) {
   const rowClassName = ["settings-info-row", options.rowClassName || ""].filter(Boolean).join(" ");
   const valueClassName = ["settings-info-row__value", options.valueClassName || ""].filter(Boolean).join(" ");
+  const displayValue = options.rawValue ? value : escapeHtml(value);
   return `
     <div class="${rowClassName}">
       <span class="settings-info-row__label">${escapeHtml(label)}</span>
-      <span class="${valueClassName}">${escapeHtml(value)}</span>
+      <span class="${valueClassName}">${displayValue}</span>
     </div>
   `;
 }
@@ -3377,8 +3391,9 @@ function renderStandardDetailDesktop(detail) {
       ${renderInterruptedDetailNotice(detail)}
       ${renderMoltbookReplyComposer(detail)}
       ${renderMoltbookDraftComposer(detail)}
+      ${renderA2ATaskDetail(detail)}
       ${
-        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply"
+        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task"
           ? ""
           : plainIntro
             ? plainIntro
@@ -3413,8 +3428,9 @@ function renderStandardDetailMobile(detail) {
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
           ${renderMoltbookReplyComposer(detail, { mobile: true })}
           ${renderMoltbookDraftComposer(detail, { mobile: true })}
+          ${renderA2ATaskDetail(detail, { mobile: true })}
           ${
-            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply"
+            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task"
               ? ""
               : plainIntro
                 ? plainIntro
@@ -3925,6 +3941,15 @@ function renderMoltbookDraftComposer(detail, options = {}) {
     : "";
   const eyebrowLabel = isOriginalPost ? L("moltbook.draft.eyebrowPost") : L("moltbook.draft.eyebrowReply");
   const approveLabel = isOriginalPost ? L("moltbook.draft.approvePost") : L("moltbook.draft.approveReply");
+  const greetingBlock = (() => {
+    if (!isOriginalPost) return "";
+    const slot = detail.slot || "";
+    const icons = { morning: "\u2600\ufe0f", noon: "\u26c5", evening: "\ud83c\udf19" };
+    const keys = { morning: "moltbook.draft.greetMorning", noon: "moltbook.draft.greetNoon", evening: "moltbook.draft.greetEvening" };
+    const icon = icons[slot] || "\u270d\ufe0f";
+    const msg = keys[slot] ? L(keys[slot]) : L("moltbook.draft.greetFallback");
+    return `<div class="compose-greeting"><span class="compose-greeting__icon">${icon}</span><span class="compose-greeting__text">${escapeHtml(msg)}</span></div>`;
+  })();
   const buttons = enabled
     ? `
       <div class="actions actions--stack${options.mobile ? " actions--sticky" : ""}">
@@ -3940,6 +3965,7 @@ function renderMoltbookDraftComposer(detail, options = {}) {
         <div class="reply-composer__copy">
           <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(eyebrowLabel)}</span>
           ${submoltBadge}
+          ${greetingBlock}
           ${postLink}
           ${postAuthorLine}
           ${titleInput}
@@ -3948,6 +3974,58 @@ function renderMoltbookDraftComposer(detail, options = {}) {
           <p class="muted reply-composer__description">${escapeHtml(L("moltbook.draft.editHint"))}</p>
         </div>
         <textarea name="text" class="reply-composer__textarea" data-moltbook-draft-textarea rows="8" ${enabled ? "" : "readonly"}>${escapeHtml(draftText)}</textarea>
+        ${buttonsWrapped}
+      </form>
+    </section>
+  `;
+}
+
+function renderA2ATaskDetail(detail, options = {}) {
+  if (detail.kind !== "a2a_task") return "";
+  const enabled = detail.a2aTaskEnabled !== false && detail.readOnly !== true;
+  const instruction = detail.instruction || "";
+  const callerIp = detail.callerInfo?.ip || "";
+  const callerAgent = detail.callerInfo?.userAgent || "";
+  const callerLine = callerIp
+    ? `<p class="reply-composer__author-meta muted">${escapeHtml(L("a2a.task.from"))}: ${escapeHtml(callerIp)}${callerAgent ? ` (${escapeHtml(callerAgent.slice(0, 60))})` : ""}</p>`
+    : "";
+
+  const statusKey = {
+    submitted: "a2a.task.statusSubmitted",
+    working: "a2a.task.statusWorking",
+    completed: "a2a.task.statusCompleted",
+    failed: "a2a.task.statusFailed",
+    canceled: "a2a.task.statusCanceled",
+    rejected: "a2a.task.statusRejected",
+  }[detail.taskStatus] || "a2a.task.statusSubmitted";
+
+  const statusBadge = !enabled
+    ? `<span class="eyebrow-pill eyebrow-pill--subtle">${escapeHtml(L(statusKey))}</span>`
+    : "";
+
+  const buttons = enabled
+    ? `
+      <div class="actions actions--stack${options.mobile ? " actions--sticky" : ""}">
+        <button type="submit" data-action="approve" class="primary primary--wide">${escapeHtml(L("a2a.task.approve"))}</button>
+        <button type="submit" data-action="deny" class="danger danger--wide">${escapeHtml(L("a2a.task.deny"))}</button>
+      </div>
+    `
+    : `<p class="muted reply-composer__description">${escapeHtml(L("a2a.task.resolved"))}</p>`;
+  const buttonsWrapped = enabled && options.mobile ? `<div class="detail-action-bar">${buttons}</div>` : buttons;
+
+  return `
+    <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
+      <form class="reply-composer" data-a2a-task-form data-token="${escapeHtml(detail.token || "")}">
+        <div class="reply-composer__copy">
+          <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("a2a.task.eyebrow"))}</span>
+          ${statusBadge}
+          ${callerLine}
+          <p class="muted reply-composer__description">${enabled ? escapeHtml(L("a2a.task.editHint")) : ""}</p>
+        </div>
+        <div class="reply-composer__instruction">
+          <label class="field-label">${escapeHtml(L("a2a.task.instruction"))}</label>
+          <textarea name="instruction" class="reply-composer__textarea" rows="6" ${enabled ? "" : "readonly"}>${escapeHtml(instruction)}</textarea>
+        </div>
         ${buttonsWrapped}
       </form>
     </section>
@@ -5077,6 +5155,72 @@ function bindShellInteractions() {
         });
         if (textarea) textarea.readOnly = false;
         moltbookDraftForm.dataset.submitting = "";
+      }
+    });
+  }
+
+  const a2aTaskForm = document.querySelector("[data-a2a-task-form]");
+  if (a2aTaskForm) {
+    const token = a2aTaskForm.dataset.token || "";
+    let submittedAction = "approve";
+    a2aTaskForm.querySelectorAll("button[type='submit']").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        submittedAction = btn.dataset.action || "approve";
+      });
+    });
+    a2aTaskForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (a2aTaskForm.dataset.submitting === "1") return;
+      a2aTaskForm.dataset.submitting = "1";
+      const buttons = a2aTaskForm.querySelectorAll("button[type='submit']");
+      const textarea = a2aTaskForm.querySelector("textarea");
+      const labelCache = new Map();
+      buttons.forEach((btn) => {
+        labelCache.set(btn, btn.innerHTML);
+        btn.disabled = true;
+        if (btn.dataset.action === submittedAction) {
+          btn.innerHTML = submittedAction === "approve" ? "Executing…" : "Denying…";
+          btn.classList.add("is-loading");
+        } else {
+          btn.classList.add("is-dimmed");
+        }
+      });
+      if (textarea) textarea.readOnly = true;
+      const instruction = normalizeClientText(new FormData(a2aTaskForm).get("instruction"));
+      try {
+        const res = await fetch(`/api/items/a2a-task/${encodeURIComponent(token)}/decision`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ action: submittedAction, instruction }),
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          alert(`A2A task ${submittedAction} failed: ${errBody.error || res.status}`);
+          buttons.forEach((btn) => {
+            btn.disabled = false;
+            btn.classList.remove("is-loading", "is-dimmed");
+            btn.innerHTML = labelCache.get(btn);
+          });
+          if (textarea) textarea.readOnly = false;
+          a2aTaskForm.dataset.submitting = "";
+          return;
+        }
+        if (state.currentDetail?.kind === "a2a_task") {
+          state.currentDetail.a2aTaskEnabled = false;
+          state.currentDetail.readOnly = true;
+        }
+        await refreshAuthenticatedState();
+        await renderShell();
+      } catch (error) {
+        alert(`A2A task error: ${error.message}`);
+        buttons.forEach((btn) => {
+          btn.disabled = false;
+          btn.classList.remove("is-loading", "is-dimmed");
+          btn.innerHTML = labelCache.get(btn);
+        });
+        if (textarea) textarea.readOnly = false;
+        a2aTaskForm.dataset.submitting = "";
       }
     });
   }

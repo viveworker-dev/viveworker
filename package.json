@@ -1,7 +1,7 @@
 {
   "name": "viveworker",
   "version": "0.3.0",
-  "description": "Local mobile companion for Codex Desktop and Claude Desktop approvals, questions, completions, and code review on your LAN.",
+  "description": "Local mobile companion for Codex Desktop and Claude Desktop — approvals, code review, Moltbook drafts, and A2A (Agent-to-Agent) task relay on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
   "keywords": [
@@ -19,6 +19,10 @@
     "approvals",
     "questions",
     "code-review",
+    "moltbook",
+    "ai-agents",
+    "a2a",
+    "agent-to-agent",
     "lan",
     "companion-app",
     "vivecoding"
@@ -37,7 +41,12 @@
     "scripts/moltbook-cli.mjs",
     "scripts/moltbook-watcher.mjs",
     "scripts/moltbook-scout-run.sh",
+    "scripts/moltbook-scout-auto.sh",
     "scripts/com.viveworker.moltbook-scout.plist.sample",
+    "scripts/a2a-cli.mjs",
+    "scripts/a2a-handler.mjs",
+    "scripts/a2a-executor.mjs",
+    "scripts/a2a-relay-client.mjs",
     "scripts/lib",
     "web",
     "README.md",

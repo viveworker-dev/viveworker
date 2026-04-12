@@ -98,3 +98,107 @@ The bridge half (`POST /api/providers/moltbook/draft`, the long-poll, and the ph
 - `MOLTBOOK_API_KEY missing` → check that `~/.viveworker/moltbook.env` exists and is readable.
 - `moltbook 4xx` → suspect an expired API key or an endpoint change.
 - Watcher isn't picking up notifications → `tail -f /tmp/viveworker-moltbook-watcher.{out,err}.log` and `launchctl list | grep moltbook`.
+
+## viveworker a2a
+
+viveworker supports Google's A2A protocol, allowing external agents worldwide to send tasks. Tasks arrive via a Cloudflare Worker relay at `a2a.viveworker.com`, get pushed to the user's phone for approval, and execute via Codex.
+
+### Setup (first time)
+
+Run the setup command — the agent handles everything, the user just clicks "Authorize" on GitHub:
+
+```bash
+node scripts/viveworker.mjs a2a setup --user-id <desired-id>
+```
+
+This will:
+1. Open a browser for GitHub OAuth authorization
+2. Auto-write credentials to `~/.viveworker/a2a.env`
+3. The running bridge detects the new config within 30 seconds and auto-connects
+
+Optional flags:
+- `--relay-url <url>` — custom relay (default: `https://a2a.viveworker.com`)
+- `--timeout <seconds>` — how long to wait for GitHub auth (default: 300)
+
+### How it works
+
+```
+External agent
+    │  POST https://a2a.viveworker.com/<userId>
+    ▼
+Cloudflare Worker (relay)
+    │  bridge polls every 20s
+    ▼
+viveworker bridge (user's Mac)
+    │  Web Push → phone → user approval → Codex execution
+    ▼
+Cloudflare Worker
+    │  external agent polls tasks/get
+    ▼
+External agent ← gets result
+```
+
+### Credentials
+
+All stored in `~/.viveworker/a2a.env`:
+
+| Key | Purpose |
+|-----|---------|
+| `A2A_API_KEY` | External agents use this to authenticate (via `X-A2A-Key` header) |
+| `A2A_RELAY_URL` | Relay endpoint (e.g. `https://a2a.viveworker.com`) |
+| `A2A_RELAY_USER_ID` | Your user ID on the relay |
+| `A2A_RELAY_SECRET` | Auto-generated on first bridge connect; authenticates bridge↔relay |
+| `A2A_RELAY_REGISTER_SECRET` | One-time secret from GitHub signup; consumed on first connect |
+
+### External agent usage
+
+Other agents interact with your viveworker via standard A2A JSON-RPC:
+
+```bash
+# 1. Discover
+curl https://a2a.viveworker.com/<userId>/.well-known/agent.json
+
+# 2. Send a task
+curl -X POST https://a2a.viveworker.com/<userId> \
+  -H 'Content-Type: application/json' \
+  -H 'X-A2A-Key: <api-key>' \
+  -d '{
+    "jsonrpc": "2.0", "id": 1,
+    "method": "message/send",
+    "params": { "message": { "role": "user", "parts": [{"type":"text","text":"Review my README"}] } }
+  }'
+
+# 3. Poll for result
+curl -X POST https://a2a.viveworker.com/<userId> \
+  -H 'Content-Type: application/json' \
+  -H 'X-A2A-Key: <api-key>' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":"<id-from-step-2>"}}'
+```
+
+### Admin operations
+
+```bash
+# Delete a user (requires REGISTER_SECRET)
+curl -X DELETE https://a2a.viveworker.com/internal/admin/user/<userId> \
+  -H 'Authorization: Bearer <register-secret>'
+```
+
+### Architecture
+
+| Component | Location |
+|-----------|----------|
+| Cloudflare Worker (relay) | `worker/worker.js` |
+| Worker config | `worker/wrangler.toml` |
+| Bridge relay client | `scripts/a2a-relay-client.mjs` |
+| Local A2A handler | `scripts/a2a-handler.mjs` |
+| Task executor | `scripts/a2a-executor.mjs` |
+| Setup CLI | `scripts/a2a-cli.mjs` |
+| Bridge integration | `scripts/viveworker-bridge.mjs` (relay startup, decision handler, hot-reload) |
+
+### Notes
+
+- Free tier: 25 tasks/day, 5 concurrent pending tasks
+- Tasks expire after 24 hours in the relay
+- Bridge polls every 20 seconds; unclaimed tasks re-release after 2 minutes
+- GitHub OAuth enforces 1 account per GitHub user, 3 registrations per IP per day
+- Local A2A (direct `POST /a2a` to bridge) still works alongside the relay

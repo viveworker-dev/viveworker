@@ -214,6 +214,7 @@ COMPOSE_EOF
           --content "$C_BODY" \
           --submolt "$C_SUBMOLT" \
           --intent "${C_INTENT:-auto-compose: $COMPOSE_SLOT update}" \
+          --slot "$COMPOSE_SLOT" \
           --timeout "$COMPOSE_TIMEOUT"
 
         exit 0

@@ -16,6 +16,8 @@ import webPush from "web-push";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
+import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
+import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult } from "./a2a-relay-client.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,6 +41,7 @@ const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
 loadEnvFile(envFile);
+loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
 await maybeRotateStartupPairingEnv(envFile);
 
 const config = buildConfig(cli);
@@ -81,6 +84,7 @@ const runtime = {
   completionDetailsByToken: new Map(),
   moltbookItemsByToken: new Map(),
   moltbookDraftsByToken: new Map(),
+  a2aTasksByToken: new Map(),
   planDetailsByToken: new Map(),
   recentHistoryItems: [],
   recentTimelineEntries: [],
@@ -215,6 +219,8 @@ function buildSessionLocalePayload(config, state, deviceId) {
     deviceOverrideLocale: resolved.overrideLocale || null,
     claudeAwayMode: state?.claudeAwayMode === true,
     moltbookEnabled: Boolean(config.moltbookApiKey),
+    a2aEnabled: Boolean(config.a2aApiKey),
+    a2aRelayEnabled: Boolean(config.a2aRelayUrl && config.a2aRelayUserId),
   };
 }
 
@@ -283,6 +289,8 @@ function notificationIconPrefix(kind) {
       return "☑️";
     case "completion":
       return "✅";
+    case "a2a_task":
+      return "🤝";
     default:
       return "";
   }
@@ -1994,6 +2002,7 @@ function normalizeProvider(value) {
   const normalized = String(value || "").toLowerCase();
   if (normalized === "claude") return "claude";
   if (normalized === "moltbook") return "moltbook";
+  if (normalized === "a2a") return "a2a";
   return "codex";
 }
 
@@ -2001,6 +2010,7 @@ function providerDisplayName(locale, provider) {
   const p = normalizeProvider(provider);
   if (p === "claude") return t(locale, "common.claude");
   if (p === "moltbook") return "Moltbook";
+  if (p === "a2a") return "A2A";
   return t(locale, "common.codex");
 }
 
@@ -2093,17 +2103,31 @@ function normalizeTimelineEntries(rawItems, maxItems) {
       }
       return timelineKindSortPriority(right.kind) - timelineKindSortPriority(left.kind);
     });
+  // Per-provider eviction: each provider (codex, claude, moltbook) gets up
+  // to `maxItems` entries, so entries from one busy provider don't push out
+  // entries from another.  Total capacity is maxItems * providerCount.
   const deduped = [];
   const seen = new Set();
+  const perProviderCount = {};
+  const knownProviders = new Set(["codex", "claude", "moltbook", "a2a"]);
+  const saturatedProviders = new Set();
   for (const item of normalized) {
     if (seen.has(item.stableId)) {
       continue;
     }
+    const prov = item.provider || "codex";
+    if (saturatedProviders.has(prov)) {
+      continue;
+    }
+    const count = (perProviderCount[prov] || 0) + 1;
+    perProviderCount[prov] = count;
+    if (count > maxItems) {
+      saturatedProviders.add(prov);
+      if (saturatedProviders.size >= knownProviders.size) break;
+      continue;
+    }
     seen.add(item.stableId);
     deduped.push(item);
-    if (deduped.length >= maxItems) {
-      break;
-    }
   }
   return deduped;
 }
@@ -2241,6 +2265,7 @@ function normalizeTimelineEntry(raw) {
     ...(raw.contextText != null ? { contextText: cleanText(raw.contextText) } : {}),
     ...(raw.draftType != null ? { draftType: cleanText(raw.draftType) } : {}),
     ...(raw.submoltName != null ? { submoltName: cleanText(raw.submoltName) } : {}),
+    ...(raw.slot != null ? { slot: cleanText(raw.slot) } : {}),
   };
 }
 
@@ -3091,7 +3116,7 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     const defaultThreadLabel = path.basename(decodedProjectDir) || "";
 
     // On startup, use the same "recent only" strategy as processRolloutFile to avoid
-    // re-processing old entries that would be immediately discarded by the 250-entry limit.
+    // re-processing old entries that would be immediately discarded by the per-provider entry limit.
     let initialOffset = 0;
     let startupCutoffMs = 0;
     try {
@@ -3204,6 +3229,10 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     }
     text = cleanText(text);
     if (!text) continue;
+    // Skip Claude Code internal system messages (task notifications, system
+    // reminders, etc.) — these are XML-like tags injected into the
+    // conversation that should not appear on the user-facing timeline.
+    if (/^<(?:task-notification|system-reminder)\b/i.test(text.trim())) continue;
 
     const kind = type === "user" ? "user_message" : "assistant_final";
     const stableId = `${kind}:${threadId}:${uuid}`;
@@ -9023,6 +9052,21 @@ function buildPendingInboxItems(runtime, state, config, locale) {
     });
   }
 
+  for (const task of runtime.a2aTasksByToken.values()) {
+    if (task.status !== "submitted") continue;
+    items.push({
+      kind: "a2a_task",
+      token: task.token,
+      threadId: "a2a",
+      threadLabel: "A2A",
+      title: `A2A: ${cleanText(task.instruction || "").slice(0, 80)}`,
+      summary: cleanText(task.instruction || "").slice(0, 160),
+      primaryLabel: t(locale, "server.action.review"),
+      createdAtMs: Number(task.createdAtMs) || now,
+      provider: "a2a",
+    });
+  }
+
   // Moltbook reply items intentionally do not appear in the unhandled list.
   // Reply drafting is delegated to Codex/Claude Desktop via the
   // `viveworker moltbook` CLI, so they live in the timeline only.
@@ -10526,10 +10570,43 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
       draftType: draft?.draftType || entry?.draftType || "reply",
       submoltName: draft?.submoltName || entry?.submoltName || "",
       intent: draft?.intent || entry?.intent || "",
+      slot: draft?.slot || entry?.slot || "",
       createdAtMs: source.createdAtMs || Date.now(),
       readOnly: !draft || Boolean(draft?.decision),
       actions: [],
       moltbookDraftEnabled: Boolean(draft) && !draft.decision,
+    };
+  }
+
+  if (kind === "a2a_task") {
+    const task = runtime.a2aTasksByToken.get(token);
+    const entry = task
+      ? null
+      : runtime.recentTimelineEntries.find((e) => e.kind === "a2a_task" && e.token === token);
+    const source = task || entry;
+    if (!source) return null;
+    const instruction = task ? task.instruction : entry.messageText || entry.summary || "";
+    const messageHtml = escapeHtml(instruction)
+      .split("\n")
+      .map((line) => `<p>${line}</p>`)
+      .join("");
+    return {
+      kind: "a2a_task",
+      token,
+      threadId: "a2a",
+      threadLabel: "A2A",
+      title: source.title || `A2A Task`,
+      summary: source.summary || cleanText(instruction).slice(0, 160),
+      messageHtml,
+      provider: "a2a",
+      instruction,
+      taskId: task?.id || "",
+      taskStatus: task?.status || entry?.taskStatus || "unknown",
+      callerInfo: task?.callerInfo || {},
+      createdAtMs: source.createdAtMs || Date.now(),
+      readOnly: !task || task.status !== "submitted",
+      actions: [],
+      a2aTaskEnabled: Boolean(task) && task.status === "submitted",
     };
   }
 
@@ -10748,6 +10825,104 @@ function createNativeApprovalServer({ config, runtime, state }) {
         if (served) {
           return;
         }
+      }
+
+      // ---------------------------------------------------------------
+      // A2A (Agent2Agent) Protocol endpoints
+      // ---------------------------------------------------------------
+
+      if (url.pathname === "/.well-known/agent.json" && req.method === "GET") {
+        if (!config.a2aApiKey) {
+          return writeJson(res, 404, { error: "a2a-not-configured" });
+        }
+        return writeJson(res, 200, buildAgentCard(config));
+      }
+
+      if (url.pathname === "/a2a" && req.method === "POST") {
+        if (!config.a2aApiKey) {
+          return writeJson(res, 404, { error: "a2a-not-configured" });
+        }
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+        }
+        return handleA2ARequest({
+          req, res, body, config, runtime, state,
+          writeJson, recordTimelineEntry, deliverWebPushItem, saveState, historyToken, cleanText,
+        });
+      }
+
+      // A2A task decision (user approves/denies from PWA)
+      const apiA2ATaskDecide = url.pathname.match(/^\/api\/items\/a2a-task\/([^/]+)\/decision$/u);
+      if (apiA2ATaskDecide && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        const token = decodeURIComponent(apiA2ATaskDecide[1]);
+        const task = runtime.a2aTasksByToken.get(token);
+        if (!task) return writeJson(res, 404, { error: "task-not-found" });
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const action = String(body.action || "") === "approve" ? "approve" : "deny";
+        const instruction = cleanText(body.instruction || "");
+        resolveA2ATaskDecision(task, { action, instruction });
+
+        if (action === "approve") {
+          // Execute task asynchronously via Codex
+          (async () => {
+            try {
+              const { executeA2ATask } = await import("./a2a-executor.mjs");
+              await executeA2ATask(task, config, runtime, state, { recordTimelineEntry, saveState });
+            } catch (error) {
+              console.error(`[a2a-execute-error] ${error.message}`);
+              failA2ATask(task, error.message);
+            }
+            // Post result to relay if this is a relay-originated task
+            if (task.relayTaskId) {
+              postRelayResult({ config, task }).catch((err) =>
+                console.error(`[a2a-relay] Result post error: ${err.message}`)
+              );
+            }
+          })();
+        } else if (task.relayTaskId) {
+          // Denied — post rejection back to relay
+          postRelayResult({ config, task }).catch((err) =>
+            console.error(`[a2a-relay] Rejection post error: ${err.message}`)
+          );
+        }
+
+        // Keep entry briefly for polling
+        setTimeout(() => {
+          if (task.status === "rejected" || task.status === "canceled") {
+            runtime.a2aTasksByToken.delete(token);
+          }
+        }, 300_000).unref?.(); // 5 min cleanup for rejected/canceled
+
+        return writeJson(res, 200, { ok: true, action });
+      }
+
+      // A2A task status polling (for external callers, authenticated via A2A key)
+      const apiA2ATaskStatus = url.pathname.match(/^\/api\/providers\/a2a\/tasks\/([^/]+)\/status$/u);
+      if (apiA2ATaskStatus && req.method === "GET") {
+        const apiKey = req.headers["x-a2a-key"] || "";
+        if (!config.a2aApiKey || apiKey !== config.a2aApiKey) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+        const token = decodeURIComponent(apiA2ATaskStatus[1]);
+        const task = runtime.a2aTasksByToken.get(token);
+        if (!task) return writeJson(res, 404, { error: "task-not-found" });
+        return writeJson(res, 200, {
+          id: task.id,
+          status: task.status,
+          statusMessage: task.statusMessage || "",
+          artifacts: task.artifacts,
+          updatedAtMs: task.updatedAtMs,
+        });
       }
 
       if (url.pathname === "/api/session" && req.method === "GET") {
@@ -11507,6 +11682,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const postAuthor = cleanText(body.postAuthor || "");
         const postBody = typeof body.postBody === "string" ? body.postBody : "";
         const intent = typeof body.intent === "string" ? body.intent : "";
+        const slot = cleanText(body.slot || "");
         const draft = {
           token,
           sourceId,
@@ -11520,6 +11696,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           draftType,
           submoltName,
           intent,
+          slot,
           contextSummary,
           createdAtMs: Date.now(),
           decisionWaiters: [],
@@ -11546,6 +11723,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
               draftType,
               submoltName,
               intent,
+              slot,
               postId,
               postUrl,
               postTitle,
@@ -11561,16 +11739,28 @@ function createNativeApprovalServer({ config, runtime, state }) {
           console.error(`[moltbook-draft-timeline-save] ${error.message}`);
         }
         try {
+          const pushTitle = (() => {
+            if (draftType !== "original_post") {
+              return postTitle ? `draft → ${postTitle}` : "Moltbook draft";
+            }
+            const greetings = {
+              morning: { en: "Good morning! Share yesterday's highlights?", ja: "おはようございます！昨日の成果をシェアしませんか？" },
+              noon: { en: "Nice progress! Ready to share your morning work?", ja: "午前中お疲れ様でした！進捗をシェアしませんか？" },
+              evening: { en: "Great work today! Let's share what you built.", ja: "今日もお疲れ様でした！成果をシェアしませんか？" },
+            };
+            const locale = config.locale || "en";
+            const lang = locale.startsWith("ja") ? "ja" : "en";
+            const g = greetings[slot];
+            return g ? g[lang] : (postTitle || "Moltbook new post");
+          })();
           await deliverWebPushItem({
             config,
             state,
             kind: "moltbook_draft",
             token,
             stableId: `moltbook_draft:${sourceId}`,
-            title: draftType === "original_post"
-              ? (postTitle || "Moltbook new post")
-              : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
-            body: String(draftText).slice(0, 160),
+            title: pushTitle,
+            body: draftType === "original_post" ? (postTitle || String(draftText).slice(0, 160)) : String(draftText).slice(0, 160),
           });
         } catch (error) {
           console.error(`[moltbook-draft-push-error] ${error.message}`);
@@ -13556,6 +13746,20 @@ function isLoopbackHostname(value) {
   return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
 }
 
+function readA2AEnvKey() {
+  try {
+    const envPath = path.join(os.homedir(), ".viveworker", "a2a.env");
+    const raw = readFileSync(envPath, "utf8");
+    for (const line of raw.split(/\r?\n/u)) {
+      const m = line.match(/^\s*A2A_API_KEY\s*=\s*(.+?)\s*$/u);
+      if (m) return m[1].replace(/^['"]|['"]$/gu, "");
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
 function readMoltbookEnvKey() {
   // Fall back to the standalone watcher's env file so the bridge can detect
   // a configured Moltbook integration without requiring MOLTBOOK_API_KEY to
@@ -13581,6 +13785,12 @@ function buildConfig(cli) {
     once: cli.once,
     codexHome,
     moltbookApiKey: cleanText(process.env.MOLTBOOK_API_KEY || readMoltbookEnvKey() || ""),
+    a2aApiKey: cleanText(process.env.A2A_API_KEY || readA2AEnvKey() || ""),
+    a2aPublicUrl: cleanText(process.env.A2A_PUBLIC_URL || ""),
+    a2aRelayUrl: cleanText(process.env.A2A_RELAY_URL || ""),
+    a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
+    a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
+    a2aRelayRegisterSecret: cleanText(process.env.A2A_RELAY_REGISTER_SECRET || ""),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
     webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
@@ -14954,6 +15164,24 @@ async function main() {
       }
     }
 
+    // --- A2A Relay ---
+    if (config.a2aRelayUrl && config.a2aRelayUserId) {
+      const regResult = await registerWithRelay({ config, buildAgentCard });
+      if (regResult.ok) {
+        startRelayPolling({
+          config,
+          runtime,
+          state,
+          helpers: { recordTimelineEntry, deliverWebPushItem, saveState, historyToken, cleanText },
+        });
+      } else {
+        console.error(`[a2a-relay] Registration failed: ${regResult.error}`);
+      }
+    }
+
+    let lastA2aEnvCheckAt = 0;
+    const A2A_ENV_CHECK_INTERVAL_MS = 30_000; // check every 30 seconds
+
     while (!runtime.stopping) {
       try {
         const dirty = await scanOnce({ config, runtime, state });
@@ -14964,6 +15192,38 @@ async function main() {
         console.error(`[scan-error] ${error.message}`);
       }
 
+      // Hot-reload: detect a2a.env changes and auto-start relay
+      const now = Date.now();
+      if (!config.a2aRelayUrl && now - lastA2aEnvCheckAt > A2A_ENV_CHECK_INTERVAL_MS) {
+        lastA2aEnvCheckAt = now;
+        try {
+          loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
+          const newRelayUrl = cleanText(process.env.A2A_RELAY_URL || "");
+          const newRelayUserId = cleanText(process.env.A2A_RELAY_USER_ID || "");
+          const newRelayRegisterSecret = cleanText(process.env.A2A_RELAY_REGISTER_SECRET || "");
+          if (newRelayUrl && newRelayUserId) {
+            config.a2aRelayUrl = newRelayUrl;
+            config.a2aRelayUserId = newRelayUserId;
+            config.a2aRelayRegisterSecret = newRelayRegisterSecret;
+            config.a2aApiKey = cleanText(process.env.A2A_API_KEY || config.a2aApiKey || "");
+            console.log(`[a2a-relay] Detected new relay config, registering...`);
+            const regResult = await registerWithRelay({ config, buildAgentCard });
+            if (regResult.ok) {
+              startRelayPolling({
+                config,
+                runtime,
+                state,
+                helpers: { recordTimelineEntry, deliverWebPushItem, saveState, historyToken, cleanText },
+              });
+            } else {
+              console.error(`[a2a-relay] Registration failed: ${regResult.error}`);
+            }
+          }
+        } catch (error) {
+          // ignore — env file may not exist yet
+        }
+      }
+
       if (config.once) {
         break;
       }
@@ -14972,6 +15232,8 @@ async function main() {
     }
   } finally {
     runtime.stopping = true;
+
+    stopRelayPolling();
 
     if (runtime.ipcClient) {
       runtime.ipcClient.stop();
