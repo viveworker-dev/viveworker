@@ -1,3 +1,5 @@
+import { Resvg } from "@cf-wasm/resvg/workerd";
+
 /**
  * viveworker a2a — Cloudflare Worker
  *
@@ -27,6 +29,22 @@ const USER_ID_RE = /^[a-zA-Z0-9_-]{3,40}$/;
 const TASK_TTL = 86400;        // 24 hours
 const MAX_BODY_BYTES = 10240;  // 10 KB
 const OAUTH_STATE_TTL = 600;   // 10 minutes
+
+// SVG favicon — worker bee
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <ellipse cx="16" cy="19" rx="7" ry="8" fill="#00d4aa"/>
+  <ellipse cx="16" cy="19" rx="5.5" ry="6" fill="#0a0f0d"/>
+  <ellipse cx="16" cy="19" rx="4" ry="4.3" fill="#00d4aa"/>
+  <circle cx="16" cy="9.5" r="4" fill="#00d4aa"/>
+  <line x1="13.5" y1="7" x2="10.5" y2="3" stroke="#00d4aa" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="18.5" y1="7" x2="21.5" y2="3" stroke="#00d4aa" stroke-width="1.2" stroke-linecap="round"/>
+  <circle cx="10.5" cy="3" r="1.5" fill="#00d4aa"/>
+  <circle cx="21.5" cy="3" r="1.5" fill="#00d4aa"/>
+  <ellipse cx="8.5" cy="15" rx="5" ry="3.5" fill="#00d4aa" opacity="0.35" transform="rotate(-20 8.5 15)"/>
+  <ellipse cx="23.5" cy="15" rx="5" ry="3.5" fill="#00d4aa" opacity="0.35" transform="rotate(20 23.5 15)"/>
+  <polygon points="16,27 14.5,29.5 17.5,29.5" fill="#00d4aa" opacity="0.7"/>
+</svg>`;
+const FAVICON_LINK = `<link rel="icon" type="image/svg+xml" href="/favicon.svg">`;
 
 // ---------------------------------------------------------------------------
 // Skill document — served at GET /skill.md
@@ -613,6 +631,19 @@ async function handleUserProfile(env, request, userId) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(userId)} — viveworker a2a</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon/${escapeHtml(userId)}.svg">
+  <meta name="description" content="${escapeHtml(card.description)}">
+  <meta property="og:type" content="profile">
+  <meta property="og:title" content="${escapeHtml(userId)} — viveworker a2a">
+  <meta property="og:description" content="${escapeHtml(card.description)}">
+  <meta property="og:url" content="${origin}/${escapeHtml(userId)}">
+  <meta property="og:image" content="${origin}/og/${escapeHtml(userId)}.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escapeHtml(userId)} — viveworker a2a">
+  <meta name="twitter:description" content="${escapeHtml(card.description)}">
+  <meta name="twitter:image" content="${origin}/og/${escapeHtml(userId)}.png">
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f0d;color:#e6e6e6;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:1.5rem}
@@ -1259,6 +1290,7 @@ async function handleGitHubCallback(env, request) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>viveworker — Setup Complete</title>
+  ${FAVICON_LINK}
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 4rem auto; padding: 0 1rem; background: #0d1117; color: #e6edf3; text-align: center; }
     h1 { color: #58a6ff; font-size: 1.4rem; }
@@ -1269,7 +1301,7 @@ async function handleGitHubCallback(env, request) {
 <body>
   <div class="check">&#x2705;</div>
   <h1>Setup Complete</h1>
-  <p>Welcome, <strong>@${escapeHtml(ghUser.login)}</strong>!</p>
+  <p>Welcome, <strong>${escapeHtml(userId)}</strong>!</p>
   <p class="info">Your credentials are being sent to the CLI automatically.<br>You can close this tab.</p>
 </body>
 </html>`, 200);
@@ -1283,6 +1315,7 @@ async function handleGitHubCallback(env, request) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>viveworker a2a — Registration Complete</title>
+  ${FAVICON_LINK}
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; background: #0d1117; color: #e6edf3; }
     h1 { color: #58a6ff; font-size: 1.4rem; }
@@ -1295,7 +1328,7 @@ async function handleGitHubCallback(env, request) {
 </head>
 <body>
   <h1>Registration Complete</h1>
-  <p>Welcome, <strong>@${escapeHtml(ghUser.login)}</strong>! Your A2A relay is ready.</p>
+  <p>Welcome, <strong>${escapeHtml(userId)}</strong>! Your A2A relay is ready.</p>
   <div class="card">
     <h2>Your Relay Endpoint</h2>
     <pre>${origin}/${escapeHtml(userId)}</pre>
@@ -1341,6 +1374,146 @@ function htmlResponse(body, status = 200) {
 }
 
 // ---------------------------------------------------------------------------
+// OG image: GET /og/<userId>.png
+// ---------------------------------------------------------------------------
+
+/** Convert an emoji string to Twemoji codepoint filename (strip fe0f variant selectors). */
+function emojiToTwemojiCode(emoji) {
+  return Array.from(emoji)
+    .map((c) => c.codePointAt(0).toString(16))
+    .filter((cp) => cp !== "fe0f")
+    .join("-");
+}
+
+const OG_DEFAULT_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="glow"><stop offset="0%" stop-color="#00d4aa" stop-opacity="0.15"/><stop offset="100%" stop-color="#00d4aa" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#0a0f0d"/>
+  <circle cx="600" cy="315" r="260" fill="url(#glow)"/>
+  <ellipse cx="600" cy="330" rx="48" ry="55" fill="#00d4aa"/>
+  <ellipse cx="600" cy="330" rx="38" ry="42" fill="#0a0f0d"/>
+  <ellipse cx="600" cy="330" rx="28" ry="30" fill="#00d4aa"/>
+  <circle cx="600" cy="255" r="28" fill="#00d4aa"/>
+  <line x1="585" y1="240" x2="555" y2="200" stroke="#00d4aa" stroke-width="3" stroke-linecap="round"/>
+  <line x1="615" y1="240" x2="645" y2="200" stroke="#00d4aa" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="555" cy="200" r="6" fill="#00d4aa"/>
+  <circle cx="645" cy="200" r="6" fill="#00d4aa"/>
+  <ellipse cx="535" cy="290" rx="45" ry="28" fill="#00d4aa" opacity="0.3" transform="rotate(-20 535 290)"/>
+  <ellipse cx="665" cy="290" rx="45" ry="28" fill="#00d4aa" opacity="0.3" transform="rotate(20 665 290)"/>
+  <polygon points="600,385 590,400 610,400" fill="#00d4aa" opacity="0.7"/>
+</svg>`;
+
+async function handleOgDefault() {
+  const resvg = await Resvg.async(OG_DEFAULT_SVG, { fitTo: { mode: "original" } });
+  const png = resvg.render().asPng();
+  return new Response(png, {
+    headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+  });
+}
+
+async function handleFaviconUser(env, userId) {
+  const userRecord = await env.KV.get(userKey(userId), "json");
+  if (!userRecord) return new Response(FAVICON_SVG, { headers: { "content-type": "image/svg+xml" } });
+
+  const card = userRecord.agentCard || {};
+  const avatar = card.avatar || "\u{1F916}";
+  const isUrl = avatar.startsWith("http");
+
+  if (isUrl) {
+    // Proxy the image URL as favicon
+    try {
+      const res = await fetch(avatar, { headers: { "User-Agent": "Mozilla/5.0" } });
+      return new Response(res.body, {
+        headers: {
+          "content-type": res.headers.get("content-type") || "image/png",
+          "cache-control": "public, max-age=3600",
+        },
+      });
+    } catch {
+      return new Response(FAVICON_SVG, { headers: { "content-type": "image/svg+xml" } });
+    }
+  }
+
+  // Emoji → Twemoji SVG
+  const code = emojiToTwemojiCode(avatar);
+  try {
+    const res = await fetch(
+      `https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/${code}.svg`,
+      { headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    if (res.ok) {
+      const svgText = await res.text();
+      return new Response(svgText, {
+        headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=3600" },
+      });
+    }
+  } catch {}
+  return new Response(FAVICON_SVG, { headers: { "content-type": "image/svg+xml" } });
+}
+
+async function handleOgImage(env, userId) {
+  const userRecord = await env.KV.get(userKey(userId), "json");
+  if (!userRecord) return new Response("not found", { status: 404 });
+
+  const card = userRecord.agentCard || {};
+  const avatar = card.avatar || "\u{1F916}";
+  const isUrl = avatar.startsWith("http");
+
+  // Fetch avatar image as base64 data URI
+  let avatarDataUri;
+  if (isUrl) {
+    try {
+      const res = await fetch(avatar, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const buf = await res.arrayBuffer();
+      const ct = res.headers.get("content-type") || "image/png";
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      avatarDataUri = `data:${ct};base64,${b64}`;
+    } catch {
+      avatarDataUri = null;
+    }
+  } else {
+    // Emoji → fetch Twemoji SVG
+    const code = emojiToTwemojiCode(avatar);
+    try {
+      const res = await fetch(
+        `https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/${code}.svg`,
+        { headers: { "User-Agent": "Mozilla/5.0" } }
+      );
+      if (res.ok) {
+        const svgText = await res.text();
+        const b64 = btoa(svgText);
+        avatarDataUri = `data:image/svg+xml;base64,${b64}`;
+      }
+    } catch {
+      avatarDataUri = null;
+    }
+  }
+
+  const W = 1200, H = 630;
+  const avatarSize = 200;
+  const avatarX = (W - avatarSize) / 2;
+  const avatarY = (H - avatarSize) / 2;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+  <rect width="${W}" height="${H}" fill="#0a0f0d"/>
+  ${avatarDataUri
+    ? `<image href="${avatarDataUri}" x="${avatarX}" y="${avatarY}" width="${avatarSize}" height="${avatarSize}"/>`
+    : `<circle cx="${W / 2}" cy="${H / 2}" r="${avatarSize / 2}" fill="#0d2b20"/>`}
+</svg>`;
+
+  const resvg = await Resvg.async(svg, { fitTo: { mode: "original" } });
+  const png = resvg.render().asPng();
+
+  return new Response(png, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=3600",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Landing page: GET /
 // ---------------------------------------------------------------------------
 
@@ -1368,6 +1541,19 @@ function handleLandingPage(request) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>viveworker a2a</title>
+  ${FAVICON_LINK}
+  <meta name="description" content="Agent-to-agent task relay. Send tasks to any agent with human approval in the loop.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="viveworker a2a">
+  <meta property="og:description" content="Agent-to-agent task relay. Send tasks to any agent with human approval in the loop.">
+  <meta property="og:url" content="${new URL(request.url).origin}">
+  <meta property="og:image" content="${new URL(request.url).origin}/og/default.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="viveworker a2a">
+  <meta name="twitter:description" content="Agent-to-agent task relay. Send tasks to any agent with human approval in the loop.">
+  <meta name="twitter:image" content="${new URL(request.url).origin}/og/default.png">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -1776,6 +1962,31 @@ export default {
     // Health check
     if (path === "/health" && request.method === "GET") {
       return jsonResponse({ ok: true, service: "viveworker-a2a" });
+    }
+
+    // Favicon
+    if (path === "/favicon.svg" && request.method === "GET") {
+      return new Response(FAVICON_SVG, {
+        headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=604800" },
+      });
+    }
+    if (path === "/favicon.ico" && request.method === "GET") {
+      return new Response(null, { status: 204 });
+    }
+
+    // Per-user favicon
+    const faviconMatch = path.match(/^\/favicon\/([^/]+)\.svg$/);
+    if (faviconMatch && request.method === "GET") {
+      return handleFaviconUser(env, faviconMatch[1]);
+    }
+
+    // OG images
+    if (path === "/og/default.png" && request.method === "GET") {
+      return handleOgDefault();
+    }
+    const ogMatch = path.match(/^\/og\/([^/]+)\.png$/);
+    if (ogMatch && request.method === "GET") {
+      return handleOgImage(env, ogMatch[1]);
     }
 
     // Landing page

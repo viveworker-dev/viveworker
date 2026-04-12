@@ -1124,6 +1124,9 @@ code {
   top: calc(100% + 0.46rem);
   z-index: 14;
   width: min(15rem, calc(100vw - 2.25rem));
+  max-height: 18rem;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   display: grid;
   gap: 0.22rem;
   padding: 0.4rem;
@@ -1649,6 +1652,15 @@ code {
   font-size: clamp(1.28rem, 2.3vw, 1.72rem);
   line-height: 1.15;
   letter-spacing: -0.03em;
+}
+.detail-title__link {
+  color: inherit;
+  text-decoration: none;
+}
+.detail-title__link:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--accent, #00d4aa);
+  text-underline-offset: 0.15em;
 }
 
 .detail-body {
@@ -2246,6 +2258,9 @@ code {
   gap: 0.78rem;
 }
 
+.reply-composer--readonly {
+  gap: 0.35rem;
+}
 .reply-composer__copy {
   display: grid;
   gap: 0.34rem;
@@ -2280,9 +2295,15 @@ code {
   color: var(--muted);
 }
 .reply-composer__context-body {
-  margin-top: 0.5rem;
+  margin-top: 0.25rem;
   line-height: 1.55;
   color: var(--text);
+}
+.reply-composer__context-body > :first-child {
+  margin-top: 0;
+}
+.reply-composer__context-body > :last-child {
+  margin-bottom: 0;
 }
 .reply-composer__intent {
   margin: 0.5rem 0;
@@ -2298,6 +2319,21 @@ code {
 .reply-composer__author-meta {
   margin: 0.1rem 0 0.4rem;
   font-size: 0.85rem;
+}
+.reply-composer__author {
+  margin: 0;
+}
+.reply-composer__post-title {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.reply-composer__post-title a {
+  color: var(--accent, #00d4aa);
+  text-decoration: none;
+}
+.reply-composer__post-title a:hover {
+  text-decoration: underline;
 }
 .reply-composer__textarea {
   width: 100%;

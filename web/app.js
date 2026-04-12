@@ -624,6 +624,8 @@ function timelineKindFilterOptions() {
     { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
     { id: "choices", label: L("timeline.kindFilter.choices"), icon: "choice" },
     { id: "completions", label: L("timeline.kindFilter.completions"), icon: "completion-item" },
+    { id: "moltbook_drafts", label: L("timeline.kindFilter.moltbookDrafts"), icon: "moltbook-draft" },
+    { id: "moltbook_comments", label: L("timeline.kindFilter.moltbookComments"), icon: "moltbook-comment" },
   ];
 }
 
@@ -649,6 +651,10 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
       return kind === "choice";
     case "completions":
       return kind === "completion";
+    case "moltbook_drafts":
+      return kind === "moltbook_draft";
+    case "moltbook_comments":
+      return kind === "moltbook_reply";
     default:
       return true;
   }
@@ -989,6 +995,9 @@ function shouldDeferRenderForActiveInteraction() {
     activeElement instanceof HTMLSelectElement &&
     activeElement.matches("[data-timeline-thread-select], [data-diff-thread-select], [data-completed-thread-select]")
   ) {
+    return true;
+  }
+  if (state.timelineKindFilterOpen) {
     return true;
   }
   return state.threadFilterInteractionUntilMs > Date.now();
@@ -3385,7 +3394,7 @@ function renderStandardDetailDesktop(detail) {
   return `
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
-      <h2 class="detail-title detail-title--desktop">${escapeHtml(detailDisplayTitle(detail))}</h2>
+      <h2 class="detail-title detail-title--desktop">${renderDetailTitle(detail)}</h2>
       ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
@@ -3893,9 +3902,12 @@ function renderMoltbookReplyComposer(detail, options = {}) {
   const rawTitle = normalizeClientText(detail.title || "");
   const match = rawTitle.match(/^@([^\s]+)/u);
   const authorHandle = match ? match[1] : detail.commentAuthor || "";
-  const postUrl = detail.postUrl || "";
-  const postLink = postUrl
-    ? `<p class="reply-composer__author"><a href="${escapeHtml(postUrl)}" target="_blank" rel="noopener">${escapeHtml(postUrl)}</a></p>`
+  const postUrl = detail.postUrl || (detail.threadId ? `https://www.moltbook.com/post/${detail.threadId}` : "");
+  const postTitle = normalizeClientText(detail.postTitle || detail.threadLabel || "").replace(/^Moltbook\s*·\s*/iu, "");
+  const postLink = postTitle
+    ? (postUrl
+      ? `<p class="reply-composer__post-title"><a href="${escapeHtml(postUrl)}" target="_blank" rel="noopener">${escapeHtml(postTitle)}</a></p>`
+      : `<p class="reply-composer__post-title">${escapeHtml(postTitle)}</p>`)
     : "";
   const bodyHtml = detail.messageHtml
     ? `<div class="reply-composer__context-body markdown">${detail.messageHtml}</div>`
@@ -3922,8 +3934,12 @@ function renderMoltbookDraftComposer(detail, options = {}) {
   const postAuthorLine = !isOriginalPost && detail.postAuthor
     ? `<p class="reply-composer__author-meta muted">@${escapeHtml(detail.postAuthor)}</p>`
     : "";
-  const postLink = !isOriginalPost && detail.postUrl
-    ? `<p class="reply-composer__author"><a href="${escapeHtml(detail.postUrl)}" target="_blank" rel="noopener">${escapeHtml(detail.postTitle || detail.postUrl)}</a></p>`
+  const draftPostUrl = detail.postUrl || (detail.threadId ? `https://www.moltbook.com/post/${detail.threadId}` : "");
+  const draftPostTitle = normalizeClientText(detail.postTitle || detail.threadLabel || "").replace(/^Moltbook\s*·\s*/iu, "");
+  const postLink = !isOriginalPost && draftPostTitle
+    ? (draftPostUrl
+      ? `<p class="reply-composer__post-title"><a href="${escapeHtml(draftPostUrl)}" target="_blank" rel="noopener">${escapeHtml(draftPostTitle)}</a></p>`
+      : `<p class="reply-composer__post-title">${escapeHtml(draftPostTitle)}</p>`)
     : "";
   const postBodyBlock = !isOriginalPost && detail.postBody
     ? `<details class="reply-composer__context"><summary>元の投稿</summary><div class="reply-composer__context-body">${escapeHtml(detail.postBody).replace(/\n/g, "<br>")}</div></details>`
@@ -5769,6 +5785,14 @@ function detailIntentText(detail) {
   return itemIntentText(detail.kind, "pending", provider);
 }
 
+function renderDetailTitle(detail) {
+  const title = escapeHtml(detailDisplayTitle(detail));
+  if ((detail.kind === "moltbook_reply" || detail.kind === "moltbook_draft") && detail.postUrl) {
+    return `<a href="${escapeHtml(detail.postUrl)}" target="_blank" rel="noopener" class="detail-title__link">${title}</a>`;
+  }
+  return title;
+}
+
 function detailDisplayTitle(detail) {
   const threadLabel = normalizeClientText(detail?.threadLabel || "");
   if (threadLabel) {
@@ -6050,6 +6074,10 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 13.6 8.3 15.7a3 3 0 0 1-4.2-4.2l2.8-2.8a3 3 0 0 1 4.2 0"/><path d="m13.6 10.4 2.1-2.1a3 3 0 1 1 4.2 4.2l-2.8 2.8a3 3 0 0 1-4.2 0"/><path d="m9.5 14.5 5-5"/></svg>`;
     case "clip":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 12.5 5.9-5.9a3 3 0 1 1 4.2 4.2l-7.7 7.7a5 5 0 1 1-7.1-7.1l8.1-8.1"/></svg>`;
+    case "moltbook-draft":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3.8 20.2 8.8 8.5 20.5 3.5 20.5 3.5 15.5Z"/><path d="M12.5 6.5l5 5"/></svg>`;
+    case "moltbook-comment":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 5.5h15a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4 3.5v-3.5H4.5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z"/><path d="M8 10h8"/><path d="M8 13h5"/></svg>`;
     case "filter":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M8 12h8"/><path d="M10.5 17h3"/></svg>`;
     case "check":

@@ -147,6 +147,7 @@ async function pollOnce() {
     const notifications = extractNotifications(data);
     const postCommentCache = new Map();
     const postCache = new Map();
+    const postIdsToMarkRead = new Set();
     for (const n of notifications) {
       if (!isCommentNotification(n)) continue;
       if (n.is_read === true || n.read === true || n.isRead === true) continue;
@@ -182,7 +183,7 @@ async function pollOnce() {
         parentCommentId,
         authorName,
         postTitle,
-        postUrl: `https://www.moltbook.com/posts/${postId}`,
+        postUrl: `https://www.moltbook.com/post/${postId}`,
         contextText,
         createdAt: createdAtIso,
         status: "pending",
@@ -205,6 +206,8 @@ async function pollOnce() {
           contextText,
           draftReply: draftReply(),
           callbackUrl: CALLBACK_URL,
+          postUrl: `https://www.moltbook.com/post/${postId}`,
+          postTitle,
           createdAtMs: Date.parse(createdAtIso) || Date.now(),
         });
         console.log(`[moltbook-watcher] pushed ${sourceId}`);
@@ -212,6 +215,11 @@ async function pollOnce() {
         console.error(`[moltbook-watcher] bridge push failed: ${error.message}`);
       }
 
+      postIdsToMarkRead.add(postId);
+    }
+
+    // Mark notifications as read after processing all comments in this cycle
+    for (const postId of postIdsToMarkRead) {
       try {
         await mb(`/notifications/read-by-post/${postId}`, { method: "POST" });
       } catch (error) {
