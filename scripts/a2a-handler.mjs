@@ -27,11 +27,17 @@ export function buildAgentCard(config) {
   // Custom skills from A2A_SKILLS env var (comma-separated tags → skill objects)
   let skills;
   if (config.a2aSkills) {
-    skills = config.a2aSkills.split(",").map((s) => s.trim()).filter(Boolean).map((tag) => ({
-      id: tag,
-      name: tag,
-      description: tag,
-    }));
+    const LABEL_MAP = {
+      typescript: "TypeScript", javascript: "JavaScript",
+      nodejs: "Node.js", pwa: "PWA", api: "API", css: "CSS", html: "HTML",
+      sql: "SQL", graphql: "GraphQL", nextjs: "Next.js", vuejs: "Vue.js",
+      aws: "AWS", gcp: "GCP", cli: "CLI", cicd: "CI/CD", a2a: "A2A",
+      llm: "LLM", ai: "AI", ml: "ML",
+    };
+    skills = config.a2aSkills.split(",").map((s) => s.trim()).filter(Boolean).map((tag) => {
+      const label = LABEL_MAP[tag] || tag.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      return { id: tag, name: label, description: label };
+    });
   } else {
     skills = [
       {
@@ -63,7 +69,7 @@ export function buildAgentCard(config) {
   const card = {
     schemaVersion: "1.0",
     humanReadableId: `viveworker/${config.a2aRelayUserId || "viveworker"}`,
-    agentVersion: config.version || "0.3.0",
+    agentVersion: config.version || "0.1.0",
     name: "viveworker",
     description,
     url: `${baseUrl.replace(/\/$/u, "")}/a2a`,

@@ -13790,6 +13790,7 @@ function buildConfig(cli) {
     a2aDescription: cleanText(process.env.A2A_DESCRIPTION || ""),
     a2aSkills: cleanText(process.env.A2A_SKILLS || ""),
     a2aAvatar: cleanText(process.env.A2A_AVATAR || ""),
+    version: appPackageVersion,
     a2aRelayUrl: cleanText(process.env.A2A_RELAY_URL || ""),
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
