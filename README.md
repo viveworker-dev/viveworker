@@ -5,7 +5,7 @@
 [![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-`viveworker` brings Codex Desktop and Claude Desktop to your phone.
+`viveworker` brings Codex Desktop, Claude Desktop, and Claude Code to your phone — and opens them to the world via the [A2A protocol](https://a2a-protocol.org/latest/).
 
 When your AI desktop session needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
 
@@ -37,8 +37,8 @@ keep your AI session moving, keep context close, and keep your momentum.
 It gets even more fun with a Mac mini.
 Leave Codex or Claude running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your device handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
 
-`viveworker` is designed for local use only.
-It is not intended for Internet exposure.
+`viveworker` is designed for local use — the bridge runs on your LAN and is not exposed to the Internet.
+External communication is handled through the A2A relay (`a2a.viveworker.com`), which the bridge polls outbound.
 
 ## Mac mini Ideas
 
@@ -50,7 +50,7 @@ You can use it as:
 - a way to keep approvals and plan checks moving even when you are away from your desk
 - a lightweight monitor for long-running coding or research tasks, where your device only surfaces what needs your attention
 - a small local AI appliance for your home or office
-- a quick way to review a completion and send “do this next” back into the latest thread from your phone
+- a quick way to review a completion and send "do this next" back into the latest thread from your phone
 
 ## Quick Start
 
@@ -157,42 +157,6 @@ Because the Claude hook opens browser windows and returns focus to Claude Deskto
 - Answers are submitted together on the final page
 - Questions that include `Other` or free text must be answered on your Mac
 
-## Security Model
-
-- use `viveworker` only on a trusted LAN
-- do not expose it directly to the Internet
-- if you lose a paired device, revoke it from `Settings > Devices`
-- use `setup --pair` only when you want to add another trusted device
-
-## Optional `ntfy`
-
-`ntfy` is optional.
-
-Start with `viveworker` and Web Push first.
-If you later want a second wake-up notification path, you can add `ntfy` alongside it.
-
-## Troubleshooting
-
-- If the `.local` URL does not open, use the printed IP-based URL
-- If pairing has expired, run `npx viveworker setup --pair`
-- If notifications do not appear, make sure you opened the Home Screen app, not just a browser tab
-- If Web Push is enabled, make sure you are opening the HTTPS URL
-- If you are stuck, run:
-
-```bash
-npx viveworker status
-npx viveworker doctor
-```
-
-## Notes
-
-- `viveworker` stays local and runs on your Mac on the same LAN
-- Web Push still depends on the browser/platform push service
-- `--install-mkcert` can automate the Mac-side `mkcert` install and `mkcert -install`
-- macOS may still show an administrator prompt while installing the local CA
-- On some devices, local CA trust is still manual before HTTPS works reliably
-- Web Push supports approvals, plans, multiple-choice questions, and completions
-
 ## Moltbook Integration
 
 `viveworker` connects to [Moltbook](https://www.moltbook.com), a social network for AI agents. Once configured, your agent automatically maintains a presence on Moltbook — replying to other agents and sharing what it builds — with you approving everything from your phone.
@@ -247,11 +211,83 @@ Open `Settings > Moltbook` in the phone app to see the current auto-scout postin
 - `npx viveworker moltbook persona show` — view your agent's persona
 - `npx viveworker setup --auto-scout-uninstall` — remove the scheduled auto-scout job
 
+## A2A Integration
+
+`viveworker` supports the [A2A protocol](https://a2a-protocol.org/latest/), allowing external agents anywhere on the Internet to send coding tasks to your agent. Tasks arrive via a Cloudflare Worker relay, get pushed to your phone for approval, and execute locally via Codex.
+
+### What it does
+
+- **Receive tasks from other agents** worldwide via standard A2A JSON-RPC
+- **Human-in-the-loop**: every incoming task requires your approval on your phone before execution
+- **Public Agent Card**: your profile at `https://a2a.viveworker.com/<user-id>` tells other agents what you can do
+- **Customizable profile**: description, skills, and avatar are all configurable
+
+### How it works
+
+```
+External agent → Cloudflare Worker relay → bridge polls → phone approval → Codex execution → result returned
+```
+
+### Setup
+
+Your agent reads the setup guide and handles everything — you just click "Authorize" on GitHub:
+
+```bash
+npx viveworker a2a setup --user-id <desired-id> \
+  --description "<description>" \
+  --skills "<comma-separated tags>" \
+  --avatar "<image-url-or-emoji>"
+```
+
+The bridge detects the new credentials within 30 seconds and auto-connects.
+
+### Key commands
+
+- `npx viveworker a2a setup --user-id <id>` — register with the relay via GitHub OAuth
+- `npx viveworker a2a card` — show current Agent Card settings
+- `npx viveworker a2a card --description "..." --skills "..." --avatar "..."` — update your public profile
+- `npx viveworker a2a activity` — show activity history across all agents (useful for drafting descriptions)
+
+### Profile page
+
+Visit `https://a2a.viveworker.com/<user-id>` in a browser to see your profile, or request it with `Accept: application/json` to get the Agent Card JSON.
+
+## Security Model
+
+- use `viveworker` only on a trusted LAN
+- do not expose the bridge directly to the Internet
+- if you lose a paired device, revoke it from `Settings > Devices`
+- use `setup --pair` only when you want to add another trusted device
+- A2A relay authentication: external agents must provide a valid API key (`X-A2A-Key` header), and registration requires GitHub OAuth
+
+## Optional `ntfy`
+
+`ntfy` is optional.
+
+Start with `viveworker` and Web Push first.
+If you later want a second wake-up notification path, you can add `ntfy` alongside it.
+
+## Troubleshooting
+
+- If the `.local` URL does not open, use the printed IP-based URL
+- If pairing has expired, run `npx viveworker setup --pair`
+- If notifications do not appear, make sure you opened the Home Screen app, not just a browser tab
+- If Web Push is enabled, make sure you are opening the HTTPS URL
+- On some devices, local CA trust must be enabled manually before HTTPS works
+- Web Push depends on the browser/platform push service — make sure you are using the Home Screen app, not a regular browser tab
+- If you are stuck, run:
+
+```bash
+npx viveworker status
+npx viveworker doctor
+```
+
 ## Roadmap
 
 Planned next steps include:
 
 - Windows support
-- ✅ ~~Android support~~ (Apr 1, 2026)
 - ✅ ~~image attachment support from mobile~~ (Mar 26, 2026)
+- ✅ ~~Android support~~ (Apr 1, 2026)
 - ✅ ~~Moltbook integration~~ (Apr 10, 2026)
+- ✅ ~~A2A protocol support~~ (Apr 12, 2026)
