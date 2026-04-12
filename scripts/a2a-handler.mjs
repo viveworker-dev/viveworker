@@ -18,22 +18,22 @@ import crypto from "node:crypto";
 
 export function buildAgentCard(config) {
   const baseUrl = config.a2aPublicUrl || config.publicBaseUrl || `http://localhost:${config.port || 7860}`;
-  return {
-    schemaVersion: "1.0",
-    humanReadableId: "viveworker/viveworker",
-    agentVersion: config.version || "0.3.0",
-    name: "viveworker",
-    description:
-      "LAN-connected AI companion that bridges Codex and Claude Desktop. " +
-      "Can execute coding tasks, file operations, and code reviews with human approval.",
-    url: `${baseUrl.replace(/\/$/u, "")}/a2a`,
-    provider: { name: "viveworker" },
-    capabilities: {
-      a2aVersion: "0.2.3",
-      streaming: false,
-      pushNotifications: false,
-    },
-    skills: [
+
+  // Custom description from A2A_DESCRIPTION env var (set during setup)
+  const description = config.a2aDescription ||
+    "LAN-connected AI companion that bridges Codex and Claude Desktop. " +
+    "Can execute coding tasks, file operations, and code reviews with human approval.";
+
+  // Custom skills from A2A_SKILLS env var (comma-separated tags → skill objects)
+  let skills;
+  if (config.a2aSkills) {
+    skills = config.a2aSkills.split(",").map((s) => s.trim()).filter(Boolean).map((tag) => ({
+      id: tag,
+      name: tag,
+      description: tag,
+    }));
+  } else {
+    skills = [
       {
         id: "code-task",
         name: "Code Task",
@@ -57,7 +57,23 @@ export function buildAgentCard(config) {
           required: ["target"],
         },
       },
-    ],
+    ];
+  }
+
+  return {
+    schemaVersion: "1.0",
+    humanReadableId: `viveworker/${config.a2aRelayUserId || "viveworker"}`,
+    agentVersion: config.version || "0.3.0",
+    name: "viveworker",
+    description,
+    url: `${baseUrl.replace(/\/$/u, "")}/a2a`,
+    provider: { name: "viveworker" },
+    capabilities: {
+      a2aVersion: "0.2.3",
+      streaming: false,
+      pushNotifications: false,
+    },
+    skills,
     authSchemes: [{ scheme: "apiKey", in: "header", name: "X-A2A-Key" }],
   };
 }

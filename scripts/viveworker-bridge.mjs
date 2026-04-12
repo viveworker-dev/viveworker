@@ -13787,6 +13787,8 @@ function buildConfig(cli) {
     moltbookApiKey: cleanText(process.env.MOLTBOOK_API_KEY || readMoltbookEnvKey() || ""),
     a2aApiKey: cleanText(process.env.A2A_API_KEY || readA2AEnvKey() || ""),
     a2aPublicUrl: cleanText(process.env.A2A_PUBLIC_URL || ""),
+    a2aDescription: cleanText(process.env.A2A_DESCRIPTION || ""),
+    a2aSkills: cleanText(process.env.A2A_SKILLS || ""),
     a2aRelayUrl: cleanText(process.env.A2A_RELAY_URL || ""),
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),

@@ -34,7 +34,7 @@ export async function runA2ACli(args) {
     case "setup":
       return handleSetup(args.slice(1));
     default:
-      console.log("Usage: viveworker a2a setup --user-id <id> [--relay-url <url>] [--timeout <seconds>]");
+      console.log("Usage: viveworker a2a setup --user-id <id> [--description <text>] [--skills <csv>] [--relay-url <url>] [--timeout <seconds>]");
       if (cmd && cmd !== "help" && cmd !== "--help") {
         throw new Error(`Unknown command: ${cmd}`);
       }
@@ -50,6 +50,8 @@ async function handleSetup(args) {
   const userId = flags["user-id"] || flags["userId"];
   const relayUrl = (flags["relay-url"] || flags["relayUrl"] || DEFAULT_RELAY_URL).replace(/\/$/u, "");
   const timeout = Number(flags["timeout"]) || DEFAULT_TIMEOUT;
+  const description = flags["description"] || "";
+  const skillsRaw = flags["skills"] || "";
 
   if (!userId) {
     throw new Error("--user-id is required\nUsage: viveworker a2a setup --user-id <id>");
@@ -57,7 +59,10 @@ async function handleSetup(args) {
 
   console.log(`\n🔗 viveworker A2A Relay Setup`);
   console.log(`   Relay:   ${relayUrl}`);
-  console.log(`   User ID: ${userId}\n`);
+  console.log(`   User ID: ${userId}`);
+  if (description) console.log(`   Desc:    ${description}`);
+  if (skillsRaw) console.log(`   Skills:  ${skillsRaw}`);
+  console.log();
 
   // Step 1: Create setup session
   console.log("⏳ Creating setup session...");
@@ -122,12 +127,16 @@ async function handleSetup(args) {
     // File may not exist
   }
 
-  const updated = upsertEnvText(currentEnv, {
+  const envVars = {
     A2A_API_KEY: result.a2aApiKey,
     A2A_RELAY_URL: result.relayUrl,
     A2A_RELAY_USER_ID: result.userId,
     A2A_RELAY_REGISTER_SECRET: result.registerSecret,
-  });
+  };
+  if (description) envVars.A2A_DESCRIPTION = description;
+  if (skillsRaw) envVars.A2A_SKILLS = skillsRaw;
+
+  const updated = upsertEnvText(currentEnv, envVars);
 
   await fs.mkdir(path.dirname(A2A_ENV_FILE), { recursive: true, mode: 0o700 });
   await fs.writeFile(A2A_ENV_FILE, updated, { mode: 0o600 });
