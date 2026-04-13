@@ -28,7 +28,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -85,6 +85,8 @@ const runtime = {
   moltbookItemsByToken: new Map(),
   moltbookDraftsByToken: new Map(),
   a2aTasksByToken: new Map(),
+  threadSharesByToken: new Map(),
+  threadRegistry: new Map(),
   planDetailsByToken: new Map(),
   recentHistoryItems: [],
   recentTimelineEntries: [],
@@ -94,6 +96,7 @@ const runtime = {
   stopping: false,
 };
 const state = await loadState(config.stateFile);
+runtime.threadRegistry = await loadThreadRegistry(config.threadRegistryFile);
 await syncClaudeAwayModeSentinel(config, state.claudeAwayMode === true);
 const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
 const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
@@ -6970,6 +6973,20 @@ class NativeIpcClient {
 
     this.runtime.threadStates.set(normalized.conversationId, nextState);
 
+    // Register / update in the persistent thread registry.
+    const regLabel = extractThreadLabelFromState(nextState)
+      || getThreadName(this.runtime.sessionIndex, this.runtime.rolloutThreadLabels, normalized.conversationId, nextState.cwd || "", "");
+    if (registerThread(this.runtime, {
+      id: normalized.conversationId,
+      label: regLabel,
+      tool: "codex",
+      cwd: nextState.cwd || "",
+      lastSeenAtMs: Date.now(),
+      active: true,
+    })) {
+      saveThreadRegistry(this.config.threadRegistryFile, this.runtime.threadRegistry).catch(() => {});
+    }
+
     await this.onThreadStateChanged({
       conversationId: normalized.conversationId,
       previousRequests,
@@ -9067,6 +9084,24 @@ function buildPendingInboxItems(runtime, state, config, locale) {
     });
   }
 
+  for (const share of runtime.threadSharesByToken.values()) {
+    if (share.decision) continue;
+    const title = share.sourceLabel
+      ? `${share.sourceLabel} → ${share.targetLabel || share.targetTool}`
+      : `→ ${share.targetLabel || share.targetTool}`;
+    items.push({
+      kind: "thread_share",
+      token: share.token,
+      threadId: "thread_share",
+      threadLabel: "Thread Share",
+      title,
+      summary: String(share.content || "").slice(0, 160),
+      primaryLabel: t(locale, "server.action.review"),
+      createdAtMs: Number(share.createdAtMs) || now,
+      provider: "viveworker",
+    });
+  }
+
   // Moltbook reply items intentionally do not appear in the unhandled list.
   // Reply drafting is delegated to Codex/Claude Desktop via the
   // `viveworker moltbook` CLI, so they live in the timeline only.
@@ -10611,6 +10646,42 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
     };
   }
 
+  if (kind === "thread_share") {
+    const share = runtime.threadSharesByToken.get(token);
+    const entry = share
+      ? null
+      : runtime.recentTimelineEntries.find((e) => e.kind === "thread_share" && e.token === token);
+    const source = share || entry;
+    if (!source) return null;
+    const content = share ? share.content : entry.messageText || entry.summary || "";
+    const messageHtml = escapeHtml(content)
+      .split("\n")
+      .map((line) => `<p>${line}</p>`)
+      .join("");
+    return {
+      kind: "thread_share",
+      token,
+      threadId: "thread_share",
+      threadLabel: "Thread Share",
+      title: source.title || "Thread Share",
+      summary: source.summary || cleanText(content).slice(0, 160),
+      messageHtml,
+      provider: "viveworker",
+      shareContent: content,
+      shareType: share?.shareType || entry?.shareType || "message",
+      sourceTool: share?.sourceTool || entry?.sourceTool || "",
+      sourceLabel: share?.sourceLabel || entry?.sourceLabel || "",
+      targetTool: share?.targetTool || entry?.targetTool || "",
+      targetLabel: share?.targetLabel || entry?.targetLabel || "",
+      targetConversationId: share?.targetConversationId || entry?.targetConversationId || "",
+      contextFiles: share?.contextFiles || entry?.contextFiles || [],
+      createdAtMs: source.createdAtMs || Date.now(),
+      readOnly: !share || Boolean(share?.decision),
+      actions: [],
+      threadShareEnabled: Boolean(share) && !share.decision,
+    };
+  }
+
   const historyItem = historyItemByToken(runtime, kind, token);
   return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
 }
@@ -11149,6 +11220,318 @@ function createNativeApprovalServer({ config, runtime, state }) {
         });
       }
 
+      // ─── Thread sharing ──────────────────────────────────────────────
+
+      function buildThreadShareContent(shareType, body) {
+        if (shareType === "plan_review") {
+          const sections = [];
+          if (body.context) sections.push(`## Context\n${body.context}`);
+          if (body.plan) sections.push(`## Plan\n${body.plan}`);
+          if (Array.isArray(body.files) && body.files.length) {
+            sections.push(`## Relevant files\n${body.files.map((f) => `- ${f}`).join("\n")}`);
+          }
+          sections.push(`## Instruction\n${body.instruction || "共有されたプランの内容を把握し、実現可能性や改善点を検討してください。"}`);
+          return sections.join("\n\n");
+        }
+        if (shareType === "handoff") {
+          const sections = [];
+          if (body.summary) sections.push(`## Summary\n${body.summary}`);
+          if (Array.isArray(body.completed) && body.completed.length) {
+            sections.push(`## Completed\n${body.completed.map((t) => `- ${t}`).join("\n")}`);
+          }
+          if (Array.isArray(body.remaining) && body.remaining.length) {
+            sections.push(`## Remaining\n${body.remaining.map((t) => `- ${t}`).join("\n")}`);
+          }
+          if (Array.isArray(body.decisions) && body.decisions.length) {
+            sections.push(`## Key decisions\n${body.decisions.map((d) => `- ${d}`).join("\n")}`);
+          }
+          if (Array.isArray(body.modifiedFiles) && body.modifiedFiles.length) {
+            sections.push(`## Modified files\n${body.modifiedFiles.map((f) => `- ${f}`).join("\n")}`);
+          }
+          sections.push(`## Instruction\n${body.instruction || "これまでの作業内容と経緯を把握した上で、次に何をすべきか検討してください。"}`);
+          return sections.join("\n\n");
+        }
+        // Default: message type — use raw content.
+        return cleanText(body?.content || "");
+      }
+
+      // List known threads (active + registry) for the share target picker.
+      if (url.pathname === "/api/threads/list" && req.method === "GET") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+        if (!hookAuth) { const session = requireApiSession(req, res, config, state); if (!session) return; }
+        const codexConnected = Boolean(runtime.ipcClient?.clientId);
+        const activeIds = new Set();
+        const threads = [];
+        // Active Codex threads (from IPC).
+        for (const [conversationId, threadState] of runtime.threadStates) {
+          activeIds.add(conversationId);
+          const label = getThreadName(
+            runtime.sessionIndex,
+            runtime.rolloutThreadLabels,
+            conversationId,
+            cleanText(threadState?.cwd || ""),
+            ""
+          );
+          threads.push({
+            conversationId,
+            label: label || conversationId.slice(0, 8),
+            tool: "codex",
+            cwd: cleanText(threadState?.cwd || ""),
+            hasOwner: runtime.threadOwnerClientIds.has(conversationId),
+            active: true,
+          });
+        }
+        // Registry entries not already covered by active threads.
+        for (const entry of runtime.threadRegistry.values()) {
+          if (!activeIds.has(entry.id)) {
+            threads.push({
+              conversationId: entry.id,
+              label: entry.label || entry.id.slice(0, 8),
+              tool: entry.tool || "codex",
+              cwd: entry.cwd || "",
+              hasOwner: false,
+              active: false,
+              lastSeenAtMs: entry.lastSeenAtMs || 0,
+            });
+          }
+        }
+        return writeJson(res, 200, { threads, codexConnected });
+      }
+
+      // Submit a thread share request (creates an approval item on the phone).
+      if (url.pathname === "/api/threads/share" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+        if (!hookAuth) { const session = requireApiSession(req, res, config, state); if (!session) return; }
+        const body = await parseJsonBody(req);
+        const shareType = cleanText(body?.shareType || "message");
+        const sourceTool = cleanText(body?.sourceTool || "");
+        const sourceLabel = cleanText(body?.sourceLabel || "");
+        const targetConversationId = cleanText(body?.targetConversationId || "");
+        let targetTool = cleanText(body?.targetTool || "");
+        let targetCwd = cleanText(body?.targetCwd || "");
+        const contextFiles = Array.isArray(body?.contextFiles)
+          ? body.contextFiles.map((f) => cleanText(String(f))).filter(Boolean)
+          : [];
+
+        // Auto-resolve targetTool and targetCwd from registry if not provided.
+        if (targetConversationId) {
+          const regEntry = runtime.threadRegistry.get(targetConversationId);
+          if (regEntry) {
+            if (!targetTool) targetTool = regEntry.tool || "";
+            if (!targetCwd) targetCwd = regEntry.cwd || "";
+          }
+        }
+
+        // Build content from structured fields depending on shareType.
+        const content = buildThreadShareContent(shareType, body);
+        if (!content && contextFiles.length === 0) {
+          return writeJson(res, 400, { error: "missing-content" });
+        }
+        if (!targetConversationId && !targetTool) {
+          return writeJson(res, 400, { error: "missing-target" });
+        }
+        const shareId = crypto.randomUUID();
+        const token = historyToken(`thread_share:${shareId}`);
+        const targetLabel = targetConversationId
+          ? (getThreadName(runtime.sessionIndex, runtime.rolloutThreadLabels, targetConversationId, runtime.threadStates.get(targetConversationId)?.cwd || "", "") || runtime.threadRegistry.get(targetConversationId)?.label || "")
+          : targetTool;
+        const share = {
+          token,
+          shareId,
+          shareType,
+          content: content || "",
+          contextFiles,
+          sourceTool,
+          sourceLabel,
+          targetConversationId,
+          targetTool: targetTool || "codex",
+          targetCwd,
+          targetLabel,
+          createdAtMs: Date.now(),
+          decision: null,
+          decisionWaiters: [],
+        };
+        runtime.threadSharesByToken.set(token, share);
+        try {
+          const title = sourceLabel
+            ? `${sourceLabel} → ${targetLabel || targetTool}`
+            : `→ ${targetLabel || targetTool}`;
+          recordTimelineEntry({
+            config, runtime, state,
+            entry: {
+              stableId: `thread_share:${shareId}`,
+              token,
+              kind: "thread_share",
+              threadId: "thread_share",
+              threadLabel: "Thread Share",
+              title,
+              summary: String(content).slice(0, 160),
+              messageText: content,
+              createdAtMs: share.createdAtMs,
+              readOnly: false,
+              provider: "viveworker",
+            },
+          });
+          await saveState(config.stateFile, state);
+        } catch (error) {
+          console.error(`[thread-share-timeline] ${error.message}`);
+        }
+        try {
+          await deliverWebPushItem({
+            config, state,
+            kind: "thread_share",
+            token,
+            stableId: `thread_share:${shareId}`,
+            title: `Thread Share: ${sourceLabel || sourceTool || "agent"} → ${targetLabel || targetTool}`,
+            body: String(content).slice(0, 160),
+          });
+        } catch (error) {
+          console.error(`[thread-share-push] ${error.message}`);
+        }
+        return writeJson(res, 200, { ok: true, token, shareId });
+      }
+
+      // Decision endpoint for thread share (approve / deny from phone).
+      const threadShareDecisionMatch = url.pathname.match(/^\/api\/threads\/share\/([^/]+)\/decision$/);
+      if (threadShareDecisionMatch && req.method === "POST") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const token = cleanText(threadShareDecisionMatch[1]);
+        const share = runtime.threadSharesByToken.get(token);
+        if (!share) {
+          return writeJson(res, 404, { error: "not-found" });
+        }
+        if (share.decision) {
+          return writeJson(res, 200, { ok: true, decision: share.decision });
+        }
+        const body = await parseJsonBody(req);
+        const decision = cleanText(body?.decision || "");
+        const editedContent = typeof body?.editedContent === "string" ? body.editedContent : null;
+        if (decision !== "approve" && decision !== "deny") {
+          return writeJson(res, 400, { error: "invalid-decision" });
+        }
+        share.decision = decision;
+        if (editedContent !== null) {
+          share.content = editedContent;
+        }
+
+        // Deliver the shared content to the target.
+        let deliveryStatus = "delivered";
+        if (decision === "approve") {
+          const prefix = share.sourceLabel ? `[Shared from ${share.sourceLabel}]\n\n` : "[Shared from another thread]\n\n";
+          // Append context file references if present.
+          if (share.contextFiles && share.contextFiles.length > 0) {
+            const fileList = share.contextFiles.map((f) => `- ${f}`).join("\n");
+            share.content = (share.content ? share.content + "\n\n" : "")
+              + `## Context files\n\nRead the following files for full conversation context:\n${fileList}`;
+          }
+          let injectedViaIpc = false;
+
+          // Try Codex IPC injection if targeting a specific thread.
+          if (share.targetConversationId && runtime.ipcClient?.clientId) {
+            const ownerClientId = runtime.threadOwnerClientIds.get(share.targetConversationId) ?? null;
+            const turnStartParams = { input: buildTurnInput(prefix + share.content) };
+            // Try direct first, then fall back to thread-follower.
+            for (const transport of ["direct", "follower"]) {
+              try {
+                if (transport === "direct" && ownerClientId) {
+                  await runtime.ipcClient.startTurnDirect(share.targetConversationId, turnStartParams, ownerClientId);
+                } else {
+                  await runtime.ipcClient.startTurn(share.targetConversationId, turnStartParams, ownerClientId);
+                }
+                injectedViaIpc = true;
+                console.log(`[thread-share] Delivered to Codex thread ${share.targetConversationId} via ${transport}`);
+                break;
+              } catch (error) {
+                console.error(`[thread-share-ipc-${transport}] ${error.message}`);
+              }
+            }
+          }
+
+          // Write to file inbox (always for claude-code targets, fallback for failed Codex delivery).
+          if (!injectedViaIpc) {
+            try {
+              const inboxDir = path.join(os.homedir(), ".viveworker", "thread-inbox");
+              await fs.mkdir(inboxDir, { recursive: true });
+              const inboxFile = path.join(inboxDir, `${share.shareId}.json`);
+              await fs.writeFile(inboxFile, JSON.stringify({
+                shareId: share.shareId,
+                content: share.content,
+                contextFiles: share.contextFiles || [],
+                targetCwd: share.targetCwd || "",
+                sourceTool: share.sourceTool,
+                sourceLabel: share.sourceLabel,
+                targetTool: share.targetTool,
+                createdAtMs: share.createdAtMs,
+                deliveredAtMs: Date.now(),
+              }, null, 2), "utf8");
+              console.log(`[thread-share] Written to inbox: ${inboxFile}`);
+            } catch (error) {
+              console.error(`[thread-share-inbox-write] ${error.message}`);
+            }
+
+            // If the user intended Codex but it wasn't reachable, notify.
+            if (share.targetConversationId && share.targetTool !== "claude-code") {
+              deliveryStatus = "inbox_fallback";
+              try {
+                await deliverWebPushItem({
+                  config, state,
+                  kind: "thread_share",
+                  token: share.token,
+                  stableId: `thread_share_fallback:${share.shareId}`,
+                  title: "Thread Share: target unreachable",
+                  body: `Codex thread "${share.targetLabel || share.targetConversationId.slice(0, 8)}" is not connected. Content saved to inbox.`,
+                });
+              } catch (error) {
+                console.error(`[thread-share-fallback-push] ${error.message}`);
+              }
+            }
+          }
+        }
+
+        // Wake any long-poll waiters.
+        for (const waiter of share.decisionWaiters) {
+          waiter({ decision: share.decision, content: share.content });
+        }
+        share.decisionWaiters = [];
+        return writeJson(res, 200, { ok: true, decision: share.decision });
+      }
+
+      // Long-poll: wait for a thread share decision (used by the CLI or hook).
+      const threadSharePollMatch = url.pathname.match(/^\/api\/threads\/share\/([^/]+)\/poll$/);
+      if (threadSharePollMatch && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const token = cleanText(threadSharePollMatch[1]);
+        const share = runtime.threadSharesByToken.get(token);
+        if (!share) {
+          return writeJson(res, 404, { error: "not-found" });
+        }
+        if (share.decision) {
+          return writeJson(res, 200, { decision: share.decision, content: share.content });
+        }
+        const timeoutMs = Math.min(Number(url.searchParams.get("timeout")) || 120_000, 300_000);
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            const idx = share.decisionWaiters.indexOf(done);
+            if (idx >= 0) share.decisionWaiters.splice(idx, 1);
+            resolve();
+          }, timeoutMs);
+          timer.unref?.();
+          function done(result) {
+            clearTimeout(timer);
+            resolve(result);
+          }
+          share.decisionWaiters.push(done);
+        });
+        if (share.decision) {
+          return writeJson(res, 200, { decision: share.decision, content: share.content });
+        }
+        return writeJson(res, 200, { decision: null, timeout: true });
+      }
+
       // Activity summary for compose (original post) drafting.
       // Supports ?slot=morning|noon|evening and ?date=YYYY-MM-DD for
       // time-slot-based compose.  Defaults to full-day today.
@@ -11430,6 +11813,27 @@ function createNativeApprovalServer({ config, runtime, state }) {
             }
           }
           return writeJson(res, 200, {});
+        }
+
+        // Register Claude Code thread in persistent registry on every event.
+        {
+          const regThreadId = String(body.threadId || body.sessionId || "");
+          const regCwd = String(body.cwd || "");
+          if (regThreadId) {
+            const regLabel = runtime.claudeSessionTitles.get(regThreadId)
+              || (regCwd ? path.basename(regCwd) : "")
+              || regThreadId.slice(0, 40);
+            if (registerThread(runtime, {
+              id: regThreadId,
+              label: regLabel,
+              tool: "claude-code",
+              cwd: regCwd,
+              lastSeenAtMs: Date.now(),
+              active: eventType !== "Stop" && eventType !== "SessionEnd",
+            })) {
+              saveThreadRegistry(config.threadRegistryFile, runtime.threadRegistry).catch(() => {});
+            }
+          }
         }
 
         if (eventType !== "approval_request") {
@@ -13828,6 +14232,7 @@ function buildConfig(cli) {
     historyFile: resolvePath(process.env.HISTORY_FILE || path.join(codexHome, "history.jsonl")),
     codexLogsDbFile: resolvePath(process.env.CODEX_LOGS_DB_FILE || ""),
     stateFile,
+    threadRegistryFile: resolvePath(process.env.THREAD_REGISTRY_FILE || path.join(os.homedir(), ".viveworker", "thread-registry.json")),
     replyUploadsDir: resolvePath(process.env.REPLY_UPLOADS_DIR || path.join(path.dirname(stateFile), "uploads")),
     timelineAttachmentsDir: resolvePath(
       process.env.TIMELINE_ATTACHMENTS_DIR || path.join(path.dirname(stateFile), "timeline-attachments")
@@ -14139,6 +14544,59 @@ async function saveState(stateFile, state) {
   await fs.mkdir(path.dirname(stateFile), { recursive: true });
   await fs.writeFile(stateFile, `${output}\n`, "utf8");
 }
+
+// ---------------------------------------------------------------------------
+// Thread registry — persistent record of all known threads (survives restarts)
+// ---------------------------------------------------------------------------
+
+async function loadThreadRegistry(filePath) {
+  const registry = new Map();
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      for (const entry of arr) {
+        if (entry && entry.id) {
+          registry.set(entry.id, entry);
+        }
+      }
+    }
+  } catch {
+    // Missing or corrupt file — start with empty registry.
+  }
+  return registry;
+}
+
+async function saveThreadRegistry(filePath, registry) {
+  const arr = [...registry.values()].sort((a, b) => (b.lastSeenAtMs || 0) - (a.lastSeenAtMs || 0));
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(arr, null, 2) + "\n", "utf8");
+}
+
+/** Upsert a thread in the registry. Returns true if something changed. */
+function registerThread(runtime, entry) {
+  const existing = runtime.threadRegistry.get(entry.id);
+  const merged = {
+    id: entry.id,
+    label: entry.label || existing?.label || "",
+    tool: entry.tool || existing?.tool || "codex",
+    cwd: entry.cwd || existing?.cwd || "",
+    lastSeenAtMs: Math.max(entry.lastSeenAtMs || Date.now(), existing?.lastSeenAtMs || 0),
+    active: entry.active !== undefined ? entry.active : (existing?.active ?? true),
+  };
+  const changed = !existing
+    || existing.label !== merged.label
+    || existing.tool !== merged.tool
+    || existing.cwd !== merged.cwd
+    || existing.active !== merged.active
+    || existing.lastSeenAtMs !== merged.lastSeenAtMs;
+  if (changed) {
+    runtime.threadRegistry.set(entry.id, merged);
+  }
+  return changed;
+}
+
+// ---------------------------------------------------------------------------
 
 async function loadSessionIndex(filePath) {
   const result = new Map();

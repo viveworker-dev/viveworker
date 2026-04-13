@@ -107,8 +107,11 @@ switch (hookEventName) {
   case "PostToolUseFailure":
     await handlePostToolUse();
     break;
+  case "UserPromptSubmit":
+    await handleUserPromptSubmit();
+    break;
   default:
-    // Notification, Stop, UserPromptSubmit, SessionEnd
+    // Notification, Stop, SessionEnd
     await postEvent(hookEventName, { sessionId, toolName, cwd }, DEFAULT_EVENT_TIMEOUT_MS);
     break;
 }
@@ -397,6 +400,76 @@ async function handlePostToolUse() {
     { threadId: sessionId, sessionId, toolName, toolInput, cwd },
     DEFAULT_EVENT_TIMEOUT_MS
   );
+}
+
+// ---------------------------------------------------------------------------
+// UserPromptSubmit — thread inbox auto-read
+// ---------------------------------------------------------------------------
+
+async function handleUserPromptSubmit() {
+  // Check ~/.viveworker/thread-inbox/ for pending shared content from other
+  // AI tool sessions. If files are found, inject their content as additional
+  // context so the assistant sees them automatically.
+  //
+  // Targeting: if an inbox file has a `targetCwd` field, only consume it when
+  // the current session's cwd starts with that path (project match). Files
+  // without targetCwd are consumed by any session.
+  const inboxDir = path.join(os.homedir(), ".viveworker", "thread-inbox");
+  let inboxFiles = [];
+  try {
+    const entries = await fs.readdir(inboxDir);
+    inboxFiles = entries.filter((e) => e.endsWith(".json"));
+  } catch {
+    // Inbox dir doesn't exist or is unreadable — nothing to inject.
+  }
+
+  if (inboxFiles.length > 0) {
+    const parts = [];
+    for (const file of inboxFiles) {
+      const filePath = path.join(inboxDir, file);
+      try {
+        const raw = await fs.readFile(filePath, "utf8");
+        const share = JSON.parse(raw);
+        // Skip files targeted at a different project.
+        if (share.targetCwd && !cwd.startsWith(share.targetCwd)) {
+          continue;
+        }
+        const sourceLabel = share.sourceLabel || share.sourceTool || "another session";
+        const header = `[Shared from ${sourceLabel}]`;
+        let body = share.content || "";
+        // Append context file references if the content doesn't already include them.
+        const ctxFiles = Array.isArray(share.contextFiles) ? share.contextFiles.filter(Boolean) : [];
+        if (ctxFiles.length > 0 && !body.includes("Context files")) {
+          const fileList = ctxFiles.map((f) => `- ${f}`).join("\n");
+          body += `\n\n## Context files\n\nRead the following files for full conversation context:\n${fileList}`;
+        }
+        parts.push(`${header}\n\n${body}`);
+        // Mark as consumed by removing the file.
+        await fs.unlink(filePath);
+      } catch {
+        // Skip malformed or unreadable files.
+      }
+    }
+
+    if (parts.length > 0) {
+      // Cap at 10,000 chars (Claude Code hook output limit).
+      let combined = parts.join("\n\n---\n\n");
+      if (combined.length > 9800) {
+        combined = combined.slice(0, 9800) + "\n\n… (truncated)";
+      }
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "UserPromptSubmit",
+            additionalContext: combined,
+          },
+        }) + "\n"
+      );
+    }
+  }
+
+  // Forward event to bridge as usual.
+  await postEvent("UserPromptSubmit", { sessionId, toolName, cwd }, DEFAULT_EVENT_TIMEOUT_MS);
 }
 
 // ---------------------------------------------------------------------------

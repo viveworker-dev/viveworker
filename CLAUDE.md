@@ -202,3 +202,171 @@ curl -X DELETE https://a2a.viveworker.com/internal/admin/user/<userId> \
 - Bridge polls every 20 seconds; unclaimed tasks re-release after 2 minutes
 - GitHub OAuth enforces 1 account per GitHub user, 3 registrations per IP per day
 - Local A2A (direct `POST /a2a` to bridge) still works alongside the relay
+
+## Thread sharing (cross-thread context transfer)
+
+Share context between AI tool sessions (Codex ↔ Claude Code) with user approval on the paired phone.
+
+### When to use
+
+When the user asks to share context across threads, for example:
+- "Share this conversation with the Codex thread"
+- "Send this plan to Claude Code for review"
+- "Hand off the work so far to Codex"
+- "Share just the recent conversation"
+- "Share the entire thread"
+
+### Prerequisites
+
+- The bridge must be running (`viveworker start`).
+- `SESSION_SECRET` from `~/.viveworker/config.env` is used for API auth.
+- For Codex targets: the target thread must be active (check with the list endpoint).
+
+### Share types
+
+| Type | Purpose | Default instruction |
+|------|---------|---------------------|
+| `message` | Simple memo / note | (none) |
+| `plan_review` | Request plan review | Review the shared plan for feasibility and potential improvements. |
+| `handoff` | Work handoff | Understand the work done so far and decide what to do next. |
+
+### Standard flow
+
+1. **List available Codex threads**
+   ```bash
+   SECRET=$(grep SESSION_SECRET ~/.viveworker/config.env | cut -d= -f2)
+   curl -sk -H "x-viveworker-hook-secret: $SECRET" \
+     "https://localhost:8810/api/threads/list"
+   ```
+   Returns `{ "threads": [{ "conversationId": "...", "label": "...", ... }] }`.
+
+2. **Send a share request** — pick the appropriate type:
+
+   **Message** (simple text):
+   ```bash
+   curl -sk -H "x-viveworker-hook-secret: $SECRET" \
+     -H "Content-Type: application/json" \
+     -X POST "https://localhost:8810/api/threads/share" \
+     -d '{
+       "shareType": "message",
+       "content": "free-form text here",
+       "sourceTool": "claude-code",
+       "sourceLabel": "Claude Code (project name)",
+       "targetConversationId": "<conversationId from step 1>",
+       "targetTool": "codex"
+     }'
+   ```
+
+   **Plan review**:
+   ```bash
+   curl -sk -H "x-viveworker-hook-secret: $SECRET" \
+     -H "Content-Type: application/json" \
+     -X POST "https://localhost:8810/api/threads/share" \
+     -d '{
+       "shareType": "plan_review",
+       "plan": "1. Step one\n2. Step two\n3. Step three",
+       "context": "Background and motivation for this plan",
+       "files": ["src/api/schema.ts", "src/db/migrations/001.sql"],
+       "instruction": "optional custom instruction",
+       "sourceTool": "claude-code",
+       "sourceLabel": "Claude Code (project name)",
+       "targetConversationId": "<conversationId>",
+       "targetTool": "codex"
+     }'
+   ```
+
+   **Handoff**:
+   ```bash
+   curl -sk -H "x-viveworker-hook-secret: $SECRET" \
+     -H "Content-Type: application/json" \
+     -X POST "https://localhost:8810/api/threads/share" \
+     -d '{
+       "shareType": "handoff",
+       "summary": "What was accomplished",
+       "completed": ["task 1", "task 2"],
+       "remaining": ["task 3", "task 4"],
+       "decisions": ["key decision 1", "key decision 2"],
+       "modifiedFiles": ["src/foo.ts", "src/bar.ts"],
+       "instruction": "optional custom instruction",
+       "sourceTool": "claude-code",
+       "sourceLabel": "Claude Code (project name)",
+       "targetConversationId": "<conversationId>",
+       "targetTool": "codex"
+     }'
+   ```
+
+   All requests return `{ "ok": true, "token": "...", "shareId": "..." }`.
+
+3. **User approves on the paired phone**
+   - The share appears in the Pending inbox with an "Approve & Share" / "Deny" button.
+   - The user can review and edit the content before approving.
+
+4. **Delivery**
+   - **Codex target**: injected as a user message into the thread via IPC.
+   - **Claude Code target**: written to `~/.viveworker/thread-inbox/<shareId>.json`.
+
+### Sending to Claude Code (no active thread)
+
+When the target is Claude Code rather than a specific Codex thread, omit `targetConversationId` and set `targetTool` to `"claude-code"`. On approval the content is written to `~/.viveworker/thread-inbox/` for the next session to pick up.
+
+### Handling unavailable targets
+
+The thread list response includes `codexConnected: true/false` so you can check before sharing.
+
+- **Codex not running**: If `codexConnected` is `false` or no threads are listed, tell the user that Codex is not connected. You can still send the share with `targetTool: "codex"` — the content will be saved to the file inbox as a fallback and the user will be notified on their phone that the target was unreachable.
+- **Claude Code target**: Always works — content is written to `~/.viveworker/thread-inbox/` and auto-injected when the next Claude Code session starts (via the `UserPromptSubmit` hook).
+- **No specific thread**: If the user doesn't specify which thread, omit `targetConversationId`. For Codex, this saves to the file inbox. For Claude Code, it saves to the thread inbox.
+
+### Auto-read inbox (Claude Code)
+
+Shared content targeting Claude Code is saved to `~/.viveworker/thread-inbox/`. The viveworker Claude Code hook automatically reads these files on your first prompt and injects them as additional context. You do not need to manually check the inbox — it happens transparently.
+
+### Sharing conversation context (contextFiles)
+
+When the user asks you to share conversation history or context with another thread — especially across different projects — use `contextFiles` to pass full context via temporary files. The recipient reads the files to understand the conversation.
+
+**Workflow:**
+
+1. **Determine scope** based on the user's request:
+   - "just the recent conversation" → extract the recent relevant portion
+   - "the update we just worked on" → extract the topic-specific portion
+   - "share the entire thread" → extract the full conversation
+
+2. **Extract and write context** to `~/.viveworker/thread-shares/`:
+   ```bash
+   mkdir -p ~/.viveworker/thread-shares
+   ```
+   Write a markdown file with the relevant conversation content. For Claude Code, your session transcript is at `~/.claude/projects/<project-path>/<session-id>.jsonl` — read it, extract relevant human/assistant messages, and format as readable markdown.
+
+3. **Send share with contextFiles**:
+   ```bash
+   curl -sk -H "x-viveworker-hook-secret: $SECRET" \
+     -H "Content-Type: application/json" \
+     -X POST "https://localhost:8810/api/threads/share" \
+     -d '{
+       "shareType": "handoff",
+       "summary": "Brief description of what is being shared",
+       "contextFiles": [
+         "~/.viveworker/thread-shares/session-context-20260413.md"
+       ],
+       "sourceTool": "claude-code",
+       "sourceLabel": "Claude Code (project name)",
+       "targetConversationId": "<conversationId>",
+       "targetTool": "codex"
+     }'
+   ```
+
+4. **Recipient** sees "Context files" in the share detail and the delivered message includes `Read the following files for full conversation context:` with the file paths.
+
+**Tips:**
+- Use absolute paths in `contextFiles` so the recipient can Read them directly.
+- Keep context files in `~/.viveworker/thread-shares/` — they persist across sessions and are accessible to all tools.
+- For large conversations, summarize irrelevant sections and keep detailed content for the relevant parts.
+- The structured fields (`summary`, `completed`, `remaining`, etc.) serve as a quick overview; `contextFiles` provide the deep context.
+
+### Notes
+
+- Always get the thread list first — stale `conversationId` values will still deliver but won't reach an active thread.
+- The bridge URL port may vary; check `NATIVE_APPROVAL_SERVER_PORT` in `~/.viveworker/config.env`.
+- Share requests are held in memory only; they do not survive a bridge restart.
+- The `instruction` field is optional for all types; sensible defaults are used when omitted.

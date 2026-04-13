@@ -993,6 +993,9 @@ function shouldDeferRenderForActiveInteraction() {
   if (state.currentDetail?.kind === "moltbook_draft") {
     return true;
   }
+  if (state.currentDetail?.kind === "thread_share" && state.currentDetail?.threadShareEnabled) {
+    return true;
+  }
   if (
     activeElement instanceof HTMLTextAreaElement &&
     activeElement.matches("[data-claude-question-note]")
@@ -3459,14 +3462,15 @@ function renderStandardDetailDesktop(detail) {
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
       <h2 class="detail-title detail-title--desktop">${renderDetailTitle(detail)}</h2>
-      ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" ? "" : renderDetailLead(detail, kindInfo)}
+      ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "thread_share" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
       ${renderMoltbookReplyComposer(detail)}
       ${renderMoltbookDraftComposer(detail)}
       ${renderA2ATaskDetail(detail)}
+      ${renderThreadShareDetail(detail)}
       ${
-        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task"
+        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "thread_share"
           ? ""
           : plainIntro
             ? plainIntro
@@ -3502,8 +3506,9 @@ function renderStandardDetailMobile(detail) {
           ${renderMoltbookReplyComposer(detail, { mobile: true })}
           ${renderMoltbookDraftComposer(detail, { mobile: true })}
           ${renderA2ATaskDetail(detail, { mobile: true })}
+          ${renderThreadShareDetail(detail, { mobile: true })}
           ${
-            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task"
+            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "thread_share"
               ? ""
               : plainIntro
                 ? plainIntro
@@ -4105,6 +4110,56 @@ function renderA2ATaskDetail(detail, options = {}) {
         <div class="reply-composer__instruction">
           <label class="field-label">${escapeHtml(L("a2a.task.instruction"))}</label>
           <textarea name="instruction" class="reply-composer__textarea" rows="6" ${enabled ? "" : "readonly"}>${escapeHtml(instruction)}</textarea>
+        </div>
+        ${buttonsWrapped}
+      </form>
+    </section>
+  `;
+}
+
+function renderThreadShareDetail(detail, options = {}) {
+  if (detail.kind !== "thread_share") return "";
+  const enabled = detail.threadShareEnabled !== false && detail.readOnly !== true;
+  const content = detail.shareContent || "";
+  const fromLabel = detail.sourceLabel || detail.sourceTool || "agent";
+  const toLabel = detail.targetLabel || detail.targetConversationId?.slice(0, 8) || detail.targetTool || "thread";
+  const contextFiles = Array.isArray(detail.contextFiles) ? detail.contextFiles : [];
+  const shareTypeLabel = {
+    plan_review: L("threadShare.type.planReview"),
+    handoff: L("threadShare.type.handoff"),
+    message: L("threadShare.type.message"),
+  }[detail.shareType] || L("threadShare.type.message");
+
+  const contextFilesHtml = contextFiles.length > 0
+    ? `<div class="reply-composer__instruction">
+        <label class="field-label">${escapeHtml(L("threadShare.contextFiles"))}</label>
+        <ul class="context-files-list">${contextFiles.map((f) => `<li class="context-file-item"><code>${escapeHtml(f)}</code></li>`).join("")}</ul>
+      </div>`
+    : "";
+
+  const buttons = enabled
+    ? `
+      <div class="actions actions--stack${options.mobile ? " actions--sticky" : ""}">
+        <button type="submit" data-action="approve" class="primary primary--wide">${escapeHtml(L("threadShare.approve"))}</button>
+        <button type="submit" data-action="deny" class="danger danger--wide">${escapeHtml(L("threadShare.deny"))}</button>
+      </div>
+    `
+    : `<p class="muted reply-composer__description">${escapeHtml(L("threadShare.resolved"))}</p>`;
+  const buttonsWrapped = enabled && options.mobile ? `<div class="detail-action-bar">${buttons}</div>` : buttons;
+
+  return `
+    <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
+      <form class="reply-composer" data-thread-share-form data-token="${escapeHtml(detail.token || "")}">
+        <div class="reply-composer__copy">
+          <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("threadShare.eyebrow"))}</span>
+          <span class="eyebrow-pill eyebrow-pill--subtle">${escapeHtml(shareTypeLabel)}</span>
+          <p class="reply-composer__author-meta muted">${escapeHtml(fromLabel)} → ${escapeHtml(toLabel)}</p>
+          <p class="muted reply-composer__description">${enabled ? escapeHtml(L("threadShare.editHint")) : ""}</p>
+        </div>
+        ${contextFilesHtml}
+        <div class="reply-composer__instruction">
+          <label class="field-label">${escapeHtml(L("threadShare.content"))}</label>
+          <textarea name="shareContent" class="reply-composer__textarea" rows="12" ${enabled ? "" : "readonly"}>${escapeHtml(content)}</textarea>
         </div>
         ${buttonsWrapped}
       </form>
@@ -5305,6 +5360,72 @@ function bindShellInteractions() {
     });
   }
 
+  const threadShareForm = document.querySelector("[data-thread-share-form]");
+  if (threadShareForm) {
+    const token = threadShareForm.dataset.token || "";
+    let submittedAction = "approve";
+    threadShareForm.querySelectorAll("button[type='submit']").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        submittedAction = btn.dataset.action || "approve";
+      });
+    });
+    threadShareForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (threadShareForm.dataset.submitting === "1") return;
+      threadShareForm.dataset.submitting = "1";
+      const buttons = threadShareForm.querySelectorAll("button[type='submit']");
+      const textarea = threadShareForm.querySelector("textarea");
+      const labelCache = new Map();
+      buttons.forEach((btn) => {
+        labelCache.set(btn, btn.innerHTML);
+        btn.disabled = true;
+        if (btn.dataset.action === submittedAction) {
+          btn.innerHTML = submittedAction === "approve" ? "Sharing…" : "Denying…";
+          btn.classList.add("is-loading");
+        } else {
+          btn.classList.add("is-dimmed");
+        }
+      });
+      if (textarea) textarea.readOnly = true;
+      const editedContent = normalizeClientText(new FormData(threadShareForm).get("shareContent"));
+      try {
+        const res = await fetch(`/api/threads/share/${encodeURIComponent(token)}/decision`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ decision: submittedAction, editedContent }),
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          alert(`Thread share ${submittedAction} failed: ${errBody.error || res.status}`);
+          buttons.forEach((btn) => {
+            btn.disabled = false;
+            btn.classList.remove("is-loading", "is-dimmed");
+            btn.innerHTML = labelCache.get(btn);
+          });
+          if (textarea) textarea.readOnly = false;
+          threadShareForm.dataset.submitting = "";
+          return;
+        }
+        if (state.currentDetail?.kind === "thread_share") {
+          state.currentDetail.threadShareEnabled = false;
+          state.currentDetail.readOnly = true;
+        }
+        await refreshAuthenticatedState();
+        await renderShell();
+      } catch (error) {
+        alert(`Thread share error: ${error.message}`);
+        buttons.forEach((btn) => {
+          btn.disabled = false;
+          btn.classList.remove("is-loading", "is-dimmed");
+          btn.innerHTML = labelCache.get(btn);
+        });
+        if (textarea) textarea.readOnly = false;
+        threadShareForm.dataset.submitting = "";
+      }
+    });
+  }
+
   const replyForm = document.querySelector("[data-completion-reply-form]");
   if (replyForm) {
     const token = replyForm.dataset.token || "";
@@ -5786,6 +5907,8 @@ function kindMeta(kind) {
     case "moltbook_reply":
     case "moltbook_draft":
       return { label: L("common.sns"), tone: "neutral", icon: "item" };
+    case "thread_share":
+      return { label: L("common.threadShare"), tone: "neutral", icon: "link" };
     default:
       return { label: L("common.item"), tone: "neutral", icon: "item" };
   }
