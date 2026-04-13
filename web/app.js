@@ -48,6 +48,7 @@ const state = {
   pairNotice: "",
   pushStatus: null,
   moltbookScoutStatus: null,
+  a2aRelayStatus: null,
   pushNotice: "",
   pushError: "",
   deviceNotice: "",
@@ -214,6 +215,7 @@ async function refreshAuthenticatedState() {
   await refreshDevices();
   await refreshPushStatus();
   await fetchMoltbookScoutStatus();
+  await fetchA2aRelayStatus();
   ensureCurrentSelection();
 }
 
@@ -328,6 +330,18 @@ async function fetchMoltbookScoutStatus() {
     state.moltbookScoutStatus = await apiGet("/api/moltbook/scout-status");
   } catch {
     state.moltbookScoutStatus = null;
+  }
+}
+
+async function fetchA2aRelayStatus() {
+  if (!state.session?.a2aRelayEnabled) {
+    state.a2aRelayStatus = null;
+    return;
+  }
+  try {
+    state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
+  } catch {
+    state.a2aRelayStatus = null;
   }
 }
 
@@ -2754,6 +2768,7 @@ function buildSettingsContext() {
       serverEnabled,
     }),
     moltbookScout: state.moltbookScoutStatus,
+    a2aRelay: state.a2aRelayStatus,
   };
 }
 
@@ -2907,6 +2922,13 @@ function settingsPageMeta(page) {
         description: L("settings.moltbook.copy"),
         icon: "item",
       };
+    case "a2aRelay":
+      return {
+        id: "a2aRelay",
+        title: L("settings.a2aRelay.title"),
+        description: L("settings.a2aRelay.copy"),
+        icon: "link",
+      };
     default:
       return settingsPageMeta("notifications");
   }
@@ -2976,15 +2998,22 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
-      ${state.session?.moltbookEnabled ? renderSettingsGroup(L("common.sns"), [
-        renderSettingsNavRow({
+      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled) ? renderSettingsGroup(L("settings.group.integrations"), [
+        state.session?.moltbookEnabled ? renderSettingsNavRow({
           page: "moltbook",
           icon: "item",
           title: L("settings.moltbook.title"),
           subtitle: L("settings.moltbook.subtitle"),
           value: context.moltbookScout?.enabled ? `${context.moltbookScout.sentToday} / ${context.moltbookScout.maxDaily}` : "",
-        }),
-      ]) : ""}
+        }) : "",
+        state.session?.a2aRelayEnabled ? renderSettingsNavRow({
+          page: "a2aRelay",
+          icon: "link",
+          title: L("settings.a2aRelay.title"),
+          subtitle: L("settings.a2aRelay.subtitle"),
+          value: context.a2aRelay?.connected ? L("settings.status.connected") : L("settings.a2aRelay.status.disconnected"),
+        }) : "",
+      ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
       ${renderSettingsGroup(L("settings.group.advanced"), advancedRows)}
     </div>
@@ -3030,6 +3059,9 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "moltbook":
       content = renderSettingsMoltbookPage(context);
+      break;
+    case "a2aRelay":
+      content = renderSettingsA2aRelayPage(context);
       break;
     default:
       content = "";
@@ -3278,6 +3310,38 @@ function renderSettingsMoltbookPage(context) {
             return renderSettingsInfoRow("", display, { rawValue: true, rowClassName: "settings-info-row--stacked" });
           }))
         : ""}
+    </div>
+  `;
+}
+
+function renderSettingsA2aRelayPage(context) {
+  const relay = context.a2aRelay;
+  if (!relay?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.a2aRelay.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const statusLabel = relay.connected
+    ? L("settings.status.connected")
+    : relay.polling
+      ? L("settings.a2aRelay.status.polling")
+      : L("settings.a2aRelay.status.disconnected");
+  const profileUrl = `${relay.relayUrl}/${relay.userId}`;
+  const userIdLink = `<a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener">${escapeHtml(relay.userId)}</a>`;
+  const relayHost = (() => { try { return new URL(relay.relayUrl).host; } catch { return relay.relayUrl; } })();
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup("", [
+        renderSettingsInfoRow(L("settings.row.a2aStatus"), statusLabel),
+        renderSettingsInfoRow(L("settings.row.a2aUserId"), userIdLink, { rawValue: true }),
+        renderSettingsInfoRow(L("settings.row.a2aRelay"), relayHost),
+        renderSettingsInfoRow(L("settings.row.a2aApiKey"), relay.apiKeyConfigured ? L("settings.a2aRelay.apiKey.configured") : L("settings.a2aRelay.apiKey.notConfigured")),
+        relay.lastPollAtMs
+          ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
+          : "",
+      ].filter(Boolean))}
     </div>
   `;
 }

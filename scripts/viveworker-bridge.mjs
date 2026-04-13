@@ -17,7 +17,7 @@ import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, 
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
-import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult } from "./a2a-relay-client.mjs";
+import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus } from "./a2a-relay-client.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11126,6 +11126,27 @@ function createNativeApprovalServer({ config, runtime, state }) {
         } catch {
           return writeJson(res, 200, { enabled: true, day: "", sentToday: 0, maxDaily: 5, seenPostCount: 0 });
         }
+      }
+
+      // A2A relay status for the settings UI.
+      if (url.pathname === "/api/a2a/relay-status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const relayEnabled = Boolean(config.a2aRelayUrl && config.a2aRelayUserId);
+        if (!relayEnabled) {
+          return writeJson(res, 200, { enabled: false });
+        }
+        const relay = getRelayStatus();
+        return writeJson(res, 200, {
+          enabled: true,
+          connected: relay.polling && relay.lastPollOk,
+          polling: relay.polling,
+          lastPollOk: relay.lastPollOk,
+          lastPollAtMs: relay.lastPollAtMs,
+          userId: config.a2aRelayUserId,
+          relayUrl: config.a2aRelayUrl,
+          apiKeyConfigured: Boolean(config.a2aApiKey),
+        });
       }
 
       // Activity summary for compose (original post) drafting.

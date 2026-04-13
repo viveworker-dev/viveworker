@@ -82,6 +82,9 @@ async function main(cliOptions) {
     case "doctor":
       await runDoctor(cliOptions);
       return;
+    case "update":
+      await runUpdate(cliOptions);
+      return;
     case "help":
     default:
       printHelp();
@@ -846,6 +849,67 @@ async function runDoctor(cliOptions) {
   }
 }
 
+async function runUpdate(cliOptions) {
+  const locale = await resolveCliLocale(cliOptions);
+  const progress = createCliProgressReporter(locale);
+
+  // 1. Check current vs latest version
+  progress.update("cli.update.progress.checkVersion");
+  const pkg = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8"));
+  const currentVersion = pkg.version;
+  const { stdout: latestRaw } = await execCommand(["npm", "view", "viveworker", "version"], { ignoreError: true });
+  const latestVersion = (latestRaw || "").trim();
+
+  if (!latestVersion) {
+    progress.done("cli.update.checkFailed");
+    return;
+  }
+
+  if (currentVersion === latestVersion) {
+    progress.done("cli.update.alreadyLatest", { version: currentVersion });
+    return;
+  }
+
+  console.log(t(locale, "cli.update.versionInfo", { current: currentVersion, latest: latestVersion }));
+
+  // 2. Clear npx cache and re-fetch
+  progress.update("cli.update.progress.install");
+  const npxCacheResult = await execCommand(["npx", "--yes", "viveworker@latest", "--version"], { ignoreError: true });
+  if (!npxCacheResult.ok) {
+    // Fallback: try global install
+    await execCommand(["npm", "install", "-g", "viveworker@latest"], { ignoreError: true });
+  }
+
+  // 3. Restart bridge
+  const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
+  if (await fileExists(launchAgentPath)) {
+    progress.update("cli.update.progress.restartBridge");
+    await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
+    await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
+    await execCommand(["launchctl", "kickstart", "-k", `gui/${process.getuid()}/${defaultLabel}`], { ignoreError: true });
+  }
+
+  // 4. Restart moltbook-watcher if present
+  const watcherLabel = "com.viveworker.moltbook-watcher";
+  const watcherPlistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${watcherLabel}.plist`);
+  if (await fileExists(watcherPlistPath)) {
+    progress.update("cli.update.progress.restartWatcher");
+    await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, watcherPlistPath], { ignoreError: true });
+    await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, watcherPlistPath], { ignoreError: true });
+  }
+
+  // 5. Restart moltbook-scout if present
+  const scoutLabel = "com.viveworker.moltbook-scout";
+  const scoutPlistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${scoutLabel}.plist`);
+  if (await fileExists(scoutPlistPath)) {
+    progress.update("cli.update.progress.restartScout");
+    await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, scoutPlistPath], { ignoreError: true });
+    await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, scoutPlistPath], { ignoreError: true });
+  }
+
+  progress.done("cli.update.done", { version: latestVersion });
+}
+
 function parseArgs(argv) {
   const parsed = {
     command: "help",
@@ -1019,6 +1083,7 @@ ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.stop")}
   ${t(locale, "cli.help.status")}
   ${t(locale, "cli.help.doctor")}
+  ${t(locale, "cli.help.update")}
 
 ${t(locale, "cli.help.commonOptions")}
   --port <n>

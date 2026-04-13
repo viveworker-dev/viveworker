@@ -29,6 +29,8 @@ const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
 
 let pollTimer = null;
 let isPolling = false;
+let lastPollOk = false;
+let lastPollAtMs = 0;
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -165,6 +167,17 @@ export function stopRelayPolling() {
 }
 
 /**
+ * Return current relay connection status for the settings UI.
+ */
+export function getRelayStatus() {
+  return {
+    polling: pollTimer !== null,
+    lastPollOk,
+    lastPollAtMs,
+  };
+}
+
+/**
  * Single poll cycle: fetch pending tasks from the relay and ingest them.
  */
 async function pollOnce({ config, runtime, state, helpers }) {
@@ -186,8 +199,13 @@ async function pollOnce({ config, runtime, state, helpers }) {
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       console.error(`[a2a-relay] Poll failed: HTTP ${res.status} ${text.slice(0, 200)}`);
+      lastPollOk = false;
+      lastPollAtMs = Date.now();
       return;
     }
+
+    lastPollOk = true;
+    lastPollAtMs = Date.now();
 
     const data = await res.json();
     const tasks = data.tasks || [];
