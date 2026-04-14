@@ -5,7 +5,7 @@ const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice", "completion"]);
+const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
@@ -612,12 +612,19 @@ function filteredDiffEntries() {
 }
 
 function syncTimelineThreadFilter() {
-  const threads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
   if (!state.timelineThreadFilter || state.timelineThreadFilter === "all") {
     state.timelineThreadFilter = "all";
     return;
   }
-  if (!threads.some((thread) => thread.id === state.timelineThreadFilter)) {
+  const provider = state.providerFilter || "all";
+  let validThreadIds;
+  if (provider === "all") {
+    const threads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
+    validThreadIds = new Set(threads.map((t) => t.id));
+  } else {
+    validThreadIds = new Set(timelineThreadsForProvider(provider).map((t) => t.id));
+  }
+  if (!validThreadIds.has(state.timelineThreadFilter)) {
     state.timelineThreadFilter = "all";
   }
 }
@@ -630,16 +637,47 @@ function syncTimelineKindFilter() {
 }
 
 function timelineKindFilterOptions() {
-  return [
-    { id: "all", label: L("timeline.kindFilter.all"), icon: "filter" },
+  const provider = state.providerFilter || "all";
+  const allOption = { id: "all", label: L("timeline.kindFilter.all"), icon: "filter" };
+
+  if (provider === "moltbook") {
+    return [
+      allOption,
+      { id: "moltbook_reply_drafts", label: L("timeline.kindFilter.moltbookReplyDrafts"), icon: "moltbook-reply" },
+      { id: "moltbook_post_drafts", label: L("timeline.kindFilter.moltbookPostDrafts"), icon: "moltbook-draft" },
+      { id: "moltbook_comments", label: L("timeline.kindFilter.moltbookComments"), icon: "moltbook-comment" },
+    ];
+  }
+  if (provider === "a2a") {
+    return [
+      allOption,
+      { id: "a2a_requests", label: L("timeline.kindFilter.a2aRequests"), icon: "item" },
+      { id: "a2a_results", label: L("timeline.kindFilter.a2aResults"), icon: "completion-item" },
+    ];
+  }
+
+  const codexClaudeOptions = [
+    allOption,
     { id: "messages", label: L("timeline.kindFilter.messages"), icon: "timeline" },
     { id: "files", label: L("timeline.kindFilter.files"), icon: "file-event" },
     { id: "approvals", label: L("timeline.kindFilter.approvals"), icon: "approval" },
     { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
     { id: "choices", label: L("timeline.kindFilter.choices"), icon: "choice" },
-    { id: "completions", label: L("timeline.kindFilter.completions"), icon: "completion-item" },
-    { id: "moltbook_drafts", label: L("timeline.kindFilter.moltbookDrafts"), icon: "moltbook-draft" },
+    { id: "final_answers", label: L("timeline.kindFilter.finalAnswers"), icon: "assistant-final" },
+  ];
+
+  if (provider === "codex" || provider === "claude") {
+    return codexClaudeOptions;
+  }
+
+  // "all" — union of everything
+  return [
+    ...codexClaudeOptions,
+    { id: "moltbook_reply_drafts", label: L("timeline.kindFilter.moltbookReplyDrafts"), icon: "moltbook-reply" },
+    { id: "moltbook_post_drafts", label: L("timeline.kindFilter.moltbookPostDrafts"), icon: "moltbook-draft" },
     { id: "moltbook_comments", label: L("timeline.kindFilter.moltbookComments"), icon: "moltbook-comment" },
+    { id: "a2a_requests", label: L("timeline.kindFilter.a2aRequests"), icon: "item" },
+    { id: "a2a_results", label: L("timeline.kindFilter.a2aResults"), icon: "completion-item" },
   ];
 }
 
@@ -665,10 +703,20 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
       return kind === "choice";
     case "completions":
       return kind === "completion";
+    case "final_answers":
+      return kind === "assistant_final";
     case "moltbook_drafts":
       return kind === "moltbook_draft";
+    case "moltbook_reply_drafts":
+      return kind === "moltbook_draft" && entry?.draftType === "reply";
+    case "moltbook_post_drafts":
+      return kind === "moltbook_draft" && entry?.draftType !== "reply";
     case "moltbook_comments":
       return kind === "moltbook_reply";
+    case "a2a_requests":
+      return kind === "a2a_task";
+    case "a2a_results":
+      return kind === "a2a_task_result";
     default:
       return true;
   }
@@ -689,10 +737,19 @@ function completedThreads() {
   if (!items.length) {
     return [];
   }
+  const provider = state.providerFilter || "all";
   const byThread = new Map();
   for (const item of items) {
     const threadId = normalizeClientText(item.threadId || "");
-    if (!threadId || isMoltbookThreadId(threadId, item)) {
+    if (!threadId) {
+      continue;
+    }
+    // Skip Moltbook threads unless Moltbook tab is active
+    if (provider !== "moltbook" && isMoltbookThreadId(threadId, item)) {
+      continue;
+    }
+    // Filter by provider
+    if (provider !== "all" && normalizeProviderClient(item.provider) !== provider) {
       continue;
     }
     const latestAtMs = Number(item.createdAtMs || 0);
@@ -1375,7 +1432,6 @@ function buildDetailLoadingSnapshot(itemRef = state.currentItem) {
     readOnly:
       entry?.status === "completed" ||
       TIMELINE_MESSAGE_KINDS.has(itemRef.kind) ||
-      itemRef.kind === "completion" ||
       (itemRef.kind === "choice" && item.supported === false),
     loading: true,
   };
@@ -1779,11 +1835,13 @@ function renderProviderFilter() {
   `;
 }
 
+const COMPLETED_CARD_KINDS = new Set(["assistant_final", "approval", "moltbook_reply", "moltbook_draft", "a2a_task_result", "thread_share"]);
+
 function renderItemCard(entry, sourceTab, desktop) {
-  if (entry.status === "completed" && entry.item.kind === "completion") {
+  if (entry.status === "completed" && COMPLETED_CARD_KINDS.has(entry.item.kind)) {
     return renderCompletedCompletionCard(entry, sourceTab);
   }
-  const kindInfo = kindMeta(entry.item.kind);
+  const kindInfo = kindMeta(entry.item.kind, entry.item);
   const cardTitle = cardTitleForEntry(entry);
   const statusText = entry.status === "completed" ? L("common.completed") : L("common.actionNeeded");
   const intentText = itemIntentText(entry.item.kind, entry.status, entry.item.provider);
@@ -1852,10 +1910,12 @@ function cardTitleForEntry(entry) {
 
 function renderCompletedCompletionCard(entry, sourceTab) {
   const item = entry.item;
-  const kindInfo = kindMeta(item.kind);
+  const kindInfo = kindMeta(item.kind, item);
   const summaryText = item.summary || fallbackSummaryForKind(item.kind, entry.status, item.provider);
   const threadLabel = timelineEntryThreadLabel(item, true);
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
+  const pillLabel = item.kind === "completion" ? L("common.task") : kindInfo.label;
+  const pillTone = item.kind === "completion" ? "completion" : kindInfo.tone;
 
   return `
     <button
@@ -1867,7 +1927,7 @@ function renderCompletedCompletionCard(entry, sourceTab) {
     >
       <div class="item-card__header">
         <div class="item-card__meta">
-          <span class="type-pill type-pill--completion">${escapeHtml(L("common.task"))}</span>
+          <span class="type-pill type-pill--${escapeHtml(pillTone)}">${escapeHtml(pillLabel)}</span>
           ${renderProviderBadge(item.provider)}
         </div>
         <div class="item-card__header-right">
@@ -1957,17 +2017,47 @@ function renderDiffPanel({ entries, desktop }) {
   `;
 }
 
+function timelineThreadsForProvider(provider) {
+  const entries = Array.isArray(state.timeline?.entries) ? state.timeline.entries : [];
+  const byThread = new Map();
+  for (const entry of entries) {
+    const threadId = entry.threadId || "";
+    if (!threadId) continue;
+    if (normalizeProviderClient(entry.provider) !== provider) continue;
+    const latestAtMs = Number(entry.createdAtMs) || 0;
+    const label = entry.threadLabel || "";
+    const existing = byThread.get(threadId);
+    if (!existing || latestAtMs > existing.latestAtMs) {
+      byThread.set(threadId, { id: threadId, label, latestAtMs });
+    }
+  }
+  return [...byThread.values()]
+    .sort((a, b) => b.latestAtMs - a.latestAtMs)
+    .map((t) => ({ id: t.id, label: dropdownThreadLabel(t.id, t.label) }));
+}
+
 function renderTimelineThreadDropdown() {
-  const threads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
+  const provider = state.providerFilter || "all";
+  const kindFilterHtml = renderTimelineKindFilterControls();
+
+  let threads;
+  if (provider === "all") {
+    // "All" view — use the server-provided thread list
+    threads = (Array.isArray(state.timeline?.threads) ? state.timeline.threads : []).map((thread) => ({
+      id: thread.id,
+      label: dropdownThreadLabel(thread.id, thread.label || ""),
+    }));
+  } else {
+    // Provider-specific view — build from entries matching this provider
+    threads = timelineThreadsForProvider(provider);
+  }
+
   return renderThreadDropdown({
     inputId: "timeline-thread-select",
     dataAttribute: "data-timeline-thread-select",
     selectedThreadId: state.timelineThreadFilter,
-    controlsHtml: renderTimelineKindFilterControls(),
-    threads: threads.map((thread) => ({
-      id: thread.id,
-      label: dropdownThreadLabel(thread.id, thread.label || ""),
-    })),
+    controlsHtml: kindFilterHtml,
+    threads,
   });
 }
 
@@ -2072,10 +2162,11 @@ function renderTimelineKindFilterControls() {
 
 function renderTimelineEntry(entry, { desktop }) {
   const item = entry.item;
-  const kindInfo = kindMeta(item.kind);
+  const kindInfo = kindMeta(item.kind, item);
   const kindClassName = escapeHtml(kindInfo.tone || "neutral");
   const kindNameClass = escapeHtml(String(item.kind || "item").replace(/_/gu, "-"));
-  const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || item.kind === "completion";
+  const isMoltbookOrA2A = item.kind === "moltbook_reply" || item.kind === "moltbook_draft" || item.kind === "a2a_task" || item.kind === "a2a_task_result" || item.kind === "thread_share";
+  const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || isMoltbookOrA2A;
   const isFileEvent = item.kind === "file_event";
   const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
   const fileRefs = normalizeClientFileRefs(item.fileRefs);
@@ -2932,6 +3023,9 @@ function settingsPageMeta(page) {
         description: L("settings.a2aRelay.copy"),
         icon: "link",
       };
+    case "a2aExecutor":
+      // Executor settings integrated into a2aRelay page — redirect.
+      return settingsPageMeta("a2aRelay");
     default:
       return settingsPageMeta("notifications");
   }
@@ -3064,6 +3158,7 @@ function renderSettingsSubpage(context, { mobile }) {
       content = renderSettingsMoltbookPage(context);
       break;
     case "a2aRelay":
+    case "a2aExecutor":
       content = renderSettingsA2aRelayPage(context);
       break;
     default:
@@ -3334,6 +3429,21 @@ function renderSettingsA2aRelayPage(context) {
   const profileUrl = `${relay.relayUrl}/${relay.userId}`;
   const userIdLink = `<a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener">${escapeHtml(relay.userId)}</a>`;
   const relayHost = (() => { try { return new URL(relay.relayUrl).host; } catch { return relay.relayUrl; } })();
+  const publicChecked = relay.acceptPublicTasks === true;
+
+  // Executor preference section
+  const executors = state.session?.a2aExecutors || { codex: false, claude: false };
+  const currentExec = state.session?.a2aExecutorPreference || "ask";
+  const bothAvailable = executors.codex && executors.claude;
+  const execOptions = [
+    { id: "ask", label: L("settings.a2aExecutor.ask") },
+  ];
+  if (executors.codex) execOptions.push({ id: "codex", label: L("settings.a2aExecutor.codex"), detected: true });
+  if (executors.claude) execOptions.push({ id: "claude", label: L("settings.a2aExecutor.claude"), detected: true });
+  if (bothAvailable) {
+    execOptions.push({ id: "auto", label: L("settings.a2aExecutor.auto") });
+  }
+
   return `
     <div class="settings-page">
       ${renderSettingsGroup("", [
@@ -3345,6 +3455,28 @@ function renderSettingsA2aRelayPage(context) {
           ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
           : "",
       ].filter(Boolean))}
+      <section class="settings-group">
+        <p class="settings-group__title">${escapeHtml(L("settings.a2aRelay.publicTasks.title"))}</p>
+        <label class="reply-mode-switch reply-mode-switch--settings" data-a2a-public-toggle>
+          <input type="checkbox" class="reply-mode-switch__input" ${publicChecked ? "checked" : ""} data-a2a-public-checkbox />
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(publicChecked ? L("settings.claudeAway.on") : L("settings.claudeAway.off"))}</span>
+          </span>
+          <span class="reply-mode-switch__hint">${escapeHtml(L("settings.a2aRelay.publicTasks.description"))}</span>
+        </label>
+      </section>
+      ${renderSettingsGroup(L("settings.a2aExecutor.title"), [
+        `<p class="settings-group__description">${escapeHtml(L("settings.a2aExecutor.copy"))}</p>`,
+        ...execOptions.map((opt) => `
+          <label class="settings-radio-row" data-a2a-executor-option="${escapeHtml(opt.id)}">
+            <input type="radio" name="a2aExecutor" value="${escapeHtml(opt.id)}"
+              ${currentExec === opt.id ? "checked" : ""} />
+            <span class="settings-radio-row__label">${escapeHtml(opt.label)}</span>
+            ${opt.detected ? `<span class="settings-radio-row__badge">✓ ${escapeHtml(L("settings.a2aExecutor.detected"))}</span>` : ""}
+          </label>
+        `),
+      ])}
     </div>
   `;
 }
@@ -3455,8 +3587,8 @@ function renderDetailContent(detail, { mobile }) {
 }
 
 function renderStandardDetailDesktop(detail) {
-  const kindInfo = kindMeta(detail.kind);
-  const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind) || detail.kind === "completion";
+  const kindInfo = kindMeta(detail.kind, detail);
+  const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind);
   const plainIntro = renderDetailPlainIntro(detail);
   return `
     <div class="detail-shell">
@@ -3470,7 +3602,7 @@ function renderStandardDetailDesktop(detail) {
       ${renderA2ATaskDetail(detail)}
       ${renderThreadShareDetail(detail)}
       ${
-        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "thread_share"
+        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share"
           ? ""
           : plainIntro
             ? plainIntro
@@ -3493,8 +3625,8 @@ function renderStandardDetailDesktop(detail) {
 }
 
 function renderStandardDetailMobile(detail) {
-  const kindInfo = kindMeta(detail.kind);
-  const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind) || detail.kind === "completion";
+  const kindInfo = kindMeta(detail.kind, detail);
+  const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind);
   const plainIntro = renderDetailPlainIntro(detail, { mobile: true });
   return `
     <div class="mobile-detail-screen">
@@ -3508,7 +3640,7 @@ function renderStandardDetailMobile(detail) {
           ${renderA2ATaskDetail(detail, { mobile: true })}
           ${renderThreadShareDetail(detail, { mobile: true })}
           ${
-            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "thread_share"
+            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share"
               ? ""
               : plainIntro
                 ? plainIntro
@@ -4066,7 +4198,7 @@ function renderMoltbookDraftComposer(detail, options = {}) {
 }
 
 function renderA2ATaskDetail(detail, options = {}) {
-  if (detail.kind !== "a2a_task") return "";
+  if (detail.kind !== "a2a_task" && detail.kind !== "a2a_task_result") return "";
   const enabled = detail.a2aTaskEnabled !== false && detail.readOnly !== true;
   const instruction = detail.instruction || "";
   const callerIp = detail.callerInfo?.ip || "";
@@ -4084,8 +4216,30 @@ function renderA2ATaskDetail(detail, options = {}) {
     rejected: "a2a.task.statusRejected",
   }[detail.taskStatus] || "a2a.task.statusSubmitted";
 
-  const statusBadge = !enabled
+  const statusBadge = !enabled && detail.kind === "a2a_task_result"
     ? `<span class="eyebrow-pill eyebrow-pill--subtle">${escapeHtml(L(statusKey))}</span>`
+    : "";
+
+  // Show executor selector when "ask" mode is active and both CLIs are available.
+  const executors = state.session?.a2aExecutors || { codex: false, claude: false };
+  const executorPref = state.session?.a2aExecutorPreference || "auto";
+  const showExecutorPicker = enabled && executorPref === "ask" && executors.codex && executors.claude;
+  const executorPicker = showExecutorPicker
+    ? `
+      <div class="reply-composer__instruction">
+        <label class="field-label">${escapeHtml(L("a2a.task.executor"))}</label>
+        <div class="a2a-executor-picker">
+          <label class="a2a-executor-picker__option">
+            <input type="radio" name="executor" value="codex" checked />
+            <span>${escapeHtml(L("a2a.executor.codex"))}</span>
+          </label>
+          <label class="a2a-executor-picker__option">
+            <input type="radio" name="executor" value="claude" />
+            <span>${escapeHtml(L("a2a.executor.claude"))}</span>
+          </label>
+        </div>
+      </div>
+    `
     : "";
 
   const buttons = enabled
@@ -4111,6 +4265,13 @@ function renderA2ATaskDetail(detail, options = {}) {
           <label class="field-label">${escapeHtml(L("a2a.task.instruction"))}</label>
           <textarea name="instruction" class="reply-composer__textarea" rows="6" ${enabled ? "" : "readonly"}>${escapeHtml(instruction)}</textarea>
         </div>
+        ${executorPicker}
+        ${!enabled && detail.messageText ? `
+        <div class="reply-composer__instruction">
+          <label class="field-label">${escapeHtml(L("a2a.task.response"))}</label>
+          <pre class="a2a-task-response">${escapeHtml(detail.messageText)}</pre>
+        </div>
+        ` : ""}
         ${buttonsWrapped}
       </form>
     </section>
@@ -4168,7 +4329,7 @@ function renderThreadShareDetail(detail, options = {}) {
 }
 
 function renderCompletionReplyComposer(detail, options = {}) {
-  if (detail.kind !== "completion" || detail.reply?.enabled !== true) {
+  if ((detail.kind !== "completion" && detail.kind !== "assistant_final") || detail.reply?.enabled !== true) {
     return "";
   }
 
@@ -4238,7 +4399,7 @@ function renderCompletionReplyComposer(detail, options = {}) {
               </div>
             `
             : `
-              <form class="reply-composer__form" data-completion-reply-form data-token="${escapeHtml(detail.token)}" data-provider="${escapeHtml(normalizeProviderClient(detail?.provider))}">
+              <form class="reply-composer__form" data-completion-reply-form data-token="${escapeHtml(detail.token)}" data-provider="${escapeHtml(normalizeProviderClient(detail?.provider))}" data-reply-kind="${escapeHtml(detail.kind)}">
                 <label class="field reply-field">
                   <span class="field-label">${escapeHtml(L("reply.fieldLabel"))}</span>
                   <div class="reply-field__shell">
@@ -4816,6 +4977,11 @@ function bindShellInteractions() {
         return;
       }
       state.providerFilter = next;
+      // Reset thread/kind filters — each provider has its own set of valid options
+      state.timelineThreadFilter = "all";
+      state.timelineKindFilter = "all";
+      state.timelineKindFilterOpen = false;
+      state.completedThreadFilter = "all";
       alignCurrentItemToVisibleEntries();
       await renderShell();
     });
@@ -5161,6 +5327,33 @@ function bindShellInteractions() {
     });
   }
 
+  for (const checkbox of document.querySelectorAll("[data-a2a-public-checkbox]")) {
+    checkbox.addEventListener("change", async () => {
+      const next = checkbox.checked === true;
+      try {
+        await apiPost("/api/a2a/public-tasks", { accept: next });
+        state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
+  for (const radio of document.querySelectorAll("[data-a2a-executor-option] input[type='radio']")) {
+    radio.addEventListener("change", async () => {
+      if (!radio.checked) return;
+      const preference = radio.value || "auto";
+      try {
+        await apiPost("/api/settings/a2a-executor", { preference });
+        await refreshSession();
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-locale-option]")) {
     button.addEventListener("click", async () => {
       state.pushError = "";
@@ -5322,12 +5515,16 @@ function bindShellInteractions() {
       });
       if (textarea) textarea.readOnly = true;
       const instruction = normalizeClientText(new FormData(a2aTaskForm).get("instruction"));
+      const executorRadio = a2aTaskForm.querySelector("input[name='executor']:checked");
+      const executor = executorRadio ? executorRadio.value : "";
       try {
+        const decisionBody = { action: submittedAction, instruction };
+        if (executor) decisionBody.executor = executor;
         const res = await fetch(`/api/items/a2a-task/${encodeURIComponent(token)}/decision`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           credentials: "same-origin",
-          body: JSON.stringify({ action: submittedAction, instruction }),
+          body: JSON.stringify(decisionBody),
         });
         if (!res.ok) {
           const errBody = await res.json().catch(() => ({}));
@@ -5482,7 +5679,8 @@ function bindShellInteractions() {
             requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
           }
         }
-        await apiPost(`/api/items/completion/${encodeURIComponent(token)}/reply`, requestBody);
+        const replyKind = replyForm.dataset.replyKind || "completion";
+        await apiPost(`/api/items/${encodeURIComponent(replyKind)}/${encodeURIComponent(token)}/reply`, requestBody);
         setCompletionReplyDraft(token, {
           text: "",
           sentText: text,
@@ -5880,10 +6078,10 @@ function inboxSubtabForItemKind(kind, sourceSubtab = "") {
   if (normalizeClientText(sourceSubtab || "") === "completed") {
     return "completed";
   }
-  return kind === "completion" ? "completed" : "pending";
+  return kind === "completion" || kind === "assistant_final" ? "completed" : "pending";
 }
 
-function kindMeta(kind) {
+function kindMeta(kind, item) {
   switch (kind) {
     case "user_message":
       return { label: L("common.userMessage"), tone: "neutral", icon: "user-message" };
@@ -5905,10 +6103,17 @@ function kindMeta(kind) {
     case "file_event":
       return { label: L("common.fileEvent"), tone: "neutral", icon: "file-event" };
     case "moltbook_reply":
+      return { label: L("common.moltbookReply"), tone: "neutral", icon: "moltbook-comment" };
     case "moltbook_draft":
-      return { label: L("common.sns"), tone: "neutral", icon: "item" };
+      return item?.draftType === "reply"
+        ? { label: L("common.moltbookDraftReply"), tone: "neutral", icon: "moltbook-reply" }
+        : { label: L("common.moltbookDraft"), tone: "neutral", icon: "moltbook-draft" };
     case "thread_share":
       return { label: L("common.threadShare"), tone: "neutral", icon: "link" };
+    case "a2a_task":
+      return { label: L("common.a2aTaskRequest"), tone: "neutral", icon: "item" };
+    case "a2a_task_result":
+      return { label: L("common.a2aTaskResult"), tone: "completion", icon: "completion-item" };
     default:
       return { label: L("common.item"), tone: "neutral", icon: "item" };
   }
@@ -6263,6 +6468,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 12.5 5.9-5.9a3 3 0 1 1 4.2 4.2l-7.7 7.7a5 5 0 1 1-7.1-7.1l8.1-8.1"/></svg>`;
     case "moltbook-draft":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3.8 20.2 8.8 8.5 20.5 3.5 20.5 3.5 15.5Z"/><path d="M12.5 6.5l5 5"/></svg>`;
+    case "moltbook-reply":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 4 9l5 5"/><path d="M4 9h11a4 4 0 0 1 4 4v3"/></svg>`;
     case "moltbook-comment":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 5.5h15a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4 3.5v-3.5H4.5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z"/><path d="M8 10h8"/><path d="M8 13h5"/></svg>`;
     case "filter":

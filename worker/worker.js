@@ -28,6 +28,7 @@ const PLAN_LIMITS = {
 const USER_ID_RE = /^[a-zA-Z0-9_-]{3,40}$/;
 const TASK_TTL = 86400;        // 24 hours
 const MAX_BODY_BYTES = 10240;  // 10 KB
+const PUBLIC_TASKS_PER_IP_PER_DAY = 5;
 const OAUTH_STATE_TTL = 600;   // 10 minutes
 
 // SVG favicon — worker bee
@@ -206,8 +207,38 @@ const SETUP_MD = [
   "",
   "- Node.js 18+ installed",
   "- Your human needs a GitHub account (used for identity verification)",
+  "- **viveworker bridge must be running** — it connects the relay to your human's machine",
   "",
   "## Setup Flow",
+  "",
+  "### Step 0: Verify viveworker bridge is running",
+  "",
+  "A2A requires the viveworker bridge to relay tasks between the cloud and your human's machine.",
+  "Check if it's already set up:",
+  "",
+  "```bash",
+  "# Check if the bridge process is running",
+  "ps aux | grep viveworker | grep -v grep",
+  "",
+  "# Or check if the config exists",
+  "ls ~/.viveworker/config.env 2>/dev/null && echo 'Bridge configured' || echo 'Bridge NOT configured'",
+  "```",
+  "",
+  "**If the bridge is NOT configured:** Your human needs to set up viveworker first.",
+  "Visit [viveworker.com](https://viveworker.com) for initial setup instructions, or run:",
+  "",
+  "```bash",
+  "npx viveworker",
+  "```",
+  "",
+  "This will guide your human through pairing viveworker with their phone and AI tools.",
+  "Once the bridge is running, come back here to add A2A support.",
+  "",
+  "**If the bridge IS configured but not running:** Start it with:",
+  "",
+  "```bash",
+  "npx viveworker start",
+  "```",
   "",
   "### Step 1: Check activity history (if viveworker is already running)",
   "",
@@ -308,7 +339,28 @@ const SETUP_MD = [
   "",
   "## After Setup",
   "",
-  "Your A2A endpoint is live:",
+  "### Verify the bridge is connected",
+  "",
+  "**Important:** The A2A endpoint is created immediately, but your Agent Card (description, skills) is only",
+  "populated once the viveworker bridge connects to the relay. This happens automatically within 30 seconds",
+  "if the bridge is running.",
+  "",
+  "```bash",
+  "# Check your Agent Card — description and skills should be populated",
+  "curl -s https://a2a.viveworker.com/<user-id>/.well-known/agent.json | python3 -m json.tool",
+  "```",
+  "",
+  "If the description shows the generic default (`\"AI companion that can execute coding tasks...\"`) and skills",
+  "is empty (`[]`), the bridge has not connected yet. Make sure the bridge is running:",
+  "",
+  "```bash",
+  "npx viveworker start",
+  "```",
+  "",
+  "The bridge reads `~/.viveworker/a2a.env`, connects to the relay, and registers your Agent Card.",
+  "Check the bridge logs for `[a2a-relay] Registered as <user-id>` to confirm.",
+  "",
+  "### Your A2A endpoint",
   "",
   "```",
   "https://a2a.viveworker.com/<user-id>",
@@ -324,7 +376,7 @@ const SETUP_MD = [
   "",
   "```bash",
   "# Check your Agent Card",
-  "curl https://a2a.viveworker.com/<user-id>/.well-known/agent.json",
+  "curl -s https://a2a.viveworker.com/<user-id>/.well-known/agent.json | python3 -m json.tool",
   "```",
   "",
   "### Update Agent Card later",
@@ -489,7 +541,9 @@ function buildAgentCardForRelay(userRecord, userId, relayOrigin) {
       pushNotifications: false,
     },
     skills: card.skills || [],
-    authSchemes: [{ scheme: "apiKey", in: "header", name: "X-A2A-Key" }],
+    authSchemes: userRecord.acceptPublicTasks
+      ? []
+      : [{ scheme: "apiKey", in: "header", name: "X-A2A-Key" }],
   };
   if (avatar) result.avatar = avatar;
   return result;
@@ -723,7 +777,8 @@ async function handleA2A(env, request, userId) {
     return jsonResponse(jsonRpcError(null, -32000, "User not found"), 404);
   }
 
-  if (!validateExternalAuth(request, userRecord)) {
+  const isPublicAccess = userRecord.acceptPublicTasks && !validateExternalAuth(request, userRecord);
+  if (!userRecord.acceptPublicTasks && !validateExternalAuth(request, userRecord)) {
     return jsonResponse(jsonRpcError(null, -32000, "Unauthorized: invalid or missing X-A2A-Key"), 401);
   }
 
@@ -748,7 +803,7 @@ async function handleA2A(env, request, userId) {
 
   switch (method) {
     case "message/send":
-      return handleMessageSend(env, request, userRecord, userId, rpcId, params);
+      return handleMessageSend(env, request, userRecord, userId, rpcId, params, isPublicAccess);
     case "tasks/get":
       return handleTasksGet(env, userId, rpcId, params);
     case "tasks/cancel":
@@ -760,7 +815,7 @@ async function handleA2A(env, request, userId) {
 
 // --- message/send ---
 
-async function handleMessageSend(env, request, userRecord, userId, rpcId, params) {
+async function handleMessageSend(env, request, userRecord, userId, rpcId, params, isPublicAccess) {
   const message = params.message;
   if (!message || !Array.isArray(message.parts) || message.parts.length === 0) {
     return jsonResponse(jsonRpcError(rpcId, -32602, "Invalid params: message.parts is required"));
@@ -794,6 +849,17 @@ async function handleMessageSend(env, request, userRecord, userId, rpcId, params
   const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
   if (pendingRecord.tasks.length >= limits.maxPending) {
     return jsonResponse(jsonRpcError(rpcId, -32000, `Too many pending tasks (max ${limits.maxPending})`), 429);
+  }
+
+  // Stricter IP-based rate limit for public (unauthenticated) access
+  if (isPublicAccess) {
+    const callerIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const ipLimitKey = `public_ip:${userId}:${callerIp}:${todayKey()}`;
+    const ipCount = Number(await env.KV.get(ipLimitKey)) || 0;
+    if (ipCount >= PUBLIC_TASKS_PER_IP_PER_DAY) {
+      return jsonResponse(jsonRpcError(rpcId, -32000, "Public task limit reached for this IP"), 429);
+    }
+    await env.KV.put(ipLimitKey, String(ipCount + 1), { expirationTtl: 86400 });
   }
 
   // Create task
@@ -933,6 +999,7 @@ async function handleRegister(env, request) {
     userId,
     bridgeSecret,
     a2aApiKey,
+    acceptPublicTasks: typeof body.acceptPublicTasks === "boolean" ? body.acceptPublicTasks : (existing?.acceptPublicTasks || false),
     agentCard: body.agentCard || {},
     plan: existing?.plan || "free",
     registeredAtMs: existing?.registeredAtMs || Date.now(),

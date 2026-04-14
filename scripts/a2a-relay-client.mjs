@@ -68,6 +68,7 @@ export async function registerWithRelay({ config, buildAgentCard }) {
     userId,
     bridgeSecret,
     a2aApiKey: config.a2aApiKey || "",
+    acceptPublicTasks: config.a2aAcceptPublicTasks || false,
     agentCard,
     ...(config.a2aRelayRegisterSecret ? { registerSecret: config.a2aRelayRegisterSecret } : {}),
   };
@@ -164,6 +165,14 @@ export function stopRelayPolling() {
   }
   isPolling = false;
   console.log("[a2a-relay] Polling stopped");
+}
+
+/**
+ * Update the acceptPublicTasks flag on the relay via re-registration.
+ */
+export async function updatePublicTasksFlag({ config, buildAgentCard, acceptPublicTasks }) {
+  config.a2aAcceptPublicTasks = acceptPublicTasks;
+  return registerWithRelay({ config, buildAgentCard });
 }
 
 /**

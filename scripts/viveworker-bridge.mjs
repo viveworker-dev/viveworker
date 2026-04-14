@@ -17,7 +17,8 @@ import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, 
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
-import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus } from "./a2a-relay-client.mjs";
+import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
+import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM } from "./moltbook-api.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,9 +27,9 @@ const webRoot = path.join(workspaceRoot, "web");
 const appPackageVersion = readPackageVersion();
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
-const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
+const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -101,6 +102,50 @@ await syncClaudeAwayModeSentinel(config, state.claudeAwayMode === true);
 const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
 const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
+
+// Detect available A2A executors (codex / claude CLIs).
+try {
+  const { detectAvailableExecutors } = await import("./a2a-executor.mjs");
+  runtime.a2aAvailableExecutors = detectAvailableExecutors();
+  console.log(`[a2a-executors] codex=${runtime.a2aAvailableExecutors.codex}, claude=${runtime.a2aAvailableExecutors.claude}`);
+} catch (error) {
+  runtime.a2aAvailableExecutors = { codex: false, claude: false };
+  console.error(`[a2a-executors] Detection failed: ${error.message}`);
+}
+
+// Restore persisted moltbook drafts that haven't expired.
+try {
+  const pendingDrafts = await listPendingDrafts();
+  const now = Date.now();
+  for (const draft of pendingDrafts) {
+    const age = now - (draft.createdAtMs || 0);
+    const ttl = draft.ttlMs || 86400000;
+    if (age > ttl) {
+      await deleteDraft(draft.token).catch(() => {});
+      continue;
+    }
+    runtime.moltbookDraftsByToken.set(draft.token, { ...draft, decisionWaiters: [] });
+  }
+  if (runtime.moltbookDraftsByToken.size) {
+    console.log(`[moltbook-drafts] Restored ${runtime.moltbookDraftsByToken.size} pending draft(s) from disk`);
+  }
+} catch (error) {
+  console.error(`[moltbook-drafts-restore] ${error.message}`);
+}
+
+// Periodic TTL sweeper for expired drafts (every 60s).
+setInterval(async () => {
+  const now = Date.now();
+  for (const [token, draft] of runtime.moltbookDraftsByToken) {
+    if (draft.decision) continue;
+    const age = now - (draft.createdAtMs || 0);
+    if (age > (draft.ttlMs || 86400000)) {
+      runtime.moltbookDraftsByToken.delete(token);
+      await deleteDraft(token).catch(() => {});
+      console.log(`[moltbook-draft-expired] ${token} (age=${Math.round(age / 1000)}s)`);
+    }
+  }
+}, 60_000).unref?.();
 const initialHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
 const initialTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
 const normalizedHistoryStateChanged =
@@ -224,6 +269,8 @@ function buildSessionLocalePayload(config, state, deviceId) {
     moltbookEnabled: Boolean(config.moltbookApiKey),
     a2aEnabled: Boolean(config.a2aApiKey),
     a2aRelayEnabled: Boolean(config.a2aRelayUrl && config.a2aRelayUserId),
+    a2aExecutors: runtime.a2aAvailableExecutors || { codex: false, claude: false },
+    a2aExecutorPreference: state.a2aExecutorPreference || "ask",
   };
 }
 
@@ -249,6 +296,15 @@ function kindTitle(locale, kind) {
       return t(locale, "common.fileEvent");
     case "diff_thread":
       return t(locale, "common.diff");
+    case "a2a_task":
+      return "A2A";
+    case "a2a_task_result":
+      return "A2A";
+    case "moltbook_reply":
+    case "moltbook_draft":
+      return "Moltbook";
+    case "thread_share":
+      return t(locale, "server.title.threadShare") || "Thread Share";
     default:
       return t(locale, "common.item");
   }
@@ -293,6 +349,7 @@ function notificationIconPrefix(kind) {
     case "completion":
       return "✅";
     case "a2a_task":
+    case "a2a_task_result":
       return "🤝";
     default:
       return "";
@@ -2006,6 +2063,7 @@ function normalizeProvider(value) {
   if (normalized === "claude") return "claude";
   if (normalized === "moltbook") return "moltbook";
   if (normalized === "a2a") return "a2a";
+  if (normalized === "viveworker") return "viveworker";
   return "codex";
 }
 
@@ -2050,7 +2108,12 @@ function normalizeHistoryItem(raw) {
   const kind = cleanText(raw.kind ?? "");
   const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
   const rawThreadLabel = cleanText(raw.threadLabel ?? "");
-  const threadLabel = preferTitleOnlyJsonThreadLabel(rawThreadLabel, threadId, raw.messageText, raw.summary, raw.detailText, raw.message);
+  const historyProvider = normalizeProvider(raw.provider);
+  const skipHistoryThreadLabelRewrite = historyProvider === "moltbook" || historyProvider === "a2a" || historyProvider === "viveworker"
+    || kind === "moltbook_reply" || kind === "moltbook_draft" || kind === "a2a_task" || kind === "a2a_task_result" || kind === "thread_share";
+  const threadLabel = skipHistoryThreadLabelRewrite
+    ? rawThreadLabel
+    : preferTitleOnlyJsonThreadLabel(rawThreadLabel, threadId, raw.messageText, raw.summary, raw.detailText, raw.message);
   const title =
     cleanText(raw.title ?? "") || (threadLabel ? formatTitle(kindTitle(DEFAULT_LOCALE, kind), threadLabel) : kindTitle(DEFAULT_LOCALE, kind));
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
@@ -2084,6 +2147,11 @@ function normalizeHistoryItem(raw) {
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
     tone: cleanText(raw.tone ?? "") || "secondary",
     provider: normalizeProvider(raw.provider),
+    // Moltbook draft-specific
+    ...(raw.draftType != null ? { draftType: cleanText(raw.draftType) } : {}),
+    // A2A task-specific
+    ...(raw.instruction != null ? { instruction: cleanText(raw.instruction) } : {}),
+    ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
   };
 }
 
@@ -2112,7 +2180,7 @@ function normalizeTimelineEntries(rawItems, maxItems) {
   const deduped = [];
   const seen = new Set();
   const perProviderCount = {};
-  const knownProviders = new Set(["codex", "claude", "moltbook", "a2a"]);
+  const knownProviders = new Set(["codex", "claude", "moltbook", "a2a", "viveworker"]);
   const saturatedProviders = new Set();
   for (const item of normalized) {
     if (seen.has(item.stableId)) {
@@ -2210,8 +2278,10 @@ function normalizeTimelineEntry(raw) {
     (kind === "file_event" ? "" : cleanText(raw.title ?? "")) ||
     "";
   const rawProvider = normalizeProvider(raw.provider);
+  const skipThreadLabelRewrite = rawProvider === "moltbook" || rawProvider === "a2a" || rawProvider === "viveworker"
+    || kind === "moltbook_reply" || kind === "moltbook_draft" || kind === "a2a_task" || kind === "a2a_task_result" || kind === "thread_share";
   const threadLabel =
-    rawProvider === "moltbook"
+    skipThreadLabelRewrite
       ? cleanText(raw.threadLabel ?? "")
       : preferTitleOnlyJsonThreadLabel(
           cleanText(raw.threadLabel ?? ""),
@@ -2269,6 +2339,9 @@ function normalizeTimelineEntry(raw) {
     ...(raw.draftType != null ? { draftType: cleanText(raw.draftType) } : {}),
     ...(raw.submoltName != null ? { submoltName: cleanText(raw.submoltName) } : {}),
     ...(raw.slot != null ? { slot: cleanText(raw.slot) } : {}),
+    // A2A task-specific fields
+    ...(raw.instruction != null ? { instruction: cleanText(raw.instruction) } : {}),
+    ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
   };
 }
 
@@ -3237,8 +3310,19 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     // conversation that should not appear on the user-facing timeline.
     if (/^<(?:task-notification|system-reminder)\b/i.test(text.trim())) continue;
 
-    const kind = type === "user" ? "user_message" : "assistant_final";
-    const stableId = `${kind}:${threadId}:${uuid}`;
+    // Classify assistant messages using Claude's stop_reason:
+    //   "end_turn"  → final answer (like Codex phase "final_answer")
+    //   "tool_use"  → intermediate, about to call tools (commentary)
+    //   null/other  → intermediate thinking (commentary)
+    const stopReason = msg.stop_reason || "";
+    const kind = type === "user"
+      ? "user_message"
+      : stopReason === "end_turn"
+        ? "assistant_final"
+        : "assistant_commentary";
+    // Use kind-independent stableId so re-scans with corrected classification
+    // replace old entries rather than creating duplicates.
+    const stableId = `claude_msg:${threadId}:${uuid}`;
     const entry = normalizeTimelineEntry({
       stableId,
       token: historyToken(stableId),
@@ -3255,6 +3339,46 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     });
     if (entry) {
       dirty = recordTimelineEntry({ config, runtime, state, entry }) || dirty;
+
+      // Also record Claude assistant_final as a history item for the completed list
+      if (kind === "assistant_final") {
+        dirty = recordHistoryItem({
+          config, runtime, state,
+          item: {
+            stableId: entry.stableId,
+            kind: entry.kind,
+            threadId: entry.threadId,
+            title: entry.title,
+            threadLabel: entry.threadLabel,
+            summary: entry.summary,
+            messageText: entry.messageText,
+            createdAtMs: entry.createdAtMs,
+            readOnly: true,
+            provider: "claude",
+          },
+        }) || dirty;
+      }
+
+      // Push notification for Claude final answers (skip during startup replay)
+      if (kind === "assistant_final" && !fileState.startupCutoffMs) {
+        try {
+          await deliverWebPushItem({
+            config,
+            state,
+            kind: "assistant_final",
+            token: entry.token,
+            stableId: entry.stableId,
+            title: threadLabel || "Claude",
+            body: truncate(singleLine(text), 160),
+            buildLocalizedContent: ({ locale }) => ({
+              title: formatLocalizedTitle(locale, "server.title.assistantFinal", threadLabel),
+              body: truncate(singleLine(text), 160),
+            }),
+          });
+        } catch (pushError) {
+          console.error(`[claude-push-error] ${pushError.message}`);
+        }
+      }
     }
   }
 
@@ -3400,6 +3524,29 @@ async function processSqliteTimelineLog({ config, runtime, state, now }) {
           state,
           entry,
         }) || dirty;
+
+      // Also record Codex assistant_final as a history item so it appears
+      // in the completed inbox and supports reply (replaces "completion").
+      if (entry.kind === "assistant_final") {
+        dirty =
+          recordHistoryItem({
+            config,
+            runtime,
+            state,
+            item: {
+              stableId: entry.stableId,
+              kind: entry.kind,
+              threadId: entry.threadId,
+              title: entry.title,
+              threadLabel: entry.threadLabel,
+              summary: entry.summary,
+              messageText: entry.messageText,
+              createdAtMs: entry.createdAtMs,
+              readOnly: true,
+              provider: "codex",
+            },
+          }) || dirty;
+      }
     }
 
     state.sqliteMessageCursorId = cursorId;
@@ -9056,16 +9203,18 @@ function buildPendingInboxItems(runtime, state, config, locale) {
   for (const draft of runtime.moltbookDraftsByToken.values()) {
     if (draft.decision) continue;
     const title = draft.postTitle ? `draft → ${draft.postTitle}` : "Moltbook draft";
+    const draftThreadLabel = draft.postTitle || "Moltbook";
     items.push({
       kind: "moltbook_draft",
       token: draft.token,
       threadId: "moltbook",
-      threadLabel: "Moltbook",
+      threadLabel: draftThreadLabel,
       title,
       summary: draft.contextSummary || String(draft.draftText || "").slice(0, 160),
       primaryLabel: t(locale, "server.action.review"),
       createdAtMs: Number(draft.createdAtMs) || now,
       provider: "moltbook",
+      draftType: draft.draftType || "reply",
     });
   }
 
@@ -9075,7 +9224,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       kind: "a2a_task",
       token: task.token,
       threadId: "a2a",
-      threadLabel: "A2A",
+      threadLabel: cleanText(task.instruction || "").slice(0, 80),
       title: `A2A: ${cleanText(task.instruction || "").slice(0, 80)}`,
       summary: cleanText(task.instruction || "").slice(0, 160),
       primaryLabel: t(locale, "server.action.review"),
@@ -9112,8 +9261,15 @@ function buildPendingInboxItems(runtime, state, config, locale) {
 function buildCompletedInboxItems(runtime, state, config, locale) {
   const items = normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems);
   runtime.recentHistoryItems = items;
+  const completedKinds = new Set(["assistant_final", "approval", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task_result"]);
   return items
-    .filter((item) => cleanText(item?.kind || "") === "completion")
+    .filter((item) => {
+      const k = cleanText(item?.kind || "");
+      if (!completedKinds.has(k)) return false;
+      // Only resolved approvals (readOnly = true)
+      if (k === "approval" && !item.readOnly) return false;
+      return true;
+    })
     .slice()
     .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0))
     .map((item) => ({
@@ -9121,12 +9277,19 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
       token: item.token,
       threadId: cleanText(item.threadId || extractConversationIdFromStableId(item.stableId) || ""),
       threadLabel: item.threadLabel || "",
-      title: item.threadLabel ? formatTitle(kindTitle(locale, item.kind), item.threadLabel) : item.title,
+      title: item.kind === "assistant_final"
+        ? (item.threadLabel ? formatTitle(kindTitle(locale, item.kind), item.threadLabel) : item.title)
+        : (item.kind === "a2a_task_result" && item.instruction)
+          ? cleanText(item.instruction).slice(0, 80)
+          : (item.kind === "moltbook_reply" || item.kind === "moltbook_draft")
+            ? cleanText(item.summary || item.messageText || "").slice(0, 80) || item.title
+            : item.title || kindTitle(locale, item.kind),
       summary: item.summary,
       fileRefs: normalizeTimelineFileRefs(item.fileRefs ?? []),
       primaryLabel: t(locale, "server.action.detail"),
       createdAtMs: item.createdAtMs,
       provider: normalizeProvider(item.provider),
+      ...(item.draftType != null ? { draftType: item.draftType } : {}),
     }));
 }
 
@@ -9480,6 +9643,7 @@ function buildTimelineResponse(runtime, state, config, locale) {
     outcome: entry.outcome || "",
     createdAtMs: entry.createdAtMs,
     provider: normalizeProvider(entry.provider),
+    ...(entry.draftType != null ? { draftType: entry.draftType } : {}),
   }));
 
   return {
@@ -9696,8 +9860,11 @@ function historyItemThreadId(item) {
   return cleanText(item?.threadId || extractConversationIdFromStableId(item?.stableId) || "");
 }
 
-function isLatestCompletionHistoryItem(runtime, item) {
-  if (!runtime || cleanText(item?.kind || "") !== "completion") {
+const REPLYABLE_HISTORY_KINDS = new Set(["assistant_final"]);
+
+function isLatestReplyableHistoryItem(runtime, item) {
+  const itemKind = cleanText(item?.kind || "");
+  if (!runtime || !REPLYABLE_HISTORY_KINDS.has(itemKind)) {
     return false;
   }
 
@@ -9707,14 +9874,24 @@ function isLatestCompletionHistoryItem(runtime, item) {
     return false;
   }
 
-  const latestForThread = runtime.recentHistoryItems.find(
-    (entry) => cleanText(entry?.kind || "") === "completion" && historyItemThreadId(entry) === threadId
-  );
+  // Find the latest replyable item (completion or assistant_final) for this thread
+  // Sort by createdAtMs descending since array order is not guaranteed
+  let latestForThread = null;
+  let latestTs = 0;
+  for (const entry of runtime.recentHistoryItems) {
+    if (!REPLYABLE_HISTORY_KINDS.has(cleanText(entry?.kind || "")) || historyItemThreadId(entry) !== threadId) continue;
+    const ts = Number(entry.createdAtMs) || 0;
+    if (!latestForThread || ts > latestTs) {
+      latestForThread = entry;
+      latestTs = ts;
+    }
+  }
   return cleanText(latestForThread?.token || "") === token;
 }
 
 function findNewerThreadMessageAfterCompletion(runtime, completionItem) {
-  if (!runtime || cleanText(completionItem?.kind || "") !== "completion") {
+  const itemKind = cleanText(completionItem?.kind || "");
+  if (!runtime || !REPLYABLE_HISTORY_KINDS.has(itemKind)) {
     return null;
   }
 
@@ -9740,10 +9917,10 @@ function findNewerThreadMessageAfterCompletion(runtime, completionItem) {
 function buildHistoryDetail(item, locale, runtime = null) {
   const threadId = historyItemThreadId(item);
   const replyEnabled =
-    item.kind === "completion" &&
+    REPLYABLE_HISTORY_KINDS.has(item.kind) &&
     Boolean(threadId) &&
     Boolean(runtime?.ipcClient) &&
-    isLatestCompletionHistoryItem(runtime, item);
+    isLatestReplyableHistoryItem(runtime, item);
   return {
     kind: item.kind,
     token: item.token,
@@ -10197,7 +10374,20 @@ async function handleCompletionReply({
   if (!conversationId) {
     throw new Error("completion-reply-unavailable");
   }
-  if (!isLatestCompletionHistoryItem(runtime, completionItem)) {
+  // For assistant_final, check against timeline entries (avoids maxHistoryItems eviction).
+  // For legacy completion, check against history items.
+  const itemKind = cleanText(completionItem?.kind || "");
+  if (itemKind === "assistant_final") {
+    const itemTs = Number(completionItem.createdAtMs) || 0;
+    const hasNewer = runtime.recentTimelineEntries.some(
+      (e) => e.kind === "assistant_final" &&
+        cleanText(e.threadId || "") === conversationId &&
+        (Number(e.createdAtMs) || 0) > itemTs
+    );
+    if (hasNewer) {
+      throw new Error("completion-reply-unavailable");
+    }
+  } else if (!isLatestReplyableHistoryItem(runtime, completionItem)) {
     throw new Error("completion-reply-unavailable");
   }
   const newerThreadMessage = findNewerThreadMessageAfterCompletion(runtime, completionItem);
@@ -10484,7 +10674,7 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     title: approval.title,
     threadLabel: approval.threadLabel || "",
     messageText: `${approvalDecisionMessage(decision, config.defaultLocale, approval.provider)}\n\n${approval.messageText}`,
-    summary: approvalDecisionMessage(decision, config.defaultLocale, approval.provider),
+    summary: formatNotificationBody(approval.messageText, 160) || approvalDecisionMessage(decision, config.defaultLocale, approval.provider),
     fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
     diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
     diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
@@ -10511,7 +10701,32 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   }
   if (timelineMessageKinds.has(kind)) {
     const entry = timelineEntryByToken(runtime, token, kind);
-    return entry ? buildTimelineMessageDetail(entry, locale, runtime) : null;
+    if (!entry) return null;
+    const detail = buildTimelineMessageDetail(entry, locale, runtime);
+    // Add reply support for Codex assistant_final entries only (replaces completion reply).
+    // Check directly against timeline entries (not history items) to avoid
+    // maxHistoryItems eviction issues.
+    if (kind === "assistant_final") {
+      const entryProvider = normalizeProvider(entry.provider);
+      if (entryProvider === "codex" && runtime?.ipcClient) {
+        const entryThreadId = cleanText(entry.threadId || "");
+        const entryTs = Number(entry.createdAtMs) || 0;
+        let isLatestForThread = true;
+        for (const other of runtime.recentTimelineEntries) {
+          if (other.kind === "assistant_final" &&
+            cleanText(other.threadId || "") === entryThreadId &&
+            (Number(other.createdAtMs) || 0) > entryTs) {
+            isLatestForThread = false;
+            break;
+          }
+        }
+        if (isLatestForThread) {
+          detail.reply = { enabled: true, supportsPlanMode: true, supportsImages: true };
+          detail.provider = entryProvider;
+        }
+      }
+    }
+    return detail;
   }
   if (kind === "approval") {
     const approval = runtime.nativeApprovalsByToken.get(token);
@@ -10614,20 +10829,21 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
     };
   }
 
-  if (kind === "a2a_task") {
-    const task = runtime.a2aTasksByToken.get(token);
+  if (kind === "a2a_task" || kind === "a2a_task_result") {
+    const task = kind === "a2a_task" ? runtime.a2aTasksByToken.get(token) : null;
     const entry = task
       ? null
-      : runtime.recentTimelineEntries.find((e) => e.kind === "a2a_task" && e.token === token);
+      : runtime.recentTimelineEntries.find((e) => e.kind === kind && e.token === token);
     const source = task || entry;
     if (!source) return null;
-    const instruction = task ? task.instruction : entry.messageText || entry.summary || "";
+    const instruction = task ? task.instruction : entry.instruction || entry.summary || "";
+    const responseText = kind === "a2a_task_result" && !task ? entry.messageText || "" : "";
     const messageHtml = escapeHtml(instruction)
       .split("\n")
       .map((line) => `<p>${line}</p>`)
       .join("");
     return {
-      kind: "a2a_task",
+      kind,
       token,
       threadId: "a2a",
       threadLabel: "A2A",
@@ -10636,8 +10852,9 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
       messageHtml,
       provider: "a2a",
       instruction,
+      messageText: responseText,
       taskId: task?.id || "",
-      taskStatus: task?.status || entry?.taskStatus || "unknown",
+      taskStatus: task?.status || entry?.taskStatus || (kind === "a2a_task_result" ? "completed" : "submitted"),
       callerInfo: task?.callerInfo || {},
       createdAtMs: source.createdAtMs || Date.now(),
       readOnly: !task || task.status !== "submitted",
@@ -10942,14 +11159,25 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         const action = String(body.action || "") === "approve" ? "approve" : "deny";
         const instruction = cleanText(body.instruction || "");
+        const requestedExecutor = cleanText(body.executor || "");
         resolveA2ATaskDecision(task, { action, instruction });
 
         if (action === "approve") {
-          // Execute task asynchronously via Codex
+          // Resolve which executor to use.
+          const available = runtime.a2aAvailableExecutors || { codex: false, claude: false };
+          const preference = requestedExecutor || state.a2aExecutorPreference || "ask";
+          let executor;
+          if (preference === "codex" && available.codex) executor = "codex";
+          else if (preference === "claude" && available.claude) executor = "claude";
+          else if (available.codex) executor = "codex";
+          else if (available.claude) executor = "claude";
+          else executor = "codex"; // fallback
+
+          // Execute task asynchronously
           (async () => {
             try {
               const { executeA2ATask } = await import("./a2a-executor.mjs");
-              await executeA2ATask(task, config, runtime, state, { recordTimelineEntry, saveState });
+              await executeA2ATask(task, config, runtime, state, { recordTimelineEntry, saveState }, executor);
             } catch (error) {
               console.error(`[a2a-execute-error] ${error.message}`);
               failA2ATask(task, error.message);
@@ -11165,6 +11393,24 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, { ok: true, enabled });
       }
 
+      if (url.pathname === "/api/settings/a2a-executor" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let payload;
+        try {
+          payload = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const valid = new Set(["auto", "codex", "claude", "ask"]);
+        const preference = valid.has(payload?.preference) ? payload.preference : "auto";
+        if (state.a2aExecutorPreference !== preference) {
+          state.a2aExecutorPreference = preference;
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, { ok: true, preference });
+      }
+
       if (url.pathname === "/api/moltbook/scout-status" && req.method === "GET") {
         const session = requireApiSession(req, res, config, state);
         if (!session) {
@@ -11217,7 +11463,33 @@ function createNativeApprovalServer({ config, runtime, state }) {
           userId: config.a2aRelayUserId,
           relayUrl: config.a2aRelayUrl,
           apiKeyConfigured: Boolean(config.a2aApiKey),
+          acceptPublicTasks: config.a2aAcceptPublicTasks === true,
         });
+      }
+
+      // Toggle acceptPublicTasks on the A2A relay.
+      if (url.pathname === "/api/a2a/public-tasks" && req.method === "POST") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const body = await parseJsonBody(req);
+        const accept = body?.accept === true;
+        config.a2aAcceptPublicTasks = accept;
+        state.a2aAcceptPublicTasks = accept;
+        try {
+          await saveState(config.stateFile, state);
+        } catch (error) {
+          console.error(`[a2a-public-tasks-save] ${error.message}`);
+        }
+        // Re-register with relay to propagate the flag.
+        if (config.a2aRelayUrl && config.a2aRelayUserId) {
+          try {
+            await updatePublicTasksFlag({ config, buildAgentCard, acceptPublicTasks: accept });
+            console.log(`[a2a-relay] acceptPublicTasks updated to ${accept}`);
+          } catch (error) {
+            console.error(`[a2a-relay-public-update] ${error.message}`);
+          }
+        }
+        return writeJson(res, 200, { ok: true, acceptPublicTasks: accept });
       }
 
       // ─── Thread sharing ──────────────────────────────────────────────
@@ -12074,10 +12346,12 @@ function createNativeApprovalServer({ config, runtime, state }) {
       // ---------------------------------------------------------------
       // Moltbook scout draft channel
       //
-      // The standalone scout CLI (`viveworker moltbook propose`) submits
-      // a draft reply via POST /api/providers/moltbook/draft, then long-
-      // polls /api/providers/moltbook/draft/:token/decision until the
-      // phone responds via POST /api/items/moltbook-draft/:token/decision.
+      // The CLI submits a draft via POST /api/providers/moltbook/draft
+      // and exits immediately (fire-and-forget).  The draft is persisted
+      // to ~/.viveworker/moltbook-drafts/ and survives bridge restarts.
+      // When the phone approves via POST /api/items/moltbook-draft/:token/decision,
+      // the bridge posts to the Moltbook API and solves the verification
+      // puzzle inline.
       // ---------------------------------------------------------------
 
       if (url.pathname === "/api/providers/moltbook/draft" && req.method === "POST") {
@@ -12110,6 +12384,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const postBody = typeof body.postBody === "string" ? body.postBody : "";
         const intent = typeof body.intent === "string" ? body.intent : "";
         const slot = cleanText(body.slot || "");
+        const ttlMs = Math.max(60000, Math.min(Number(body.ttlMs) || 86400000, 86400000));
         const draft = {
           token,
           sourceId,
@@ -12125,11 +12400,13 @@ function createNativeApprovalServer({ config, runtime, state }) {
           intent,
           slot,
           contextSummary,
+          ttlMs,
           createdAtMs: Date.now(),
           decisionWaiters: [],
           decision: null,
         };
         runtime.moltbookDraftsByToken.set(token, draft);
+        await writeDraft(draft).catch((e) => console.error(`[moltbook-draft-persist] ${e.message}`));
         try {
           recordTimelineEntry({
             config,
@@ -12140,7 +12417,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
               token,
               kind: "moltbook_draft",
               threadId: "moltbook",
-              threadLabel: "Moltbook",
+              threadLabel: postTitle || "Moltbook",
               title: draftType === "original_post"
                 ? (postTitle || "Moltbook new post")
                 : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
@@ -12258,9 +12535,33 @@ function createNativeApprovalServer({ config, runtime, state }) {
             // ignore
           }
         }
-        // Keep the entry in moltbookDraftsByToken briefly so a slow long-
-        // poll can still pick it up; sweeper below removes it after 2min.
-        setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120 * 1000).unref?.();
+        // Persist decision to disk.
+        await writeDraft(draft).catch((e) => console.error(`[moltbook-draft-persist-decision] ${e.message}`));
+
+        if (action === "approve") {
+          // Execute posting asynchronously — fire-and-forget from the HTTP handler.
+          (async () => {
+            try {
+              await executeMoltbookDraftPost(draft, config, runtime, state);
+            } catch (postError) {
+              console.error(`[moltbook-draft-post-error] ${postError.message}`);
+              try {
+                await deliverWebPushItem({
+                  config, state, kind: "moltbook_draft", token: draft.token,
+                  stableId: `moltbook_draft_failed:${draft.sourceId}`,
+                  title: "Draft post failed",
+                  body: String(postError.message || "").slice(0, 160),
+                });
+              } catch { /* ignore push error */ }
+            }
+            await deleteDraft(token).catch(() => {});
+            setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120_000).unref?.();
+          })();
+        } else {
+          // Deny — clean up.
+          await deleteDraft(token).catch(() => {});
+          setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120_000).unref?.();
+        }
         return writeJson(res, 200, { ok: true, action });
       }
 
@@ -12326,15 +12627,19 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, detail);
       }
 
-      const apiCompletionReplyMatch = url.pathname.match(/^\/api\/items\/completion\/([^/]+)\/reply$/u);
+      const apiCompletionReplyMatch = url.pathname.match(/^\/api\/items\/(completion|assistant_final)\/([^/]+)\/reply$/u);
       if (apiCompletionReplyMatch && req.method === "POST") {
         const session = requireMutatingApiSession(req, res, config, state);
         if (!session) {
           return;
         }
 
-        const token = decodeURIComponent(apiCompletionReplyMatch[1]);
-        const completionItem = historyItemByToken(runtime, "completion", token);
+        const replyKind = apiCompletionReplyMatch[1];
+        const token = decodeURIComponent(apiCompletionReplyMatch[2]);
+        // Try history items first, fall back to timeline entries for assistant_final
+        // (history items may be evicted by maxHistoryItems limit)
+        const completionItem = historyItemByToken(runtime, replyKind, token)
+          || (replyKind === "assistant_final" ? timelineEntryByToken(runtime, token, replyKind) : null);
         if (!completionItem) {
           return writeJson(res, 404, { error: "item-not-found" });
         }
@@ -14204,6 +14509,105 @@ function readMoltbookEnvKey() {
   return "";
 }
 
+// Post an approved Moltbook draft (reply or original post), solve the
+// verification puzzle, and update scout state.  Called asynchronously from
+// the decision handler.
+async function executeMoltbookDraftPost(draft, config, runtime, state) {
+  if (!config.moltbookApiKey) throw new Error("MOLTBOOK_API_KEY not configured");
+  const mb = createMoltbookClient(config.moltbookApiKey);
+
+  const finalText = draft.decision.text || draft.draftText;
+  const finalTitle = draft.decision.title || draft.postTitle;
+
+  let verification;
+
+  if (draft.draftType === "original_post") {
+    const result = await mb("/posts", {
+      method: "POST",
+      body: JSON.stringify({
+        submolt_name: draft.submoltName,
+        submolt: draft.submoltName,
+        title: finalTitle,
+        content: finalText,
+      }),
+    });
+    const post = result?.post || null;
+    verification = post?.verification || null;
+    console.log(`[moltbook-draft-post] Posted original post (id=${post?.id})`);
+
+    const scoutState = rollScoutDayIfNeeded(await readScoutState());
+    recordComposeAttempt(scoutState, finalTitle, post?.id);
+    await writeScoutState(scoutState);
+  } else {
+    const result = await mb(`/posts/${draft.postId}/comments`, {
+      method: "POST",
+      body: JSON.stringify({
+        content: finalText,
+        ...(draft.parentCommentId ? { parent_id: draft.parentCommentId } : {}),
+      }),
+    });
+    const comment = result?.comment || null;
+    verification = comment?.verification || null;
+    console.log(`[moltbook-draft-post] Posted reply (commentId=${comment?.id}) to post ${draft.postId}`);
+
+    const scoutState = rollScoutDayIfNeeded(await readScoutState());
+    scoutState.sentToday += 1;
+    markPostSeen(scoutState, draft.postId, "published");
+    await writeScoutState(scoutState);
+  }
+
+  // Solve verification puzzle if present.
+  if (verification) {
+    let answer = solveVerificationPuzzle(verification.challenge_text);
+    const source = answer != null ? "solver" : null;
+    if (answer == null) {
+      answer = await solvePuzzleWithLLM(verification.challenge_text);
+    }
+    if (answer != null) {
+      try {
+        await mb("/verify", {
+          method: "POST",
+          body: JSON.stringify({ verification_code: verification.verification_code, answer }),
+        });
+        console.log(`[moltbook-draft-verify] Verified with answer ${answer}`);
+      } catch (verifyError) {
+        // Wrong answer from solver — retry with LLM.
+        if (/incorrect/i.test(verifyError.message) && source === "solver") {
+          const llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
+          if (llmAnswer && llmAnswer !== answer) {
+            try {
+              await mb("/verify", {
+                method: "POST",
+                body: JSON.stringify({ verification_code: verification.verification_code, answer: llmAnswer }),
+              });
+              console.log(`[moltbook-draft-verify] Verified with LLM retry answer ${llmAnswer}`);
+            } catch (retryError) {
+              console.error(`[moltbook-draft-verify] LLM retry failed: ${retryError.message}`);
+            }
+          }
+        } else {
+          console.error(`[moltbook-draft-verify] Failed: ${verifyError.message}`);
+        }
+      }
+    } else {
+      console.error(`[moltbook-draft-verify] Could not solve puzzle for draft ${draft.token}`);
+    }
+  }
+
+  // Push notification for successful post.
+  try {
+    const pushTitle = draft.draftType === "original_post" ? finalTitle : `Reply → ${draft.postTitle || "Moltbook"}`;
+    await deliverWebPushItem({
+      config, state, kind: "moltbook_draft", token: draft.token,
+      stableId: `moltbook_draft_posted:${draft.sourceId}`,
+      title: "Moltbook posted",
+      body: truncate(singleLine(pushTitle), 160),
+    });
+  } catch { /* ignore push error */ }
+
+  console.log(`[moltbook-draft] Successfully posted draft ${draft.token} (type=${draft.draftType})`);
+}
+
 function buildConfig(cli) {
   const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
   const stateFile = resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json"));
@@ -14489,6 +14893,7 @@ async function loadState(stateFile) {
       pairingConsumedAt: Number(parsed.pairingConsumedAt) || 0,
       pairingConsumedCredential: cleanText(parsed.pairingConsumedCredential ?? ""),
       claudeAwayMode: parsed.claudeAwayMode === true,
+      a2aAcceptPublicTasks: parsed.a2aAcceptPublicTasks === true,
     };
   } catch {
     return {
@@ -15034,11 +15439,17 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
 
   const nextHistoryItems = normalizeHistoryItems(
     runtime.recentHistoryItems.map((item) => {
+      // Moltbook / A2A / thread-share entries carry their own titles — skip relabel.
+      const itemKind = item.kind || "";
+      if (itemKind === "moltbook_reply" || itemKind === "moltbook_draft" || itemKind === "a2a_task" || itemKind === "a2a_task_result" || itemKind === "thread_share") {
+        return item;
+      }
       const conversationId = extractConversationIdFromStableId(item.stableId);
       if (!conversationId) {
         return item;
       }
-      const nativeThreadLabel = getNativeThreadLabel({
+      const claudeTitle = runtime.claudeSessionTitles.get(conversationId) || "";
+      const nativeThreadLabel = claudeTitle || getNativeThreadLabel({
         runtime,
         conversationId,
         cwd: "",
@@ -15069,10 +15480,10 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
 
   const nextTimelineEntries = normalizeTimelineEntries(
     runtime.recentTimelineEntries.map((entry) => {
-      // Moltbook entries carry their own author-provided title/threadLabel
-      // (e.g. "@broanbot commented"). Skip the native-thread relabel pass so
-      // we don't overwrite them with the UUID-head fallback.
-      if (normalizeProvider(entry.provider) === "moltbook") {
+      // Moltbook / A2A / thread-share entries carry their own titles.
+      // Skip the native-thread relabel pass so we don't overwrite them.
+      const entryKind = entry.kind || "";
+      if (entryKind === "moltbook_reply" || entryKind === "moltbook_draft" || entryKind === "a2a_task" || entryKind === "a2a_task_result" || entryKind === "thread_share") {
         return entry;
       }
       const threadId = cleanText(entry.threadId || "");
@@ -15651,6 +16062,7 @@ async function main() {
 
     // --- A2A Relay ---
     if (config.a2aRelayUrl && config.a2aRelayUserId) {
+      config.a2aAcceptPublicTasks = state.a2aAcceptPublicTasks === true;
       const regResult = await registerWithRelay({ config, buildAgentCard });
       if (regResult.ok) {
         startRelayPolling({

@@ -31,6 +31,8 @@ import {
   rollScoutDayIfNeeded,
   markPostSeen,
   recordComposeAttempt,
+  solveVerificationPuzzle,
+  solvePuzzleWithLLM,
 } from "./moltbook-api.mjs";
 
 function fail(message, code = 1) {
@@ -486,7 +488,7 @@ async function cmdPropose(postId, flags) {
   if (!postId) fail("usage: viveworker moltbook propose <postId> --text \"...\"");
   const text = typeof flags.text === "string" ? flags.text : "";
   if (!text.trim()) fail("--text is required and must be non-empty");
-  const timeoutSec = Number(flags.timeout) || 900;
+  const ttlSec = Number(flags.ttl) || Number(flags.timeout) || 86400;
   const parentCommentId = typeof flags["parent-id"] === "string" ? flags["parent-id"] : "";
   const postTitle = typeof flags.title === "string" ? flags.title : "";
   const postBody = typeof flags["post-body"] === "string" ? flags["post-body"] : "";
@@ -504,7 +506,8 @@ async function cmdPropose(postId, flags) {
 
   const sourceId = `draft:${postId}:${Date.now()}`;
 
-  // 1. Submit draft to bridge.
+  // Submit draft to bridge. The bridge persists it to disk and handles posting
+  // on approval — the CLI exits immediately (fire-and-forget).
   let submitRes;
   try {
     const r = await fetch(`${base}/api/providers/moltbook/draft`, {
@@ -520,6 +523,7 @@ async function cmdPropose(postId, flags) {
         parentCommentId,
         intent,
         draftText: text,
+        ttlMs: ttlSec * 1000,
         contextSummary: truncate(intent || text, 160),
       }),
     });
@@ -534,301 +538,8 @@ async function cmdPropose(postId, flags) {
   const token = submitRes?.token;
   if (!token) fail(`bridge did not return a token: ${JSON.stringify(submitRes)}`);
 
-  console.log(`propose: draft submitted (token=${token}); waiting for phone decision (timeout=${timeoutSec}s)`);
-
-  // 2. Long-poll decision.
-  const deadline = Date.now() + timeoutSec * 1000;
-  let decision = null;
-  while (Date.now() < deadline && !decision) {
-    const remain = Math.min(60, Math.ceil((deadline - Date.now()) / 1000));
-    try {
-      const r = await fetch(
-        `${base}/api/providers/moltbook/draft/${encodeURIComponent(token)}/decision?wait=${remain}`,
-        {
-          method: "GET",
-          headers: { "x-viveworker-hook-secret": secret },
-        }
-      );
-      if (r.ok) {
-        const body = await r.json();
-        if (body && body.status === "decided") decision = body;
-      }
-    } catch {
-      // transient — retry
-    }
-  }
-
-  if (!decision) {
-    console.log("propose: timed out waiting for phone decision — treating as deny");
-    process.exit(2);
-  }
-
-  if (decision.action === "deny") {
-    console.log(`propose: denied by phone${decision.reason ? ` (${decision.reason})` : ""}`);
-    process.exit(1);
-  }
-
-  // 3. Approve path: use the (possibly edited) text to actually post.
-  const finalText = decision.text || text;
-  const { mb } = await getClient();
-  const result = await mb(`/posts/${postId}/comments`, {
-    method: "POST",
-    body: JSON.stringify({
-      content: finalText,
-      ...(parentCommentId ? { parent_id: parentCommentId } : {}),
-    }),
-  });
-  const comment = result?.comment || null;
-  const verification = comment?.verification || null;
-
-  console.log(
-    JSON.stringify(
-      { ok: true, postId, action: "posted", commentId: comment?.id, verification },
-      null,
-      2
-    )
-  );
-
-  // Bump sentToday counter immediately after posting (before verification),
-  // because the comment is already created and rate-limits are consumed
-  // regardless of verification outcome.
-  const state = rollScoutDayIfNeeded(await readScoutState());
-  state.sentToday += 1;
-  markPostSeen(state, postId, "published");
-  await writeScoutState(state);
-
-  if (!verification) {
-    console.log("propose: no verification challenge returned — done");
-    return;
-  }
-
-  // 4. Solve verification puzzle inline (try naive solver, then LLM fallback, retry once on wrong answer).
-  let answer = solveVerificationPuzzle(verification.challenge_text);
-  const source = answer != null ? "solver" : "skip";
-  console.log(`propose: verification puzzle — solver answer: ${answer ?? "(null)"}`);
-
-  // If solver couldn't parse, try LLM fallback.
-  if (answer == null) {
-    answer = await solvePuzzleWithLLM(verification.challenge_text);
-    if (answer) console.log(`propose: LLM fallback answer: ${answer}`);
-  }
-
-  if (answer == null) {
-    console.log("");
-    console.log("VERIFICATION REQUIRED (solver + LLM both failed):");
-    console.log(`  verification_code: ${verification.verification_code}`);
-    console.log(`  challenge_text:    ${verification.challenge_text}`);
-    console.log("");
-    console.log("Solve manually and run:");
-    console.log(`  viveworker moltbook verify ${verification.verification_code} <answer>`);
-    return;
-  }
-
-  let verifyRes;
-  try {
-    verifyRes = await mb(`/verify`, {
-      method: "POST",
-      body: JSON.stringify({ verification_code: verification.verification_code, answer }),
-    });
-  } catch (verifyError) {
-    // Wrong answer — retry with LLM if the first attempt was from solver.
-    const isWrongAnswer = /incorrect/i.test(verifyError.message);
-    if (isWrongAnswer && source === "solver") {
-      console.log(`propose: solver answer ${answer} was wrong, trying LLM fallback`);
-      const llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
-      if (llmAnswer && llmAnswer !== answer) {
-        console.log(`propose: LLM retry answer: ${llmAnswer}`);
-        try {
-          verifyRes = await mb(`/verify`, {
-            method: "POST",
-            body: JSON.stringify({ verification_code: verification.verification_code, answer: llmAnswer }),
-          });
-          answer = llmAnswer;
-        } catch (retryError) {
-          console.log(`propose: LLM retry also failed: ${retryError.message}`);
-          return;
-        }
-      } else {
-        console.log(`propose: LLM couldn't produce a different answer`);
-        return;
-      }
-    } else {
-      console.log(`propose: verify failed: ${verifyError.message}`);
-      return;
-    }
-  }
-  console.log(JSON.stringify({ ok: true, verify: verifyRes, answer }, null, 2));
-
+  console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
-}
-
-// LLM-based verification puzzle solver. Shells out to claude or codex CLI.
-// Returns the answer as "XX.XX" string, or null if unavailable.
-async function solvePuzzleWithLLM(challengeText) {
-  if (!challengeText) return null;
-  const prompt =
-    `The following text is an obfuscated arithmetic word problem from Moltbook (an AI social network). ` +
-    `The text has random capitalization, doubled letters, and stray punctuation — ignore all of that. ` +
-    `CRITICAL: ALL symbols (/, *, ^, ~, [, ], etc.) are NOISE, NOT arithmetic operators. ` +
-    `The operation is ALWAYS expressed in natural language words only. ` +
-    `Extract the numbers (written as words like "thirty five" = 35), determine the operation from WORDS ONLY ` +
-    `(addition: "total", "combined", "and", "plus", "gains", "new velocity"; ` +
-    `subtraction: "difference", "minus", "less", "loses"; ` +
-    `multiplication: "times", "product", "multiplied"; ` +
-    `division: "divided by", "ratio", "per"). ` +
-    `If no operation word is found, default to addition. ` +
-    `Compute the result and output ONLY the number with exactly 2 decimal places (e.g. "58.00"). No other text.\n\n` +
-    `Puzzle: ${challengeText}`;
-
-  // Try claude first, then codex.
-  for (const cmd of ["claude", "codex"]) {
-    let bin;
-    try {
-      bin = await new Promise((resolve) => {
-        const p = spawn("command", ["-v", cmd], { shell: "/bin/bash", stdio: ["ignore", "pipe", "ignore"] });
-        let out = "";
-        p.stdout.on("data", (d) => (out += d.toString()));
-        p.on("exit", (code) => resolve(code === 0 ? out.trim() : ""));
-        p.on("error", () => resolve(""));
-      });
-    } catch { bin = ""; }
-    if (!bin) continue;
-
-    const args = cmd === "claude" ? ["-p", prompt, "--output-format", "text"] : ["exec", prompt];
-    try {
-      const result = await new Promise((resolve, reject) => {
-        const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], timeout: 30000 });
-        let out = "";
-        p.stdout.on("data", (d) => (out += d.toString()));
-        p.on("exit", (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`exit ${code}`))));
-        p.on("error", reject);
-      });
-      // Extract the number from output (LLM might add extra text).
-      const match = result.match(/(\d+\.\d{2})/);
-      if (match) return match[1];
-      // Try integer and append .00
-      const intMatch = result.match(/^(\d+)$/m);
-      if (intMatch) return `${intMatch[1]}.00`;
-    } catch {
-      // try next
-    }
-  }
-  return null;
-}
-
-// Naive verification-puzzle solver. Handles the obfuscated two-number
-// arithmetic Moltbook currently uses (add / subtract / multiply). Returns
-// `null` if it can't confidently solve — caller falls back to manual.
-function solveVerificationPuzzle(challengeText) {
-  if (!challengeText) return null;
-  // Strip ALL symbolic characters as noise — operations are expressed in
-  // natural language only ("and", "times", "divided by", etc.).  Previous
-  // regex missed `*` and `@` which caused `/` or `*` to be mistaken for
-  // arithmetic operators.
-  const cleaned = String(challengeText)
-    .replace(/[^a-zA-Z0-9\s]/g, " ")
-    .toLowerCase();
-  const numberWords = {
-    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
-    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
-    seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50,
-    sixty: 60, seventy: 70, eighty: 80, ninety: 90, hundred: 100,
-  };
-  // Tokenize loosely by collapsing whitespace. Words sometimes have stray
-  // characters (e.g. "tw eLvE") so strip non-letters between word fragments.
-  // Moltbook's obfuscator randomly doubles letters ("tWeNnTy" → "twennty"),
-  // so try matching both the raw word and a version with collapsed runs.
-  // We can't blindly collapse because natural doubles exist ("three" has "ee").
-  const collapseRuns = (w) => w.replace(/([a-z])\1+/g, "$1");
-  const rawTokens = cleaned
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-
-  // The obfuscator inserts spaces mid-word (e.g. "th ree" → "three",
-  // "to tal" → "total"). Greedily merge adjacent tokens if the combined
-  // form (raw or collapsed) matches a known number word or operation keyword.
-  const operationWords = new Set([
-    "total", "combined", "force", "velocity", "speed", "gains", "plus", "and",
-    "subtract", "minus", "less", "difference", "decreased", "loses", "lost", "slower", "slows", "slowed",
-    "multiply", "times", "product", "multiplied",
-    "divide", "divided", "ratio",
-    "how", "much", "what", "exerts", "new",
-  ]);
-  const isKnown = (w) => numberWords[w] != null || numberWords[collapseRuns(w)] != null || operationWords.has(w) || operationWords.has(collapseRuns(w));
-  const merged = [];
-  let ti = 0;
-  while (ti < rawTokens.length) {
-    // Try merging up to 4 consecutive tokens.
-    let best = rawTokens[ti];
-    let bestLen = 1;
-    let candidate = rawTokens[ti];
-    for (let span = 2; span <= Math.min(4, rawTokens.length - ti); span++) {
-      candidate += rawTokens[ti + span - 1];
-      if (isKnown(candidate) || isKnown(collapseRuns(candidate))) {
-        best = candidate;
-        bestLen = span;
-      }
-    }
-    merged.push(best);
-    ti += bestLen;
-  }
-
-  // For each word, prefer the raw form if it's in the dictionary; otherwise try collapsed.
-  const words = merged.map((w) => {
-    if (/^\d+$/.test(w)) return w;
-    if (numberWords[w] != null) return w;
-    const collapsed = collapseRuns(w);
-    if (numberWords[collapsed] != null) return collapsed;
-    return collapsed; // default to collapsed for non-number words (operation keywords etc.)
-  });
-
-  // Reconstruct compound numbers like "twenty three" → 23, "one hundred
-  // twenty" → 120.
-  const numbers = [];
-  let i = 0;
-  while (i < words.length) {
-    const w = words[i];
-    if (/^\d+$/.test(w)) {
-      numbers.push(Number(w));
-      i += 1;
-      continue;
-    }
-    if (numberWords[w] != null) {
-      let total = numberWords[w];
-      i += 1;
-      while (i < words.length && numberWords[words[i]] != null) {
-        const next = numberWords[words[i]];
-        if (next === 100) total *= 100;
-        else if (next < 100 && total < 100) total += next;
-        else break;
-        i += 1;
-      }
-      numbers.push(total);
-      continue;
-    }
-    i += 1;
-  }
-
-  if (numbers.length < 2) return null;
-  const a = numbers[0];
-  const b = numbers[1];
-
-  const hasWord = (w) => words.includes(w);
-  const hasAny = (...ws) => ws.some(hasWord);
-  let result;
-  if (hasAny("subtract", "minus", "less", "difference", "decreased", "loses", "lost", "slower", "slows", "slowed")) {
-    result = a - b;
-  } else if (hasAny("multiply", "times", "product", "multiplied")) {
-    result = a * b;
-  } else if (hasAny("divide", "divided", "ratio")) {
-    result = b !== 0 ? a / b : a;
-  } else {
-    // Default to addition — the Moltbook puzzles overwhelmingly ask for
-    // "total force", "new speed", "combined", "gains", etc.
-    result = a + b;
-  }
-  return result.toFixed(2);
 }
 
 async function cmdMarkScoutSeen(postId) {
@@ -1153,7 +864,7 @@ async function cmdComposePropose(flags) {
   const submolt = typeof flags.submolt === "string" ? flags.submolt : "general";
   const intent = typeof flags.intent === "string" ? flags.intent : "";
   const slot = typeof flags.slot === "string" ? flags.slot : "";
-  const timeoutSec = Number(flags.timeout) || 900;
+  const ttlSec = Number(flags.ttl) || Number(flags.timeout) || 86400;
   if (!title.trim()) fail("--title is required");
   if (!content.trim()) fail("--content is required");
 
@@ -1167,7 +878,8 @@ async function cmdComposePropose(flags) {
 
   const sourceId = `compose:${Date.now()}`;
 
-  // 1. Submit draft to bridge.
+  // Submit draft to bridge. The bridge persists it to disk and handles posting
+  // on approval — the CLI exits immediately (fire-and-forget).
   let submitRes;
   try {
     const r = await fetch(`${base}/api/providers/moltbook/draft`, {
@@ -1182,6 +894,7 @@ async function cmdComposePropose(flags) {
         submoltName: submolt,
         intent,
         slot,
+        ttlMs: ttlSec * 1000,
         contextSummary: truncate(intent || content, 160),
       }),
     });
@@ -1196,105 +909,7 @@ async function cmdComposePropose(flags) {
   const token = submitRes?.token;
   if (!token) fail(`bridge did not return a token: ${JSON.stringify(submitRes)}`);
 
-  console.log(`compose-propose: draft submitted (token=${token}); waiting for decision (timeout=${timeoutSec}s)`);
-
-  // 2. Long-poll decision.
-  const deadline = Date.now() + timeoutSec * 1000;
-  let decision = null;
-  while (Date.now() < deadline && !decision) {
-    const remain = Math.min(60, Math.ceil((deadline - Date.now()) / 1000));
-    try {
-      const r = await fetch(
-        `${base}/api/providers/moltbook/draft/${encodeURIComponent(token)}/decision?wait=${remain}`,
-        { method: "GET", headers: { "x-viveworker-hook-secret": secret } }
-      );
-      if (r.ok) {
-        const body = await r.json();
-        if (body && body.status === "decided") decision = body;
-      }
-    } catch { /* transient — retry */ }
-  }
-
-  if (!decision) {
-    console.log("compose-propose: timed out — treating as deny");
-    process.exit(2);
-  }
-  if (decision.action === "deny") {
-    console.log("compose-propose: denied by phone");
-    process.exit(1);
-  }
-
-  // 3. Approve path: create original post.
-  const finalTitle = decision.title || title;
-  const finalContent = decision.text || content;
-  const { mb } = await getClient();
-  const result = await mb(`/posts`, {
-    method: "POST",
-    body: JSON.stringify({
-      submolt_name: submolt,
-      submolt,
-      title: finalTitle,
-      content: finalContent,
-    }),
-  });
-  const post = result?.post || null;
-  const verification = post?.verification || null;
-
-  console.log(JSON.stringify({ ok: true, action: "posted", postId: post?.id, verification }, null, 2));
-
-  if (!verification) {
-    console.log("compose-propose: no verification — done");
-  } else {
-    // Solve verification puzzle inline (try naive solver, then LLM fallback, retry once on wrong answer).
-    let answer = solveVerificationPuzzle(verification.challenge_text);
-    const source = answer != null ? "solver" : "skip";
-    console.log(`compose-propose: verification puzzle — solver answer: ${answer ?? "(null)"}`);
-
-    if (answer == null) {
-      answer = await solvePuzzleWithLLM(verification.challenge_text);
-      if (answer) console.log(`compose-propose: LLM fallback answer: ${answer}`);
-    }
-
-    if (answer == null) {
-      console.log(`VERIFICATION REQUIRED (solver + LLM both failed):\n  verification_code: ${verification.verification_code}\n  challenge_text: ${verification.challenge_text}`);
-    } else {
-      try {
-        const verifyRes = await mb(`/verify`, {
-          method: "POST",
-          body: JSON.stringify({ verification_code: verification.verification_code, answer }),
-        });
-        console.log(JSON.stringify({ ok: true, verify: verifyRes, answer }, null, 2));
-      } catch (verifyError) {
-        const isWrongAnswer = /incorrect/i.test(verifyError.message);
-        if (isWrongAnswer && source === "solver") {
-          console.log(`compose-propose: solver answer ${answer} was wrong, trying LLM fallback`);
-          const llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
-          if (llmAnswer && llmAnswer !== answer) {
-            console.log(`compose-propose: LLM retry answer: ${llmAnswer}`);
-            try {
-              const verifyRes2 = await mb(`/verify`, {
-                method: "POST",
-                body: JSON.stringify({ verification_code: verification.verification_code, answer: llmAnswer }),
-              });
-              console.log(JSON.stringify({ ok: true, verify: verifyRes2, answer: llmAnswer }, null, 2));
-            } catch (retryError) {
-              console.log(`compose-propose: LLM retry also failed: ${retryError.message}`);
-            }
-          } else {
-            console.log(`compose-propose: LLM couldn't produce a different answer`);
-          }
-        } else {
-          console.log(`compose-propose: verify failed: ${verifyError.message}`);
-        }
-      }
-    }
-  }
-
-  // 4. Bump compose counter.
-  const state = rollScoutDayIfNeeded(await readScoutState());
-  recordComposeAttempt(state, finalTitle, post?.id);
-  await writeScoutState(state);
-
+  console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
 }
 
