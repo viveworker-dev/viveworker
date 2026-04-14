@@ -11162,6 +11162,15 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const requestedExecutor = cleanText(body.executor || "");
         resolveA2ATaskDecision(task, { action, instruction });
 
+        // Update task stats.
+        if (!state.a2aTaskStats) state.a2aTaskStats = { received: 0, completed: 0, denied: 0 };
+        if (action === "approve") {
+          state.a2aTaskStats.completed += 1;
+        } else {
+          state.a2aTaskStats.denied += 1;
+        }
+        saveState(config.stateFile, state).catch(() => {});
+
         if (action === "approve") {
           // Resolve which executor to use.
           const available = runtime.a2aAvailableExecutors || { codex: false, claude: false };
@@ -11177,7 +11186,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           (async () => {
             try {
               const { executeA2ATask } = await import("./a2a-executor.mjs");
-              await executeA2ATask(task, config, runtime, state, { recordTimelineEntry, saveState }, executor);
+              await executeA2ATask(task, config, runtime, state, { recordTimelineEntry, recordHistoryItem, saveState, deliverWebPushItem }, executor);
             } catch (error) {
               console.error(`[a2a-execute-error] ${error.message}`);
               failA2ATask(task, error.message);
@@ -11454,6 +11463,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           return writeJson(res, 200, { enabled: false });
         }
         const relay = getRelayStatus();
+        const stats = state.a2aTaskStats || { received: 0, completed: 0, denied: 0 };
         return writeJson(res, 200, {
           enabled: true,
           connected: relay.polling && relay.lastPollOk,
@@ -11464,6 +11474,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           relayUrl: config.a2aRelayUrl,
           apiKeyConfigured: Boolean(config.a2aApiKey),
           acceptPublicTasks: config.a2aAcceptPublicTasks === true,
+          taskStats: stats,
         });
       }
 
@@ -14536,7 +14547,7 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     console.log(`[moltbook-draft-post] Posted original post (id=${post?.id})`);
 
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
-    recordComposeAttempt(scoutState, finalTitle, post?.id);
+    recordComposeAttempt(scoutState, finalTitle, post?.id, "post");
     await writeScoutState(scoutState);
   } else {
     const result = await mb(`/posts/${draft.postId}/comments`, {
@@ -14553,6 +14564,7 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
     scoutState.sentToday += 1;
     markPostSeen(scoutState, draft.postId, "published");
+    recordComposeAttempt(scoutState, draft.postTitle || draft.postId, draft.postId, "reply");
     await writeScoutState(scoutState);
   }
 

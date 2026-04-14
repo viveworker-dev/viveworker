@@ -14,6 +14,67 @@ import { completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 
 const APP_BUNDLE_PATH = "/Applications/Codex.app/Contents/Resources/codex";
 
+// ---------------------------------------------------------------------------
+// PATH augmentation for launchd environments
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an augmented PATH that includes nvm, homebrew, and other common
+ * directories so spawned processes (claude, codex) can find `node`, etc.
+ *
+ * Under launchd the inherited PATH is minimal (/usr/bin:/bin:/usr/sbin:/sbin).
+ * We prepend well-known bin directories so child processes work correctly.
+ *
+ * @param {string} [binPath] - Resolved path to the binary being spawned;
+ *                              its parent directory is prepended to PATH.
+ */
+function buildAugmentedPath(binPath) {
+  const extra = [];
+
+  // Include the directory of the resolved binary itself
+  if (binPath && binPath !== "codex" && binPath !== "claude") {
+    extra.push(path.dirname(binPath));
+  }
+
+  // nvm — find the active or latest node version's bin directory
+  const nvmBase = path.join(os.homedir(), ".nvm", "versions", "node");
+  if (existsSync(nvmBase)) {
+    // Prefer NVM_BIN if set (interactive shell), otherwise scan versions
+    if (process.env.NVM_BIN && existsSync(process.env.NVM_BIN)) {
+      extra.push(process.env.NVM_BIN);
+    } else {
+      const ls = spawnSync("ls", [nvmBase], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      if (ls.status === 0 && ls.stdout) {
+        const versions = ls.stdout.trim().split("\n").filter(Boolean).reverse();
+        for (const v of versions) {
+          const binDir = path.join(nvmBase, v, "bin");
+          if (existsSync(path.join(binDir, "node"))) {
+            extra.push(binDir);
+            break; // use the latest version that has node
+          }
+        }
+      }
+    }
+  }
+
+  // Homebrew and common paths
+  for (const p of ["/opt/homebrew/bin", "/usr/local/bin"]) {
+    if (existsSync(p)) extra.push(p);
+  }
+
+  const basePath = process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin";
+  // Deduplicate while preserving order
+  const seen = new Set();
+  const parts = [];
+  for (const dir of [...extra, ...basePath.split(":")]) {
+    if (dir && !seen.has(dir)) {
+      seen.add(dir);
+      parts.push(dir);
+    }
+  }
+  return parts.join(":");
+}
+
 /**
  * Try to find the claude binary by walking well-known locations.
  * Returns the absolute path if found, or null.
@@ -98,9 +159,11 @@ const EXEC_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  * @param {object}   helpers
  * @param {Function} helpers.recordTimelineEntry
  * @param {Function} helpers.saveState
+ * @param {Function} [helpers.recordHistoryItem]    - Optional history-item recorder (adds to completed inbox)
+ * @param {Function} [helpers.deliverWebPushItem]   - Optional web push delivery helper
  * @param {string}   [executor]            - "codex" or "claude" (auto-detect if omitted)
  */
-export async function executeA2ATask(task, config, runtime, state, { recordTimelineEntry, saveState }, executor) {
+export async function executeA2ATask(task, config, runtime, state, { recordTimelineEntry, recordHistoryItem, saveState, deliverWebPushItem }, executor) {
   const instruction = task.instruction || "";
   if (!instruction) {
     failA2ATask(task, "No instruction provided");
@@ -126,37 +189,58 @@ export async function executeA2ATask(task, config, runtime, state, { recordTimel
     console.error(`[a2a-exec] Task ${task.id} failed via ${executor}: ${error.message}`);
   }
 
-  // Record completion in timeline
+  // Record completion in timeline AND history (history drives completed inbox list).
+  const resultEntry = {
+    stableId: `a2a_task_result:${task.id}`,
+    token: task.token,
+    kind: "a2a_task_result",
+    threadId: "a2a",
+    threadLabel: instruction.slice(0, 80),
+    title: task.status === "completed"
+      ? `A2A ✅: ${instruction.slice(0, 60)}`
+      : `A2A ❌: ${instruction.slice(0, 60)}`,
+    summary: task.status === "completed"
+      ? (task.artifacts?.[0]?.parts?.[0]?.text || "").slice(0, 160)
+      : task.statusMessage || "Failed",
+    instruction,
+    messageText: task.status === "completed"
+      ? (task.artifacts?.[0]?.parts?.[0]?.text || "").slice(0, 500)
+      : task.statusMessage || "Failed",
+    taskStatus: task.status,
+    createdAtMs: task.updatedAtMs || Date.now(),
+    readOnly: true,
+    provider: "a2a",
+  };
   try {
-    recordTimelineEntry({
-      config,
-      runtime,
-      state,
-      entry: {
-        stableId: `a2a_task_result:${task.id}`,
-        token: task.token,
-        kind: "a2a_task_result",
-        threadId: "a2a",
-        threadLabel: instruction.slice(0, 80),
-        title: task.status === "completed"
-          ? `A2A ✅: ${instruction.slice(0, 60)}`
-          : `A2A ❌: ${instruction.slice(0, 60)}`,
-        summary: task.status === "completed"
-          ? (task.artifacts?.[0]?.parts?.[0]?.text || "").slice(0, 160)
-          : task.statusMessage || "Failed",
-        instruction,
-        messageText: task.status === "completed"
-          ? (task.artifacts?.[0]?.parts?.[0]?.text || "").slice(0, 500)
-          : task.statusMessage || "Failed",
-        taskStatus: task.status,
-        createdAtMs: task.updatedAtMs || Date.now(),
-        readOnly: true,
-        provider: "a2a",
-      },
-    });
+    recordTimelineEntry({ config, runtime, state, entry: resultEntry });
+    if (typeof recordHistoryItem === "function") {
+      recordHistoryItem({ config, runtime, state, item: resultEntry });
+    }
     await saveState(config.stateFile, state);
   } catch (error) {
     console.error(`[a2a-exec-timeline] ${error.message}`);
+  }
+
+  // Send web push notification for completion/failure.
+  if (typeof deliverWebPushItem === "function") {
+    try {
+      const isCompleted = task.status === "completed";
+      const icon = isCompleted ? "✅" : "❌";
+      const resultBody = isCompleted
+        ? (task.artifacts?.[0]?.parts?.[0]?.text || "").slice(0, 160)
+        : (task.statusMessage || "Failed").slice(0, 160);
+      await deliverWebPushItem({
+        config,
+        state,
+        kind: "a2a_task_result",
+        token: task.token,
+        stableId: `a2a_task_result:${task.id}`,
+        title: `A2A ${icon}: ${instruction.slice(0, 60)}`,
+        body: resultBody || instruction.slice(0, 160),
+      });
+    } catch (error) {
+      console.error(`[a2a-exec-push] ${error.message}`);
+    }
   }
 }
 
@@ -172,7 +256,11 @@ function runCodexExec(instruction, config) {
     const child = spawn(codexBin, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, CODEX_HOME: config.codexHome || path.join(os.homedir(), ".codex") },
+      env: {
+        ...process.env,
+        PATH: buildAugmentedPath(codexBin),
+        CODEX_HOME: config.codexHome || path.join(os.homedir(), ".codex"),
+      },
       timeout: EXEC_TIMEOUT_MS,
     });
 
@@ -223,7 +311,7 @@ function runClaudeExec(instruction) {
     const child = spawn(claudeBin, args, {
       cwd: os.tmpdir(),
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      env: { ...process.env, PATH: buildAugmentedPath(claudeBin) },
       timeout: EXEC_TIMEOUT_MS,
     });
 

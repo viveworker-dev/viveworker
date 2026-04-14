@@ -172,14 +172,14 @@ export function rollScoutDayIfNeeded(state) {
   return state;
 }
 
-export function recordComposeAttempt(state, title, postId) {
+export function recordComposeAttempt(state, title, postId, type = "post") {
   state.composedToday = (state.composedToday || 0) + 1;
   state.lastComposeDay = todayKey();
   if (!Array.isArray(state.recentComposeTitles)) state.recentComposeTitles = [];
-  state.recentComposeTitles.unshift(
-    postId ? { title: String(title || ""), postId: String(postId) } : String(title || "")
-  );
-  if (state.recentComposeTitles.length > 10) state.recentComposeTitles.length = 10;
+  const entry = { title: String(title || ""), type };
+  if (postId) entry.postId = String(postId);
+  state.recentComposeTitles.unshift(entry);
+  if (state.recentComposeTitles.length > 30) state.recentComposeTitles.length = 30;
   return state;
 }
 

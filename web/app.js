@@ -48,7 +48,9 @@ const state = {
   pairNotice: "",
   pushStatus: null,
   moltbookScoutStatus: null,
+  moltbookRecentTitlesExpanded: 0,
   a2aRelayStatus: null,
+  a2aTaskExecutorPick: "codex",
   pushNotice: "",
   pushError: "",
   deviceNotice: "",
@@ -3398,16 +3400,33 @@ function renderSettingsMoltbookPage(context) {
         renderSettingsInfoRow(L("settings.row.moltbookSeenPosts"), String(scout.seenPostCount)),
       ])}
       ${batchRows.length ? renderSettingsGroup(L("settings.moltbook.batchTitle"), batchRows) : ""}
-      ${Array.isArray(scout.recentComposeTitles) && scout.recentComposeTitles.length
-        ? renderSettingsGroup(L("settings.row.moltbookRecentTitles"), scout.recentComposeTitles.map((t) => {
-            const title = typeof t === "string" ? t : (t.title || "");
-            const postId = typeof t === "object" ? t.postId : "";
-            const display = postId
-              ? `<a href="https://www.moltbook.com/post/${escapeHtml(postId)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
-              : escapeHtml(title);
-            return renderSettingsInfoRow("", display, { rawValue: true, rowClassName: "settings-info-row--stacked" });
-          }))
-        : ""}
+      ${(() => {
+        const titles = Array.isArray(scout.recentComposeTitles) ? scout.recentComposeTitles : [];
+        if (!titles.length) return "";
+        const PAGE_SIZE = 5;
+        const visibleCount = state.moltbookRecentTitlesExpanded || PAGE_SIZE;
+        const visible = titles.slice(0, visibleCount);
+        const hasMore = titles.length > visibleCount;
+        const rows = visible.map((t) => {
+          const title = typeof t === "string" ? t : (t.title || "");
+          const postId = typeof t === "object" ? t.postId : "";
+          const type = typeof t === "object" ? (t.type || "post") : "post";
+          const badge = type === "reply"
+            ? `<span class="settings-compose-badge settings-compose-badge--reply">${escapeHtml(L("settings.moltbook.typeReply"))}</span>`
+            : `<span class="settings-compose-badge settings-compose-badge--post">${escapeHtml(L("settings.moltbook.typePost"))}</span>`;
+          const link = postId
+            ? `<a href="https://www.moltbook.com/post/${escapeHtml(postId)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
+            : escapeHtml(title);
+          return `<div class="settings-compose-entry">${badge}<span class="settings-compose-entry__title">${link}</span></div>`;
+        });
+        if (hasMore) {
+          const remaining = titles.length - visibleCount;
+          rows.push(`<button type="button" class="settings-compose-more" data-moltbook-titles-more>${escapeHtml(L("settings.moltbook.showMore", { count: remaining }))}</button>`);
+        } else if (titles.length > PAGE_SIZE) {
+          rows.push(`<button type="button" class="settings-compose-more" data-moltbook-titles-collapse>${escapeHtml(L("settings.moltbook.showLess"))}</button>`);
+        }
+        return renderSettingsGroup(L("settings.row.moltbookRecentTitles"), rows);
+      })()}
     </div>
   `;
 }
@@ -3446,15 +3465,21 @@ function renderSettingsA2aRelayPage(context) {
 
   return `
     <div class="settings-page">
-      ${renderSettingsGroup("", [
-        renderSettingsInfoRow(L("settings.row.a2aStatus"), statusLabel),
-        renderSettingsInfoRow(L("settings.row.a2aUserId"), userIdLink, { rawValue: true }),
-        renderSettingsInfoRow(L("settings.row.a2aRelay"), relayHost),
-        renderSettingsInfoRow(L("settings.row.a2aApiKey"), relay.apiKeyConfigured ? L("settings.a2aRelay.apiKey.configured") : L("settings.a2aRelay.apiKey.notConfigured")),
-        relay.lastPollAtMs
-          ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
-          : "",
-      ].filter(Boolean))}
+      ${(() => {
+        const stats = relay.taskStats || { received: 0, completed: 0, denied: 0 };
+        return renderSettingsGroup("", [
+          renderSettingsInfoRow(L("settings.row.a2aStatus"), statusLabel),
+          renderSettingsInfoRow(L("settings.row.a2aUserId"), userIdLink, { rawValue: true }),
+          renderSettingsInfoRow(L("settings.row.a2aRelay"), relayHost),
+          renderSettingsInfoRow(L("settings.row.a2aApiKey"), relay.apiKeyConfigured ? L("settings.a2aRelay.apiKey.configured") : L("settings.a2aRelay.apiKey.notConfigured")),
+          relay.lastPollAtMs
+            ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
+            : "",
+          renderSettingsInfoRow(L("settings.row.a2aTaskReceived"), String(stats.received)),
+          renderSettingsInfoRow(L("settings.row.a2aTaskCompleted"), String(stats.completed)),
+          renderSettingsInfoRow(L("settings.row.a2aTaskDenied"), String(stats.denied)),
+        ].filter(Boolean));
+      })()}
       <section class="settings-group">
         <p class="settings-group__title">${escapeHtml(L("settings.a2aRelay.publicTasks.title"))}</p>
         <label class="reply-mode-switch reply-mode-switch--settings" data-a2a-public-toggle>
@@ -4224,17 +4249,18 @@ function renderA2ATaskDetail(detail, options = {}) {
   const executors = state.session?.a2aExecutors || { codex: false, claude: false };
   const executorPref = state.session?.a2aExecutorPreference || "auto";
   const showExecutorPicker = enabled && executorPref === "ask" && executors.codex && executors.claude;
+  const pickedExecutor = state.a2aTaskExecutorPick || "codex";
   const executorPicker = showExecutorPicker
     ? `
       <div class="reply-composer__instruction">
         <label class="field-label">${escapeHtml(L("a2a.task.executor"))}</label>
         <div class="a2a-executor-picker">
           <label class="a2a-executor-picker__option">
-            <input type="radio" name="executor" value="codex" checked />
+            <input type="radio" name="executor" value="codex" ${pickedExecutor === "codex" ? "checked" : ""} />
             <span>${escapeHtml(L("a2a.executor.codex"))}</span>
           </label>
           <label class="a2a-executor-picker__option">
-            <input type="radio" name="executor" value="claude" />
+            <input type="radio" name="executor" value="claude" ${pickedExecutor === "claude" ? "checked" : ""} />
             <span>${escapeHtml(L("a2a.executor.claude"))}</span>
           </label>
         </div>
@@ -5354,6 +5380,19 @@ function bindShellInteractions() {
     });
   }
 
+  for (const btn of document.querySelectorAll("[data-moltbook-titles-more]")) {
+    btn.addEventListener("click", async () => {
+      state.moltbookRecentTitlesExpanded = (state.moltbookRecentTitlesExpanded || 5) + 5;
+      await renderShell();
+    });
+  }
+  for (const btn of document.querySelectorAll("[data-moltbook-titles-collapse]")) {
+    btn.addEventListener("click", async () => {
+      state.moltbookRecentTitlesExpanded = 0;
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-locale-option]")) {
     button.addEventListener("click", async () => {
       state.pushError = "";
@@ -5484,6 +5523,12 @@ function bindShellInteractions() {
         if (textarea) textarea.readOnly = false;
         moltbookDraftForm.dataset.submitting = "";
       }
+    });
+  }
+
+  for (const radio of document.querySelectorAll(".a2a-executor-picker input[type='radio']")) {
+    radio.addEventListener("change", () => {
+      if (radio.checked) state.a2aTaskExecutorPick = radio.value;
     });
   }
 

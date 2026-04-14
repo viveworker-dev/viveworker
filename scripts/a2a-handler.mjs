@@ -291,6 +291,10 @@ async function handleMessageSend({
 
   runtime.a2aTasksByToken.set(token, task);
 
+  // Update received task counter.
+  if (!state.a2aTaskStats) state.a2aTaskStats = { received: 0, completed: 0, denied: 0 };
+  state.a2aTaskStats.received += 1;
+
   // Record timeline entry
   try {
     recordTimelineEntry({
