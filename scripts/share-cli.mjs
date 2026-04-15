@@ -6,6 +6,7 @@
  * Commands:
  *   viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]
  *   viveworker share list [--json]
+ *   viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]
  *   viveworker share delete <slug>
  *
  * Environment overrides:
@@ -33,6 +34,8 @@ export async function runShareCli(args) {
       return handleUpload(args.slice(1));
     case "list":
       return handleList(args.slice(1));
+    case "update":
+      return handleUpdate(args.slice(1));
     case "delete":
     case "rm":
       return handleDelete(args.slice(1));
@@ -48,6 +51,7 @@ function printHelp() {
   console.log("Commands:");
   console.log("  viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]");
   console.log("  viveworker share list [--json]");
+  console.log("  viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]");
   console.log("  viveworker share delete <slug>");
   console.log("");
   console.log("Credentials are read from ~/.viveworker/a2a.env (same as `viveworker a2a`).");
@@ -93,8 +97,8 @@ async function handleUpload(args) {
   }
   if (expiresDays) {
     const n = Number(expiresDays);
-    if (!Number.isFinite(n) || n <= 0 || n > 365) {
-      throw new Error("--expires-days must be a number between 1 and 365");
+    if (!Number.isFinite(n) || n <= 0 || n > 30) {
+      throw new Error("--expires-days must be a number between 1 and 30");
     }
   }
 
@@ -202,6 +206,98 @@ async function handleList(args) {
 }
 
 // ---------------------------------------------------------------------------
+// update
+// ---------------------------------------------------------------------------
+
+async function handleUpdate(args) {
+  const flags = parseFlags(args);
+  const slug = flags._[0];
+  if (!slug) {
+    throw new Error(
+      "Usage: viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>]"
+    );
+  }
+  if (!/^[A-Za-z0-9]+$/.test(slug)) {
+    throw new Error(`Invalid slug: ${slug}`);
+  }
+
+  const hasPassword = Object.prototype.hasOwnProperty.call(flags, "password");
+  const hasNoPassword = Object.prototype.hasOwnProperty.call(flags, "no-password");
+  const hasExpires = Object.prototype.hasOwnProperty.call(flags, "expires-days") ||
+    Object.prototype.hasOwnProperty.call(flags, "expiresDays");
+
+  if (hasPassword && hasNoPassword) {
+    throw new Error("Pass either --password OR --no-password, not both");
+  }
+  if (!hasPassword && !hasNoPassword && !hasExpires) {
+    throw new Error(
+      "Nothing to update — specify at least one of --password <pw>, --no-password, --expires-days <n>"
+    );
+  }
+
+  const body = {};
+
+  if (hasPassword) {
+    const pw = flags.password;
+    if (typeof pw !== "string" || pw.length === 0) {
+      throw new Error("--password requires a non-empty value (use --no-password to clear)");
+    }
+    if (pw.length > 256) {
+      throw new Error("Password too long (max 256 chars)");
+    }
+    body.password = pw;
+  } else if (hasNoPassword) {
+    body.password = null;
+  }
+
+  if (hasExpires) {
+    const raw = flags["expires-days"] || flags["expiresDays"];
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n > 30) {
+      throw new Error("--expires-days must be a number between 1 and 30");
+    }
+    body.expiresDays = n;
+  }
+
+  const { apiKey, userId, shareUrl } = await resolveCredentials();
+
+  const res = await fetchWithTimeout(`${shareUrl}/api/share/${encodeURIComponent(slug)}`, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      "x-a2a-user": userId,
+      "x-a2a-key": apiKey,
+    },
+    body: JSON.stringify(body),
+  }, 30_000);
+
+  const respBody = await readJson(res);
+  if (!res.ok || respBody.error) {
+    throw new Error(formatApiError("Update", res.status, respBody));
+  }
+
+  if (flags.json) {
+    console.log(JSON.stringify(respBody, null, 2));
+    return;
+  }
+
+  console.log("");
+  console.log(`✅ Updated ${slug}`);
+  console.log("");
+  console.log(`   ${respBody.url}`);
+  console.log("");
+  if (respBody.hasPassword) {
+    console.log(`   🔒 Password-protected${hasPassword ? " (existing unlock cookies invalidated)" : ""}`);
+  } else if (hasNoPassword) {
+    console.log(`   🔓 Password removed`);
+  }
+  if (respBody.expiresAtMs) {
+    console.log(`   ⏱  Expires ${new Date(respBody.expiresAtMs).toISOString()}`);
+  }
+  console.log("");
+}
+
+// ---------------------------------------------------------------------------
 // delete
 // ---------------------------------------------------------------------------
 
@@ -249,6 +345,10 @@ function formatApiError(op, status, body) {
       return `${op} failed (${status}): file count exceeded — ${body.current}/${body.max}. Delete something first.`;
     case "file-too-large":
       return `${op} failed (${status}): file too large (max ${formatSize(body.maxBytes)})`;
+    case "expired-requires-expiresDays":
+      return `${op} failed (${status}): share is expired — pass --expires-days <1-${body.maxDays || 30}> to revive it`;
+    case "object-missing":
+      return `${op} failed (${status}): the R2 body is gone (90-day lifecycle reaped it). Re-upload instead.`;
     default:
       return `${op} failed (${status}): ${code || body?.statusText || "unknown error"}`;
   }

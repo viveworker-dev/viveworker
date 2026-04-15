@@ -30,8 +30,25 @@ const MAX_FILE_SIZE = 5 * 1024 * 1024;     // 5 MB per file (also the per-user c
 const MAX_TOTAL_BYTES = 5 * 1024 * 1024;   // 5 MB total per user
 const MAX_FILES = 10;                      // 10 live uploads per user
 const RATE_LIMIT_PER_HOUR = 10;            // 10 uploads / rolling hour
+const RATE_LIMIT_PATCH_PER_HOUR = 10;      // 10 patches / rolling hour (per-user, separate bucket)
 const RATE_WINDOW_MS = 60 * 60 * 1000;     // rolling 1 hour window
 const DEFAULT_EXPIRES_DAYS = 30;           // auto-expire after 30 days when client omits
+const MAX_EXPIRES_DAYS = 30;               // hard cap on expiresDays (upload + PATCH).
+                                           // Must stay ≤ R2 bucket lifecycle (currently 90d);
+                                           // with re-put on PATCH extension + 60d buffer this
+                                           // keeps KV validity aligned with R2 presence in all
+                                           // scenarios, including chained PATCH extensions.
+const GRACE_PERIOD_MS = 60 * 86400 * 1000; // 60 days. Shares remain in KV past
+                                           // `expiresAtMs` for this long, so the owner
+                                           // can still un-expire an already-expired
+                                           // share via PATCH as long as the R2 body
+                                           // hasn't been reaped. View still returns
+                                           // 410 past `expiresAtMs`; only PATCH can
+                                           // resurrect. The grace window is chosen to
+                                           // equal (R2 lifecycle − MAX_EXPIRES_DAYS) so
+                                           // the KV entry and the R2 body disappear
+                                           // at roughly the same time on an abandoned
+                                           // share.
 const SLUG_LENGTH = 16;
 const PBKDF2_ITERATIONS = 10_000;
 const PBKDF2_SALT_BYTES = 16;
@@ -70,7 +87,7 @@ async function handle(request, env, ctx) {
       status: 204,
       headers: {
         "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+        "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
         "access-control-allow-headers": "content-type, x-a2a-user, x-a2a-key",
         "access-control-max-age": "86400",
         ...SECURITY_HEADERS,
@@ -107,10 +124,13 @@ async function handle(request, env, ctx) {
     return await handleList(request, env);
   }
 
-  // API — delete by slug
-  const deleteMatch = pathname.match(/^\/api\/share\/([A-Za-z0-9]+)$/);
-  if (deleteMatch && method === "DELETE") {
-    return await handleDelete(request, env, deleteMatch[1]);
+  // API — patch / delete by slug
+  const shareMatch = pathname.match(/^\/api\/share\/([A-Za-z0-9]+)$/);
+  if (shareMatch && method === "DELETE") {
+    return await handleDelete(request, env, shareMatch[1]);
+  }
+  if (shareMatch && method === "PATCH") {
+    return await handlePatch(request, env, shareMatch[1]);
   }
 
   // Unlock form submit
@@ -200,8 +220,8 @@ async function handleUpload(request, env) {
   const now = Date.now();
   if (typeof expiresRaw === "string" && expiresRaw.length > 0) {
     const days = Number(expiresRaw);
-    if (!Number.isFinite(days) || days <= 0 || days > 365) {
-      return jsonResponse({ error: "invalid-expiresDays" }, 400);
+    if (!Number.isFinite(days) || days <= 0 || days > MAX_EXPIRES_DAYS) {
+      return jsonResponse({ error: "invalid-expiresDays", maxDays: MAX_EXPIRES_DAYS }, 400);
     }
     expiresAtMs = now + Math.floor(days * 86400 * 1000);
   } else {
@@ -263,7 +283,13 @@ async function handleUpload(request, env) {
     httpMetadata: { contentType: "text/html; charset=utf-8" },
   });
 
-  const kvOpts = expiresAtMs ? { expiration: Math.floor(expiresAtMs / 1000) } : undefined;
+  // KV keeps the metadata alive for expiresAtMs + GRACE_PERIOD_MS so an
+  // owner can still revive an expired share via PATCH (re-put on R2 + new
+  // expiresAtMs). handleView remains strict and returns 410 past
+  // expiresAtMs; the grace window only unlocks PATCH-based resurrection.
+  const kvOpts = expiresAtMs
+    ? { expiration: Math.floor((expiresAtMs + GRACE_PERIOD_MS) / 1000) }
+    : undefined;
   await env.SHARE_KV.put(`share:${slug}`, JSON.stringify(metadata), kvOpts);
 
   // Update user stats (tracks live files, bytes, rate window). No TTL — this blob
@@ -393,6 +419,188 @@ async function handleDelete(request, env, slug) {
 }
 
 // ---------------------------------------------------------------------------
+// Patch — owner-only metadata update (password + expiry)
+//
+// Body (JSON):
+//   {
+//     "password":     string | null,   // omit to leave unchanged; "" or null removes; "xyz" sets
+//     "expiresDays":  number | null,   // omit to leave unchanged; number resets TTL to N days from now
+//   }
+//
+// Notes:
+//   - Changing password rotates `passwordSalt`, which is folded into the HMAC
+//     input for unlock cookies. That invalidates any previously issued
+//     `share_unlock` cookies, forcing viewers to re-enter the new password.
+//   - Re-applies KV TTL using the new `expiresAtMs + GRACE_PERIOD_MS` so an
+//     owner still has a window to revive an already-expired share as long as
+//     the R2 body is present.
+//   - When `expiresDays` is updated, the R2 object is re-put with the same
+//     bytes. That refreshes R2's `LastModified` so the bucket's 90-day
+//     lifecycle rule (see share-worker/README) lines up with the new KV
+//     expiry — otherwise a chain of PATCH extensions could leave KV claiming
+//     the share is valid while R2 has already reaped the body.
+//   - Revival: a share past `expiresAtMs` (but still inside the KV grace
+//     window) can be PATCHed back to a live state by supplying `expiresDays`.
+//     View remains 410 until such a PATCH lands. PATCH without `expiresDays`
+//     on an expired share returns 410 — a password-only change on something
+//     that still 410s to viewers is never what the caller wants.
+//   - Rate-limited via `share_stats.patchWindow` (rolling hour, separate from
+//     upload rate limit) to cap KV-write and R2-Class-A amplification.
+// ---------------------------------------------------------------------------
+
+async function handlePatch(request, env, slug) {
+  const user = await authenticate(request, env);
+  if (!user) return jsonResponse({ error: "unauthorized" }, 401);
+
+  const raw = await env.SHARE_KV.get(`share:${slug}`);
+  if (!raw) return jsonResponse({ error: "not-found" }, 404);
+  let meta;
+  try { meta = JSON.parse(raw); } catch {
+    return jsonResponse({ error: "corrupt-metadata" }, 500);
+  }
+  if (meta.userId !== user.userId) {
+    return jsonResponse({ error: "forbidden" }, 403);
+  }
+  // Note: we deliberately do NOT early-return 410 for expired shares. Within
+  // the KV grace window an expired share can still be revived via PATCH
+  // (provided the R2 body survives). The check that gates revival lives
+  // below, after we know whether the body supplied a new `expiresDays`.
+  const wasExpired = !!(meta.expiresAtMs && Date.now() > meta.expiresAtMs);
+
+  // Rate limit check: reject early if the rolling window is full, so a burst
+  // of payloads (even malformed ones) can't push past R2 re-put / KV write
+  // amplification. Slot consumption itself happens after the update succeeds
+  // (see saveUserStats below) so that typos / client-side bugs don't lock a
+  // well-behaved user out of PATCH for an hour.
+  const stats = await loadUserStats(env, user.userId);
+  const now = Date.now();
+  const patchWindow = (stats.patchWindow || []).filter((ts) => now - ts < RATE_WINDOW_MS);
+  if (patchWindow.length >= RATE_LIMIT_PATCH_PER_HOUR) {
+    const retryAfterSec = Math.max(1, Math.ceil((patchWindow[0] + RATE_WINDOW_MS - now) / 1000));
+    return jsonResponse(
+      { error: "rate-limited", scope: "patch", limit: RATE_LIMIT_PATCH_PER_HOUR, windowSec: RATE_WINDOW_MS / 1000, retryAfterSec },
+      429,
+      { "retry-after": String(retryAfterSec) },
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid-json" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ error: "invalid-body" }, 400);
+  }
+
+  let changed = false;
+  let expiryChanged = false;
+
+  // Password: presence of the key is a signal to update, so use `in` rather
+  // than truthiness. "" or null removes; non-empty string sets.
+  if ("password" in body) {
+    const pw = body.password;
+    if (pw === null || pw === "") {
+      if (meta.passwordHash || meta.passwordSalt) {
+        meta.passwordHash = null;
+        meta.passwordSalt = null;
+        changed = true;
+      }
+    } else if (typeof pw === "string") {
+      if (pw.length > 256) {
+        return jsonResponse({ error: "password-too-long" }, 400);
+      }
+      const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
+      meta.passwordSalt = bytesToBase64(saltBuf);
+      meta.passwordHash = await hashPassword(pw, saltBuf);
+      changed = true;
+    } else {
+      return jsonResponse({ error: "invalid-password" }, 400);
+    }
+  }
+
+  // Expiry: expiresDays is always relative to "now" (so PATCH extends or
+  // shortens the TTL). null → reset to default. number/numeric-string → set.
+  if ("expiresDays" in body) {
+    const val = body.expiresDays;
+    if (val === null) {
+      meta.expiresAtMs = Date.now() + DEFAULT_EXPIRES_DAYS * 86400 * 1000;
+      changed = true;
+      expiryChanged = true;
+    } else if (typeof val === "number" || typeof val === "string") {
+      const days = Number(val);
+      if (!Number.isFinite(days) || days <= 0 || days > MAX_EXPIRES_DAYS) {
+        return jsonResponse({ error: "invalid-expiresDays", maxDays: MAX_EXPIRES_DAYS }, 400);
+      }
+      meta.expiresAtMs = Date.now() + Math.floor(days * 86400 * 1000);
+      changed = true;
+      expiryChanged = true;
+    } else {
+      return jsonResponse({ error: "invalid-expiresDays" }, 400);
+    }
+  }
+
+  if (!changed) {
+    return jsonResponse({ error: "no-changes" }, 400);
+  }
+
+  // Reviving an expired share requires `expiresDays`. A password-only PATCH on
+  // an expired share would leave it 410-Expired to viewers, so we reject it
+  // outright rather than silently swallowing the change.
+  if (wasExpired && !expiryChanged) {
+    return jsonResponse(
+      { error: "expired-requires-expiresDays", maxDays: MAX_EXPIRES_DAYS },
+      410,
+    );
+  }
+
+  // R2 re-put: only when expiry was actually touched. Password-only PATCHes
+  // don't need to refresh `LastModified` because the bucket lifecycle rule is
+  // aligned with the original upload (which is still correctly bounded).
+  if (expiryChanged) {
+    const obj = await env.SHARE_FILES.get(slug);
+    if (!obj) {
+      // Body went missing (R2 lifecycle already reaped it, or partial
+      // upload). Can't re-put without the bytes — surface a 410 instead of
+      // silently letting KV claim the share is still valid.
+      return jsonResponse({ error: "object-missing" }, 410);
+    }
+    const bytes = await obj.arrayBuffer();
+    await env.SHARE_FILES.put(slug, bytes, {
+      httpMetadata: { contentType: "text/html; charset=utf-8" },
+    });
+  }
+
+  // KV TTL = expiresAtMs + grace period. View enforces the strict 410 cutoff
+  // at expiresAtMs; the grace tail keeps the metadata resurrectable until the
+  // R2 lifecycle rule reaps the body anyway.
+  const kvOpts = meta.expiresAtMs
+    ? { expiration: Math.floor((meta.expiresAtMs + GRACE_PERIOD_MS) / 1000) }
+    : undefined;
+  await env.SHARE_KV.put(`share:${slug}`, JSON.stringify(meta), kvOpts);
+
+  // Record this attempt in the patch rate window, regardless of whether a
+  // body field actually changed anything — we already short-circuited the
+  // `no-changes` case above so this only runs for accepted PATCHes.
+  patchWindow.push(now);
+  stats.patchWindow = patchWindow;
+  await saveUserStats(env, user.userId, stats);
+
+  const origin = new URL(request.url).origin;
+  return jsonResponse({
+    ok: true,
+    slug,
+    url: `${origin}/v/${slug}`,
+    createdAtMs: meta.createdAtMs,
+    expiresAtMs: meta.expiresAtMs,
+    hasPassword: !!meta.passwordHash,
+    size: meta.size,
+    originalName: meta.originalName,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // View / render
 // ---------------------------------------------------------------------------
 
@@ -408,7 +616,7 @@ async function handleView(request, env, slug, headOnly = false) {
   if (meta.passwordHash) {
     const cookies = parseCookies(request.headers.get("cookie") || "");
     const token = cookies[UNLOCK_COOKIE_NAME] || "";
-    const ok = await verifyUnlockToken(token, slug, env);
+    const ok = await verifyUnlockToken(token, slug, env, meta.passwordSalt);
     if (!ok) {
       return headOnly
         ? new Response(null, { status: 401, headers: { "content-type": "text/html; charset=utf-8", ...SECURITY_HEADERS } })
@@ -467,7 +675,7 @@ async function handleUnlock(request, env, slug) {
     return htmlResponse(renderUnlockForm(slug, true), 401);
   }
 
-  const token = await signUnlockToken(slug, env);
+  const token = await signUnlockToken(slug, env, meta.passwordSalt);
   const setCookie = [
     `${UNLOCK_COOKIE_NAME}=${token}`,
     `Path=/v/${slug}`,
@@ -542,22 +750,24 @@ async function loadUserStats(env, userId) {
         count: Number(parsed.count) || 0,
         files: Array.isArray(parsed.files) ? parsed.files.slice() : [],
         rateWindow: Array.isArray(parsed.rateWindow) ? parsed.rateWindow.slice() : [],
+        patchWindow: Array.isArray(parsed.patchWindow) ? parsed.patchWindow.slice() : [],
       };
     } catch {
       // Corrupt — fall through to a fresh blob.
     }
   }
-  return { bytes: 0, count: 0, files: [], rateWindow: [] };
+  return { bytes: 0, count: 0, files: [], rateWindow: [], patchWindow: [] };
 }
 
 async function saveUserStats(env, userId, stats) {
-  // Prune rate window before persisting so it can't grow unbounded.
+  // Prune both rolling windows before persisting so they can't grow unbounded.
   const cutoff = Date.now() - RATE_WINDOW_MS;
   const trimmed = {
     bytes: Math.max(0, Number(stats.bytes) || 0),
     count: Math.max(0, Number(stats.count) || 0),
     files: Array.isArray(stats.files) ? stats.files : [],
     rateWindow: Array.isArray(stats.rateWindow) ? stats.rateWindow.filter((ts) => ts > cutoff) : [],
+    patchWindow: Array.isArray(stats.patchWindow) ? stats.patchWindow.filter((ts) => ts > cutoff) : [],
   };
   await env.SHARE_KV.put(`share_stats:${userId}`, JSON.stringify(trimmed));
 }
@@ -632,10 +842,13 @@ function timingSafeEqual(a, b) {
 }
 
 // ---------------------------------------------------------------------------
-// Unlock cookie — HMAC-SHA256(slug, SHARE_SECRET), base64url
+// Unlock cookie — HMAC-SHA256(slug + "\n" + passwordSalt, SHARE_SECRET).
+// Binding the password salt into the signed payload means rotating the
+// password (which rotates the salt) also invalidates every previously issued
+// unlock cookie for that slug — so PATCH /api/share/:slug can revoke access.
 // ---------------------------------------------------------------------------
 
-async function signUnlockToken(slug, env) {
+async function signUnlockToken(slug, env, passwordSalt = "") {
   const secret = env.SHARE_SECRET || "";
   if (!secret) throw new Error("SHARE_SECRET not configured");
   const key = await crypto.subtle.importKey(
@@ -645,14 +858,15 @@ async function signUnlockToken(slug, env) {
     false,
     ["sign"]
   );
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(slug));
+  const payload = `${slug}\n${passwordSalt || ""}`;
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   return bytesToBase64Url(new Uint8Array(sig));
 }
 
-async function verifyUnlockToken(token, slug, env) {
+async function verifyUnlockToken(token, slug, env, passwordSalt = "") {
   if (!token) return false;
   try {
-    const expected = await signUnlockToken(slug, env);
+    const expected = await signUnlockToken(slug, env, passwordSalt);
     return timingSafeEqual(token, expected);
   } catch {
     return false;

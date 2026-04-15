@@ -212,8 +212,12 @@ Authentication reuses the A2A relay credentials — anyone who has run `vivework
 **Quotas (per user, enforced by the worker):**
 - 5 MB total live storage, 10 live files, 5 MB per file
 - 10 uploads per rolling hour
-- Uploads default to a **30-day TTL** when `--expires-days` is omitted — plan for files disappearing, or set `--expires-days` explicitly (up to 365)
+- 10 `update` (PATCH) calls per rolling hour (separate bucket from upload). CLI surfaces this as `Update failed (429): rate limit — 10/60m, retry in …s` — wait out the window rather than retrying in a tight loop.
+- Uploads default to a **30-day TTL** when `--expires-days` is omitted, and that's also the hard cap — `--expires-days` values > 30 are rejected by both the CLI and the worker
 - `list` responses include a `quota` block for showing the user their remaining capacity
+- R2 objects are physically deleted **90 days after their last write** (bucket lifecycle rule). PATCH with `--expires-days` re-writes the object so the 90-day counter resets — without touching the share at all, an abandoned upload disappears from R2 within 90 days of its creation. Don't rely on a single share for long-term storage even if you keep extending it; make a new upload if you need a fresh lifetime.
+- **Reviving an expired share:** a share past its `expiresAtMs` (so `/v/<slug>` returns 410) can still be resurrected via `viveworker share update <slug> --expires-days N` as long as the R2 body survives. KV metadata hangs around for 60 days past `expiresAtMs` specifically to make this possible; between 60 and 90 days past expiry, KV is gone but the R2 body may still exist unused (no way to revive at that point — just re-upload). Past 90 days the body is gone too.
+- Update on an expired share **must** include `--expires-days`; password-only updates return `Update failed (410): expired-requires-expiresDays` because a password change on something that still 410s to viewers is never what the caller wants.
 
 ### Commands
 
@@ -229,11 +233,16 @@ node scripts/viveworker.mjs share upload report.html \
 # List your uploads
 node scripts/viveworker.mjs share list
 
+# Update password / expiry on an existing share (URL is preserved)
+node scripts/viveworker.mjs share update <slug> --password "hunter2"
+node scripts/viveworker.mjs share update <slug> --no-password
+node scripts/viveworker.mjs share update <slug> --expires-days 7
+
 # Delete by slug
 node scripts/viveworker.mjs share delete <slug>
 ```
 
-All commands accept `--json` for machine-readable output.
+All commands accept `--json` for machine-readable output. Changing the password via `update` invalidates any previously issued unlock cookies, so existing viewers have to re-enter the new password. `--expires-days` on `update` is always relative to *now* — use it to extend or shorten the TTL.
 
 ### When to use
 
