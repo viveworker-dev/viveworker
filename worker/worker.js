@@ -457,6 +457,24 @@ const ghStateKey = (visitorId) => `gh:${visitorId}`;
 const regRateKey = (ip, date) => `reg-rate:${ip}:${date}`;
 
 // ---------------------------------------------------------------------------
+// Crypto helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Constant-time string comparison. Use for any secret compare (API keys,
+ * bridge secrets, OAuth states, admin tokens) so an attacker cannot probe
+ * the value byte-by-byte via response timing.
+ */
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+// ---------------------------------------------------------------------------
 // Analytics Engine helpers
 // ---------------------------------------------------------------------------
 
@@ -510,13 +528,15 @@ function jsonResponse(body, status = 200, headers = {}) {
 
 function validateExternalAuth(request, userRecord) {
   const key = request.headers.get("x-a2a-key") || "";
-  return key && key === userRecord.a2aApiKey;
+  if (!key || !userRecord.a2aApiKey) return false;
+  return timingSafeEqual(key, userRecord.a2aApiKey);
 }
 
 function validateBridgeAuth(request, userRecord) {
   const auth = request.headers.get("authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "");
-  return token && token === userRecord.bridgeSecret;
+  if (!token || !userRecord.bridgeSecret) return false;
+  return timingSafeEqual(token, userRecord.bridgeSecret);
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +784,8 @@ function escapeHtml(str) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +996,10 @@ async function handleRegister(env, request) {
   if (existing) {
     const hasBridgeAuth = validateBridgeAuth(request, existing);
     const providedRegSecret = String(body.registerSecret || "").trim();
-    const hasRegSecret = providedRegSecret && existing.registerSecret && providedRegSecret === existing.registerSecret;
+    const hasRegSecret =
+      providedRegSecret &&
+      existing.registerSecret &&
+      timingSafeEqual(providedRegSecret, existing.registerSecret);
 
     if (!hasBridgeAuth && !hasRegSecret) {
       return jsonResponse({ error: "registration failed (userId unavailable or invalid credentials)" }, 409);
@@ -990,7 +1014,7 @@ async function handleRegister(env, request) {
     // New user (no GitHub signup): require global REGISTER_SECRET (admin only)
     const provided = String(body.registerSecret || "").trim();
     const globalSecret = env.REGISTER_SECRET || "";
-    if (!provided || provided !== globalSecret) {
+    if (!provided || !globalSecret || !timingSafeEqual(provided, globalSecret)) {
       return jsonResponse({ error: "invalid or missing registerSecret — sign up at /auth/github?user_id=<yourId>" }, 403);
     }
   }
@@ -1815,7 +1839,7 @@ async function handleAdminDeleteUser(env, request, userId) {
   // Require REGISTER_SECRET for admin operations
   const auth = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const adminSecret = env.REGISTER_SECRET || "";
-  if (!auth || auth !== adminSecret) {
+  if (!auth || !adminSecret || !timingSafeEqual(auth, adminSecret)) {
     return jsonResponse({ error: "unauthorized" }, 401);
   }
 
