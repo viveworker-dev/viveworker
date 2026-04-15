@@ -53,6 +53,17 @@ if (rawArgs[0] === "a2a") {
   }
 }
 
+if (rawArgs[0] === "share") {
+  const { runShareCli } = await import("./share-cli.mjs");
+  try {
+    await runShareCli(rawArgs.slice(1));
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+  }
+}
+
 const cli = parseArgs(rawArgs);
 
 try {

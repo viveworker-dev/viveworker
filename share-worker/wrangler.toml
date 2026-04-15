@@ -1,0 +1,37 @@
+name = "viveworker-share"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+# Custom domain: share.viveworker.com
+# custom_domain = true tells Cloudflare to manage the DNS record automatically.
+routes = [
+  { pattern = "share.viveworker.com", zone_name = "viveworker.com", custom_domain = true },
+]
+
+# A2A relay's KV — read-only, used to validate X-A2A-User + X-A2A-Key headers.
+# This ID matches the `KV` binding in ../worker/wrangler.toml.
+[[kv_namespaces]]
+binding = "USERS_KV"
+id = "edf93b80de6048ed9a68fad679473d57"
+preview_id = "06279d9087ea4242a2a3055ea6f57583"
+
+# Share service's own KV — replace the IDs after running:
+#   wrangler kv namespace create SHARE_KV
+#   wrangler kv namespace create SHARE_KV --preview
+[[kv_namespaces]]
+binding = "SHARE_KV"
+id = "8427125a737a46a4b0875d5b601c5351"
+preview_id = "1935eca5482f4f3db8ff50ec67891db9"
+
+# R2 bucket for the HTML bodies — create with:
+#   wrangler r2 bucket create viveworker-share-files
+[[r2_buckets]]
+binding = "SHARE_FILES"
+bucket_name = "viveworker-share-files"
+preview_bucket_name = "viveworker-share-files-preview"
+
+# SHARE_SECRET (HMAC key for unlock cookies) is a secret, not a var.
+# Set it with:
+#   wrangler secret put SHARE_SECRET
+# (paste a random 32+ byte string, e.g. `openssl rand -hex 32`)

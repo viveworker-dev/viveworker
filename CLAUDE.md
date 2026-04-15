@@ -203,6 +203,74 @@ curl -X DELETE https://a2a.viveworker.com/internal/admin/user/<userId> \
 - GitHub OAuth enforces 1 account per GitHub user, 3 registrations per IP per day
 - Local A2A (direct `POST /a2a` to bridge) still works alongside the relay
 
+## viveworker share
+
+Host HTML files on a private URL at `share.viveworker.com/v/<slug>`. Useful when an agent generates a report, a chart, or an interactive prototype and wants to hand the human a link instead of a file blob.
+
+Authentication reuses the A2A relay credentials — anyone who has run `viveworker a2a setup` can upload. Anyone with the URL can view (no auth on read); crawlers are blocked via `X-Robots-Tag` and `robots.txt`.
+
+**Quotas (per user, enforced by the worker):**
+- 5 MB total live storage, 10 live files, 5 MB per file
+- 10 uploads per rolling hour
+- Uploads default to a **30-day TTL** when `--expires-days` is omitted — plan for files disappearing, or set `--expires-days` explicitly (up to 365)
+- `list` responses include a `quota` block for showing the user their remaining capacity
+
+### Commands
+
+```bash
+# Upload an .html or .htm file (max 5 MB)
+node scripts/viveworker.mjs share upload report.html
+
+# Upload with optional password + expiry
+node scripts/viveworker.mjs share upload report.html \
+  --password "hunter2" \
+  --expires-days 7
+
+# List your uploads
+node scripts/viveworker.mjs share list
+
+# Delete by slug
+node scripts/viveworker.mjs share delete <slug>
+```
+
+All commands accept `--json` for machine-readable output.
+
+### When to use
+
+- The user asks "share this as a link" / "host this HTML" / "put this somewhere I can view on my phone".
+- You've generated a self-contained HTML artefact (report, dashboard, storybook, visualization) and want to avoid pasting 500 lines into chat.
+- The human wants to forward a result to someone else without exposing your repo or files.
+
+**Do not use for:**
+- Secrets, credentials, or PII (URLs are unguessable but assume they can leak).
+- Files that need server-side code — only static HTML is supported.
+- Non-HTML assets (PDFs, images, zips) — uploads are restricted to `.html` / `.htm`.
+
+### Typical flow
+
+1. Generate the HTML file in a temp location (`/tmp/foo.html`).
+2. Run `viveworker share upload /tmp/foo.html`.
+3. Report the returned URL back to the user. The human approval step happens on the relay (uploads are rate-limited implicitly by the A2A relay's free-tier limits, not per-upload-approved).
+4. If the user wants to rescind later, run `viveworker share delete <slug>` — the R2 object and KV metadata are both wiped.
+
+### Password gate
+
+If `--password` is set, viewers hit an unlock form. A successful submit sets an HMAC-signed cookie (`share_unlock`, Path=/v/:slug, 7 days, HttpOnly, Secure, SameSite=Lax).
+
+### Credentials
+
+Uses `A2A_API_KEY` and `A2A_RELAY_USER_ID` from `~/.viveworker/a2a.env`. Override the worker URL with `VIVEWORKER_SHARE_URL` env var (for staging).
+
+### Architecture
+
+| Component | Location |
+|-----------|----------|
+| Cloudflare Worker | `share-worker/worker.js` |
+| Worker config | `share-worker/wrangler.toml` |
+| Deployment guide | `share-worker/README.md` |
+| CLI | `scripts/share-cli.mjs` |
+| Subcommand dispatch | `scripts/viveworker.mjs` |
+
 ## Thread sharing (cross-thread context transfer)
 
 Share context between AI tool sessions (Codex ↔ Claude Code) with user approval on the paired phone.
