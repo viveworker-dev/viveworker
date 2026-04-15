@@ -238,6 +238,10 @@ node scripts/viveworker.mjs share update <slug> --password "hunter2"
 node scripts/viveworker.mjs share update <slug> --no-password
 node scripts/viveworker.mjs share update <slug> --expires-days 7
 
+# Mint a short-lived pre-unlocked URL for handing off a password-protected share
+node scripts/viveworker.mjs share link <slug> --password "hunter2"
+node scripts/viveworker.mjs share link <slug> --password "hunter2" --ttl-hours 48
+
 # Delete by slug
 node scripts/viveworker.mjs share delete <slug>
 ```
@@ -265,6 +269,24 @@ All commands accept `--json` for machine-readable output. Changing the password 
 ### Password gate
 
 If `--password` is set, viewers hit an unlock form. A successful submit sets an HMAC-signed cookie (`share_unlock`, Path=/v/:slug, 7 days, HttpOnly, Secure, SameSite=Lax).
+
+### Agent handoff (pre-unlocked `?t=` URLs)
+
+When the user asks to forward a password-protected share to another AI agent — especially via A2A or by pasting into a different chat — **do not send the plaintext password**. Instead, mint a short-lived token-embedded URL:
+
+```bash
+# 24h default TTL (capped at 168h / 7d, and capped by the share's own expiresAtMs)
+node scripts/viveworker.mjs share link <slug> --password "hunter2"
+# → 🔗 https://share.viveworker.com/v/<slug>?t=<expMs>.<hmac>
+```
+
+The returned URL unlocks the share on any plain `GET` — no form POST, no cookie handling. Paste it into the A2A message / chat; the receiving agent uses its WebFetch-equivalent tool and reads the HTML directly.
+
+Semantics:
+- Tokens are stateless HMACs (`<expMs>.<base64url(hmac)>`), signed with the share's `passwordSalt`. Rotating the password via `share update --password <new>` rotates the salt and invalidates every outstanding token for the slug — both browser cookies and agent `?t=` links. Use this to revoke.
+- TTL: default 24h, max 168h. Capped further by the share's `expiresAtMs` so a link can never outlive the underlying share.
+- Owner-auth: only the share owner (the same `A2A_API_KEY` that uploaded it) can mint tokens. Wrong password returns `401 invalid-password`.
+- The endpoint (`POST /v/<slug>/unlock.json`) does **not** Set-Cookie on `?t=` views — a URL pasted into a third-party log or chat must not become a durable session for whichever browser later opens it.
 
 ### Credentials
 

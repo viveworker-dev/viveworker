@@ -7,6 +7,7 @@
  *   viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]
  *   viveworker share list [--json]
  *   viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]
+ *   viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]
  *   viveworker share delete <slug>
  *
  * Environment overrides:
@@ -36,6 +37,8 @@ export async function runShareCli(args) {
       return handleList(args.slice(1));
     case "update":
       return handleUpdate(args.slice(1));
+    case "link":
+      return handleLink(args.slice(1));
     case "delete":
     case "rm":
       return handleDelete(args.slice(1));
@@ -52,6 +55,7 @@ function printHelp() {
   console.log("  viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]");
   console.log("  viveworker share list [--json]");
   console.log("  viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]");
+  console.log("  viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
   console.log("  viveworker share delete <slug>");
   console.log("");
   console.log("Credentials are read from ~/.viveworker/a2a.env (same as `viveworker a2a`).");
@@ -298,6 +302,81 @@ async function handleUpdate(args) {
 }
 
 // ---------------------------------------------------------------------------
+// link — mint a short-lived `?t=<token>` URL for handing off a
+// password-protected share to another agent without disclosing the password.
+//
+// The owner keeps the password on their side; the receiver only needs to GET
+// the returned URL. Tokens default to 24h, capped at 168h (7d) and capped by
+// the share's own `expiresAtMs`. Rotating the password via `share update
+// --password ...` invalidates every outstanding token for the slug.
+// ---------------------------------------------------------------------------
+
+async function handleLink(args) {
+  const flags = parseFlags(args);
+  const slug = flags._[0];
+  if (!slug) {
+    throw new Error("Usage: viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
+  }
+  if (!/^[A-Za-z0-9]+$/.test(slug)) {
+    throw new Error(`Invalid slug: ${slug}`);
+  }
+
+  const password = flags.password;
+  if (typeof password !== "string" || password.length === 0) {
+    throw new Error("--password is required (the share's current password)");
+  }
+  if (password.length > 256) {
+    throw new Error("Password too long (max 256 chars)");
+  }
+
+  const hasTtl = Object.prototype.hasOwnProperty.call(flags, "ttl-hours") ||
+    Object.prototype.hasOwnProperty.call(flags, "ttlHours");
+  let ttlHours;
+  if (hasTtl) {
+    const raw = flags["ttl-hours"] || flags["ttlHours"];
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n > 168) {
+      throw new Error("--ttl-hours must be a number between 1 and 168");
+    }
+    ttlHours = n;
+  }
+
+  const { apiKey, userId, shareUrl } = await resolveCredentials();
+
+  const payload = { password };
+  if (ttlHours !== undefined) payload.ttlHours = ttlHours;
+
+  const res = await fetchWithTimeout(`${shareUrl}/v/${encodeURIComponent(slug)}/unlock.json`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-a2a-user": userId,
+      "x-a2a-key": apiKey,
+    },
+    body: JSON.stringify(payload),
+  }, 30_000);
+
+  const body = await readJson(res);
+  if (!res.ok || body.error) {
+    throw new Error(formatApiError("Link", res.status, body));
+  }
+
+  if (flags.json) {
+    console.log(JSON.stringify(body, null, 2));
+    return;
+  }
+
+  console.log("");
+  console.log(`🔗 ${body.url}`);
+  console.log("");
+  if (body.expiresAtMs) {
+    console.log(`   ⏱  Expires ${new Date(body.expiresAtMs).toISOString()}`);
+  }
+  console.log(`   Note: rotating the password via 'share update --password' invalidates this link.`);
+  console.log("");
+}
+
+// ---------------------------------------------------------------------------
 // delete
 // ---------------------------------------------------------------------------
 
@@ -349,6 +428,12 @@ function formatApiError(op, status, body) {
       return `${op} failed (${status}): share is expired — pass --expires-days <1-${body.maxDays || 30}> to revive it`;
     case "object-missing":
       return `${op} failed (${status}): the R2 body is gone (90-day lifecycle reaped it). Re-upload instead.`;
+    case "invalid-password":
+      return `${op} failed (${status}): wrong password`;
+    case "not-password-protected":
+      return `${op} failed (${status}): share has no password — no link token needed, just share the URL directly`;
+    case "invalid-ttlHours":
+      return `${op} failed (${status}): --ttl-hours must be between 1 and ${body.maxHours || 168}`;
     default:
       return `${op} failed (${status}): ${code || body?.statusText || "unknown error"}`;
   }

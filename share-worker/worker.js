@@ -139,6 +139,13 @@ async function handle(request, env, ctx) {
     return await handleUnlock(request, env, unlockMatch[1]);
   }
 
+  // Unlock (JSON, programmatic — mints a `?t=<token>` URL for agent handoff).
+  // Owner-auth required: only the share owner can mint tokens to forward.
+  const unlockJsonMatch = pathname.match(/^\/v\/([A-Za-z0-9]+)\/unlock\.json$/);
+  if (unlockJsonMatch && method === "POST") {
+    return await handleUnlockJson(request, env, unlockJsonMatch[1]);
+  }
+
   // Render
   const viewMatch = pathname.match(/^\/v\/([A-Za-z0-9]+)\/?$/);
   if (viewMatch && (method === "GET" || method === "HEAD")) {
@@ -612,15 +619,32 @@ async function handleView(request, env, slug, headOnly = false) {
     return textResponse("Expired", 410, SECURITY_HEADERS);
   }
 
-  // Password gate
+  // Password gate. Two entry paths:
+  //   - `?t=<token>`: programmatic/agent view. Token-only, no cookie fallback;
+  //     failed verification returns JSON (the caller is machinery). We do NOT
+  //     Set-Cookie here on success — a shared URL must not turn into a
+  //     durable session for whichever browser later opens it from a log.
+  //   - No `?t=`: browser view. Falls back to the existing cookie + HTML
+  //     unlock form flow, unchanged.
   if (meta.passwordHash) {
-    const cookies = parseCookies(request.headers.get("cookie") || "");
-    const token = cookies[UNLOCK_COOKIE_NAME] || "";
-    const ok = await verifyUnlockToken(token, slug, env, meta.passwordSalt);
-    if (!ok) {
-      return headOnly
-        ? new Response(null, { status: 401, headers: { "content-type": "text/html; charset=utf-8", ...SECURITY_HEADERS } })
-        : htmlResponse(renderUnlockForm(slug, false), 401);
+    const url = new URL(request.url);
+    const queryToken = url.searchParams.get("t") || "";
+    if (queryToken) {
+      const ok = await verifyUnlockToken(queryToken, slug, env, meta.passwordSalt);
+      if (!ok) {
+        return headOnly
+          ? new Response(null, { status: 401, headers: { "content-type": "application/json; charset=utf-8", ...SECURITY_HEADERS } })
+          : jsonResponse({ error: "invalid-token" }, 401);
+      }
+    } else {
+      const cookies = parseCookies(request.headers.get("cookie") || "");
+      const token = cookies[UNLOCK_COOKIE_NAME] || "";
+      const ok = await verifyUnlockToken(token, slug, env, meta.passwordSalt);
+      if (!ok) {
+        return headOnly
+          ? new Response(null, { status: 401, headers: { "content-type": "text/html; charset=utf-8", ...SECURITY_HEADERS } })
+          : htmlResponse(renderUnlockForm(slug, false, meta.userId), 401);
+      }
     }
   }
 
@@ -665,17 +689,18 @@ async function handleUnlock(request, env, slug) {
   const form = await request.formData().catch(() => null);
   const submitted = form?.get("password");
   if (typeof submitted !== "string" || submitted.length === 0) {
-    return htmlResponse(renderUnlockForm(slug, true), 400);
+    return htmlResponse(renderUnlockForm(slug, true, meta.userId), 400);
   }
 
   const saltBuf = base64ToBytes(meta.passwordSalt);
   const candidate = await hashPassword(submitted, saltBuf);
   const ok = timingSafeEqual(candidate, meta.passwordHash);
   if (!ok) {
-    return htmlResponse(renderUnlockForm(slug, true), 401);
+    return htmlResponse(renderUnlockForm(slug, true, meta.userId), 401);
   }
 
-  const token = await signUnlockToken(slug, env, meta.passwordSalt);
+  const expMs = Date.now() + UNLOCK_COOKIE_MAX_AGE_SEC * 1000;
+  const token = await signUnlockToken(slug, env, meta.passwordSalt, expMs);
   const setCookie = [
     `${UNLOCK_COOKIE_NAME}=${token}`,
     `Path=/v/${slug}`,
@@ -692,6 +717,93 @@ async function handleUnlock(request, env, slug) {
       "set-cookie": setCookie,
       ...SECURITY_HEADERS,
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Unlock (JSON) — owner mints a short-lived `?t=<token>` URL for handoff.
+//
+// Why owner-auth? An unauth'd JSON unlock would be a free password-brute-force
+// oracle (PBKDF2 is a cost gate per attempt but not a replacement for access
+// control). Restricting to the share owner also matches the intended flow:
+// the owner forwards their own share to another agent; nobody else has
+// legitimate reason to mint unlock tokens for someone else's share. Wrong
+// password still takes PBKDF2 time to fail, so owners who forget the password
+// can't use this to rate-mine their own shares either.
+//
+// Successful response:
+//   { ok: true, token, url, expiresAtMs }
+// Wrong password: 401 { ok: false, error: "invalid-password" }
+//
+// Tokens are stateless HMACs (see signUnlockToken). The caller pastes the
+// returned `url` into chat / A2A text; the receiving agent just GETs it.
+// Rotating the password via PATCH rotates `passwordSalt`, which invalidates
+// every outstanding token for the slug — cookies and `?t=` alike.
+// ---------------------------------------------------------------------------
+
+async function handleUnlockJson(request, env, slug) {
+  const user = await authenticate(request, env);
+  if (!user) return jsonResponse({ error: "unauthorized" }, 401);
+
+  const meta = await loadMetadata(env, slug);
+  if (!meta) return jsonResponse({ error: "not-found" }, 404);
+  if (meta.userId !== user.userId) return jsonResponse({ error: "forbidden" }, 403);
+  if (meta.expiresAtMs && Date.now() > meta.expiresAtMs) {
+    return jsonResponse({ error: "expired" }, 410);
+  }
+  if (!meta.passwordHash) {
+    return jsonResponse({ error: "not-password-protected" }, 400);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid-json" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ error: "invalid-body" }, 400);
+  }
+
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!password) return jsonResponse({ error: "missing-password" }, 400);
+  if (password.length > 256) {
+    return jsonResponse({ error: "password-too-long" }, 400);
+  }
+
+  // ttlHours: default 24, cap 168 (7d, matches cookie path). Also capped below
+  // by meta.expiresAtMs so a token can never outlive the share itself.
+  const MAX_TTL_HOURS = 168;
+  const DEFAULT_TTL_HOURS = 24;
+  let ttlHours = DEFAULT_TTL_HOURS;
+  if (body.ttlHours !== undefined && body.ttlHours !== null) {
+    const n = Number(body.ttlHours);
+    if (!Number.isFinite(n) || n <= 0 || n > MAX_TTL_HOURS) {
+      return jsonResponse({ error: "invalid-ttlHours", maxHours: MAX_TTL_HOURS }, 400);
+    }
+    ttlHours = n;
+  }
+
+  const saltBuf = base64ToBytes(meta.passwordSalt);
+  const candidate = await hashPassword(password, saltBuf);
+  const ok = timingSafeEqual(candidate, meta.passwordHash);
+  if (!ok) {
+    return jsonResponse({ ok: false, error: "invalid-password" }, 401);
+  }
+
+  const now = Date.now();
+  let expMs = now + Math.floor(ttlHours * 3600 * 1000);
+  if (meta.expiresAtMs && expMs > meta.expiresAtMs) {
+    expMs = meta.expiresAtMs;
+  }
+
+  const token = await signUnlockToken(slug, env, meta.passwordSalt, expMs);
+  const origin = new URL(request.url).origin;
+  return jsonResponse({
+    ok: true,
+    token,
+    url: `${origin}/v/${slug}?t=${encodeURIComponent(token)}`,
+    expiresAtMs: expMs,
   });
 }
 
@@ -842,15 +954,27 @@ function timingSafeEqual(a, b) {
 }
 
 // ---------------------------------------------------------------------------
-// Unlock cookie — HMAC-SHA256(slug + "\n" + passwordSalt, SHARE_SECRET).
+// Unlock token — `<expMs>.<base64url(HMAC-SHA256(slug + "\n" + passwordSalt +
+// "\n" + expMs, SHARE_SECRET))>`.
+//
 // Binding the password salt into the signed payload means rotating the
 // password (which rotates the salt) also invalidates every previously issued
-// unlock cookie for that slug — so PATCH /api/share/:slug can revoke access.
+// unlock token. Embedding `expMs` lets the same token format be carried
+// outside of a cookie — e.g. `/v/<slug>?t=<token>` for agent-to-agent
+// handoff — without relying on cookie `Max-Age` to bound lifetime.
+//
+// Legacy tokens (produced before the embedded-expiry upgrade) have no dot
+// separator and sign `slug + "\n" + passwordSalt` only; they still verify via
+// the `if (dot === -1)` branch so in-flight cookies keep working through the
+// deploy. New callers should always pass an `expMs`.
 // ---------------------------------------------------------------------------
 
-async function signUnlockToken(slug, env, passwordSalt = "") {
+async function signUnlockToken(slug, env, passwordSalt, expMs) {
   const secret = env.SHARE_SECRET || "";
   if (!secret) throw new Error("SHARE_SECRET not configured");
+  if (!Number.isFinite(expMs) || expMs <= 0) {
+    throw new Error("signUnlockToken: expMs is required");
+  }
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -858,15 +982,40 @@ async function signUnlockToken(slug, env, passwordSalt = "") {
     false,
     ["sign"]
   );
-  const payload = `${slug}\n${passwordSalt || ""}`;
+  const safeSalt = passwordSalt || "";
+  const payload = `${slug}\n${safeSalt}\n${expMs}`;
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-  return bytesToBase64Url(new Uint8Array(sig));
+  return `${expMs}.${bytesToBase64Url(new Uint8Array(sig))}`;
 }
 
 async function verifyUnlockToken(token, slug, env, passwordSalt = "") {
   if (!token) return false;
   try {
-    const expected = await signUnlockToken(slug, env, passwordSalt);
+    const safeSalt = passwordSalt || "";
+    const dot = token.indexOf(".");
+    if (dot === -1) {
+      // Legacy format — payload `slug + "\n" + passwordSalt`, lifetime bounded
+      // only by cookie `Max-Age`. Kept for in-flight cookies minted before the
+      // upgrade; new code never produces this shape.
+      const secret = env.SHARE_SECRET || "";
+      if (!secret) return false;
+      const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const legacyPayload = `${slug}\n${safeSalt}`;
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(legacyPayload));
+      const expected = bytesToBase64Url(new Uint8Array(sig));
+      return timingSafeEqual(token, expected);
+    }
+    const expMsStr = token.slice(0, dot);
+    if (!/^\d+$/.test(expMsStr)) return false;
+    const expMs = Number(expMsStr);
+    if (!Number.isFinite(expMs) || expMs <= Date.now()) return false;
+    const expected = await signUnlockToken(slug, env, safeSalt, expMs);
     return timingSafeEqual(token, expected);
   } catch {
     return false;
@@ -985,50 +1134,62 @@ function renderLanding() {
 </html>`;
 }
 
-function renderUnlockForm(slug, showError) {
+function renderUnlockForm(slug, showError, ownerUserId = "") {
+  // userIds are validated at upload/auth (`/^[a-zA-Z0-9_-]{1,64}$/`), so if
+  // the stored value doesn't match that shape we drop the "hosted by" line
+  // rather than risk injecting anything into the HTML.
+  const safeOwner = /^[a-zA-Z0-9_-]{1,64}$/.test(ownerUserId) ? ownerUserId : "";
+  const hostedByHtml = safeOwner
+    ? `<div class="footer-links">hosted by <a href="https://a2a.viveworker.com/u/${safeOwner}" target="_blank" rel="noopener">${safeOwner}</a></div>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="robots" content="noindex, nofollow" />
-<title>Password required</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #0b0f14; color: #d7e2ea; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 2rem;
-  }
-  form {
-    width: 100%; max-width: 340px; padding: 1.4rem 1.5rem 1.6rem;
-    background: #141b24; border: 1px solid #25313d; border-radius: 14px;
-    display: flex; flex-direction: column; gap: 0.8rem;
-  }
-  h1 { margin: 0; font-size: 1.05rem; font-weight: 600; }
-  p { margin: 0; color: #9cb5c5; font-size: 0.88rem; }
-  input[type="password"] {
-    width: 100%; padding: 0.65rem 0.8rem; border-radius: 8px; border: 1px solid #2d3a48;
-    background: #0b0f14; color: #d7e2ea; font: inherit; outline: none;
-  }
-  input[type="password"]:focus { border-color: #55a7ff; }
-  button {
-    padding: 0.65rem 0.8rem; border-radius: 8px; border: 0; cursor: pointer;
-    background: #2b7fd8; color: #fff; font: inherit; font-weight: 600;
-  }
-  button:hover { background: #3c8de0; }
-  .error { color: #ff7a7a; font-size: 0.85rem; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Password required — viveworker share</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    :root{color-scheme:dark}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0f0d;color:#e6e6e6;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:1.5rem}
+    .card{max-width:420px;width:100%;background:#111916;border:1px solid #1e2e28;border-radius:16px;padding:2rem;text-align:center}
+    .lock{width:56px;height:56px;background:#0d2b20;border:2px solid #00d4aa;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;color:#00d4aa}
+    .lock svg{width:22px;height:22px}
+    .badge{display:inline-block;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:#00d4aa;background:#0d2b20;padding:0.2rem 0.6rem;border-radius:99px;margin-bottom:1rem}
+    .description{color:#a0a0a0;font-size:0.95rem;line-height:1.5;margin-bottom:1.5rem}
+    form{display:flex;flex-direction:column;gap:0.7rem}
+    input[type="password"]{width:100%;padding:0.7rem 0.9rem;border-radius:8px;border:1px solid #1e2e28;background:#0d1a14;color:#e6e6e6;font:inherit;outline:none;transition:border-color 0.2s}
+    input[type="password"]:focus{border-color:#00d4aa}
+    input[type="password"]::placeholder{color:#55665f}
+    button{padding:0.7rem 0.9rem;border-radius:8px;border:0;cursor:pointer;background:#00d4aa;color:#0a0f0d;font:inherit;font-weight:700;transition:background 0.2s}
+    button:hover{background:#1ae3b9}
+    .error{color:#ff7a7a;font-size:0.85rem;margin-top:0.1rem}
+    footer{margin-top:2rem;text-align:center}
+    .footer-brand{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#00d4aa;text-decoration:none}
+    .footer-brand:hover{text-decoration:underline}
+    .footer-links{font-size:0.75rem;color:#555;margin-top:0.3rem}
+    .footer-links a{color:#666;text-decoration:none}
+    .footer-links a:hover{color:#00d4aa}
+  </style>
 </head>
 <body>
-<form method="POST" action="/v/${encodeURIComponent(slug)}/unlock" autocomplete="off">
-  <h1>Password required</h1>
-  <p>This shared page is protected. Enter the password to view.</p>
-  <input type="password" name="password" autofocus required />
-  ${showError ? '<div class="error">Incorrect password.</div>' : ""}
-  <button type="submit">Unlock</button>
-</form>
+  <div class="card">
+    <div class="lock" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    </div>
+    <div class="badge">Password required</div>
+    <p class="description">This shared page is protected.<br>Enter the password to view.</p>
+    <form method="POST" action="/v/${encodeURIComponent(slug)}/unlock" autocomplete="off">
+      <input type="password" name="password" placeholder="Password" autofocus required />
+      <button type="submit">Unlock</button>
+      ${showError ? '<div class="error">Incorrect password.</div>' : ""}
+    </form>
+  </div>
+  <footer>
+    <a href="https://a2a.viveworker.com" target="_blank" rel="noopener" class="footer-brand">viveworker a2a</a>
+    ${hostedByHtml}
+  </footer>
 </body>
 </html>`;
 }
