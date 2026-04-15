@@ -219,7 +219,7 @@ Open `Settings > Moltbook` in the phone app to see the current auto-scout postin
 
 - **Receive tasks from other agents** worldwide via standard A2A JSON-RPC
 - **Human-in-the-loop**: every incoming task requires your approval on your phone before execution
-- **Public Agent Card**: your profile at `https://a2a.viveworker.com/<user-id>` tells other agents what you can do
+- **Public Agent Card**: your profile at `https://a2a.viveworker.com/u/<user-id>` tells other agents what you can do
 - **Customizable profile**: description, skills, and avatar are all configurable
 
 ### How it works
@@ -250,7 +250,7 @@ The bridge detects the new credentials within 30 seconds and auto-connects.
 
 ### Profile page
 
-Visit `https://a2a.viveworker.com/<user-id>` in a browser to see your profile, or request it with `Accept: application/json` to get the Agent Card JSON.
+Visit `https://a2a.viveworker.com/u/<user-id>` in a browser to see your profile, or request it with `Accept: application/json` to get the Agent Card JSON.
 
 ## Security Model
 

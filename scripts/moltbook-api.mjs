@@ -39,22 +39,56 @@ export function createMoltbookClient(apiKey) {
     throw new Error("MOLTBOOK_API_KEY is required");
   }
   return async function mb(pathname, init = {}) {
-    const res = await fetch(`${API_BASE}${pathname}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`,
-        ...(init.headers || {}),
-      },
-    });
-    const text = await res.text().catch(() => "");
-    if (!res.ok) {
-      throw new Error(`moltbook ${res.status} ${pathname}: ${text}`);
-    }
+    const { timeoutMs: overrideTimeoutMs, ...fetchInit } = init;
+    const method = String(fetchInit.method || "GET").toUpperCase();
+    const isWrite = method !== "GET" && method !== "HEAD";
+    // Reads get 30s, writes 60s. A flaky upstream must not be able to hang
+    // the process indefinitely — this exact failure mode took out the
+    // moltbook-watcher in mid-April 2026 when /notifications started
+    // returning 500s and later stopped responding entirely. Bare fetch has
+    // no default timeout and the undici connection pool saturated, leaving
+    // the process alive but unable to log, poll, or push anything.
+    // Writes get a longer budget because POST /posts and /comments do
+    // synchronous spam-screening on the server side.
+    const timeoutMs = typeof overrideTimeoutMs === "number"
+      ? overrideTimeoutMs
+      : (isWrite ? 60_000 : 30_000);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return JSON.parse(text);
-    } catch {
-      return text;
+      const res = await fetch(`${API_BASE}${pathname}`, {
+        ...fetchInit,
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+          ...(fetchInit.headers || {}),
+        },
+      });
+      const text = await res.text().catch(() => "");
+      if (controller.signal.aborted) {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      if (!res.ok) {
+        throw new Error(`moltbook ${res.status} ${pathname}: ${text}`);
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const hint = isWrite
+          ? " — may have succeeded server-side; run `moltbook reconcile` before retrying"
+          : "";
+        throw new Error(`moltbook timeout after ${timeoutMs}ms ${method} ${pathname}${hint}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
   };
 }
@@ -173,7 +207,13 @@ export function rollScoutDayIfNeeded(state) {
 }
 
 export function recordComposeAttempt(state, title, postId, type = "post") {
-  state.composedToday = (state.composedToday || 0) + 1;
+  // Only original posts count against the daily "本日の新規投稿数" quota
+  // (composedToday). Replies are still appended to recentComposeTitles so
+  // the "最近の投稿" list in settings shows them with their reply badge,
+  // but they intentionally do not inflate the counter.
+  if (type === "post") {
+    state.composedToday = (state.composedToday || 0) + 1;
+  }
   state.lastComposeDay = todayKey();
   if (!Array.isArray(state.recentComposeTitles)) state.recentComposeTitles = [];
   const entry = { title: String(title || ""), type };

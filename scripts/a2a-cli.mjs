@@ -153,7 +153,7 @@ async function handleSetup(args) {
 
   console.log(`✅ Credentials saved\n`);
   console.log(`🚀 Setup complete! Restart your viveworker bridge to connect.`);
-  console.log(`   Your A2A endpoint: ${result.relayUrl}/${result.userId}\n`);
+  console.log(`   Your A2A endpoint: ${result.relayUrl}/u/${result.userId}\n`);
 }
 
 // ---------------------------------------------------------------------------

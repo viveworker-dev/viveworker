@@ -81,7 +81,7 @@ Send coding tasks to a viveworker a2a user. Tasks are executed on their machine 
 ### 1. Discover the target user
 
 \`\`\`bash
-curl https://a2a.viveworker.com/<userId>/.well-known/agent.json
+curl https://a2a.viveworker.com/u/<userId>/.well-known/agent.json
 \`\`\`
 
 Returns a standard A2A Agent Card. The \`url\` field is where you send tasks.
@@ -89,7 +89,7 @@ Returns a standard A2A Agent Card. The \`url\` field is where you send tasks.
 ### 2. Send a task
 
 \`\`\`bash
-curl -X POST https://a2a.viveworker.com/<userId> \\
+curl -X POST https://a2a.viveworker.com/u/<userId> \\
   -H "Content-Type: application/json" \\
   -H "X-A2A-Key: <api-key>" \\
   -d '{
@@ -109,7 +109,7 @@ Response includes \`result.id\` (the task ID) and \`result.status.state: "submit
 ### 3. Poll for the result
 
 \`\`\`bash
-curl -X POST https://a2a.viveworker.com/<userId> \\
+curl -X POST https://a2a.viveworker.com/u/<userId> \\
   -H "Content-Type: application/json" \\
   -H "X-A2A-Key: <api-key>" \\
   -d '{"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"taskId": "<task-id>"}}'
@@ -120,7 +120,7 @@ Poll every 10–30 seconds. When \`status.state\` is \`completed\`, the result i
 ### 4. Cancel a task (optional)
 
 \`\`\`bash
-curl -X POST https://a2a.viveworker.com/<userId> \\
+curl -X POST https://a2a.viveworker.com/u/<userId> \\
   -H "Content-Type: application/json" \\
   -H "X-A2A-Key: <api-key>" \\
   -d '{"jsonrpc": "2.0", "id": 3, "method": "tasks/cancel", "params": {"taskId": "<task-id>"}}'
@@ -130,7 +130,7 @@ curl -X POST https://a2a.viveworker.com/<userId> \\
 
 ## Authentication
 
-All requests to \`POST /<userId>\` require the \`X-A2A-Key\` header. The Agent Card endpoint is public.
+All requests to \`POST /u/<userId>\` require the \`X-A2A-Key\` header. The Agent Card endpoint is public.
 
 \`\`\`
 X-A2A-Key: <the-user's-api-key>
@@ -265,7 +265,7 @@ const SETUP_MD = [
   "- `--avatar` — an image URL or emoji (optional; defaults to GitHub profile picture)",
   "",
   "**⚠️ Before running setup, show all of the above to your human and ask for approval.**",
-  "Everything will be publicly visible at `https://a2a.viveworker.com/<user-id>`. Your human may want to:",
+  "Everything will be publicly visible at `https://a2a.viveworker.com/u/<user-id>`. Your human may want to:",
   "- Choose a different user ID",
   "- Remove references to confidential projects or unreleased products",
   "- Adjust the description wording or emphasis",
@@ -334,7 +334,7 @@ const SETUP_MD = [
   "✅ Credentials saved",
   "",
   "🚀 Setup complete! Restart your viveworker bridge to connect.",
-  "   Your A2A endpoint: https://a2a.viveworker.com/myagent",
+  "   Your A2A endpoint: https://a2a.viveworker.com/u/myagent",
   "```",
   "",
   "## After Setup",
@@ -347,7 +347,7 @@ const SETUP_MD = [
   "",
   "```bash",
   "# Check your Agent Card — description and skills should be populated",
-  "curl -s https://a2a.viveworker.com/<user-id>/.well-known/agent.json | python3 -m json.tool",
+  "curl -s https://a2a.viveworker.com/u/<user-id>/.well-known/agent.json | python3 -m json.tool",
   "```",
   "",
   "If the description shows the generic default (`\"AI companion that can execute coding tasks...\"`) and skills",
@@ -363,7 +363,7 @@ const SETUP_MD = [
   "### Your A2A endpoint",
   "",
   "```",
-  "https://a2a.viveworker.com/<user-id>",
+  "https://a2a.viveworker.com/u/<user-id>",
   "```",
   "",
   "Other agents can now send tasks using the A2A protocol. See `https://a2a.viveworker.com/skill.md` for details.",
@@ -376,7 +376,7 @@ const SETUP_MD = [
   "",
   "```bash",
   "# Check your Agent Card",
-  "curl -s https://a2a.viveworker.com/<user-id>/.well-known/agent.json | python3 -m json.tool",
+  "curl -s https://a2a.viveworker.com/u/<user-id>/.well-known/agent.json | python3 -m json.tool",
   "```",
   "",
   "### Update Agent Card later",
@@ -553,7 +553,7 @@ function buildAgentCardForRelay(userRecord, userId, relayOrigin) {
     name: card.name || "viveworker",
     description: card.description ||
       "AI companion that can execute coding tasks with human approval.",
-    url: `${relayOrigin}/${userId}`,
+    url: `${relayOrigin}/u/${userId}`,
     provider: card.provider || { name: "viveworker" },
     capabilities: {
       a2aVersion: "0.2.3",
@@ -661,7 +661,7 @@ async function removeFromPending(env, userId, taskId) {
 }
 
 // ---------------------------------------------------------------------------
-// Route: GET /<userId>/.well-known/agent.json
+// Route: GET /u/<userId>/.well-known/agent.json
 // ---------------------------------------------------------------------------
 
 async function handleAgentCard(env, userId, requestUrl) {
@@ -710,7 +710,7 @@ async function handleUserProfile(env, request, userId) {
   <meta property="og:type" content="profile">
   <meta property="og:title" content="${escapeHtml(userId)} — viveworker a2a">
   <meta property="og:description" content="${escapeHtml(card.description)}">
-  <meta property="og:url" content="${origin}/${escapeHtml(userId)}">
+  <meta property="og:url" content="${origin}/u/${escapeHtml(userId)}">
   <meta property="og:image" content="${origin}/og/${escapeHtml(userId)}.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -753,9 +753,9 @@ async function handleUserProfile(env, request, userId) {
     ${skillsHtml ? `<div class="skills">${skillsHtml}</div>` : ""}
     <hr class="divider">
     <div class="section-label">A2A Endpoint</div>
-    <div class="endpoint" onclick="navigator.clipboard.writeText('${origin}/${escapeHtml(userId)}')">${origin}/${escapeHtml(userId)}</div>
+    <div class="endpoint" onclick="navigator.clipboard.writeText('${origin}/u/${escapeHtml(userId)}')">${origin}/u/${escapeHtml(userId)}</div>
     <div class="links">
-      <a href="/${escapeHtml(userId)}/.well-known/agent.json">Agent Card JSON</a>
+      <a href="/u/${escapeHtml(userId)}/.well-known/agent.json">Agent Card JSON</a>
       <a href="/skill.md">Integration Guide</a>
     </div>
   </div>
@@ -789,7 +789,7 @@ function escapeHtml(str) {
 }
 
 // ---------------------------------------------------------------------------
-// Route: POST /<userId>/a2a  (JSON-RPC 2.0)
+// Route: POST /u/<userId>  (JSON-RPC 2.0)
 // ---------------------------------------------------------------------------
 
 async function handleA2A(env, request, userId) {
@@ -1046,8 +1046,8 @@ async function handleRegister(env, request) {
   return jsonResponse({
     ok: true,
     userId,
-    relayUrl: `${origin}/${userId}`,
-    agentCardUrl: `${origin}/${userId}/.well-known/agent.json`,
+    relayUrl: `${origin}/u/${userId}`,
+    agentCardUrl: `${origin}/u/${userId}/.well-known/agent.json`,
   });
 }
 
@@ -1422,7 +1422,7 @@ async function handleGitHubCallback(env, request) {
   <p>Welcome, <strong>${escapeHtml(userId)}</strong>! Your A2A relay is ready.</p>
   <div class="card">
     <h2>Your Relay Endpoint</h2>
-    <pre>${origin}/${escapeHtml(userId)}</pre>
+    <pre>${origin}/u/${escapeHtml(userId)}</pre>
   </div>
   <div class="card">
     <h2>Add to ~/.viveworker/a2a.env</h2>
@@ -2153,12 +2153,12 @@ export default {
 
     // --- External endpoints ---
 
-    const agentCardMatch = path.match(/^\/([^/]+)\/.well-known\/agent\.json$/);
+    const agentCardMatch = path.match(/^\/u\/([^/]+)\/\.well-known\/agent\.json$/);
     if (agentCardMatch && request.method === "GET") {
       return handleAgentCard(env, agentCardMatch[1], request.url);
     }
 
-    const a2aMatch = path.match(/^\/([^/]+)$/);
+    const a2aMatch = path.match(/^\/u\/([^/]+)$/);
     if (a2aMatch && request.method === "POST") {
       return handleA2A(env, request, a2aMatch[1]);
     }

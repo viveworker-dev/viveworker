@@ -50,6 +50,8 @@ const state = {
   moltbookScoutStatus: null,
   moltbookRecentTitlesExpanded: 0,
   a2aRelayStatus: null,
+  a2aShareStatus: null,
+  a2aShareRecentExpanded: 0,
   a2aTaskExecutorPick: "codex",
   pushNotice: "",
   pushError: "",
@@ -218,6 +220,7 @@ async function refreshAuthenticatedState() {
   await refreshPushStatus();
   await fetchMoltbookScoutStatus();
   await fetchA2aRelayStatus();
+  await fetchA2aShareStatus();
   ensureCurrentSelection();
 }
 
@@ -344,6 +347,18 @@ async function fetchA2aRelayStatus() {
     state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
   } catch {
     state.a2aRelayStatus = null;
+  }
+}
+
+async function fetchA2aShareStatus() {
+  if (!state.session?.a2aShareEnabled) {
+    state.a2aShareStatus = null;
+    return;
+  }
+  try {
+    state.a2aShareStatus = await apiGet("/api/share/status");
+  } catch {
+    state.a2aShareStatus = null;
   }
 }
 
@@ -2865,6 +2880,7 @@ function buildSettingsContext() {
     }),
     moltbookScout: state.moltbookScoutStatus,
     a2aRelay: state.a2aRelayStatus,
+    a2aShare: state.a2aShareStatus,
   };
 }
 
@@ -3025,6 +3041,13 @@ function settingsPageMeta(page) {
         description: L("settings.a2aRelay.copy"),
         icon: "link",
       };
+    case "a2aShare":
+      return {
+        id: "a2aShare",
+        title: L("settings.a2aShare.title"),
+        description: L("settings.a2aShare.copy"),
+        icon: "link",
+      };
     case "a2aExecutor":
       // Executor settings integrated into a2aRelay page — redirect.
       return settingsPageMeta("a2aRelay");
@@ -3097,13 +3120,13 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
-      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled) ? renderSettingsGroup(L("settings.group.integrations"), [
+      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled) ? renderSettingsGroup(L("settings.group.integrations"), [
         state.session?.moltbookEnabled ? renderSettingsNavRow({
           page: "moltbook",
           icon: "item",
           title: L("settings.moltbook.title"),
           subtitle: L("settings.moltbook.subtitle"),
-          value: context.moltbookScout?.enabled ? `${context.moltbookScout.sentToday} / ${context.moltbookScout.maxDaily}` : "",
+          value: context.moltbookScout?.enabled ? L("settings.status.enabled") : L("settings.status.disabled"),
         }) : "",
         state.session?.a2aRelayEnabled ? renderSettingsNavRow({
           page: "a2aRelay",
@@ -3111,6 +3134,13 @@ function renderSettingsRoot(context, { mobile }) {
           title: L("settings.a2aRelay.title"),
           subtitle: L("settings.a2aRelay.subtitle"),
           value: context.a2aRelay?.connected ? L("settings.status.connected") : L("settings.a2aRelay.status.disconnected"),
+        }) : "",
+        state.session?.a2aShareEnabled ? renderSettingsNavRow({
+          page: "a2aShare",
+          icon: "link",
+          title: L("settings.a2aShare.title"),
+          subtitle: L("settings.a2aShare.subtitle"),
+          value: context.a2aShare?.enabled ? L("settings.status.enabled") : L("settings.status.disabled"),
         }) : "",
       ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
@@ -3162,6 +3192,9 @@ function renderSettingsSubpage(context, { mobile }) {
     case "a2aRelay":
     case "a2aExecutor":
       content = renderSettingsA2aRelayPage(context);
+      break;
+    case "a2aShare":
+      content = renderSettingsA2aSharePage(context);
       break;
     default:
       content = "";
@@ -3392,8 +3425,16 @@ function renderSettingsMoltbookPage(context) {
     renderSettingsInfoRow(L("settings.row.moltbookBatchTopScore"), String(scout.batch.topScore)),
     renderSettingsInfoRow(L("settings.row.moltbookBatchRemaining"), `${Math.floor(scout.batch.remainingSeconds / 60)}:${String(scout.batch.remainingSeconds % 60).padStart(2, "0")}`),
   ] : [];
+  const accountRow = scout.account?.name && scout.account?.profileUrl
+    ? renderSettingsInfoRow(
+        L("settings.row.moltbookAccount"),
+        `<a href="${escapeHtml(scout.account.profileUrl)}" target="_blank" rel="noopener">${escapeHtml(scout.account.name)}</a>`,
+        { rawValue: true }
+      )
+    : null;
   return `
     <div class="settings-page">
+      ${accountRow ? renderSettingsGroup("", [accountRow]) : ""}
       ${renderSettingsGroup("", [
         renderSettingsInfoRow(L("settings.row.moltbookQuota"), `${scout.sentToday} / ${scout.maxDaily}`),
         renderSettingsInfoRow(L("settings.row.moltbookComposed"), `${scout.composedToday || 0} / 3`),
@@ -3417,7 +3458,19 @@ function renderSettingsMoltbookPage(context) {
           const link = postId
             ? `<a href="https://www.moltbook.com/post/${escapeHtml(postId)}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
             : escapeHtml(title);
-          return `<div class="settings-compose-entry">${badge}<span class="settings-compose-entry__title">${link}</span></div>`;
+          const iconName = type === "reply" ? "moltbook-reply" : "moltbook-draft";
+          const iconTone = type === "reply" ? "settings-icon-entry__icon--reply" : "settings-icon-entry__icon--post";
+          return `
+            <div class="settings-compose-entry settings-icon-entry">
+              <span class="settings-icon-entry__icon ${iconTone}" aria-hidden="true">${renderIcon(iconName)}</span>
+              <span class="settings-icon-entry__body">
+                <span class="settings-icon-entry__title-row">
+                  <span class="settings-compose-entry__title">${link}</span>
+                  ${badge}
+                </span>
+              </span>
+            </div>
+          `;
         });
         if (hasMore) {
           const remaining = titles.length - visibleCount;
@@ -3445,7 +3498,7 @@ function renderSettingsA2aRelayPage(context) {
     : relay.polling
       ? L("settings.a2aRelay.status.polling")
       : L("settings.a2aRelay.status.disconnected");
-  const profileUrl = `${relay.relayUrl}/${relay.userId}`;
+  const profileUrl = `${relay.relayUrl}/u/${relay.userId}`;
   const userIdLink = `<a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener">${escapeHtml(relay.userId)}</a>`;
   const relayHost = (() => { try { return new URL(relay.relayUrl).host; } catch { return relay.relayUrl; } })();
   const publicChecked = relay.acceptPublicTasks === true;
@@ -3465,20 +3518,22 @@ function renderSettingsA2aRelayPage(context) {
 
   return `
     <div class="settings-page">
+      ${renderSettingsGroup("", [
+        renderSettingsInfoRow(L("settings.row.a2aStatus"), statusLabel),
+        renderSettingsInfoRow(L("settings.row.a2aUserId"), userIdLink, { rawValue: true }),
+        renderSettingsInfoRow(L("settings.row.a2aRelay"), relayHost),
+        renderSettingsInfoRow(L("settings.row.a2aApiKey"), relay.apiKeyConfigured ? L("settings.a2aRelay.apiKey.configured") : L("settings.a2aRelay.apiKey.notConfigured")),
+        relay.lastPollAtMs
+          ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
+          : "",
+      ].filter(Boolean))}
       ${(() => {
         const stats = relay.taskStats || { received: 0, completed: 0, denied: 0 };
-        return renderSettingsGroup("", [
-          renderSettingsInfoRow(L("settings.row.a2aStatus"), statusLabel),
-          renderSettingsInfoRow(L("settings.row.a2aUserId"), userIdLink, { rawValue: true }),
-          renderSettingsInfoRow(L("settings.row.a2aRelay"), relayHost),
-          renderSettingsInfoRow(L("settings.row.a2aApiKey"), relay.apiKeyConfigured ? L("settings.a2aRelay.apiKey.configured") : L("settings.a2aRelay.apiKey.notConfigured")),
-          relay.lastPollAtMs
-            ? renderSettingsInfoRow(L("settings.row.a2aLastPoll"), new Date(relay.lastPollAtMs).toLocaleString(state.locale))
-            : "",
+        return renderSettingsGroup(L("settings.a2aRelay.taskStats.title"), [
           renderSettingsInfoRow(L("settings.row.a2aTaskReceived"), String(stats.received)),
           renderSettingsInfoRow(L("settings.row.a2aTaskCompleted"), String(stats.completed)),
           renderSettingsInfoRow(L("settings.row.a2aTaskDenied"), String(stats.denied)),
-        ].filter(Boolean));
+        ]);
       })()}
       <section class="settings-group">
         <p class="settings-group__title">${escapeHtml(L("settings.a2aRelay.publicTasks.title"))}</p>
@@ -3504,6 +3559,150 @@ function renderSettingsA2aRelayPage(context) {
       ])}
     </div>
   `;
+}
+
+function renderSettingsA2aSharePage(context) {
+  const share = context.a2aShare;
+  if (!share?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.a2aShare.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const quota = share.quota || { bytes: 0, maxBytes: 0, count: 0, maxCount: 0 };
+  const limits = share.limits || {};
+  const items = Array.isArray(share.items) ? share.items : [];
+  const statusLabel = share.error
+    ? L("settings.a2aShare.status.unreachable")
+    : L("settings.status.enabled");
+  const formatBytes = (bytes) => {
+    if (!Number.isFinite(bytes)) return "—";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+  const storageValue = share.quota
+    ? `${formatBytes(quota.bytes)} / ${formatBytes(quota.maxBytes || limits.maxTotalBytes || 0)}`
+    : "—";
+  const filesValue = share.quota
+    ? `${quota.count} / ${quota.maxCount || limits.maxFiles || 0}`
+    : "—";
+  const storageRows = [
+    renderSettingsInfoRow(L("settings.row.a2aShareStorage"), storageValue),
+    renderSettingsInfoRow(L("settings.row.a2aShareFiles"), filesValue),
+    renderSettingsInfoRow(L("settings.row.a2aShareMaxFileSize"), formatBytes(limits.maxFileBytes || 0)),
+    renderSettingsInfoRow(
+      L("settings.row.a2aShareDefaultExpiry"),
+      L("settings.a2aShare.days", { count: limits.defaultExpiresDays || 30 })
+    ),
+    renderSettingsInfoRow(
+      L("settings.row.a2aShareUploadRate"),
+      L("settings.a2aShare.ratePerHour", { count: limits.uploadRatePerHour || 10 })
+    ),
+  ];
+
+  const PAGE_SIZE = 5;
+  const visibleCount = state.a2aShareRecentExpanded || PAGE_SIZE;
+  const visible = items.slice(0, visibleCount);
+  const hasMore = items.length > visibleCount;
+  const filesList = visible.map((item) => {
+    const lock = item.hasPassword
+      ? `<span class="settings-compose-badge settings-compose-badge--reply" title="${escapeHtml(L("settings.a2aShare.passwordProtected"))}">🔒</span>`
+      : "";
+    const label = escapeHtml(item.originalName || item.slug);
+    const link = item.url
+      ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">${label}</a>`
+      : label;
+    const sizeText = escapeHtml(formatBytes(item.size || 0));
+    const createdText = item.createdAtMs
+      ? escapeHtml(formatRelativeAge(Date.now() - item.createdAtMs))
+      : "";
+    const expiresText = item.expiresAtMs
+      ? escapeHtml(formatExpiresIn(item.expiresAtMs - Date.now()))
+      : "";
+    const meta = [sizeText, createdText, expiresText].filter(Boolean).join(" · ");
+    return `
+      <div class="settings-compose-entry settings-icon-entry">
+        <span class="settings-icon-entry__icon settings-icon-entry__icon--file" aria-hidden="true">${renderIcon("file-event")}</span>
+        <span class="settings-icon-entry__body">
+          <span class="settings-icon-entry__title-row">
+            <span class="settings-compose-entry__title">${link}</span>
+            ${lock}
+          </span>
+          ${meta ? `<span class="settings-compose-entry__meta muted">${meta}</span>` : ""}
+        </span>
+      </div>
+    `;
+  });
+  if (hasMore) {
+    const remaining = items.length - visibleCount;
+    filesList.push(
+      `<button type="button" class="settings-compose-more" data-a2a-share-files-more>${escapeHtml(L("settings.a2aShare.showMore", { count: remaining }))}</button>`
+    );
+  } else if (items.length > PAGE_SIZE) {
+    filesList.push(
+      `<button type="button" class="settings-compose-more" data-a2a-share-files-collapse>${escapeHtml(L("settings.a2aShare.showLess"))}</button>`
+    );
+  }
+
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup("", [
+        renderSettingsInfoRow(L("settings.row.a2aShareStatus"), statusLabel),
+        renderSettingsInfoRow(L("settings.row.a2aShareEndpoint"), share.shareHost || share.shareUrl || ""),
+        renderSettingsInfoRow(L("settings.row.a2aShareUserId"), share.userId || ""),
+      ])}
+      ${renderSettingsGroup(L("settings.a2aShare.storage.title"), storageRows)}
+      ${items.length
+        ? renderSettingsGroup(L("settings.a2aShare.files.title"), filesList)
+        : renderSettingsGroup(L("settings.a2aShare.files.title"), [
+            `<p class="settings-group__description muted">${escapeHtml(L("settings.a2aShare.files.empty"))}</p>`,
+          ])}
+      ${share.error ? `<p class="settings-page-copy muted">${escapeHtml(L("settings.a2aShare.error", { reason: share.error }))}</p>` : ""}
+    </div>
+  `;
+}
+
+function formatRelativeAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  // Intl.RelativeTimeFormat with numeric:"auto" gives us locale-aware phrasing
+  // ("5 minutes ago" / "5分前") without needing dedicated translation keys.
+  const locale = state.locale || DEFAULT_LOCALE;
+  let rtf;
+  try {
+    rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  } catch {
+    rtf = null;
+  }
+  const sec = Math.floor(ms / 1000);
+  const pick = (value, unit, fallback) => (rtf ? rtf.format(-value, unit) : fallback);
+  if (sec < 60) return pick(sec, "second", `${sec}s ago`);
+  const min = Math.floor(sec / 60);
+  if (min < 60) return pick(min, "minute", `${min}m ago`);
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return pick(hr, "hour", `${hr}h ago`);
+  const day = Math.floor(hr / 24);
+  if (day < 30) return pick(day, "day", `${day}d ago`);
+  const mo = Math.floor(day / 30);
+  if (mo < 12) return pick(mo, "month", `${mo}mo ago`);
+  return pick(Math.floor(mo / 12), "year", `${Math.floor(mo / 12)}y ago`);
+}
+
+function formatExpiresIn(ms) {
+  if (!Number.isFinite(ms)) return "";
+  if (ms <= 0) return L("settings.a2aShare.expired");
+  const locale = state.locale || DEFAULT_LOCALE;
+  let rtf;
+  try {
+    rtf = new Intl.RelativeTimeFormat(locale, { numeric: "always" });
+  } catch {
+    rtf = null;
+  }
+  const day = Math.floor(ms / 86400000);
+  if (day >= 1) return rtf ? rtf.format(day, "day") : `in ${day}d`;
+  const hr = Math.max(1, Math.floor(ms / 3600000));
+  return rtf ? rtf.format(hr, "hour") : `in ${hr}h`;
 }
 
 function renderSettingsInfoRow(label, value, options = {}) {
@@ -5389,6 +5588,19 @@ function bindShellInteractions() {
   for (const btn of document.querySelectorAll("[data-moltbook-titles-collapse]")) {
     btn.addEventListener("click", async () => {
       state.moltbookRecentTitlesExpanded = 0;
+      await renderShell();
+    });
+  }
+
+  for (const btn of document.querySelectorAll("[data-a2a-share-files-more]")) {
+    btn.addEventListener("click", async () => {
+      state.a2aShareRecentExpanded = (state.a2aShareRecentExpanded || 5) + 5;
+      await renderShell();
+    });
+  }
+  for (const btn of document.querySelectorAll("[data-a2a-share-files-collapse]")) {
+    btn.addEventListener("click", async () => {
+      state.a2aShareRecentExpanded = 0;
       await renderShell();
     });
   }

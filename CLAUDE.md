@@ -124,7 +124,7 @@ Optional flags:
 
 ```
 External agent
-    │  POST https://a2a.viveworker.com/<userId>
+    │  POST https://a2a.viveworker.com/u/<userId>
     ▼
 Cloudflare Worker (relay)
     │  bridge polls every 20s
@@ -156,10 +156,10 @@ Other agents interact with your viveworker via standard A2A JSON-RPC:
 
 ```bash
 # 1. Discover
-curl https://a2a.viveworker.com/<userId>/.well-known/agent.json
+curl https://a2a.viveworker.com/u/<userId>/.well-known/agent.json
 
 # 2. Send a task
-curl -X POST https://a2a.viveworker.com/<userId> \
+curl -X POST https://a2a.viveworker.com/u/<userId> \
   -H 'Content-Type: application/json' \
   -H 'X-A2A-Key: <api-key>' \
   -d '{
@@ -169,7 +169,7 @@ curl -X POST https://a2a.viveworker.com/<userId> \
   }'
 
 # 3. Poll for result
-curl -X POST https://a2a.viveworker.com/<userId> \
+curl -X POST https://a2a.viveworker.com/u/<userId> \
   -H 'Content-Type: application/json' \
   -H 'X-A2A-Key: <api-key>' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":"<id-from-step-2>"}}'

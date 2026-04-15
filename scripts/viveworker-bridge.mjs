@@ -18,7 +18,7 @@ import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
-import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM } from "./moltbook-api.mjs";
+import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, listInboxItems } from "./moltbook-api.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -95,6 +95,11 @@ const runtime = {
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
   stopping: false,
+  // In-memory cache for the `/api/share/status` endpoint. A 30s TTL avoids
+  // hammering the share worker on every settings-page render. Purely runtime —
+  // deliberately NOT persisted via `state` since the cache is worthless after
+  // a restart and would just bloat the state file.
+  a2aShareStatusCache: null,
 };
 const state = await loadState(config.stateFile);
 runtime.threadRegistry = await loadThreadRegistry(config.threadRegistryFile);
@@ -158,6 +163,7 @@ state.recentHistoryItems = initialHistoryItems;
 state.recentTimelineEntries = initialTimelineEntries;
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
 const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
+const backfilledMoltbookInboxChanged = await backfillMoltbookInboxHistory({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
 runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
 
@@ -269,6 +275,9 @@ function buildSessionLocalePayload(config, state, deviceId) {
     moltbookEnabled: Boolean(config.moltbookApiKey),
     a2aEnabled: Boolean(config.a2aApiKey),
     a2aRelayEnabled: Boolean(config.a2aRelayUrl && config.a2aRelayUserId),
+    // Share piggy-backs on A2A credentials — it's "enabled" as soon as both
+    // halves (user id + API key) are provisioned.
+    a2aShareEnabled: Boolean(config.a2aRelayUserId && config.a2aApiKey),
     a2aExecutors: runtime.a2aAvailableExecutors || { codex: false, claude: false },
     a2aExecutorPreference: state.a2aExecutorPreference || "ask",
   };
@@ -2549,6 +2558,26 @@ function recordHistoryItem({ config, runtime, state, item }) {
   return changed;
 }
 
+// Flip a previously-recorded history item's readOnly flag without disturbing
+// its ordering or other fields.  Used by moltbook_reply / moltbook_draft flows
+// to transition pending → resolved so the entry starts matching the completed
+// tab's readOnly filter.  Returns true if a mutation happened (caller should
+// saveState in that case).
+function flipHistoryItemReadOnly({ runtime, state, stableId, readOnly = true }) {
+  const normalizedStableId = cleanText(stableId || "");
+  if (!normalizedStableId) return false;
+  const idx = runtime.recentHistoryItems.findIndex((entry) => entry.stableId === normalizedStableId);
+  if (idx === -1) return false;
+  const current = runtime.recentHistoryItems[idx];
+  if (current.readOnly === readOnly) return false;
+  const next = { ...current, readOnly };
+  const nextItems = runtime.recentHistoryItems.slice();
+  nextItems[idx] = next;
+  runtime.recentHistoryItems = nextItems;
+  state.recentHistoryItems = nextItems;
+  return true;
+}
+
 function recordActionHistoryItem({
   config,
   runtime,
@@ -3758,6 +3787,66 @@ async function backfillPersistedTimelineImagePaths({ config, runtime, state }) {
   runtime.recentTimelineEntries = normalized;
   state.recentTimelineEntries = normalized;
   return true;
+}
+
+// Walk ~/.viveworker/moltbook-inbox/ on startup and synthesize readOnly
+// history entries for items the CLI / reconcile marked as replied or skipped.
+// Without this, an inbox item that was handled before the history hooks
+// existed — or that was resolved purely via the CLI path, which doesn't touch
+// the bridge's in-memory maps — never makes it into `recentHistoryItems` and
+// so never appears in the completed tab.  We match the same stableId / token
+// scheme as the live push (sourceId = `comment:<commentId>`) so a future
+// watcher push for the same commentId replaces this entry cleanly rather than
+// creating a duplicate.
+async function backfillMoltbookInboxHistory({ config, runtime, state }) {
+  let changed = false;
+  try {
+    const inboxItems = await listInboxItems();
+    for (const inbox of inboxItems) {
+      const status = String(inbox?.status || "").toLowerCase();
+      if (status !== "replied" && status !== "skipped") continue;
+      const commentId = String(inbox?.commentId || "");
+      if (!commentId) continue;
+      const sourceId = `comment:${commentId}`;
+      const stableId = `moltbook_reply:${sourceId}`;
+      if (runtime.recentHistoryItems.some((entry) => entry.stableId === stableId)) continue;
+      const token = historyToken(`moltbook:${sourceId}`);
+      const createdAtMs = Number(Date.parse(inbox.updatedAt || inbox.createdAt || "")) || Date.now();
+      const postTitle = cleanText(inbox.postTitle || "");
+      const contextText = cleanText(inbox.contextText || "");
+      const replyText = cleanText(inbox.replyText || "");
+      const messageText = status === "replied" ? (replyText || contextText) : contextText;
+      const summary = (status === "replied" ? (replyText || contextText) : contextText).slice(0, 160);
+      const titlePrefix = status === "replied" ? "replied" : "skipped";
+      const title = postTitle ? `${titlePrefix} → ${postTitle}` : (status === "replied" ? "Moltbook reply" : "Moltbook skipped");
+      const recorded = recordHistoryItem({
+        config,
+        runtime,
+        state,
+        item: {
+          stableId,
+          token,
+          kind: "moltbook_reply",
+          threadId: "moltbook",
+          threadLabel: postTitle || "Moltbook",
+          title,
+          summary,
+          messageText,
+          createdAtMs,
+          readOnly: true,
+          provider: "moltbook",
+        },
+      });
+      if (recorded) changed = true;
+    }
+  } catch (error) {
+    console.error(`[moltbook-inbox-backfill] ${error.message}`);
+    return false;
+  }
+  if (changed) {
+    console.log(`[moltbook-inbox-backfill] Synthesized history entries for resolved inbox items`);
+  }
+  return changed;
 }
 
 async function backfillRecentTimelineEntryDiffs({ config, runtime, state }) {
@@ -9266,8 +9355,11 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
     .filter((item) => {
       const k = cleanText(item?.kind || "");
       if (!completedKinds.has(k)) return false;
-      // Only resolved approvals (readOnly = true)
-      if (k === "approval" && !item.readOnly) return false;
+      // Only resolved approvals (readOnly = true).  Moltbook reply/draft items
+      // are gated the same way so pending entries don't double-show as
+      // completed while they're also surfaced via moltbookItemsByToken /
+      // moltbookDraftsByToken on the pending list.
+      if ((k === "approval" || k === "moltbook_reply" || k === "moltbook_draft") && !item.readOnly) return false;
       return true;
     })
     .slice()
@@ -11429,7 +11521,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           return writeJson(res, 200, { enabled: false });
         }
         try {
-          const { readScoutState, rollScoutDayIfNeeded } = await import("./moltbook-api.mjs");
+          const { readScoutState, rollScoutDayIfNeeded, createMoltbookClient } = await import("./moltbook-api.mjs");
           const scoutState = rollScoutDayIfNeeded(await readScoutState());
           const batch = scoutState.batch;
           const batchInfo = batch && batch.candidates?.length ? {
@@ -11438,8 +11530,39 @@ function createNativeApprovalServer({ config, runtime, state }) {
             topScore: Math.max(...batch.candidates.map((c) => c.score || 0)),
             remainingSeconds: Math.max(0, Math.round(((batch.startedAt || 0) + (batch.windowMs || 1800000) - Date.now()) / 1000)),
           } : null;
+
+          // Agent profile — lazy-fetched, cached 1h. Stale cache survives
+          // fetch failures so the UI never goes blank mid-outage.
+          let account = null;
+          try {
+            const PROFILE_TTL_MS = 60 * 60 * 1000;
+            const cached = runtime.moltbookAgentProfile;
+            const nowMs = Date.now();
+            if (!cached || nowMs - (cached.fetchedAtMs || 0) > PROFILE_TTL_MS) {
+              const mb = createMoltbookClient(config.moltbookApiKey);
+              const meRes = await mb("/agents/me");
+              const name = cleanText(meRes?.agent?.name || meRes?.agent?.display_name || "");
+              if (name) {
+                runtime.moltbookAgentProfile = {
+                  name,
+                  profileUrl: `https://www.moltbook.com/u/${encodeURIComponent(name)}`,
+                  fetchedAtMs: nowMs,
+                };
+              }
+            }
+          } catch {
+            // Fall through — if fetch fails, use whatever's cached (possibly null).
+          }
+          if (runtime.moltbookAgentProfile) {
+            account = {
+              name: runtime.moltbookAgentProfile.name,
+              profileUrl: runtime.moltbookAgentProfile.profileUrl,
+            };
+          }
+
           return writeJson(res, 200, {
             enabled: true,
+            account,
             day: scoutState.day,
             sentToday: scoutState.sentToday,
             maxDaily: 5,
@@ -11475,6 +11598,82 @@ function createNativeApprovalServer({ config, runtime, state }) {
           apiKeyConfigured: Boolean(config.a2aApiKey),
           acceptPublicTasks: config.a2aAcceptPublicTasks === true,
           taskStats: stats,
+        });
+      }
+
+      // A2A Share status (HTML hosting) for the settings UI. Reuses A2A
+      // credentials; enabled iff both user id + API key are provisioned.
+      // Results from the upstream `/api/list` call are cached for 30s so a
+      // settings-page render doesn't hammer the worker on every refresh tick.
+      if (url.pathname === "/api/share/status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const enabled = Boolean(config.a2aRelayUserId && config.a2aApiKey);
+        if (!enabled) {
+          return writeJson(res, 200, { enabled: false });
+        }
+        const shareHost = (() => {
+          try { return new URL(config.a2aShareUrl).host; } catch { return config.a2aShareUrl || ""; }
+        })();
+        // Mirror the constants baked into share-worker/worker.js. If those
+        // change, bump here too — there's no shared module between the two.
+        const limits = {
+          maxFileBytes: 5 * 1024 * 1024,
+          maxTotalBytes: 5 * 1024 * 1024,
+          maxFiles: 10,
+          defaultExpiresDays: 30,
+          maxExpiresDays: 30,
+          uploadRatePerHour: 10,
+        };
+        const cacheKey = `${config.a2aRelayUserId}|${config.a2aShareUrl}`;
+        const nowMs = Date.now();
+        const cached = runtime.a2aShareStatusCache;
+        if (cached && cached.key === cacheKey && nowMs - cached.fetchedAtMs < 30_000) {
+          return writeJson(res, 200, {
+            enabled: true,
+            userId: config.a2aRelayUserId,
+            shareUrl: config.a2aShareUrl,
+            shareHost,
+            limits,
+            ...cached.payload,
+            fetchedAtMs: cached.fetchedAtMs,
+          });
+        }
+        let upstream = { items: [], quota: null, error: null };
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10_000);
+        try {
+          const resUpstream = await fetch(`${config.a2aShareUrl}/api/list`, {
+            method: "GET",
+            headers: {
+              "x-a2a-user": config.a2aRelayUserId,
+              "x-a2a-key": config.a2aApiKey,
+            },
+            signal: controller.signal,
+          });
+          if (resUpstream.ok) {
+            const body = await resUpstream.json().catch(() => ({}));
+            upstream.items = Array.isArray(body.items) ? body.items : [];
+            upstream.quota = body.quota || null;
+          } else {
+            upstream.error = `HTTP ${resUpstream.status}`;
+          }
+        } catch (error) {
+          upstream.error = error?.name === "AbortError"
+            ? "upstream timeout"
+            : (error?.message || String(error));
+        } finally {
+          clearTimeout(timer);
+        }
+        runtime.a2aShareStatusCache = { key: cacheKey, fetchedAtMs: nowMs, payload: upstream };
+        return writeJson(res, 200, {
+          enabled: true,
+          userId: config.a2aRelayUserId,
+          shareUrl: config.a2aShareUrl,
+          shareHost,
+          limits,
+          ...upstream,
+          fetchedAtMs: nowMs,
         });
       }
 
@@ -12247,6 +12446,14 @@ function createNativeApprovalServer({ config, runtime, state }) {
         if (eventType === "resolve") {
           const token = historyToken(`moltbook:${sourceId}`);
           runtime.moltbookItemsByToken.delete(token);
+          // Flip the history item to readOnly so it moves from pending → completed.
+          try {
+            if (flipHistoryItemReadOnly({ runtime, state, stableId: `moltbook_reply:${sourceId}` })) {
+              await saveState(config.stateFile, state);
+            }
+          } catch (error) {
+            console.error(`[moltbook-reply-resolve] ${error.message}`);
+          }
           return writeJson(res, 200, { ok: true });
         }
         const token = historyToken(`moltbook:${sourceId}`);
@@ -12268,24 +12475,21 @@ function createNativeApprovalServer({ config, runtime, state }) {
         };
         runtime.moltbookItemsByToken.set(token, item);
         try {
-          recordTimelineEntry({
-            config,
-            runtime,
-            state,
-            entry: {
-              stableId: `moltbook_reply:${sourceId}`,
-              token,
-              kind: "moltbook_reply",
-              threadId: item.threadId,
-              threadLabel: item.threadLabel,
-              title: item.title,
-              summary: item.summary,
-              messageText: item.contextText,
-              createdAtMs: item.createdAtMs,
-              readOnly: false,
-              provider: "moltbook",
-            },
-          });
+          const historyEntry = {
+            stableId: `moltbook_reply:${sourceId}`,
+            token,
+            kind: "moltbook_reply",
+            threadId: item.threadId,
+            threadLabel: item.threadLabel,
+            title: item.title,
+            summary: item.summary,
+            messageText: item.contextText,
+            createdAtMs: item.createdAtMs,
+            readOnly: false,
+            provider: "moltbook",
+          };
+          recordTimelineEntry({ config, runtime, state, entry: historyEntry });
+          recordHistoryItem({ config, runtime, state, item: historyEntry });
           await saveState(config.stateFile, state);
         } catch (error) {
           console.error(`[moltbook-timeline-save] ${error.message}`);
@@ -12351,6 +12555,13 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         item.resolved = true;
         runtime.moltbookItemsByToken.delete(token);
+        try {
+          if (flipHistoryItemReadOnly({ runtime, state, stableId: `moltbook_reply:${item.sourceId}` })) {
+            await saveState(config.stateFile, state);
+          }
+        } catch (error) {
+          console.error(`[moltbook-reply-phone] ${error.message}`);
+        }
         return writeJson(res, 200, { ok: true, action });
       }
 
@@ -12419,36 +12630,33 @@ function createNativeApprovalServer({ config, runtime, state }) {
         runtime.moltbookDraftsByToken.set(token, draft);
         await writeDraft(draft).catch((e) => console.error(`[moltbook-draft-persist] ${e.message}`));
         try {
-          recordTimelineEntry({
-            config,
-            runtime,
-            state,
-            entry: {
-              stableId: `moltbook_draft:${sourceId}`,
-              token,
-              kind: "moltbook_draft",
-              threadId: "moltbook",
-              threadLabel: postTitle || "Moltbook",
-              title: draftType === "original_post"
-                ? (postTitle || "Moltbook new post")
-                : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
-              summary: contextSummary || String(draftText).slice(0, 160),
-              messageText: contextSummary || draftText,
-              draftText,
-              draftType,
-              submoltName,
-              intent,
-              slot,
-              postId,
-              postUrl,
-              postTitle,
-              postAuthor,
-              postBody,
-              createdAtMs: draft.createdAtMs,
-              readOnly: false,
-              provider: "moltbook",
-            },
-          });
+          const draftEntry = {
+            stableId: `moltbook_draft:${sourceId}`,
+            token,
+            kind: "moltbook_draft",
+            threadId: "moltbook",
+            threadLabel: postTitle || "Moltbook",
+            title: draftType === "original_post"
+              ? (postTitle || "Moltbook new post")
+              : (postTitle ? `draft → ${postTitle}` : "Moltbook draft"),
+            summary: contextSummary || String(draftText).slice(0, 160),
+            messageText: contextSummary || draftText,
+            draftText,
+            draftType,
+            submoltName,
+            intent,
+            slot,
+            postId,
+            postUrl,
+            postTitle,
+            postAuthor,
+            postBody,
+            createdAtMs: draft.createdAtMs,
+            readOnly: false,
+            provider: "moltbook",
+          };
+          recordTimelineEntry({ config, runtime, state, entry: draftEntry });
+          recordHistoryItem({ config, runtime, state, item: draftEntry });
           await saveState(config.stateFile, state);
         } catch (error) {
           console.error(`[moltbook-draft-timeline-save] ${error.message}`);
@@ -12548,6 +12756,15 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         // Persist decision to disk.
         await writeDraft(draft).catch((e) => console.error(`[moltbook-draft-persist-decision] ${e.message}`));
+
+        // Flip the history entry to readOnly so it moves from pending → completed.
+        try {
+          if (flipHistoryItemReadOnly({ runtime, state, stableId: `moltbook_draft:${draft.sourceId}` })) {
+            await saveState(config.stateFile, state);
+          }
+        } catch (error) {
+          console.error(`[moltbook-draft-decision-flip] ${error.message}`);
+        }
 
         if (action === "approve") {
           // Execute posting asynchronously — fire-and-forget from the HTTP handler.
@@ -14564,12 +14781,11 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
     scoutState.sentToday += 1;
     markPostSeen(scoutState, draft.postId, "published");
-    // Note: replies are tracked via sentToday + markPostSeen("published").
-    // They intentionally do NOT flow through recordComposeAttempt because
-    // `composedToday` / `recentComposeTitles` back the "本日の新規投稿数"
-    // settings row, which is labelled for ORIGINAL posts only. Counting
-    // replies there produced a misleading "6 / 3" over-quota display even
-    // when the user only published one actual new post for the day.
+    // Append the reply to `recentComposeTitles` so it shows up in the
+    // "最近の投稿" list with its reply badge. `recordComposeAttempt` knows
+    // not to bump `composedToday` when type === "reply", so the
+    // "本日の新規投稿数" counter only reflects original posts.
+    recordComposeAttempt(scoutState, draft.postTitle || draft.postId, draft.postId, "reply");
     await writeScoutState(scoutState);
   }
 
@@ -14643,6 +14859,11 @@ function buildConfig(cli) {
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
     a2aRelayRegisterSecret: cleanText(process.env.A2A_RELAY_REGISTER_SECRET || ""),
+    // share.viveworker.com — HTML hosting backed by the same A2A credentials.
+    // Override for staging / self-hosted deployments via VIVEWORKER_SHARE_URL.
+    a2aShareUrl: stripTrailingSlash(
+      process.env.VIVEWORKER_SHARE_URL || "https://share.viveworker.com"
+    ),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
     webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
@@ -15994,6 +16215,7 @@ async function main() {
       restoredTimelineImagePathsStateChanged ||
       migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
+      backfilledMoltbookInboxChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {
       await saveState(config.stateFile, state);

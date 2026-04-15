@@ -71,18 +71,37 @@ try {
 const pending = new Map(); // sourceId -> { commentId, postId }
 
 async function pushToBridge(item) {
-  const res = await fetch(`${VIVEWORKER_BASE}/api/providers/moltbook/events`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-viveworker-hook-secret": HOOK_SECRET,
-    },
-    body: JSON.stringify(item),
-  });
-  if (!res.ok) {
-    throw new Error(`bridge ${res.status}: ${await res.text().catch(() => "")}`);
+  // Loopback HTTPS call to the viveworker bridge. Normally completes in
+  // milliseconds, but if the bridge process is hung this fetch — like any
+  // unbounded fetch — would wait forever and eventually zombify the watcher
+  // (same failure mode that took out the Moltbook poll path in April 2026).
+  // 10s is a generous cap for a local call; anything slower means the bridge
+  // is already unhealthy and we're better off erroring out and retrying next
+  // poll cycle than blocking the whole watcher on it.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(`${VIVEWORKER_BASE}/api/providers/moltbook/events`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-viveworker-hook-secret": HOOK_SECRET,
+      },
+      body: JSON.stringify(item),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`bridge ${res.status}: ${await res.text().catch(() => "")}`);
+    }
+    return await res.json();
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`bridge timeout after 10000ms POST /api/providers/moltbook/events`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 function draftReply() {
