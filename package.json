@@ -1,6 +1,6 @@
 {
   "name": "viveworker",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Local mobile companion for Codex Desktop and Claude Desktop — approvals, code review, Moltbook drafts, and A2A (Agent-to-Agent) task relay on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
