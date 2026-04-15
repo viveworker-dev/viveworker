@@ -14564,7 +14564,12 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
     scoutState.sentToday += 1;
     markPostSeen(scoutState, draft.postId, "published");
-    recordComposeAttempt(scoutState, draft.postTitle || draft.postId, draft.postId, "reply");
+    // Note: replies are tracked via sentToday + markPostSeen("published").
+    // They intentionally do NOT flow through recordComposeAttempt because
+    // `composedToday` / `recentComposeTitles` back the "本日の新規投稿数"
+    // settings row, which is labelled for ORIGINAL posts only. Counting
+    // replies there produced a misleading "6 / 3" over-quota display even
+    // when the user only published one actual new post for the day.
     await writeScoutState(scoutState);
   }
 
