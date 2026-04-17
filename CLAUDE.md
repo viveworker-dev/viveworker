@@ -214,7 +214,7 @@ Host static artefacts on a private URL at `share.viveworker.com/v/<slug>`. Usefu
 - PDF / image → served with `Content-Disposition: inline` so browsers preview rather than download.
 - CSV → parsed server-side and rendered as an HTML table (sticky header, monospace cells, cells HTML-escaped so `<script>` in a cell stays inert). Appending `?raw=1` returns the original bytes as `text/csv`; `?raw=1&download=1` forces an attachment download. Tables are capped at 5000 rows on render; oversized CSVs get a truncation banner with a "Download raw CSV" escape hatch.
 
-Authentication reuses the A2A relay credentials — anyone who has run `viveworker a2a setup` can upload. Anyone with the URL can view (no auth on read); crawlers are blocked via `X-Robots-Tag` and `robots.txt`.
+Authentication reuses the A2A relay credentials — anyone who has run `viveworker a2a setup` can upload. By default anyone with the URL can view (no auth on read); attach `--password` or `--price` to gate access, and all shares are blocked from crawlers via `X-Robots-Tag` and `robots.txt`.
 
 **Quotas (per user, enforced by the worker):**
 - 5 MB total live storage, 10 live files, 5 MB per file
@@ -239,12 +239,26 @@ node scripts/viveworker.mjs share upload report.html \
   --password "hunter2" \
   --expires-days 7
 
-# List your uploads
-node scripts/viveworker.mjs share list
+# Upload with a payment gate (x402 / USDC on Base). --price is USDC as a
+# decimal (≤6 fractional digits); --pay-to is the seller's EVM address.
+# Mutually exclusive with --password on a single share.
+# ⚠ Replace the zero-address example below with YOUR OWN Base EOA / multisig
+# before running — copy-pasting as-is will either fail verification or burn
+# the USDC (no escrow, no refunds; viveworker never holds the funds).
+node scripts/viveworker.mjs share upload report.pdf \
+  --price 0.10 \
+  --pay-to 0x0000000000000000000000000000000000000000
 
-# Update password / expiry on an existing share (URL is preserved)
+# List your uploads (append --metrics for 24h/7d payment-flow stats)
+node scripts/viveworker.mjs share list
+node scripts/viveworker.mjs share list --metrics
+
+# Update password / price / expiry on an existing share (URL is preserved)
 node scripts/viveworker.mjs share update <slug> --password "hunter2"
 node scripts/viveworker.mjs share update <slug> --no-password
+node scripts/viveworker.mjs share update <slug> --price 0.20
+node scripts/viveworker.mjs share update <slug> --pay-to 0x742d...
+node scripts/viveworker.mjs share update <slug> --no-price
 node scripts/viveworker.mjs share update <slug> --expires-days 7
 
 # Mint a short-lived pre-unlocked URL for handing off a password-protected share
@@ -297,6 +311,48 @@ Semantics:
 - TTL: default 24h, max 168h. Capped further by the share's `expiresAtMs` so a link can never outlive the underlying share.
 - Owner-auth: only the share owner (the same `A2A_API_KEY` that uploaded it) can mint tokens. Wrong password returns `401 invalid-password`.
 - The endpoint (`POST /v/<slug>/unlock.json`) does **not** Set-Cookie on `?t=` views — a URL pasted into a third-party log or chat must not become a durable session for whichever browser later opens it.
+
+### Paid deliverables (x402 / USDC on Base) — CLOSED BETA (testnet only)
+
+> **⚠ Closed beta.** Paid shares run on **Base Sepolia** (testnet) and are gated by a server-side allowlist (`X402_BETA_ALLOWLIST`). Your `--price` / `--pay-to` upload will fail with `paid-shares-closed-beta` (403) unless the worker operator has added your userId. While in beta, all payment amounts are test-USDC with no monetary value; buyer-side docs and the 402 HTML call this out prominently. Mainnet flip is a `wrangler.toml` change + a `wrangler secret put X402_FACILITATOR_AUTH` — no code changes needed.
+
+Attach `--price <usd> --pay-to <0x…>` to an upload to gate the share behind a USDC payment on Base. This is the A2A "納品" pattern — Agent A uploads a report, Agent B pays Agent A to unlock it.
+
+```bash
+# Seller: upload a paid report. Substitute --pay-to with YOUR OWN Base EOA
+# or multisig — the zero-address placeholder below won't actually receive
+# funds (and nothing in viveworker can recover them if USDC reaches it).
+node scripts/viveworker.mjs share upload report.pdf \
+  --price 0.10 \
+  --pay-to 0x0000000000000000000000000000000000000000
+# → https://share.viveworker.com/v/<slug>
+
+# Rotate the price (invalidates outstanding paid sessions)
+node scripts/viveworker.mjs share update <slug> --price 0.20
+
+# Change the recipient only (paid sessions keep working)
+node scripts/viveworker.mjs share update <slug> --pay-to 0x…
+
+# Remove the payment gate entirely (share becomes public)
+node scripts/viveworker.mjs share update <slug> --no-price
+```
+
+**A2A flow:**
+1. Paste the `/v/<slug>` URL into the message body for the buying agent (via `viveworker a2a`, Moltbook comment, thread-share, or whatever transport applies).
+2. The buyer's `WebFetch`-equivalent tool gets a `402 Payment Required` response with the x402 requirements body.
+3. The buyer uses any x402-compatible client — the `x402-fetch` npm library, Cursor's built-in browser, or Coinbase AgentKit — to sign an EIP-3009 `transferWithAuthorization` and retry with an `X-PAYMENT` header. viveworker's current CLI does **not** include a buyer-side wallet; the external agent must bring its own signer.
+4. The worker serves the content, sets a 15-minute `share_paid` cookie, and emits `X-PAYMENT-RESPONSE` with a settlement preview. Reloads within the 15 minutes skip the 402.
+
+**Semantics:**
+- **Closed-beta gate:** `--price` and `--pay-to` at upload time (and setting/rotating price via `update`) require the caller's userId to be on the worker's `X402_BETA_ALLOWLIST` secret. Non-beta users get `paid-shares-closed-beta` (403). Clearing price via `--no-price` is always allowed — removed users can still wind their shares down to public without re-approval.
+- `--price` and `--password` are mutually exclusive on a single share (v1). Adding one to a share that has the other returns `price-and-password-mutually-exclusive`.
+- Price range: `$0.01` min, `$1000` max per share. Below `$0.01` gas dwarfs the price; the `$1000` cap is an accident-cap, not a policy limit.
+- Decimals: USDC has 6 decimals. `--price 0.10` → stored as atomic units `"100000"`; the CLI shows the USDC decimal back to the user.
+- Network: driven by the worker's `X402_NETWORK` var (`base-sepolia` by default, flip to `base` for mainnet). The chainId is pinned per-share at upload time. **While in closed beta, only `base-sepolia` is in active use.**
+- Trust: **pay-first, non-custodial.** viveworker never holds funds. Buyer sends USDC directly to `payTo` via the facilitator-broadcast transaction. No escrow, no dispute resolution — if the deliverable doesn't match the description, the buyer's recourse is to stop buying from that seller.
+- Revocation: change the price (or call `--no-price`) to rotate `paymentSalt` and invalidate every outstanding paid session. Deleting the share (`share delete <slug>`) also works.
+
+**Metrics (`share list --metrics`):** adds a "Paid-share metrics" block after the file list, summarising 24h / 7d counters for every payment-flow event (uploads, 402s served, verified paid views, paid-session reloads, verification rejections, facilitator unreachable, async settle failures). Drill-down shows the top 5 shares by activity. Data comes from Cloudflare Analytics Engine (worker writes events via `writeShareEvent`, CLI reads them via `/api/metrics`). Requires `CF_ACCOUNT_ID` and `CF_API_TOKEN` secrets on the worker — without them, the endpoint returns 501 `metrics-not-configured` and the CLI shows a warning.
 
 ### Credentials
 

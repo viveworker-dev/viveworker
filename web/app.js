@@ -3619,8 +3619,26 @@ function renderSettingsA2aSharePage(context) {
   const visible = items.slice(0, visibleCount);
   const hasMore = items.length > visibleCount;
   const filesList = visible.map((item) => {
+    // Badges use SVG icons (see renderIcon "lock" / "coin") to match the
+    // rest of the settings UI. `title` drives the hover tooltip;
+    // `aria-label` names the span for screen readers since the SVG itself
+    // is decorative.
+    const passwordLabel = L("settings.a2aShare.passwordProtected");
     const lock = item.hasPassword
-      ? `<span class="settings-compose-badge settings-compose-badge--reply" title="${escapeHtml(L("settings.a2aShare.passwordProtected"))}">🔒</span>`
+      ? `<span class="settings-compose-badge settings-compose-badge--reply" role="img" title="${escapeHtml(passwordLabel)}" aria-label="${escapeHtml(passwordLabel)}">${renderIcon("lock")}</span>`
+      : "";
+    // Paid-share badge. `price` is atomic USDC (6-decimals) on the item.
+    // Mutually exclusive with hasPassword at upload time, so the two badges
+    // never both render, but the HTML doesn't assume that — it just renders
+    // whichever are set.
+    const paidLabel = item.price
+      ? L("settings.a2aShare.paidShare", {
+          price: formatUsdcAtomic(item.price),
+          network: item.network || "?",
+        })
+      : "";
+    const paid = item.price
+      ? `<span class="settings-compose-badge settings-compose-badge--paid" role="img" title="${escapeHtml(paidLabel)}" aria-label="${escapeHtml(paidLabel)}">${renderIcon("coin")}</span>`
       : "";
     const label = escapeHtml(item.originalName || item.slug);
     const link = item.url
@@ -3640,7 +3658,7 @@ function renderSettingsA2aSharePage(context) {
         <span class="settings-icon-entry__body">
           <span class="settings-icon-entry__title-row">
             <span class="settings-compose-entry__title">${link}</span>
-            ${lock}
+            ${lock}${paid}
           </span>
           ${meta ? `<span class="settings-compose-entry__meta muted">${meta}</span>` : ""}
         </span>
@@ -3715,6 +3733,24 @@ function formatExpiresIn(ms) {
   if (day >= 1) return rtf ? rtf.format(day, "day") : `in ${day}d`;
   const hr = Math.max(1, Math.floor(ms / 3600000));
   return rtf ? rtf.format(hr, "hour") : `in ${hr}h`;
+}
+
+// USDC has 6 decimals, stored as atomic units in a string (e.g. "100000" ⇒
+// $0.10). Mirrors formatUsdc() in scripts/share-cli.mjs — kept as a small
+// standalone helper rather than a shared module since the app bundle has no
+// build step that pulls from scripts/.
+function formatUsdcAtomic(atomic) {
+  let n;
+  try {
+    n = BigInt(String(atomic ?? "0"));
+  } catch {
+    return "0.00";
+  }
+  if (n < 0n) n = -n;
+  const whole = n / 1_000_000n;
+  const frac = (n % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "");
+  if (!frac) return `${whole}.00`;
+  return `${whole}.${frac.padEnd(2, "0")}`;
 }
 
 function renderSettingsInfoRow(label, value, options = {}) {
@@ -6857,6 +6893,10 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M8 12h8"/><path d="M10.5 17h3"/></svg>`;
     case "check":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6.8 12.5 3.2 3.2 7.2-7.4"/></svg>`;
+    case "lock":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>`;
+    case "coin":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v10"/><path d="M14.5 9.3c-.6-.8-1.5-1.3-2.5-1.3-1.4 0-2.5 1-2.5 2.2 0 1.3 1.1 2 2.5 2s2.5.7 2.5 2c0 1.2-1.1 2.2-2.5 2.2-1 0-1.9-.5-2.5-1.3"/></svg>`;
     case "back":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`;
     case "chevron-down":
