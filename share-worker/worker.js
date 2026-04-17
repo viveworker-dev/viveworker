@@ -1,25 +1,27 @@
 /**
- * viveworker-share — Cloudflare Worker for sharing HTML files.
+ * viveworker-share — Cloudflare Worker for sharing static artefacts.
  *
  * Features:
- *   - Upload .html / .htm files (auth: X-A2A-User + X-A2A-Key, reuses A2A relay users)
+ *   - Upload .html / .htm / .pdf / .png / .jpg / .jpeg / .gif / .webp / .csv
+ *     (auth: X-A2A-User + X-A2A-Key, reuses A2A relay users)
  *   - Per-upload random slug URL (https://share.viveworker.com/v/<slug>)
  *   - Optional PBKDF2 password protection
  *   - Robot / crawler blocking (X-Robots-Tag + robots.txt)
  *   - Owner-only delete via same A2A credentials
+ *   - CSV is rendered server-side as an HTML table on view (`?raw=1` for bytes)
  *
  * Bindings (see wrangler.toml):
  *   USERS_KV      — A2A relay's KV (read-only), used to validate user credentials
  *   SHARE_KV      — this service's KV (metadata per upload, per-user indexes)
- *   SHARE_FILES   — R2 bucket, stores the HTML bodies
+ *   SHARE_FILES   — R2 bucket, stores the uploaded bytes
  *   SHARE_SECRET  — env var, signing key for unlock cookies
  *
  * KV schema:
- *   share:<slug>                        → metadata JSON
+ *   share:<slug>                        → metadata JSON (incl. contentType / kind)
  *   share_stats:<userId>                → { bytes, count, files: [slug...], rateWindow: [ts...] }
  *
  * R2 schema:
- *   <slug>                              → raw HTML bytes
+ *   <slug>                              → raw bytes (HTML / PDF / image / CSV)
  */
 
 // ---------------------------------------------------------------------------
@@ -60,6 +62,44 @@ const SECURITY_HEADERS = {
   "referrer-policy": "no-referrer",
   "x-content-type-options": "nosniff",
 };
+
+// Accepted file types. Keys are lowercase extensions with the leading dot.
+// `kind` drives per-type handling in handleView (HTML pass-through vs. PDF
+// inline vs. image inline vs. CSV render-as-table). `mime` is what gets stored
+// on the R2 object and sent as Content-Type on view.
+//
+// SVG intentionally omitted — it can execute scripts (same surface as HTML)
+// and doesn't pay its own way for image sharing. Revisit if we later add a
+// forced-attachment disposition for it.
+const SHARE_TYPES = {
+  ".html": { mime: "text/html; charset=utf-8", kind: "html" },
+  ".htm":  { mime: "text/html; charset=utf-8", kind: "html" },
+  ".pdf":  { mime: "application/pdf",          kind: "pdf" },
+  ".png":  { mime: "image/png",                 kind: "image" },
+  ".jpg":  { mime: "image/jpeg",                kind: "image" },
+  ".jpeg": { mime: "image/jpeg",                kind: "image" },
+  ".gif":  { mime: "image/gif",                 kind: "image" },
+  ".webp": { mime: "image/webp",                kind: "image" },
+  ".csv":  { mime: "text/csv; charset=utf-8",   kind: "csv" },
+};
+const ALLOWED_EXTENSIONS = Object.keys(SHARE_TYPES);
+
+const CSV_MAX_RENDER_ROWS = 5000;
+
+// Legacy shares (uploaded before the multi-format split) have no `contentType`
+// in their KV metadata. They were always HTML, so default to that on read.
+const LEGACY_CONTENT_TYPE = "text/html; charset=utf-8";
+const LEGACY_KIND = "html";
+
+function detectShareType(filename) {
+  const name = String(filename || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot === -1) return null;
+  const ext = name.slice(dot);
+  const entry = SHARE_TYPES[ext];
+  if (!entry) return null;
+  return { ext, mime: entry.mime, kind: entry.kind };
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -190,22 +230,34 @@ async function handleUpload(request, env) {
 
   // Enforce extension
   const originalName = sanitizeFilename(file.name || "upload.html");
-  const lower = originalName.toLowerCase();
-  if (!lower.endsWith(".html") && !lower.endsWith(".htm")) {
-    return jsonResponse({ error: "unsupported-extension", allowed: [".html", ".htm"] }, 400);
+  const typeInfo = detectShareType(originalName);
+  if (!typeInfo) {
+    return jsonResponse(
+      { error: "unsupported-extension", allowed: ALLOWED_EXTENSIONS },
+      400,
+    );
   }
 
-  // Enforce declared content-type (best effort)
+  // Best-effort declared content-type check. We compare against the type
+  // implied by the extension so a `.pdf` uploaded with `Content-Type: text/html`
+  // gets rejected rather than silently stored with the wrong MIME. Browsers /
+  // curl both set a sensible declared type for standard extensions; the check
+  // is skipped when the caller didn't declare anything.
   const declaredType = (file.type || "").toLowerCase();
-  if (declaredType && !declaredType.includes("html")) {
-    return jsonResponse({ error: "unsupported-content-type", declared: declaredType }, 400);
+  if (declaredType && !isDeclaredTypeCompatible(declaredType, typeInfo.kind)) {
+    return jsonResponse(
+      { error: "unsupported-content-type", declared: declaredType, expected: typeInfo.mime },
+      400,
+    );
   }
 
   const bytes = new Uint8Array(await file.arrayBuffer());
 
-  // Sniff first non-whitespace bytes for "<" (HTML start)
-  if (!looksLikeHtml(bytes)) {
-    return jsonResponse({ error: "not-html-content" }, 400);
+  // Per-kind magic-byte sniff (defense-in-depth, not security-critical).
+  // Protects against a user accidentally uploading a mis-extensioned file;
+  // doesn't try to be a full format validator.
+  if (!sniffKind(bytes, typeInfo.kind)) {
+    return jsonResponse({ error: "content-mismatch", kind: typeInfo.kind }, 400);
   }
 
   // Optional password
@@ -283,11 +335,13 @@ async function handleUpload(request, env) {
     expiresAtMs,
     passwordHash,
     passwordSalt,
+    contentType: typeInfo.mime,
+    kind: typeInfo.kind,
   };
 
   // Write R2 first, then KV (so we never leave metadata pointing to a missing object).
   await env.SHARE_FILES.put(slug, bytes, {
-    httpMetadata: { contentType: "text/html; charset=utf-8" },
+    httpMetadata: { contentType: typeInfo.mime },
   });
 
   // KV keeps the metadata alive for expiresAtMs + GRACE_PERIOD_MS so an
@@ -575,7 +629,7 @@ async function handlePatch(request, env, slug) {
     }
     const bytes = await obj.arrayBuffer();
     await env.SHARE_FILES.put(slug, bytes, {
-      httpMetadata: { contentType: "text/html; charset=utf-8" },
+      httpMetadata: { contentType: meta.contentType || LEGACY_CONTENT_TYPE },
     });
   }
 
@@ -648,31 +702,85 @@ async function handleView(request, env, slug, headOnly = false) {
     }
   }
 
-  // For HEAD, skip R2 fetch — return headers only.
+  const url = new URL(request.url);
+  const kind = meta.kind || LEGACY_KIND;
+  const storedContentType = meta.contentType || LEGACY_CONTENT_TYPE;
+  const wantsRawCsv = kind === "csv" && url.searchParams.get("raw") === "1";
+  const wantsCsvDownload = wantsRawCsv && url.searchParams.get("download") === "1";
+
+  // Content-Type + Content-Disposition the response will use.
+  // - HTML: pass the stored bytes through as-is.
+  // - PDF / image: pass-through with `Content-Disposition: inline` so browsers
+  //   render rather than auto-download. Mobile Safari may still choose to
+  //   download PDFs — that's an OS-level decision, not ours.
+  // - CSV without ?raw=1: render to HTML table (served as text/html).
+  // - CSV with ?raw=1: original bytes, attachment when ?download=1 is set.
+  let responseContentType = storedContentType;
+  let contentDisposition = null;
+  if (kind === "pdf" || kind === "image") {
+    contentDisposition = `inline; filename="${meta.originalName || "file"}"`;
+  } else if (kind === "csv" && !wantsRawCsv) {
+    // rendered table page — served as HTML
+    responseContentType = "text/html; charset=utf-8";
+  } else if (wantsCsvDownload) {
+    contentDisposition = `attachment; filename="${meta.originalName || "file.csv"}"`;
+  } else if (wantsRawCsv) {
+    contentDisposition = `inline; filename="${meta.originalName || "file.csv"}"`;
+  }
+
+  // For HEAD, skip R2 fetch — return headers only. Content-Length is omitted
+  // for the CSV-as-table path (we don't know the rendered length without
+  // rendering) and when we'd otherwise report the raw file size for something
+  // we're going to re-render.
   if (headOnly) {
-    return new Response(null, {
-      status: 200,
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "private, no-store",
-        "content-length": String(meta.size || 0),
-        ...SECURITY_HEADERS,
-      },
-    });
+    const headers = {
+      "content-type": responseContentType,
+      "cache-control": "private, no-store",
+      ...SECURITY_HEADERS,
+    };
+    if (contentDisposition) headers["content-disposition"] = contentDisposition;
+    if (kind !== "csv" || wantsRawCsv) {
+      headers["content-length"] = String(meta.size || 0);
+    }
+    return new Response(null, { status: 200, headers });
   }
 
   const obj = await env.SHARE_FILES.get(slug);
   if (!obj) return textResponse("Gone", 410, SECURITY_HEADERS);
 
+  // CSV rendered as table — parse the body (as text) and emit an HTML page.
+  // Uses a tight CSP since the rendered page has no scripts, no fonts, no
+  // external resources; this closes the cell-content-as-HTML risk (we also
+  // HTML-escape every cell in renderCsvTable) in case a CSV cell contains
+  // something like `<script>`.
+  if (kind === "csv" && !wantsRawCsv) {
+    const text = await obj.text();
+    const { rows, truncated } = parseCsv(text, { maxRows: CSV_MAX_RENDER_ROWS });
+    const html = renderCsvTable({
+      rows,
+      truncated,
+      originalName: meta.originalName || "data.csv",
+      slug,
+    });
+    return new Response(html, {
+      status: 200,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "private, no-store",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+        ...SECURITY_HEADERS,
+      },
+    });
+  }
+
   const body = await obj.arrayBuffer();
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "private, no-store",
-      ...SECURITY_HEADERS,
-    },
-  });
+  const headers = {
+    "content-type": responseContentType,
+    "cache-control": "private, no-store",
+    ...SECURITY_HEADERS,
+  };
+  if (contentDisposition) headers["content-disposition"] = contentDisposition;
+  return new Response(body, { status: 200, headers });
 }
 
 async function handleUnlock(request, env, slug) {
@@ -924,6 +1032,214 @@ function looksLikeHtml(bytes) {
   return false;
 }
 
+// True when the client's declared `Content-Type` header is plausibly right for
+// the extension we inferred. Browsers sometimes send generic types
+// (`application/octet-stream`) or skip the header entirely (upload via FormData
+// without a declared type); in those cases the field is empty and the caller
+// short-circuits this check.
+function isDeclaredTypeCompatible(declared, kind) {
+  const lower = (declared || "").toLowerCase();
+  // Octet-stream is the "I don't know" fallback — accept it rather than reject
+  // well-formed uploads that happened to omit a specific type.
+  if (lower.includes("octet-stream")) return true;
+  switch (kind) {
+    case "html": return lower.includes("html");
+    case "pdf":  return lower.includes("pdf");
+    case "image":
+      return lower.startsWith("image/") || lower.includes("png") ||
+             lower.includes("jpeg") || lower.includes("jpg") ||
+             lower.includes("gif") || lower.includes("webp");
+    case "csv":
+      // curl often sends `application/vnd.ms-excel` or `text/csv`; also accept
+      // text/plain since the CLI used to hardcode html and some clients may
+      // mislabel.
+      return lower.includes("csv") || lower.includes("text/plain") ||
+             lower.includes("excel");
+    default: return false;
+  }
+}
+
+// Magic-byte sniff per kind. Best-effort — a correctly-crafted corrupt payload
+// can always slip through, but this catches the common "renamed the file"
+// mistake and is cheap.
+function sniffKind(bytes, kind) {
+  switch (kind) {
+    case "html":
+      return looksLikeHtml(bytes);
+    case "pdf":
+      // "%PDF"
+      return bytes.length >= 4 &&
+        bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+    case "image":
+      return sniffImage(bytes);
+    case "csv":
+      // CSV has no magic. Trust the extension + declared type.
+      return true;
+    default:
+      return false;
+  }
+}
+
+function sniffImage(bytes) {
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (bytes.length >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+      bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A) {
+    return true;
+  }
+  // JPEG: FF D8
+  if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xD8) return true;
+  // GIF87a / GIF89a
+  if (bytes.length >= 6 &&
+      bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 &&
+      (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+    return true;
+  }
+  // WebP: RIFF....WEBP
+  if (bytes.length >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// CSV parsing + HTML table rendering
+//
+// Used by handleView for shares with kind === "csv". Stays pure / sync so a
+// rendered response takes ~1ms even for the max-sized 5MB input (which is
+// bounded further by `maxRows` — free-tier Workers have a ~10ms CPU budget so
+// an unbounded parse of a pathological 5MB one-row CSV would be a DOS).
+//
+// RFC 4180-ish: handles quoted fields, escaped `""` inside quotes, and
+// \r\n / \n / \r line endings. Does NOT try to handle multi-line fields
+// embedded inside quotes — rare in practice and a rabbit hole we don't need
+// for viewing purposes; a malformed CSV renders as best-effort.
+// ---------------------------------------------------------------------------
+
+function parseCsv(text, { maxRows } = {}) {
+  const rows = [];
+  let truncated = false;
+  if (typeof text !== "string" || text.length === 0) return { rows, truncated };
+
+  // Strip UTF-8 BOM if present.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+  let field = "";
+  let row = [];
+  let inQuotes = false;
+  const rowLimit = Number.isFinite(maxRows) && maxRows > 0 ? maxRows : Infinity;
+
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => {
+    rows.push(row);
+    row = [];
+  };
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+    if (c === '"') { inQuotes = true; continue; }
+    if (c === ',') { pushField(); continue; }
+    if (c === '\n' || c === '\r') {
+      pushField();
+      pushRow();
+      if (rows.length >= rowLimit) { truncated = true; break; }
+      // Consume a following \n after \r so \r\n counts once.
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      continue;
+    }
+    field += c;
+  }
+  // Trailing row without terminator.
+  if (!truncated && (field.length > 0 || row.length > 0)) {
+    pushField();
+    pushRow();
+  }
+  return { rows, truncated };
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderCsvTable({ rows, truncated, originalName, slug }) {
+  const header = rows[0] || [];
+  const body = rows.slice(1);
+  const title = escapeHtml(originalName);
+  const safeSlug = encodeURIComponent(slug);
+
+  const headerHtml = header.length
+    ? `<thead><tr>${header.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>`
+    : "";
+  const bodyHtml = body.map(
+    (r) => `<tr>${r.map((c) => `<td>${escapeHtml(c)}</td>`).join("")}</tr>`
+  ).join("");
+
+  const truncNotice = truncated
+    ? `<div class="notice">Showing first ${CSV_MAX_RENDER_ROWS} rows. <a href="?raw=1&download=1">Download raw CSV</a> for the full file.</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>${title} — viveworker share</title>
+<style>
+  :root { color-scheme: dark; }
+  *{box-sizing:border-box}
+  body{margin:0;background:#0a0f0d;color:#e6e6e6;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{padding:1rem 1.2rem;border-bottom:1px solid #1e2e28;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+  h1{margin:0;font-size:1rem;font-weight:600;color:#e6e6e6;word-break:break-all}
+  .actions a{color:#00d4aa;text-decoration:none;font-size:0.85rem}
+  .actions a:hover{text-decoration:underline}
+  .notice{padding:0.6rem 1.2rem;background:#2a1a08;color:#f0c070;border-bottom:1px solid #3a2a18;font-size:0.85rem}
+  .scroll{overflow:auto;max-height:calc(100vh - 56px)}
+  table{border-collapse:collapse;min-width:100%;font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  thead{position:sticky;top:0;background:#111916;z-index:1}
+  th,td{padding:0.45rem 0.8rem;border-bottom:1px solid #1e2e28;text-align:left;vertical-align:top;white-space:pre-wrap;word-break:break-word}
+  th{font-weight:600;color:#00d4aa;border-bottom-color:#2a3e38;background:#111916}
+  tbody tr:nth-child(even){background:#0d1512}
+  tbody tr:hover{background:#132420}
+  footer{padding:0.8rem 1.2rem;border-top:1px solid #1e2e28;font-size:0.75rem;color:#556;text-align:center}
+  footer a{color:#00d4aa;text-decoration:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>${title}</h1>
+  <div class="actions">
+    <a href="?raw=1&amp;download=1">Download raw CSV</a>
+  </div>
+</header>
+${truncNotice}
+<div class="scroll">
+<table>
+  ${headerHtml}
+  <tbody>${bodyHtml}</tbody>
+</table>
+</div>
+<footer><a href="https://a2a.viveworker.com" rel="noopener">viveworker share</a> · /v/${safeSlug}</footer>
+</body>
+</html>`;
+}
+
 // ---------------------------------------------------------------------------
 // Password hashing (PBKDF2-SHA-256)
 // ---------------------------------------------------------------------------
@@ -1117,6 +1433,7 @@ function renderLanding() {
   main { max-width: 540px; text-align: center; }
   h1 { margin: 0 0 0.5rem; font-size: 1.6rem; font-weight: 600; letter-spacing: -0.01em; }
   p { margin: 0.4rem 0; color: #9cb5c5; }
+  .types { margin: 0.6rem 0; color: #7a93a5; font-size: 0.85rem; }
   code {
     display: inline-block; margin-top: 0.8rem; padding: 0.4rem 0.7rem; font-size: 0.85rem;
     background: #141b24; border: 1px solid #25313d; border-radius: 8px; color: #cdd6df;
@@ -1126,9 +1443,10 @@ function renderLanding() {
 <body>
 <main>
   <h1>viveworker share</h1>
-  <p>Private HTML hosting for viveworker users.</p>
+  <p>Private file hosting for viveworker users.</p>
+  <p class="types">Accepted: ${ALLOWED_EXTENSIONS.join(" · ")}</p>
   <p>Uploads are performed via the CLI:</p>
-  <code>viveworker share upload file.html</code>
+  <code>viveworker share upload report.pdf</code>
 </main>
 </body>
 </html>`;

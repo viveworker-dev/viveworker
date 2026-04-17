@@ -1,7 +1,10 @@
 /**
- * share-cli.mjs — CLI for viveworker's HTML share hosting service.
+ * share-cli.mjs — CLI for viveworker's file-share hosting service.
  *
  * Reads credentials from `~/.viveworker/a2a.env` (same creds as the A2A relay).
+ *
+ * Accepted file types (mirrors share-worker/worker.js SHARE_TYPES):
+ *   .html .htm .pdf .png .jpg .jpeg .gif .webp .csv
  *
  * Commands:
  *   viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]
@@ -22,6 +25,22 @@ import { Blob, File } from "node:buffer";
 const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
 const DEFAULT_SHARE_URL = "https://share.viveworker.com";
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // mirror worker
+
+// Mirror share-worker/worker.js SHARE_TYPES. Keep in sync by inspection —
+// scripts/ and share-worker/ don't share a module. Adding a new type here
+// without the worker will cause 400 unsupported-extension on upload.
+const SHARE_TYPES = {
+  ".html": { mime: "text/html; charset=utf-8" },
+  ".htm":  { mime: "text/html; charset=utf-8" },
+  ".pdf":  { mime: "application/pdf" },
+  ".png":  { mime: "image/png" },
+  ".jpg":  { mime: "image/jpeg" },
+  ".jpeg": { mime: "image/jpeg" },
+  ".gif":  { mime: "image/gif" },
+  ".webp": { mime: "image/webp" },
+  ".csv":  { mime: "text/csv; charset=utf-8" },
+};
+const ALLOWED_EXTENSIONS = Object.keys(SHARE_TYPES);
 
 // ---------------------------------------------------------------------------
 // CLI entry point
@@ -58,6 +77,9 @@ function printHelp() {
   console.log("  viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
   console.log("  viveworker share delete <slug>");
   console.log("");
+  console.log(`Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}`);
+  console.log("CSV files are rendered as an HTML table on view; append ?raw=1 for bytes.");
+  console.log("");
   console.log("Credentials are read from ~/.viveworker/a2a.env (same as `viveworker a2a`).");
 }
 
@@ -88,10 +110,14 @@ async function handleUpload(args) {
   if (stat.size > MAX_FILE_SIZE) {
     throw new Error(`File too large (${stat.size} bytes, max ${MAX_FILE_SIZE})`);
   }
-  const lower = absolute.toLowerCase();
-  if (!lower.endsWith(".html") && !lower.endsWith(".htm")) {
-    throw new Error(`Only .html / .htm files are accepted. Got: ${path.extname(absolute) || "(no extension)"}`);
+  const ext = path.extname(absolute).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    throw new Error(
+      `Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}. ` +
+      `Got: ${ext || "(no extension)"}`
+    );
   }
+  const { mime } = SHARE_TYPES[ext];
 
   const password = flags["password"] || "";
   const expiresDays = flags["expires-days"] || flags["expiresDays"] || "";
@@ -110,8 +136,8 @@ async function handleUpload(args) {
 
   const bytes = await fs.readFile(absolute);
   const form = new FormData();
-  const blob = new Blob([bytes], { type: "text/html" });
-  const file = new File([blob], path.basename(absolute), { type: "text/html" });
+  const blob = new Blob([bytes], { type: mime });
+  const file = new File([blob], path.basename(absolute), { type: mime });
   form.set("file", file);
   if (password) form.set("password", password);
   if (expiresDays) form.set("expiresDays", String(expiresDays));
@@ -424,6 +450,12 @@ function formatApiError(op, status, body) {
       return `${op} failed (${status}): file count exceeded — ${body.current}/${body.max}. Delete something first.`;
     case "file-too-large":
       return `${op} failed (${status}): file too large (max ${formatSize(body.maxBytes)})`;
+    case "unsupported-extension":
+      return `${op} failed (${status}): unsupported file type. Accepted: ${(body.allowed || []).join(" / ") || "n/a"}`;
+    case "unsupported-content-type":
+      return `${op} failed (${status}): declared content-type ${body.declared || "?"} does not match ${body.expected || "the file extension"}`;
+    case "content-mismatch":
+      return `${op} failed (${status}): file body does not match its extension (kind=${body.kind || "?"})`;
     case "expired-requires-expiresDays":
       return `${op} failed (${status}): share is expired — pass --expires-days <1-${body.maxDays || 30}> to revive it`;
     case "object-missing":

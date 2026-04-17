@@ -1,8 +1,10 @@
 # viveworker-share
 
-Private HTML hosting for viveworker users. Cloudflare Worker + R2 + KV.
+Private file hosting for viveworker users. Cloudflare Worker + R2 + KV.
 
 - **Auth:** reuses the A2A relay's user records (`X-A2A-User` + `X-A2A-Key`).
+- **Accepted file types:** `.html` / `.htm` / `.pdf` / `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.csv`. SVG is intentionally excluded (script-execution surface, same as HTML).
+- **Per-type rendering on view:** HTML passes through, PDFs and images get `Content-Disposition: inline`, CSVs are rendered server-side as an HTML table (opt out with `?raw=1`; `?raw=1&download=1` triggers attachment download).
 - **Storage:** one R2 object per upload, keyed by a 16-char base62 slug.
 - **URL shape:** `https://share.viveworker.com/v/<slug>`.
 - **Crawlers:** blocked via `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet` and `robots.txt` `Disallow: /`.
@@ -79,7 +81,7 @@ X-A2A-Key:  <your A2A_API_KEY from ~/.viveworker/a2a.env>
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `file` | File | yes | `.html` or `.htm`, max 5 MB, must start with `<` after optional BOM/whitespace |
+| `file` | File | yes | One of `.html` / `.htm` / `.pdf` / `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.csv`, max 5 MB. Magic-byte sniffed per kind (HTML: first non-whitespace byte `<`; PDF: `%PDF`; PNG: 8-byte signature; JPEG: `FF D8`; GIF: `GIF87a` / `GIF89a`; WebP: `RIFF....WEBP`; CSV: no magic). Mismatch → `content-mismatch` 400. |
 | `password` | string | no | 1–256 chars; enables password gate |
 | `expiresDays` | number | no | 1–**30** days; defaults to 30 when omitted. Views return 410 after expiry. Server responds with `{"error":"invalid-expiresDays","maxDays":30}` on out-of-range values. |
 
@@ -87,6 +89,9 @@ Errors:
 
 | HTTP | `error` | Meaning |
 |---|---|---|
+| 400 | `unsupported-extension` | File extension is not in the allow-list (`allowed` array in the body lists accepted extensions) |
+| 400 | `unsupported-content-type` | Declared `Content-Type` doesn't match what the extension implies (body includes `declared` + `expected`) |
+| 400 | `content-mismatch` | File body failed the per-kind magic-byte sniff (body includes `kind`) |
 | 413 | `file-too-large` | File exceeds 5 MB |
 | 413 | `quota-exceeded` | User would exceed the 5 MB total cap |
 | 409 | `file-count-exceeded` | User already has 10 live files |
@@ -171,11 +176,20 @@ Owner-only. Removes the R2 object, the `share:<slug>` KV entry, and updates `sha
 
 ### GET /v/:slug
 
-Serves the HTML. If the upload has a password, this returns `401` with an unlock form instead. The unlock form POSTs to `/v/:slug/unlock`, which sets an HMAC-signed cookie (`share_unlock`, Path=/v/:slug, 7 days) on success.
+Serves the uploaded bytes. The password gate (if any) runs first; format-specific behaviour runs after:
+
+| `kind` | Behaviour |
+|---|---|
+| `html` | Pass-through; `Content-Type: text/html; charset=utf-8`. Legacy shares (no `kind` in metadata) fall into this case. |
+| `pdf` | Pass-through; `Content-Type: application/pdf` + `Content-Disposition: inline; filename="<originalName>"`. |
+| `image` | Pass-through; `Content-Type` is whatever the extension implies (`image/png`, `image/jpeg`, `image/gif`, `image/webp`) + `Content-Disposition: inline`. |
+| `csv` | Default: server-side render to an HTML table (served as `text/html`) with a tight `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`, every cell HTML-escaped, 5000-row cap (truncation banner + raw-download link). `?raw=1` returns the original bytes as `text/csv`; `?raw=1&download=1` adds `Content-Disposition: attachment`. |
+
+If the upload has a password, this returns `401` with an unlock form instead. The unlock form POSTs to `/v/:slug/unlock`, which sets an HMAC-signed cookie (`share_unlock`, Path=/v/:slug, 7 days) on success. Programmatic callers can POST `/v/:slug/unlock.json` with the password to mint a short-lived `?t=<token>` URL (see "Agent handoff" in the root CLAUDE.md).
 
 ## CLI
 
-See `scripts/share-cli.mjs` (invoked via `viveworker share ...`). Commands: `upload`, `list`, `delete`.
+See `scripts/share-cli.mjs` (invoked via `viveworker share ...`). Commands: `upload`, `list`, `update`, `link`, `delete`. The CLI mirrors the worker's accepted-type allow-list — keep `SHARE_TYPES` in both files in sync.
 
 ## Free-tier capacity
 

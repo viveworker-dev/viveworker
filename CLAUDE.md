@@ -205,7 +205,14 @@ curl -X DELETE https://a2a.viveworker.com/internal/admin/user/<userId> \
 
 ## viveworker share
 
-Host HTML files on a private URL at `share.viveworker.com/v/<slug>`. Useful when an agent generates a report, a chart, or an interactive prototype and wants to hand the human a link instead of a file blob.
+Host static artefacts on a private URL at `share.viveworker.com/v/<slug>`. Useful when an agent generates a report, a chart, an interactive prototype, a screenshot, a PDF, or a CSV and wants to hand the human a link instead of a file blob.
+
+**Accepted file types:** `.html` / `.htm` / `.pdf` / `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.csv`. SVG is intentionally excluded (it can execute scripts — same surface as HTML). Anything else is rejected with `unsupported-extension` at both the CLI and worker layers.
+
+**Per-type rendering on view:**
+- HTML → served as-is with `Content-Type: text/html`.
+- PDF / image → served with `Content-Disposition: inline` so browsers preview rather than download.
+- CSV → parsed server-side and rendered as an HTML table (sticky header, monospace cells, cells HTML-escaped so `<script>` in a cell stays inert). Appending `?raw=1` returns the original bytes as `text/csv`; `?raw=1&download=1` forces an attachment download. Tables are capped at 5000 rows on render; oversized CSVs get a truncation banner with a "Download raw CSV" escape hatch.
 
 Authentication reuses the A2A relay credentials — anyone who has run `viveworker a2a setup` can upload. Anyone with the URL can view (no auth on read); crawlers are blocked via `X-Robots-Tag` and `robots.txt`.
 
@@ -222,8 +229,10 @@ Authentication reuses the A2A relay credentials — anyone who has run `vivework
 ### Commands
 
 ```bash
-# Upload an .html or .htm file (max 5 MB)
-node scripts/viveworker.mjs share upload report.html
+# Upload a file (max 5 MB). Accepts .html/.htm/.pdf/.png/.jpg/.jpeg/.gif/.webp/.csv
+node scripts/viveworker.mjs share upload report.pdf
+node scripts/viveworker.mjs share upload chart.png
+node scripts/viveworker.mjs share upload data.csv    # rendered as HTML table on view
 
 # Upload with optional password + expiry
 node scripts/viveworker.mjs share upload report.html \
@@ -250,20 +259,21 @@ All commands accept `--json` for machine-readable output. Changing the password 
 
 ### When to use
 
-- The user asks "share this as a link" / "host this HTML" / "put this somewhere I can view on my phone".
-- You've generated a self-contained HTML artefact (report, dashboard, storybook, visualization) and want to avoid pasting 500 lines into chat.
+- The user asks "share this as a link" / "host this" / "put this somewhere I can view on my phone".
+- You've generated a self-contained artefact — HTML report/dashboard/visualization, PDF export, rendered chart image, screenshot, tabular CSV — and want to avoid pasting megabytes of bytes (or 500 lines of markup) into chat.
 - The human wants to forward a result to someone else without exposing your repo or files.
 
 **Do not use for:**
 - Secrets, credentials, or PII (URLs are unguessable but assume they can leak).
-- Files that need server-side code — only static HTML is supported.
-- Non-HTML assets (PDFs, images, zips) — uploads are restricted to `.html` / `.htm`.
+- Files that need server-side code — only static assets are supported.
+- SVG (intentionally excluded — script-execution surface).
+- Archives or arbitrary binaries (`.zip`, `.tar`, `.exe`, …): uploads are restricted to the allow-list above.
 
 ### Typical flow
 
-1. Generate the HTML file in a temp location (`/tmp/foo.html`).
-2. Run `viveworker share upload /tmp/foo.html`.
-3. Report the returned URL back to the user. The human approval step happens on the relay (uploads are rate-limited implicitly by the A2A relay's free-tier limits, not per-upload-approved).
+1. Generate the file in a temp location (`/tmp/report.pdf`, `/tmp/chart.png`, `/tmp/data.csv`, `/tmp/page.html`, …).
+2. Run `viveworker share upload /tmp/<file>`.
+3. Report the returned URL back to the user. For CSVs, mention that the link renders as a table and `?raw=1` downloads the original bytes.
 4. If the user wants to rescind later, run `viveworker share delete <slug>` — the R2 object and KV metadata are both wiped.
 
 ### Password gate
