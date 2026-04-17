@@ -55,6 +55,7 @@ const state = {
   a2aTaskExecutorPick: "codex",
   pushNotice: "",
   pushError: "",
+  ambientSuggestionCopyState: null,
   deviceNotice: "",
   deviceError: "",
   imageViewer: null,
@@ -676,6 +677,7 @@ function timelineKindFilterOptions() {
   const codexClaudeOptions = [
     allOption,
     { id: "messages", label: L("timeline.kindFilter.messages"), icon: "timeline" },
+    { id: "suggestions", label: L("timeline.kindFilter.suggestions"), icon: "suggestions" },
     { id: "files", label: L("timeline.kindFilter.files"), icon: "file-event" },
     { id: "approvals", label: L("timeline.kindFilter.approvals"), icon: "approval" },
     { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
@@ -710,6 +712,8 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
   switch (filterId) {
     case "messages":
       return TIMELINE_MESSAGE_KINDS.has(kind);
+    case "suggestions":
+      return kind === "ambient_suggestions";
     case "files":
       return kind === "file_event";
     case "approvals":
@@ -2347,6 +2351,10 @@ function timelineEntryThreadLabel(item, isMessage) {
 }
 
 function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileEvent = false } = {}) {
+  if (item?.kind === "ambient_suggestions") {
+    return item.summary || fallbackSummaryForKind(item.kind, status, item.provider);
+  }
+
   if (isMessageLike) {
     return item.summary || fallbackSummaryForKind(item.kind, status, item.provider);
   }
@@ -2359,6 +2367,10 @@ function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileE
 }
 
 function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike = false, isFileEvent = false } = {}) {
+  if (item?.kind === "ambient_suggestions") {
+    return "";
+  }
+
   if (isMessageLike) {
     return "";
   }
@@ -3825,8 +3837,9 @@ function renderStandardDetailDesktop(detail) {
       ${renderMoltbookDraftComposer(detail)}
       ${renderA2ATaskDetail(detail)}
       ${renderThreadShareDetail(detail)}
+      ${renderAmbientSuggestionsSection(detail)}
       ${
-        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share"
+        detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share" || detail.kind === "ambient_suggestions"
           ? ""
           : plainIntro
             ? plainIntro
@@ -3863,8 +3876,9 @@ function renderStandardDetailMobile(detail) {
           ${renderMoltbookDraftComposer(detail, { mobile: true })}
           ${renderA2ATaskDetail(detail, { mobile: true })}
           ${renderThreadShareDetail(detail, { mobile: true })}
+          ${renderAmbientSuggestionsSection(detail, { mobile: true })}
           ${
-            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share"
+            detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "a2a_task" || detail.kind === "a2a_task_result" || detail.kind === "thread_share" || detail.kind === "ambient_suggestions"
               ? ""
               : plainIntro
                 ? plainIntro
@@ -3886,6 +3900,65 @@ function renderStandardDetailMobile(detail) {
         ${detail.readOnly ? "" : renderActionButtons(detail.actions || [], { mobileSticky: true })}
       </div>
     </div>
+  `;
+}
+
+function renderAmbientSuggestionsSection(detail, options = {}) {
+  if (detail?.kind !== "ambient_suggestions") {
+    return "";
+  }
+
+  const suggestions = normalizeClientAmbientSuggestions(detail?.suggestions);
+  if (suggestions.length === 0) {
+    return `
+      <section class="detail-card detail-card--body ${options.mobile ? "detail-card--mobile" : ""}">
+        <div class="detail-body markdown">${detail.messageHtml || ""}</div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="detail-card detail-card--body ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="ambient-suggestions">
+        ${detail.messageHtml ? `<div class="ambient-suggestions__intro markdown">${detail.messageHtml}</div>` : ""}
+        <div class="ambient-suggestions__list">
+          ${suggestions
+            .map((suggestion, index) => renderAmbientSuggestionCard(detail, suggestion, index))
+            .join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderAmbientSuggestionCard(detail, suggestion, index) {
+  const copyKey = ambientSuggestionCopyKey(detail?.token || "", suggestion?.id || "", index);
+  const copyStatus = state.ambientSuggestionCopyState?.key === copyKey
+    ? state.ambientSuggestionCopyState?.status || ""
+    : "";
+  const copyLabel = copyStatus === "success"
+    ? L("detail.ambientSuggestions.copyPromptDone")
+    : copyStatus === "error"
+      ? L("detail.ambientSuggestions.copyPromptFailed")
+      : L("detail.ambientSuggestions.copyPrompt");
+  return `
+    <article class="ambient-suggestion-card">
+      <div class="ambient-suggestion-card__header">
+        <h3 class="ambient-suggestion-card__title">${escapeHtml(suggestion.title)}</h3>
+        <button
+          type="button"
+          class="secondary ambient-suggestion-card__copy-button"
+          data-copy-ambient-suggestion
+          data-copy-ambient-suggestion-token="${escapeHtml(detail?.token || "")}"
+          data-copy-ambient-suggestion-index="${escapeHtml(String(index))}"
+        >${escapeHtml(copyLabel)}</button>
+      </div>
+      ${suggestion.description ? `<p class="ambient-suggestion-card__description">${escapeHtml(suggestion.description)}</p>` : ""}
+      <div class="ambient-suggestion-card__prompt-wrap">
+        <p class="ambient-suggestion-card__prompt-label">${escapeHtml(L("detail.ambientSuggestions.prompt"))}</p>
+        <pre class="ambient-suggestion-card__prompt">${escapeHtml(suggestion.prompt)}</pre>
+      </div>
+    </article>
   `;
 }
 
@@ -5290,6 +5363,41 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-copy-ambient-suggestion]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const detail = state.currentDetail;
+      if (!detail || detail.kind !== "ambient_suggestions") {
+        return;
+      }
+      if ((button.dataset.copyAmbientSuggestionToken || "") !== (detail.token || "")) {
+        return;
+      }
+      const index = Math.max(0, Number(button.dataset.copyAmbientSuggestionIndex) || 0);
+      const suggestions = normalizeClientAmbientSuggestions(detail.suggestions);
+      const suggestion = suggestions[index];
+      if (!suggestion?.prompt) {
+        return;
+      }
+      const copyKey = ambientSuggestionCopyKey(detail.token || "", suggestion.id || "", index);
+      try {
+        await copyTextToClipboard(suggestion.prompt);
+        state.ambientSuggestionCopyState = { key: copyKey, status: "success" };
+      } catch {
+        state.ambientSuggestionCopyState = { key: copyKey, status: "error" };
+      }
+      await renderShell();
+      window.setTimeout(async () => {
+        if (state.ambientSuggestionCopyState?.key !== copyKey) {
+          return;
+        }
+        state.ambientSuggestionCopyState = null;
+        await renderShell();
+      }, 1600);
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-diff-thread-file-toggle]")) {
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -6314,7 +6422,7 @@ function tabForItemKind(kind, fallback) {
   if (kind === "diff_thread") {
     return "diff";
   }
-  if (kind === "file_event") {
+  if (kind === "file_event" || kind === "ambient_suggestions") {
     return "timeline";
   }
   if (TIMELINE_MESSAGE_KINDS.has(kind)) {
@@ -6346,6 +6454,8 @@ function kindMeta(kind, item) {
       return { label: L("common.assistantCommentary"), tone: "plan", icon: "assistant-commentary" };
     case "assistant_final":
       return { label: L("common.assistantFinal"), tone: "completion", icon: "assistant-final" };
+    case "ambient_suggestions":
+      return { label: L("common.ambientSuggestions"), tone: "neutral", icon: "suggestions" };
     case "approval":
       return { label: L("common.approval"), tone: "approval", icon: "approval" };
     case "plan":
@@ -6391,6 +6501,9 @@ function itemIntentText(kind, status = "pending", provider) {
   if (kind === "file_event") {
     return L("intent.fileEvent");
   }
+  if (kind === "ambient_suggestions") {
+    return L("intent.ambientSuggestions");
+  }
   if (kind === "user_message") {
     return L("intent.userMessage");
   }
@@ -6425,6 +6538,9 @@ function detailIntentText(detail) {
   if (detail.kind === "file_event") {
     return itemIntentText(detail.kind, "timeline", provider);
   }
+  if (detail.kind === "ambient_suggestions") {
+    return itemIntentText(detail.kind, "timeline", provider);
+  }
   if (TIMELINE_MESSAGE_KINDS.has(detail.kind)) {
     return itemIntentText(detail.kind, "timeline", provider);
   }
@@ -6443,7 +6559,11 @@ function renderDetailTitle(detail) {
 }
 
 function detailDisplayTitle(detail) {
-  const threadLabel = normalizeClientText(detail?.threadLabel || "");
+  const threadLabel = sanitizeThreadLabelForDisplay(detail?.threadLabel || "", detail?.threadId || "");
+  if (detail?.kind === "ambient_suggestions") {
+    const ambientTitle = sanitizeThreadLabelForDisplay(detail?.title || "", detail?.threadId || "");
+    return ambientTitle || L("common.ambientSuggestions");
+  }
   if (threadLabel) {
     return threadLabel;
   }
@@ -6491,6 +6611,8 @@ function fallbackSummaryForKind(kind, status, provider) {
       return L("summary.diffThread");
     case "file_event":
       return L("summary.fileEvent", vars);
+    case "ambient_suggestions":
+      return L("summary.ambientSuggestions", { count: 0, firstTitle: "", more: 0 });
     case "user_message":
       return L("summary.userMessage");
     case "assistant_commentary":
@@ -6707,6 +6829,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.2v5.6"/><path d="M9.2 9h5.6"/><path d="M6 14.8a6.7 6.7 0 0 0 12 0"/><path d="M8 4.8a7.6 7.6 0 0 1 8 0"/></svg>`;
     case "assistant-final":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6.5h12a1.8 1.8 0 0 1 1.8 1.8v6.1A1.8 1.8 0 0 1 18 16.2h-5.3L9 19.4v-3.2H6a1.8 1.8 0 0 1-1.8-1.8V8.3A1.8 1.8 0 0 1 6 6.5Z"/><path d="m9.2 11.3 1.7 1.7 3.6-3.8"/></svg>`;
+    case "suggestions":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8 13 6.7l3 .5-2.2 2.2.5 3-2.3-1.2-2.3 1.2.5-3L8 7.2l3-.5Z"/><path d="M6.2 14.6h11.6"/><path d="M8.4 18.2h7.2"/></svg>`;
     case "completed":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="m8.7 12.2 2.1 2.1 4.6-4.8"/></svg>`;
     case "settings":
@@ -6977,6 +7101,58 @@ function normalizeClientFileRefs(fileRefs) {
     }
   }
   return deduped;
+}
+
+function normalizeClientAmbientSuggestions(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => {
+      const title = normalizeClientText(entry?.title);
+      const prompt = normalizeClientText(entry?.prompt);
+      if (!title || !prompt) {
+        return null;
+      }
+      return {
+        id: normalizeClientText(entry?.id),
+        title,
+        prompt,
+        description: normalizeClientText(entry?.description),
+      };
+    })
+    .filter(Boolean);
+}
+
+function ambientSuggestionCopyKey(token, suggestionId, index) {
+  return [normalizeClientText(token), normalizeClientText(suggestionId), String(Math.max(0, Number(index) || 0))].join(":");
+}
+
+async function copyTextToClipboard(text) {
+  const normalized = String(text ?? "");
+  if (!normalized) {
+    throw new Error("empty");
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(normalized);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = normalized;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("copy-failed");
+  }
 }
 
 function fileRefLabel(fileRef) {

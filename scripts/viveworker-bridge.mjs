@@ -29,7 +29,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
+const timelineKinds = new Set([...timelineMessageKinds, "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -161,6 +161,7 @@ runtime.recentHistoryItems = initialHistoryItems;
 runtime.recentTimelineEntries = initialTimelineEntries;
 state.recentHistoryItems = initialHistoryItems;
 state.recentTimelineEntries = initialTimelineEntries;
+const backfilledAmbientSuggestionsStateChanged = backfillAmbientSuggestionsState({ config, runtime, state });
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
 const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
 const backfilledMoltbookInboxChanged = await backfillMoltbookInboxHistory({ config, runtime, state });
@@ -291,6 +292,8 @@ function kindTitle(locale, kind) {
       return t(locale, "server.title.assistantCommentary");
     case "assistant_final":
       return t(locale, "server.title.assistantFinal");
+    case "ambient_suggestions":
+      return t(locale, "server.title.ambientSuggestions");
     case "approval":
       return t(locale, "server.title.approval");
     case "plan":
@@ -317,6 +320,117 @@ function kindTitle(locale, kind) {
     default:
       return t(locale, "common.item");
   }
+}
+
+function normalizeAmbientSuggestion(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const title = cleanText(raw.title ?? "");
+  const prompt = normalizeLongText(raw.prompt ?? "");
+  if (!title || !prompt) {
+    return null;
+  }
+
+  const threadAction = isPlainObject(raw.threadAction)
+    ? {
+        ...(cleanText(raw.threadAction.type ?? "") ? { type: cleanText(raw.threadAction.type) } : {}),
+      }
+    : null;
+  const appIds = Array.isArray(raw.appIds)
+    ? raw.appIds.map((value) => cleanText(value ?? "")).filter(Boolean)
+    : [];
+
+  return {
+    ...(cleanText(raw.id ?? "") ? { id: cleanText(raw.id) } : {}),
+    title,
+    prompt,
+    ...(cleanText(raw.description ?? "") ? { description: cleanText(raw.description) } : {}),
+    ...(threadAction && threadAction.type ? { threadAction } : {}),
+    ...(appIds.length > 0 ? { appIds } : {}),
+  };
+}
+
+function normalizeAmbientSuggestions(raw) {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((entry) => normalizeAmbientSuggestion(entry)).filter(Boolean);
+}
+
+function parseAmbientSuggestionsEnvelope(value) {
+  const normalized = cleanText(value ?? "");
+  if (!normalized) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(normalized);
+  } catch {
+    return null;
+  }
+
+  if (!isPlainObject(payload)) {
+    return null;
+  }
+
+  const hasSuggestionsField = Array.isArray(payload.suggestions);
+  const hasExcludeField = Array.isArray(payload.exclude);
+  if (!hasSuggestionsField && !hasExcludeField) {
+    return null;
+  }
+
+  const suggestions = hasSuggestionsField ? normalizeAmbientSuggestions(payload.suggestions) : [];
+  if (suggestions.length > 0) {
+    return { type: "suggestions", suggestions };
+  }
+
+  return {
+    type: "metadata",
+    hasSuggestionsField,
+    hasExcludeField,
+  };
+}
+
+function parseAmbientSuggestionsPayload(value) {
+  const envelope = parseAmbientSuggestionsEnvelope(value);
+  return envelope?.type === "suggestions" ? envelope.suggestions : null;
+}
+
+function isAmbientSuggestionsMetadataPayload(value) {
+  return parseAmbientSuggestionsEnvelope(value) !== null;
+}
+
+function ambientSuggestionsSummary(locale, suggestions) {
+  const count = Math.max(0, Array.isArray(suggestions) ? suggestions.length : 0);
+  if (count <= 0) {
+    return "";
+  }
+  const firstTitle = cleanText(suggestions[0]?.title || "");
+  return t(locale, "summary.ambientSuggestions", {
+    count,
+    firstTitle,
+    more: Math.max(0, count - 1),
+  });
+}
+
+function ambientSuggestionsMessageText(locale, suggestions) {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return "";
+  }
+  return [
+    kindTitle(locale, "ambient_suggestions"),
+    "",
+    ...suggestions.flatMap((suggestion, index) => {
+      const description = cleanText(suggestion.description || "");
+      return [
+        `${index + 1}. ${cleanText(suggestion.title || "")}`,
+        ...(description ? [description] : []),
+      ];
+    }),
+  ].join("\n");
 }
 
 function looksLikeGeneratedThreadTitle(value) {
@@ -2250,6 +2364,8 @@ function timelineKindSortPriority(kind) {
     case "plan_ready":
     case "choice":
       return 60;
+    case "ambient_suggestions":
+      return 52;
     case "file_event":
       return 45;
     case "assistant_final":
@@ -2281,6 +2397,10 @@ function normalizeTimelineEntry(raw) {
   const diffText = normalizeTimelineDiffText(raw.diffText ?? "");
   const diffSource = normalizeTimelineDiffSource(raw.diffSource ?? "");
   const diffCounts = diffLineCounts(diffText);
+  const suggestions = normalizeAmbientSuggestions(raw.suggestions ?? []);
+  if (kind === "ambient_suggestions" && suggestions.length === 0) {
+    return null;
+  }
   const summary =
     normalizeNotificationText(raw.summary ?? "") ||
     formatNotificationBody(messageText, 180) ||
@@ -2351,6 +2471,7 @@ function normalizeTimelineEntry(raw) {
     // A2A task-specific fields
     ...(raw.instruction != null ? { instruction: cleanText(raw.instruction) } : {}),
     ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
+    ...(suggestions.length > 0 ? { suggestions } : {}),
   };
 }
 
@@ -2525,6 +2646,9 @@ function historyItemFromEvent(event) {
 
   const kind = event.kind === "task_complete" ? "completion" : "plan_ready";
   const messageText = normalizeLongText(event.detailText || event.message || "");
+  if (kind === "completion" && isAmbientSuggestionsMetadataPayload(messageText)) {
+    return null;
+  }
   return normalizeHistoryItem({
     stableId: event.id,
     kind,
@@ -2556,6 +2680,74 @@ function recordHistoryItem({ config, runtime, state, item }) {
   runtime.recentHistoryItems = nextItems;
   state.recentHistoryItems = nextItems;
   return changed;
+}
+
+function backfillAmbientSuggestionsState({ config, runtime, state }) {
+  const nextTimelineEntries = normalizeTimelineEntries(
+    (runtime.recentTimelineEntries ?? []).map((entry) => {
+      const entryKind = cleanText(entry?.kind || "");
+      if (entryKind === "ambient_suggestions") {
+        const suggestions = normalizeAmbientSuggestions(entry?.suggestions ?? []);
+        if (suggestions.length === 0) {
+          return null;
+        }
+        return {
+          ...entry,
+          title: kindTitle(DEFAULT_LOCALE, "ambient_suggestions"),
+          summary: ambientSuggestionsSummary(DEFAULT_LOCALE, suggestions),
+          messageText: ambientSuggestionsMessageText(DEFAULT_LOCALE, suggestions),
+          suggestions,
+        };
+      }
+      if (entryKind !== "assistant_final") {
+        return entry;
+      }
+      const envelope = parseAmbientSuggestionsEnvelope(entry?.messageText ?? "");
+      if (!envelope) {
+        return entry;
+      }
+      if (envelope.type !== "suggestions") {
+        return null;
+      }
+      const suggestions = envelope.suggestions;
+      return {
+        ...entry,
+        kind: "ambient_suggestions",
+        title: kindTitle(DEFAULT_LOCALE, "ambient_suggestions"),
+        summary: ambientSuggestionsSummary(DEFAULT_LOCALE, suggestions),
+        messageText: ambientSuggestionsMessageText(DEFAULT_LOCALE, suggestions),
+        suggestions,
+      };
+    }),
+    config.maxTimelineEntries
+  );
+
+  const nextHistoryItems = normalizeHistoryItems(
+    (runtime.recentHistoryItems ?? []).filter((item) => {
+      const kind = cleanText(item?.kind || "");
+      if (kind !== "assistant_final" && kind !== "completion") {
+        return true;
+      }
+      return !isAmbientSuggestionsMetadataPayload(item?.messageText ?? "");
+    }),
+    config.maxHistoryItems
+  );
+
+  const timelineChanged =
+    JSON.stringify(nextTimelineEntries) !== JSON.stringify(runtime.recentTimelineEntries ?? []);
+  const historyChanged =
+    JSON.stringify(nextHistoryItems) !== JSON.stringify(runtime.recentHistoryItems ?? []);
+
+  if (timelineChanged) {
+    runtime.recentTimelineEntries = nextTimelineEntries;
+    state.recentTimelineEntries = nextTimelineEntries;
+  }
+  if (historyChanged) {
+    runtime.recentHistoryItems = nextHistoryItems;
+    state.recentHistoryItems = nextHistoryItems;
+  }
+
+  return timelineChanged || historyChanged;
 }
 
 // Flip a previously-recorded history item's readOnly flag without disturbing
@@ -4140,6 +4332,20 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
   if (!messageText) {
     return null;
   }
+  const ambientSuggestionsEnvelope = kind === "assistant_final" ? parseAmbientSuggestionsEnvelope(messageText) : null;
+  if (ambientSuggestionsEnvelope?.type === "metadata") {
+    return null;
+  }
+  const ambientSuggestions = ambientSuggestionsEnvelope?.type === "suggestions"
+    ? ambientSuggestionsEnvelope.suggestions
+    : null;
+  const entryKind = ambientSuggestions ? "ambient_suggestions" : kind;
+  const entryMessageText = ambientSuggestions
+    ? ambientSuggestionsMessageText(config.defaultLocale, ambientSuggestions)
+    : messageText;
+  const entrySummary = ambientSuggestions
+    ? ambientSuggestionsSummary(config.defaultLocale, ambientSuggestions)
+    : formatNotificationBody(messageText, 180) || messageText;
 
   const createdAtMs = Math.max(0, Number(row.ts) || 0) * 1000 || Date.now();
   const threadLabel = getNativeThreadLabel({
@@ -4147,17 +4353,18 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
     conversationId: threadId,
     cwd: "",
   });
-  const stableId = messageTimelineStableId(kind, threadId, item.id || row.id, messageText, createdAtMs);
+  const stableId = messageTimelineStableId(entryKind, threadId, item.id || row.id, entryMessageText, createdAtMs);
 
   return normalizeTimelineEntry({
     stableId,
     token: historyToken(stableId),
-    kind,
+    kind: entryKind,
     threadId,
     threadLabel,
-    title: threadLabel || kindTitle(config.defaultLocale, kind),
-    summary: formatNotificationBody(messageText, 180) || messageText,
-    messageText,
+    title: ambientSuggestions ? kindTitle(config.defaultLocale, entryKind) : threadLabel || kindTitle(config.defaultLocale, entryKind),
+    summary: entrySummary,
+    messageText: entryMessageText,
+    ...(ambientSuggestions ? { suggestions: ambientSuggestions } : {}),
     createdAtMs,
     readOnly: true,
   });
@@ -4609,7 +4816,11 @@ async function processScannedEvent({ config, runtime, state, event }) {
       item: historyItemFromEvent(event),
     }) || dirty;
 
-  if (event.kind === "task_complete") {
+  const isAmbientSuggestionsCompletion =
+    event.kind === "task_complete" &&
+    isAmbientSuggestionsMetadataPayload(normalizeLongText(event.detailText || event.message || ""));
+
+  if (event.kind === "task_complete" && !isAmbientSuggestionsCompletion) {
     dirty =
       (await deliverWebPushItem({
         config,
@@ -4626,7 +4837,7 @@ async function processScannedEvent({ config, runtime, state, event }) {
       })) || dirty;
   }
 
-  if (config.enableNtfy) {
+  if (config.enableNtfy && !isAmbientSuggestionsCompletion) {
     try {
       await publishNtfy(config, event);
     } catch (error) {
@@ -9351,7 +9562,18 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
   const items = normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems);
   runtime.recentHistoryItems = items;
   const completedKinds = new Set(["assistant_final", "approval", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task_result"]);
-  return items
+
+  // Infrequent kinds (A2A, thread_share) get evicted from the fixed-size
+  // history FIFO by the high volume of approval/assistant_final entries.
+  // Fall back to recentTimelineEntries so completed A2A tasks are never lost
+  // while they're still within the timeline window.
+  const infrequentKinds = new Set(["a2a_task_result", "thread_share"]);
+  const historyStableIds = new Set(items.map((i) => i.stableId).filter(Boolean));
+  const timelineEntries = (runtime.recentTimelineEntries ?? [])
+    .filter((e) => infrequentKinds.has(cleanText(e?.kind || "")) && !historyStableIds.has(e.stableId));
+  const merged = [...items, ...timelineEntries];
+
+  return merged
     .filter((item) => {
       const k = cleanText(item?.kind || "");
       if (!completedKinds.has(k)) return false;
@@ -9631,22 +9853,44 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
   }
 
   for (const historyItem of normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems)) {
-    if (!timelineKinds.has(historyItem.kind)) {
+    let historyKind = historyItem.kind;
+    let historySummary = historyItem.summary;
+    let historyMessageText = historyItem.messageText;
+    let historyTitle = historyItem.threadLabel ? formatTitle(kindTitle(locale, historyItem.kind), historyItem.threadLabel) : historyItem.title;
+    let historySuggestions = [];
+
+    if (historyItem.kind === "assistant_final" || historyItem.kind === "completion") {
+      const ambientSuggestionsEnvelope = parseAmbientSuggestionsEnvelope(historyItem.messageText ?? "");
+      if (ambientSuggestionsEnvelope?.type === "metadata") {
+        continue;
+      }
+      if (ambientSuggestionsEnvelope?.type === "suggestions") {
+        const ambientSuggestions = ambientSuggestionsEnvelope.suggestions;
+        historyKind = "ambient_suggestions";
+        historyTitle = kindTitle(locale, historyKind);
+        historySummary = ambientSuggestionsSummary(locale, ambientSuggestions);
+        historyMessageText = ambientSuggestionsMessageText(locale, ambientSuggestions);
+        historySuggestions = ambientSuggestions;
+      }
+    }
+
+    if (!timelineKinds.has(historyKind)) {
       continue;
     }
     items.push(
       normalizeTimelineEntry({
         stableId: historyItem.stableId,
         token: historyItem.token,
-        kind: historyItem.kind,
+        kind: historyKind,
         threadId: cleanText(extractConversationIdFromStableId(historyItem.stableId) || ""),
         threadLabel: historyItem.threadLabel,
-        title: historyItem.threadLabel ? formatTitle(kindTitle(locale, historyItem.kind), historyItem.threadLabel) : historyItem.title,
-        summary: historyItem.summary,
-        messageText: historyItem.messageText,
+        title: historyTitle,
+        summary: historySummary,
+        messageText: historyMessageText,
         outcome: historyItem.outcome,
         createdAtMs: historyItem.createdAtMs,
         provider: normalizeProvider(historyItem.provider),
+        ...(historySuggestions.length > 0 && historyKind === "ambient_suggestions" ? { suggestions: historySuggestions } : {}),
       })
     );
   }
@@ -10065,6 +10309,25 @@ function buildTimelineMessageDetail(entry, locale, runtime = null) {
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
     interruptNotice: interruptedDetailNotice(entry.messageText, locale),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function buildAmbientSuggestionsDetail(entry, locale) {
+  const suggestions = normalizeAmbientSuggestions(entry?.suggestions ?? []);
+  return {
+    kind: "ambient_suggestions",
+    token: cleanText(entry?.token || ""),
+    threadId: cleanText(entry?.threadId || ""),
+    title: cleanText(entry?.title || "") || kindTitle(locale, "ambient_suggestions"),
+    threadLabel: cleanText(entry?.threadLabel || ""),
+    createdAtMs: Number(entry?.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(
+      t(locale, "detail.ambientSuggestions.copy"),
+      `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`
+    ),
+    suggestions,
     readOnly: true,
     actions: [],
   };
@@ -10790,6 +11053,33 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   if (kind === "file_event") {
     const entry = timelineEntryByToken(runtime, token, kind);
     return entry ? buildTimelineFileEventDetail(entry, locale) : null;
+  }
+  if (kind === "ambient_suggestions") {
+    const entry = timelineEntryByToken(runtime, token, kind);
+    if (entry) {
+      return buildAmbientSuggestionsDetail(entry, locale);
+    }
+    const historicalSource = (runtime.recentHistoryItems ?? []).find((item) => {
+      if (cleanText(item?.token || "") !== cleanText(token || "")) {
+        return false;
+      }
+      const itemKind = cleanText(item?.kind || "");
+      if (itemKind !== "assistant_final" && itemKind !== "completion") {
+        return false;
+      }
+      return parseAmbientSuggestionsPayload(item?.messageText ?? "") !== null;
+    });
+    if (!historicalSource) {
+      return null;
+    }
+    return buildAmbientSuggestionsDetail({
+      token: historicalSource.token,
+      threadId: historyItemThreadId(historicalSource),
+      threadLabel: historicalSource.threadLabel,
+      title: kindTitle(locale, "ambient_suggestions"),
+      createdAtMs: historicalSource.createdAtMs,
+      suggestions: parseAmbientSuggestionsPayload(historicalSource.messageText ?? "") ?? [],
+    }, locale);
   }
   if (timelineMessageKinds.has(kind)) {
     const entry = timelineEntryByToken(runtime, token, kind);
@@ -16213,6 +16503,7 @@ async function main() {
       migratedPairedDevicesStateChanged ||
       restoredPendingPlanStateChanged ||
       restoredTimelineImagePathsStateChanged ||
+      backfilledAmbientSuggestionsStateChanged ||
       migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
       backfilledMoltbookInboxChanged ||

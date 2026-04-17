@@ -2182,6 +2182,95 @@ code {
   padding-inline: 0.1rem;
 }
 
+.ambient-suggestions {
+  display: grid;
+  gap: 0.95rem;
+}
+
+.ambient-suggestions__intro > :first-child {
+  margin-top: 0;
+}
+
+.ambient-suggestions__intro > :last-child {
+  margin-bottom: 0;
+}
+
+.ambient-suggestions__list {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.ambient-suggestion-card {
+  display: grid;
+  gap: 0.72rem;
+  padding: 0.95rem 1rem;
+  border-radius: 18px;
+  background: rgba(10, 17, 22, 0.54);
+  border: 1px solid rgba(156, 181, 197, 0.12);
+}
+
+.ambient-suggestion-card__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.7rem;
+  align-items: start;
+}
+
+.ambient-suggestion-card__title,
+.ambient-suggestion-card__description,
+.ambient-suggestion-card__prompt-label,
+.ambient-suggestion-card__prompt {
+  margin: 0;
+}
+
+.ambient-suggestion-card__title {
+  font-size: 1rem;
+  line-height: 1.4;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ambient-suggestion-card__description {
+  color: var(--muted);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.ambient-suggestion-card__copy-button {
+  min-height: 2.35rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: 14px;
+  font-size: 0.84rem;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.ambient-suggestion-card__prompt-wrap {
+  display: grid;
+  gap: 0.42rem;
+}
+
+.ambient-suggestion-card__prompt-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.ambient-suggestion-card__prompt {
+  padding: 0.88rem 0.92rem;
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(156, 181, 197, 0.12);
+  color: #eef8ff;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font-family: "SFMono-Regular", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .detail-diff-thread__header {
   width: 100%;
   display: grid;

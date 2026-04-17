@@ -47,6 +47,7 @@ const translations = {
     "common.userMessage": "You",
     "common.assistantCommentary": "Update",
     "common.assistantFinal": "Final reply",
+    "common.ambientSuggestions": "Suggestions",
     "common.item": "Item",
     "common.sns": "SNS",
     "common.moltbookReply": "Reply",
@@ -138,6 +139,11 @@ const translations = {
     "detail.filesTitle": "Files",
     "detail.diffTitle": "Diff",
     "detail.diffUnavailable": "Diff is not available for this change. Showing touched files only.",
+    "detail.ambientSuggestions.copy": "Review the suggested next steps and copy any prompt into a new turn when you want to try it.",
+    "detail.ambientSuggestions.prompt": "Prompt",
+    "detail.ambientSuggestions.copyPrompt": "Copy prompt",
+    "detail.ambientSuggestions.copyPromptDone": "Copied",
+    "detail.ambientSuggestions.copyPromptFailed": "Copy failed",
     "detail.diffThread.copy": ({ count }) =>
       `This thread has ${count} ${count === 1 ? "changed file" : "changed files"}. Review each file below.`,
     "detail.diffThread.copy.current": ({ count }) =>
@@ -194,6 +200,13 @@ const translations = {
     "summary.userMessage": "Open the message again and read it in context.",
     "summary.assistantCommentary": "Read {provider}'s latest working update.",
     "summary.assistantFinal": "Read {provider}'s final reply for this turn.",
+    "summary.ambientSuggestions": ({ count, firstTitle, more }) => {
+      if (!count) return "Review suggested next steps.";
+      const parts = [`${count} ${count === 1 ? "suggestion" : "suggestions"}`];
+      if (firstTitle) parts.push(firstTitle);
+      if (more > 0) parts.push(`+${more} more`);
+      return parts.join(" · ");
+    },
     "summary.approval": "Review what {provider} wants to do and decide whether to allow it.",
     "summary.plan": "Check the proposed plan before {provider} starts implementing it.",
     "summary.choice": "Pick the option {provider} needs to continue.",
@@ -206,6 +219,7 @@ const translations = {
     "intent.completed": "Finished. Open to review the result.",
     "intent.fileEvent": "Review the files involved in this step.",
     "intent.diffThread": "Review the file changes for this thread.",
+    "intent.ambientSuggestions": "Review suggested next steps and copy a prompt if you want to try one.",
     "intent.userMessage": "Open this message again.",
     "intent.assistantCommentary": "Read the latest working update.",
     "intent.assistantFinal": "Read {provider}'s final reply for this turn.",
@@ -223,6 +237,7 @@ const translations = {
     "timeline.kindFilterButtonLabel": "Filter timeline events",
     "timeline.kindFilter.all": "All events",
     "timeline.kindFilter.messages": "Messages",
+    "timeline.kindFilter.suggestions": "Suggested next steps",
     "timeline.kindFilter.files": "Files",
     "timeline.kindFilter.approvals": "Approvals",
     "timeline.kindFilter.plans": "Plans",
@@ -519,6 +534,7 @@ const translations = {
     "server.title.userMessage": "User",
     "server.title.assistantCommentary": "Update",
     "server.title.assistantFinal": "Final reply",
+    "server.title.ambientSuggestions": "Suggested next steps",
     "server.action.review": "Review",
     "server.action.detail": "Detail",
     "server.action.select": "Choose",
@@ -734,6 +750,7 @@ const translations = {
     "common.userMessage": "あなた",
     "common.assistantCommentary": "途中経過",
     "common.assistantFinal": "最終回答",
+    "common.ambientSuggestions": "候補",
     "common.item": "項目",
     "common.sns": "SNS",
     "common.moltbookReply": "返信",
@@ -824,6 +841,11 @@ const translations = {
     "detail.filesTitle": "関連ファイル",
     "detail.diffTitle": "差分",
     "detail.diffUnavailable": "この変更の差分はまだ利用できません。対象ファイルのみ表示します。",
+    "detail.ambientSuggestions.copy": "次にやる候補を確認して、試したい prompt があればコピーできます。",
+    "detail.ambientSuggestions.prompt": "Prompt",
+    "detail.ambientSuggestions.copyPrompt": "Prompt をコピー",
+    "detail.ambientSuggestions.copyPromptDone": "コピーしました",
+    "detail.ambientSuggestions.copyPromptFailed": "コピーに失敗しました",
     "detail.diffThread.copy": ({ count }) => `このスレッドで変更があるファイルは ${count}件です。下でファイルごとに確認できます。`,
     "detail.diffThread.copy.current": ({ count }) => `このスレッドで現在未ステージの変更があるファイルは ${count}件です。下でファイルごとに確認できます。`,
     "detail.diffThread.copy.latest": ({ count }) => `このスレッドで最後に観測した変更があるファイルは ${count}件です。下でファイルごとに確認できます。`,
@@ -877,6 +899,13 @@ const translations = {
     "summary.userMessage": "このメッセージをもう一度開いて文脈付きで確認します。",
     "summary.assistantCommentary": "{provider} の最新の途中経過を確認します。",
     "summary.assistantFinal": "このターンの {provider} の最終回答を確認します。",
+    "summary.ambientSuggestions": ({ count, firstTitle, more }) => {
+      if (!count) return "次にやる候補を確認します。";
+      const parts = [`${count}件の候補`];
+      if (firstTitle) parts.push(firstTitle);
+      if (more > 0) parts.push(`ほか${more}件`);
+      return parts.join(" · ");
+    },
     "summary.approval": "{provider} がやろうとしていることを確認して、許可するか決めます。",
     "summary.plan": "{provider} が実装を始める前に、提案されたプランを確認します。",
     "summary.choice": "{provider} が先へ進むために必要な選択肢を選びます。",
@@ -889,6 +918,7 @@ const translations = {
     "intent.completed": "完了済みです。結果を確認できます。",
     "intent.fileEvent": "このステップで触れたファイルを確認します。",
     "intent.diffThread": "このスレッドのファイル変更を確認します。",
+    "intent.ambientSuggestions": "次にやる候補を確認して、必要なら prompt をコピーします。",
     "intent.userMessage": "このメッセージを開き直します。",
     "intent.assistantCommentary": "最新の途中経過を確認します。",
     "intent.assistantFinal": "このターンの {provider} の最終回答を確認します。",
@@ -906,6 +936,7 @@ const translations = {
     "timeline.kindFilterButtonLabel": "タイムラインのイベントを絞り込む",
     "timeline.kindFilter.all": "すべてのイベント",
     "timeline.kindFilter.messages": "メッセージ",
+    "timeline.kindFilter.suggestions": "候補提案",
     "timeline.kindFilter.files": "ファイル",
     "timeline.kindFilter.approvals": "承認",
     "timeline.kindFilter.plans": "プラン",
@@ -1202,6 +1233,7 @@ const translations = {
     "server.title.userMessage": "ユーザー",
     "server.title.assistantCommentary": "途中経過",
     "server.title.assistantFinal": "最終回答",
+    "server.title.ambientSuggestions": "次の候補",
     "server.action.review": "判断する",
     "server.action.detail": "詳細",
     "server.action.select": "選ぶ",
