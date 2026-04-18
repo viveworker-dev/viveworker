@@ -181,6 +181,28 @@ Typical commands:
 
 The current public File Share surface is focused on private static artefact delivery from your Mac and your agents.
 
+## Experimental: Deliverable Unlock Flow
+
+`viveworker` is also experimenting with a testnet-only unlock flow for agent deliverables.
+
+The idea is simple:
+
+- an agent receives a task
+- the work runs locally
+- the result is handed back through File Share
+- the requester unlocks the deliverable on testnet
+
+This is not meant as a generic "payments feature."
+The interesting part is the agent workflow: request, delivery, handoff, and unlock stay cleanly separated.
+
+Current status:
+
+- experimental
+- testnet only
+- feedback wanted from people already building agent-to-agent workflows
+
+The goal is to learn whether deliverable unlock feels like a natural settlement point for real agent tasks.
+
 ## Claude Desktop Integration
 
 During `npx viveworker setup`, viveworker checks whether Claude Desktop is already installed and, if so, automatically installs hook entries into `~/.claude/settings.json` (`UserPromptSubmit`, `Notification`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionEnd`).
