@@ -18,7 +18,7 @@ import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
-import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, listInboxItems } from "./moltbook-api.mjs";
+import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems } from "./moltbook-api.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15038,6 +15038,12 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
   const finalTitle = draft.decision.title || draft.postTitle;
 
   let verification;
+  // Captured so the post-verify history record knows which post/comment the
+  // challenge_text was attached to. `draft.postId` only exists for replies;
+  // for `original_post` drafts the id only shows up in the POST /posts
+  // response.
+  let createdPostId = null;
+  let createdCommentId = null;
 
   if (draft.draftType === "original_post") {
     const result = await mb("/posts", {
@@ -15051,6 +15057,7 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     });
     const post = result?.post || null;
     verification = post?.verification || null;
+    createdPostId = post?.id || null;
     console.log(`[moltbook-draft-post] Posted original post (id=${post?.id})`);
 
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
@@ -15066,6 +15073,8 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     });
     const comment = result?.comment || null;
     verification = comment?.verification || null;
+    createdPostId = draft.postId || null;
+    createdCommentId = comment?.id || null;
     console.log(`[moltbook-draft-post] Posted reply (commentId=${comment?.id}) to post ${draft.postId}`);
 
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
@@ -15080,41 +15089,79 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
   }
 
   // Solve verification puzzle if present.
+  //
+  // Every attempt — success, server rejection, or complete failure — gets
+  // recorded via `recordPuzzleAttempt` so we can build a corpus of
+  // challenge_text at `~/.viveworker/moltbook-verify-history.jsonl`. This is
+  // the only way to reconstruct failing puzzles; Moltbook only returns
+  // `challenge_text` in the initial POST response.
   if (verification) {
-    let answer = solveVerificationPuzzle(verification.challenge_text);
-    const source = answer != null ? "solver" : null;
-    if (answer == null) {
-      answer = await solvePuzzleWithLLM(verification.challenge_text);
+    const solverAnswer = solveVerificationPuzzle(verification.challenge_text);
+    let submittedAnswer = solverAnswer;
+    let llmAnswer = null;
+    let outcome = "unknown";
+    let verifyError = null;
+
+    if (submittedAnswer == null) {
+      llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
+      submittedAnswer = llmAnswer;
     }
-    if (answer != null) {
+
+    if (submittedAnswer != null) {
       try {
         await mb("/verify", {
           method: "POST",
-          body: JSON.stringify({ verification_code: verification.verification_code, answer }),
+          body: JSON.stringify({ verification_code: verification.verification_code, answer: submittedAnswer }),
         });
-        console.log(`[moltbook-draft-verify] Verified with answer ${answer}`);
-      } catch (verifyError) {
+        console.log(`[moltbook-draft-verify] Verified with answer ${submittedAnswer}`);
+        outcome = solverAnswer != null && llmAnswer == null ? "solver-verified" : "llm-verified";
+      } catch (err) {
+        verifyError = err.message;
         // Wrong answer from solver — retry with LLM.
-        if (/incorrect/i.test(verifyError.message) && source === "solver") {
-          const llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
-          if (llmAnswer && llmAnswer !== answer) {
+        if (/incorrect/i.test(err.message) && solverAnswer != null && llmAnswer == null) {
+          llmAnswer = await solvePuzzleWithLLM(verification.challenge_text);
+          if (llmAnswer && llmAnswer !== solverAnswer) {
             try {
               await mb("/verify", {
                 method: "POST",
                 body: JSON.stringify({ verification_code: verification.verification_code, answer: llmAnswer }),
               });
               console.log(`[moltbook-draft-verify] Verified with LLM retry answer ${llmAnswer}`);
+              submittedAnswer = llmAnswer;
+              verifyError = null;
+              outcome = "solver-incorrect-llm-verified";
             } catch (retryError) {
               console.error(`[moltbook-draft-verify] LLM retry failed: ${retryError.message}`);
+              verifyError = retryError.message;
+              outcome = "both-incorrect";
             }
+          } else {
+            outcome = "solver-incorrect-llm-agreed-or-null";
           }
         } else {
-          console.error(`[moltbook-draft-verify] Failed: ${verifyError.message}`);
+          console.error(`[moltbook-draft-verify] Failed: ${err.message}`);
+          outcome = solverAnswer != null ? "solver-rejected" : "llm-rejected";
         }
       }
     } else {
       console.error(`[moltbook-draft-verify] Could not solve puzzle for draft ${draft.token}`);
+      outcome = "both-failed-to-solve";
     }
+
+    // Best-effort corpus write. Never throws.
+    await recordPuzzleAttempt({
+      draftToken: draft.token,
+      draftType: draft.draftType,
+      postId: createdPostId,
+      commentId: createdCommentId,
+      challenge_text: verification.challenge_text,
+      verification_code: verification.verification_code,
+      solverAnswer,
+      llmAnswer,
+      submittedAnswer,
+      outcome,
+      verifyError,
+    });
   }
 
   // Push notification for successful post.
