@@ -1,3 +1,5 @@
+import { Resvg } from "@cf-wasm/resvg/workerd";
+
 /**
  * viveworker-share — Cloudflare Worker for sharing static artefacts.
  *
@@ -91,6 +93,73 @@ const CSV_MAX_RENDER_ROWS = 5000;
 const LEGACY_CONTENT_TYPE = "text/html; charset=utf-8";
 const LEGACY_KIND = "html";
 
+// ---------------------------------------------------------------------------
+// x402 payment gate (pay-per-unlock via USDC on Base)
+// ---------------------------------------------------------------------------
+//
+// A share can optionally require a USDC payment before the content is served.
+// When `meta.price` is set, the first GET returns HTTP 402 with an x402-spec
+// body; the client retries with `X-PAYMENT: <base64(payload)>` and we verify
+// + settle via an external facilitator (Coinbase's public facilitator on
+// testnet; CDP's authed facilitator on mainnet). Successful verification
+// mints a short-lived `share_paid` cookie so subsequent reloads skip 402.
+//
+// Non-custodial: viveworker never holds funds. The seller sets `payTo`;
+// USDC goes directly from buyer to seller via the facilitator-broadcast tx.
+//
+// v1: `--price` and `--password` are mutually exclusive on a share. The
+// content-type-agnostic payment gate runs after the password gate but before
+// the format branch in handleView.
+
+const X402_VERSION = 1;
+// Keyed by chainId. `usdc` is the canonical USDC contract address for that
+// chain; `eip712Name` + `eip712Version` are the EIP-712 domain fields the
+// facilitator uses to verify transferWithAuthorization signatures.
+const X402_NETWORKS = {
+  8453:  { name: "base",         usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", eip712Name: "USD Coin", eip712Version: "2" },
+  84532: { name: "base-sepolia", usdc: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", eip712Name: "USDC",     eip712Version: "2" },
+};
+const MIN_PRICE_ATOMIC = 10_000n;         // $0.01 min (below this, gas dwarfs price)
+const MAX_PRICE_ATOMIC = 1_000_000_000n;  // $1000 max per share (accident-cap)
+const PAID_COOKIE_NAME = "share_paid";
+const PAID_COOKIE_MAX_AGE_SEC = 15 * 60;  // 15 min — short because paid content
+                                          // is sensitive and re-pay is cheap
+
+// Closed-beta allowlist for the paid-shares gate. While x402 is pinned to
+// testnet, we let a CSV of userIds through and hard-refuse everyone else at
+// upload/patch time. Unset → block-all (default-deny during rollout). Flip to
+// open GA by removing the check once mainnet + monitoring are stable.
+function isPaidSharesAllowed(env, userId) {
+  const raw = (env.X402_BETA_ALLOWLIST || "").trim();
+  if (!raw) return false;
+  // Also allow a literal "*" to mean "open to all" for when GA arrives before
+  // we rewire this call site.
+  if (raw === "*") return true;
+  const allow = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return allow.includes(userId);
+}
+
+// Analytics Engine sink for payment-flow observability. The dataset is bound
+// as `env.ANALYTICS` (see wrangler.toml). Fire-and-forget — never blocks a
+// request and never throws on quota/binding errors. index1=slug so per-share
+// drill-downs are cheap; blob1=event, blob2=userId (owner), blob3=network,
+// blob4=reason (free-form; e.g. facilitator invalid-reason code).
+function writeShareEvent(env, event, slug, extra = {}) {
+  try {
+    if (!env.ANALYTICS) return;  // binding not configured (local dev / first deploy)
+    env.ANALYTICS.writeDataPoint({
+      indexes: [slug || ""],
+      blobs: [
+        String(event || ""),
+        String(extra.userId || ""),
+        String(extra.network || ""),
+        String(extra.reason || ""),
+      ],
+      doubles: [1],
+    });
+  } catch { /* best-effort; never block a request */ }
+}
+
 function detectShareType(filename) {
   const name = String(filename || "").toLowerCase();
   const dot = name.lastIndexOf(".");
@@ -99,6 +168,61 @@ function detectShareType(filename) {
   const entry = SHARE_TYPES[ext];
   if (!entry) return null;
   return { ext, mime: entry.mime, kind: entry.kind };
+}
+
+// ---------------------------------------------------------------------------
+// Brand assets — share mark (Open Cell)
+// ---------------------------------------------------------------------------
+//
+// A2A uses the bee. Share uses the opened honeycomb cell: a scoped piece of
+// the hive, cut loose just enough to hand off. Same ecosystem, different role.
+// The OG PNG is rendered from SVG at request time via @cf-wasm/resvg and
+// cached for 24h at the edge — no pre-built PNG asset shipping in the bundle.
+
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <mask id="cell-open" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32">
+      <rect width="32" height="32" fill="#fff"/>
+      <polygon points="20.6,3.8 27.8,8.1 27.8,16.3 22.9,13.5 22.9,9.5 18.7,7.1" fill="#000"/>
+    </mask>
+  </defs>
+  <polygon points="16,4 24.5,8.9 24.5,18.6 16,23.5 7.5,18.6 7.5,8.9" fill="#00D4AA" mask="url(#cell-open)"/>
+  <polygon points="16,8.4 20.4,10.9 20.4,16 16,18.5 11.6,16 11.6,10.9" fill="#0B1116" mask="url(#cell-open)"/>
+  <circle cx="16" cy="13.4" r="1.8" fill="#00D4AA" opacity="0.84"/>
+</svg>`;
+const FAVICON_LINK = `<link rel="icon" type="image/svg+xml" href="/favicon.svg">`;
+
+// OG preview card (1200×630). No <text> nodes — Resvg without bundled fonts
+// won't paint them. The scraper overlay already supplies title/description
+// from the meta tags, so logo-only is enough here.
+const OG_DEFAULT_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(600 315) rotate(90) scale(280)">
+      <stop stop-color="#00D4AA" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#00D4AA" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="cell-open" maskUnits="userSpaceOnUse" x="0" y="0" width="1200" height="630">
+      <rect width="1200" height="630" fill="#fff"/>
+      <polygon points="680,144 805,216 805,356 719,307 719,240 646,197" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="1200" height="630" fill="#0a0f0d"/>
+  <circle cx="600" cy="315" r="260" fill="url(#glow)"/>
+  <g fill="none" stroke="#00D4AA" stroke-width="16" opacity="0.14">
+    <polygon points="372,178 471,235 471,349 372,406 273,349 273,235"/>
+    <polygon points="828,178 927,235 927,349 828,406 729,349 729,235"/>
+  </g>
+  <polygon points="600,138 744,221 744,389 600,472 456,389 456,221" fill="#00D4AA" mask="url(#cell-open)"/>
+  <polygon points="600,212 680,258 680,351 600,397 520,351 520,258" fill="#0D1511" mask="url(#cell-open)"/>
+  <circle cx="600" cy="305" r="30" fill="#00D4AA" opacity="0.84"/>
+</svg>`;
+
+async function handleOgDefault() {
+  const resvg = await Resvg.async(OG_DEFAULT_SVG, { fitTo: { mode: "original" } });
+  const png = resvg.render().asPng();
+  return new Response(png, {
+    headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -144,9 +268,28 @@ async function handle(request, env, ctx) {
     );
   }
 
+  // Favicon — SVG at /favicon.svg; /favicon.ico gets a 204 so browsers stop
+  // walking up to the root for a legacy .ico file.
+  if (pathname === "/favicon.svg" && method === "GET") {
+    return new Response(FAVICON_SVG, {
+      headers: {
+        "content-type": "image/svg+xml",
+        "cache-control": "public, max-age=604800",
+      },
+    });
+  }
+  if (pathname === "/favicon.ico" && method === "GET") {
+    return new Response(null, { status: 204 });
+  }
+
+  // OG preview image — dynamic PNG from SVG via Resvg.
+  if (pathname === "/og/default.png" && method === "GET") {
+    return await handleOgDefault();
+  }
+
   // Landing page
   if (pathname === "/" && method === "GET") {
-    return htmlResponse(renderLanding(), 200);
+    return htmlResponse(renderLanding(request), 200);
   }
 
   // Health check
@@ -162,6 +305,13 @@ async function handle(request, env, ctx) {
   // API — list user's uploads
   if (pathname === "/api/list" && method === "GET") {
     return await handleList(request, env);
+  }
+
+  // API — payment-flow metrics for the caller's paid shares.
+  // Reads Analytics Engine via the Cloudflare REST API (needs CF_ACCOUNT_ID +
+  // CF_API_TOKEN). Free tier is 10M datapoints/day; queries are cheap.
+  if (pathname === "/api/metrics" && method === "GET") {
+    return await handleShareMetrics(request, env);
   }
 
   // API — patch / delete by slug
@@ -189,7 +339,7 @@ async function handle(request, env, ctx) {
   // Render
   const viewMatch = pathname.match(/^\/v\/([A-Za-z0-9]+)\/?$/);
   if (viewMatch && (method === "GET" || method === "HEAD")) {
-    return await handleView(request, env, viewMatch[1], method === "HEAD");
+    return await handleView(request, env, ctx, viewMatch[1], method === "HEAD");
   }
 
   return textResponse("Not Found", 404);
@@ -273,6 +423,68 @@ async function handleUpload(request, env) {
     passwordHash = await hashPassword(passwordRaw, saltBuf);
   }
 
+  // Optional payment gate (x402 / USDC on Base). Both `price` and `payTo`
+  // must be supplied together; supplying one without the other is rejected so
+  // a misconfigured upload can't silently become a public share. Mutually
+  // exclusive with `password` on v1 — single-gate shares keep the state
+  // surface small.
+  const priceRaw = form.get("price");
+  const payToRaw = form.get("payTo");
+  let priceAtomic = null;
+  let payTo = null;
+  let chainId = null;
+  let paymentSalt = null;
+  const anyPricePresent = typeof priceRaw === "string" && priceRaw.length > 0;
+  const anyPayToPresent = typeof payToRaw === "string" && payToRaw.length > 0;
+  if (anyPricePresent || anyPayToPresent) {
+    // Closed-beta gate: while x402 is pinned to testnet, only allowlisted
+    // userIds can attach a price. Check first so a non-allowlisted user who
+    // fat-fingered `--price` + `--pay-to` gets a clear "not in beta" error
+    // rather than a downstream 400 about price format or cross-exclusivity.
+    if (!isPaidSharesAllowed(env, user.userId)) {
+      return jsonResponse(
+        {
+          error: "paid-shares-closed-beta",
+          hint: "paid shares are in testnet-only closed beta. Ask the operator to add your userId to X402_BETA_ALLOWLIST.",
+          network: resolveChainId(env) ? X402_NETWORKS[resolveChainId(env)].name : null,
+        },
+        403,
+      );
+    }
+    if (!anyPricePresent || !anyPayToPresent) {
+      return jsonResponse({ error: "price-payTo-both-required" }, 400);
+    }
+    if (passwordHash) {
+      return jsonResponse({ error: "price-and-password-mutually-exclusive" }, 400);
+    }
+    const parsed = parseUsdcPrice(priceRaw);
+    if (parsed === null) {
+      return jsonResponse({ error: "invalid-price" }, 400);
+    }
+    if (parsed < MIN_PRICE_ATOMIC || parsed > MAX_PRICE_ATOMIC) {
+      return jsonResponse(
+        {
+          error: "price-out-of-range",
+          minAtomic: MIN_PRICE_ATOMIC.toString(),
+          maxAtomic: MAX_PRICE_ATOMIC.toString(),
+        },
+        400,
+      );
+    }
+    if (!isValidEthAddress(payToRaw)) {
+      return jsonResponse({ error: "invalid-payTo" }, 400);
+    }
+    const resolvedChainId = resolveChainId(env);
+    if (!resolvedChainId) {
+      return jsonResponse({ error: "payment-network-not-configured" }, 500);
+    }
+    priceAtomic = parsed.toString();
+    payTo = normalizeEthAddress(payToRaw);
+    chainId = resolvedChainId;
+    const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
+    paymentSalt = bytesToBase64(saltBuf);
+  }
+
   // Optional expiry (in days). Omitted → default to DEFAULT_EXPIRES_DAYS.
   let expiresAtMs;
   const expiresRaw = form.get("expiresDays");
@@ -337,6 +549,14 @@ async function handleUpload(request, env) {
     passwordSalt,
     contentType: typeInfo.mime,
     kind: typeInfo.kind,
+    // Payment fields (v1): all `null` for free shares, set together when a
+    // payment gate is attached. `paymentSalt` participates in the HMAC input
+    // for `share_paid` cookies so rotating the price invalidates every
+    // outstanding paid session.
+    price: priceAtomic,
+    payTo,
+    chainId,
+    paymentSalt,
   };
 
   // Write R2 first, then KV (so we never leave metadata pointing to a missing object).
@@ -363,6 +583,15 @@ async function handleUpload(request, env) {
   stats.rateWindow = rateWindow;
   await saveUserStats(env, user.userId, stats);
 
+  // Analytics: log paid-share creation so `share list --metrics` can tell
+  // seller-side "how many paid shares did I spin up" vs buyer-side traffic.
+  if (priceAtomic) {
+    writeShareEvent(env, "upload_paid", slug, {
+      userId: user.userId,
+      network: chainId ? X402_NETWORKS[chainId]?.name || "" : "",
+    });
+  }
+
   const origin = new URL(request.url).origin;
   return jsonResponse({
     ok: true,
@@ -371,6 +600,10 @@ async function handleUpload(request, env) {
     createdAtMs,
     expiresAtMs,
     hasPassword: !!passwordHash,
+    price: priceAtomic,
+    payTo,
+    chainId,
+    network: chainId ? X402_NETWORKS[chainId]?.name || null : null,
     size: file.size,
     originalName,
     quota: {
@@ -420,6 +653,10 @@ async function handleList(request, env) {
       createdAtMs: meta.createdAtMs,
       expiresAtMs: meta.expiresAtMs || null,
       hasPassword: !!meta.passwordHash,
+      price: meta.price || null,
+      payTo: meta.payTo || null,
+      chainId: meta.chainId || null,
+      network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
     });
   }
 
@@ -581,6 +818,120 @@ async function handlePatch(request, env, slug) {
     }
   }
 
+  // Payment: `price` + `payTo` together, or either alone to rotate/change.
+  // Semantics mirror the CLI flags (`--price`, `--no-price`, `--pay-to`):
+  //   - body.price === null / ""  → remove the entire payment gate.
+  //   - body.price value + body.payTo value → fresh or rotated gate (rotates
+  //     paymentSalt, which invalidates every outstanding `share_paid` cookie).
+  //   - body.price value alone → change price, keep existing payTo. Still
+  //     rotates paymentSalt (seller intent is "new price, old sessions out").
+  //   - body.payTo value alone → change recipient only. Does NOT rotate salt;
+  //     already-paid sessions stay alive (the buyer already got what they
+  //     paid for; the seller simply redirects future payouts).
+  if ("price" in body) {
+    const pv = body.price;
+    if (pv === null || pv === "") {
+      // Removing the gate is always allowed — even for users who are no longer
+      // on the beta allowlist — so they can always downgrade a paid share back
+      // to public without having to wait for re-approval.
+      if (meta.price || meta.payTo || meta.paymentSalt || meta.chainId) {
+        meta.price = null;
+        meta.payTo = null;
+        meta.chainId = null;
+        meta.paymentSalt = null;
+        changed = true;
+      }
+    } else if (typeof pv === "string" || typeof pv === "number") {
+      // Setting / rotating a price requires the beta allowlist, same as upload.
+      if (!isPaidSharesAllowed(env, user.userId)) {
+        return jsonResponse(
+          {
+            error: "paid-shares-closed-beta",
+            hint: "paid shares are in testnet-only closed beta. Ask the operator to add your userId to X402_BETA_ALLOWLIST.",
+            network: resolveChainId(env) ? X402_NETWORKS[resolveChainId(env)].name : null,
+          },
+          403,
+        );
+      }
+      if (meta.passwordHash) {
+        return jsonResponse({ error: "price-and-password-mutually-exclusive" }, 400);
+      }
+      const parsed = parseUsdcPrice(String(pv));
+      if (parsed === null) {
+        return jsonResponse({ error: "invalid-price" }, 400);
+      }
+      if (parsed < MIN_PRICE_ATOMIC || parsed > MAX_PRICE_ATOMIC) {
+        return jsonResponse(
+          {
+            error: "price-out-of-range",
+            minAtomic: MIN_PRICE_ATOMIC.toString(),
+            maxAtomic: MAX_PRICE_ATOMIC.toString(),
+          },
+          400,
+        );
+      }
+      // payTo: take from body if present, else keep existing. If neither,
+      // reject — a price without a recipient is unusable.
+      let effectivePayTo;
+      if ("payTo" in body) {
+        if (typeof body.payTo !== "string" || !isValidEthAddress(body.payTo)) {
+          return jsonResponse({ error: "invalid-payTo" }, 400);
+        }
+        effectivePayTo = normalizeEthAddress(body.payTo);
+      } else if (meta.payTo) {
+        effectivePayTo = meta.payTo;
+      } else {
+        return jsonResponse({ error: "price-payTo-both-required" }, 400);
+      }
+      const resolvedChainId = meta.chainId || resolveChainId(env);
+      if (!resolvedChainId) {
+        return jsonResponse({ error: "payment-network-not-configured" }, 500);
+      }
+      meta.price = parsed.toString();
+      meta.payTo = effectivePayTo;
+      meta.chainId = resolvedChainId;
+      const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
+      meta.paymentSalt = bytesToBase64(saltBuf);
+      changed = true;
+    } else {
+      return jsonResponse({ error: "invalid-price" }, 400);
+    }
+  } else if ("payTo" in body) {
+    // payTo-only branch: only legal when the share already has a price.
+    const tv = body.payTo;
+    if (tv === null || tv === "") {
+      return jsonResponse(
+        { error: "payTo-cannot-be-cleared-alone", hint: "pass price:null to remove the payment gate" },
+        400,
+      );
+    }
+    if (typeof tv !== "string" || !isValidEthAddress(tv)) {
+      return jsonResponse({ error: "invalid-payTo" }, 400);
+    }
+    if (!meta.price) {
+      return jsonResponse({ error: "payTo-without-price" }, 400);
+    }
+    // Rotating `payTo` on a live paid share is operationally equivalent to
+    // running a paid share — still gated by the beta allowlist so a removed
+    // user can't keep redirecting payouts. They can always `--no-price` to
+    // wind the gate down.
+    if (!isPaidSharesAllowed(env, user.userId)) {
+      return jsonResponse(
+        {
+          error: "paid-shares-closed-beta",
+          hint: "paid shares are in testnet-only closed beta. Ask the operator to add your userId to X402_BETA_ALLOWLIST.",
+          network: resolveChainId(env) ? X402_NETWORKS[resolveChainId(env)].name : null,
+        },
+        403,
+      );
+    }
+    const normalized = normalizeEthAddress(tv);
+    if (normalized !== meta.payTo) {
+      meta.payTo = normalized;
+      changed = true;
+    }
+  }
+
   // Expiry: expiresDays is always relative to "now" (so PATCH extends or
   // shortens the TTL). null → reset to default. number/numeric-string → set.
   if ("expiresDays" in body) {
@@ -656,6 +1007,10 @@ async function handlePatch(request, env, slug) {
     createdAtMs: meta.createdAtMs,
     expiresAtMs: meta.expiresAtMs,
     hasPassword: !!meta.passwordHash,
+    price: meta.price || null,
+    payTo: meta.payTo || null,
+    chainId: meta.chainId || null,
+    network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
     size: meta.size,
     originalName: meta.originalName,
   });
@@ -665,7 +1020,7 @@ async function handlePatch(request, env, slug) {
 // View / render
 // ---------------------------------------------------------------------------
 
-async function handleView(request, env, slug, headOnly = false) {
+async function handleView(request, env, ctx, slug, headOnly = false) {
   const meta = await loadMetadata(env, slug);
   if (!meta) return textResponse("Not Found", 404, SECURITY_HEADERS);
 
@@ -699,6 +1054,127 @@ async function handleView(request, env, slug, headOnly = false) {
           ? new Response(null, { status: 401, headers: { "content-type": "text/html; charset=utf-8", ...SECURITY_HEADERS } })
           : htmlResponse(renderUnlockForm(slug, false, meta.userId), 401);
       }
+    }
+  }
+
+  // Payment gate (x402). Runs after the password gate — content-type-agnostic,
+  // independent from password auth. On first visit (no cookie, no X-PAYMENT
+  // header), returns 402 with the x402 requirements body. When X-PAYMENT is
+  // present, verifies via the configured facilitator, mints a short-lived
+  // `share_paid` cookie, and falls through to the format branch. Settlement
+  // (broadcasting the transfer tx on-chain) is fired via ctx.waitUntil after
+  // verify — the facilitator has already confirmed the signature + nonce, so
+  // settle is essentially a formality.
+  const paymentExtraHeaders = {};
+  if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
+    const cookies = parseCookies(request.headers.get("cookie") || "");
+    const paidToken = cookies[PAID_COOKIE_NAME] || "";
+    const hasPaidSession = paidToken
+      ? await verifyUnlockToken(paidToken, slug, env, meta.paymentSalt)
+      : false;
+
+    if (!hasPaidSession) {
+      const xPaymentHeader = request.headers.get("x-payment") || "";
+      if (!xPaymentHeader) {
+        // First visit — advertise payment requirements. HEAD is intentionally
+        // terse (no body); content-type matches what GET would negotiate so
+        // DevTools HEAD probes reflect the real response. Link + X-Payment-
+        // Required hints are included so HEAD-preflight clients and tools
+        // that drop non-2xx bodies can still extract the price / payTo /
+        // chain without a second call.
+        writeShareEvent(env, headOnly ? "402_served_head" : "402_served", slug, {
+          userId: meta.userId || "",
+          network: X402_NETWORKS[meta.chainId]?.name || "",
+        });
+        if (headOnly) {
+          const requirements = buildPaymentRequirements(meta, slug, request.url);
+          const hintHeaders = buildPaymentHintHeaders(requirements);
+          return new Response(null, {
+            status: 402,
+            headers: {
+              "content-type": prefersHtml(request)
+                ? "text/html; charset=utf-8"
+                : "application/json; charset=utf-8",
+              "cache-control": "private, no-store",
+              ...hintHeaders,
+              ...SECURITY_HEADERS,
+            },
+          });
+        }
+        return build402Response(meta, request, slug);
+      }
+
+      const verifyResult = await facilitatorVerify(env, meta, xPaymentHeader, request.url, slug);
+      if (!verifyResult || !verifyResult.isValid) {
+        const reason = (verifyResult && verifyResult.invalidReason) || "payment-verification-failed";
+        // Distinguish facilitator-reachability issues from protocol-level
+        // rejections: facilitatorVerify returns `facilitator-unavailable` when
+        // the upstream is down, everything else is the facilitator's own
+        // invalidReason (bad signature, expired nonce, wrong amount, etc.).
+        writeShareEvent(env, reason === "facilitator-unavailable" ? "facilitator_unavailable" : "verify_failed", slug, {
+          userId: meta.userId || "",
+          network: X402_NETWORKS[meta.chainId]?.name || "",
+          reason,
+        });
+        return jsonResponse(
+          {
+            x402Version: X402_VERSION,
+            error: reason,
+          },
+          402,
+        );
+      }
+
+      writeShareEvent(env, "paid_view", slug, {
+        userId: meta.userId || "",
+        network: X402_NETWORKS[meta.chainId]?.name || "",
+      });
+
+      // Settle async; don't block the view. Any failure is logged but does
+      // not fail the read — the facilitator already validated the signature.
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(
+          facilitatorSettle(env, meta, xPaymentHeader, request.url, slug).catch((err) => {
+            console.error("[share-worker] facilitator settle failed", err?.stack || err);
+            writeShareEvent(env, "settle_failed", slug, {
+              userId: meta.userId || "",
+              network: X402_NETWORKS[meta.chainId]?.name || "",
+              reason: String(err?.message || err || "").slice(0, 200),
+            });
+          }),
+        );
+      }
+
+      // Mint a paid session so reloads within PAID_COOKIE_MAX_AGE_SEC skip 402.
+      const expMs = Date.now() + PAID_COOKIE_MAX_AGE_SEC * 1000;
+      const newPaidToken = await signUnlockToken(slug, env, meta.paymentSalt, expMs);
+      paymentExtraHeaders["set-cookie"] = [
+        `${PAID_COOKIE_NAME}=${newPaidToken}`,
+        `Path=/v/${slug}`,
+        `Max-Age=${PAID_COOKIE_MAX_AGE_SEC}`,
+        "HttpOnly",
+        "Secure",
+        "SameSite=Lax",
+      ].join("; ");
+      // X-PAYMENT-RESPONSE: base64-encoded JSON preview. Settlement is async
+      // so we don't have a tx hash yet; the client can poll the facilitator
+      // directly if it needs one, or trust the verify step.
+      const preview = {
+        success: true,
+        network: X402_NETWORKS[meta.chainId]?.name || null,
+        payer: verifyResult.payer || null,
+      };
+      paymentExtraHeaders["x-payment-response"] = bytesToBase64(
+        new TextEncoder().encode(JSON.stringify(preview)),
+      );
+    } else {
+      // Returning buyer with a valid `share_paid` cookie — no 402, no
+      // facilitator round-trip. Logged separately so we can distinguish new
+      // pays (billable attention) from session reuse (free reloads).
+      writeShareEvent(env, "paid_cookie_hit", slug, {
+        userId: meta.userId || "",
+        network: X402_NETWORKS[meta.chainId]?.name || "",
+      });
     }
   }
 
@@ -737,6 +1213,7 @@ async function handleView(request, env, slug, headOnly = false) {
       "content-type": responseContentType,
       "cache-control": "private, no-store",
       ...SECURITY_HEADERS,
+      ...paymentExtraHeaders,
     };
     if (contentDisposition) headers["content-disposition"] = contentDisposition;
     if (kind !== "csv" || wantsRawCsv) {
@@ -769,6 +1246,7 @@ async function handleView(request, env, slug, headOnly = false) {
         "cache-control": "private, no-store",
         "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
         ...SECURITY_HEADERS,
+        ...paymentExtraHeaders,
       },
     });
   }
@@ -778,6 +1256,7 @@ async function handleView(request, env, slug, headOnly = false) {
     "content-type": responseContentType,
     "cache-control": "private, no-store",
     ...SECURITY_HEADERS,
+    ...paymentExtraHeaders,
   };
   if (contentDisposition) headers["content-disposition"] = contentDisposition;
   return new Response(body, { status: 200, headers });
@@ -1105,6 +1584,783 @@ function sniffImage(bytes) {
 }
 
 // ---------------------------------------------------------------------------
+// x402 payment helpers
+//
+// `parseUsdcPrice` / `isValidEthAddress` / `normalizeEthAddress` /
+// `resolveChainId` are pure validators for the upload + patch paths.
+// `build402Response` generates the spec-compliant 402 body.
+// `facilitatorVerify` / `facilitatorSettle` are the only code paths that
+// touch the external facilitator; both fail closed (verify returns isValid
+// false on network error rather than silently unlocking).
+//
+// Note: we intentionally do NOT implement EIP-55 checksum normalization —
+// that would require a keccak256 routine, which the Workers Web Crypto API
+// doesn't provide. Lowercase hex is still a valid Ethereum address; the
+// facilitator accepts it in payment requirements and verifies the signature
+// against the raw 20 bytes regardless of cased vs. lowercased input.
+// ---------------------------------------------------------------------------
+
+// "0.10" → 100000n ; "1" → 1000000n ; "0.000001" → 1n.
+// Returns null on bad format or >6 fractional digits.
+function parseUsdcPrice(raw) {
+  if (typeof raw !== "string") return null;
+  if (!/^\d+(\.\d{1,6})?$/.test(raw)) return null;
+  const [whole, frac = ""] = raw.split(".");
+  // Pad fractional part to exactly 6 digits (USDC decimals).
+  const padded = frac.padEnd(6, "0").slice(0, 6);
+  // Strip leading zeros (but preserve a single zero for "0").
+  const combined = `${whole}${padded}`.replace(/^0+(?=\d)/, "");
+  try {
+    return BigInt(combined || "0");
+  } catch {
+    return null;
+  }
+}
+
+function isValidEthAddress(addr) {
+  return typeof addr === "string" && /^0x[0-9a-fA-F]{40}$/.test(addr);
+}
+
+function normalizeEthAddress(addr) {
+  // Lowercase hex. See comment block above re: EIP-55.
+  return String(addr || "").toLowerCase();
+}
+
+function resolveChainId(env) {
+  const net = String(env?.X402_NETWORK || "").toLowerCase().trim();
+  if (net === "base") return 8453;
+  if (net === "base-sepolia" || net === "basesepolia" || net === "sepolia") return 84532;
+  return null;
+}
+
+function decodeX402Header(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    const bytes = base64ToBytes(raw);
+    const text = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Strip query string + fragment so the canonicalized `resource` we hand to
+// the facilitator matches whatever the client computed when signing. Any
+// per-request params (`?t=<token>`, `?raw=1`, etc.) would otherwise make the
+// signature fail verification.
+function canonicalizeResourceUrl(requestUrl) {
+  try {
+    const u = new URL(requestUrl);
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return String(requestUrl).split("?")[0].split("#")[0];
+  }
+}
+
+function buildPaymentRequirements(meta, slug, requestUrl) {
+  const net = X402_NETWORKS[meta.chainId];
+  if (!net) return null;
+  return {
+    scheme: "exact",
+    network: net.name,
+    maxAmountRequired: meta.price,
+    resource: canonicalizeResourceUrl(requestUrl),
+    description: `Unlock viveworker share ${slug}`,
+    mimeType: meta.contentType || LEGACY_CONTENT_TYPE,
+    payTo: meta.payTo,
+    maxTimeoutSeconds: 60,
+    asset: net.usdc,
+    extra: { name: net.eip712Name, version: net.eip712Version },
+  };
+}
+
+// Header-only advertisement of the payment gate. Used on both GET and HEAD so
+// a client that (a) can't read non-2xx bodies (some agent fetch wrappers error
+// on 402 and drop the body entirely) or (b) does a preflight HEAD before
+// committing to a GET can still extract price/recipient/chain purely from
+// response headers. Not a substitute for the x402 JSON body — this is a hint,
+// not the protocol payload. Returns an empty object if `requirements` is null.
+function buildPaymentHintHeaders(requirements) {
+  if (!requirements) return {};
+  const link = `<${requirements.resource}>; rel="payment"; type="application/json"`;
+  // Compact, RFC-7230-safe parameter list. All token-form (no quoting needed)
+  // because scheme/network/asset/payTo/amount are alphanumeric + 0x-prefixed
+  // hex. Clients can split on `; ` and then on `=`.
+  const hint = [
+    `x402Version=${X402_VERSION}`,
+    `scheme=${requirements.scheme}`,
+    `network=${requirements.network}`,
+    `amount=${requirements.maxAmountRequired}`,
+    `asset=${requirements.asset}`,
+    `payTo=${requirements.payTo}`,
+    `maxTimeoutSeconds=${requirements.maxTimeoutSeconds}`,
+  ].join("; ");
+  return {
+    link,
+    "x-payment-required": hint,
+  };
+}
+
+// Accept-header content negotiation. Browsers (Accept contains text/html) get
+// a styled 402 page; everything else — x402-fetch, curl default (*/*), Cursor,
+// AgentKit, etc. — keeps seeing the spec-compliant JSON body. Crucially, the
+// status stays 402 in both cases, so x402 clients that branch on status (not
+// body) still recognise the payment gate correctly.
+function prefersHtml(request) {
+  const accept = String(request.headers.get("accept") || "").toLowerCase();
+  if (!accept) return false;
+  // A browser default Accept starts with `text/html,...`. Only treat the
+  // request as HTML-preferring if text/html appears before (or without) any
+  // machine types. This avoids misrouting x402 clients that might send
+  // `Accept: application/json, text/html` or `*/*` alone.
+  const htmlIdx = accept.indexOf("text/html");
+  if (htmlIdx === -1) return false;
+  const jsonIdx = accept.indexOf("application/json");
+  const x402Idx = accept.indexOf("application/x-x402+json");
+  if (jsonIdx !== -1 && jsonIdx < htmlIdx) return false;
+  if (x402Idx !== -1 && x402Idx < htmlIdx) return false;
+  return true;
+}
+
+function build402Response(meta, request, slug) {
+  const requirements = buildPaymentRequirements(meta, slug, request.url);
+  if (!requirements) {
+    return jsonResponse(
+      { x402Version: X402_VERSION, error: "payment-network-not-configured" },
+      500,
+    );
+  }
+  const jsonBody = {
+    x402Version: X402_VERSION,
+    accepts: [requirements],
+    error: "payment-required",
+  };
+  // `Link: rel="payment"` (RFC 8288) + `X-Payment-Required` header-only hint.
+  // HEAD shares the same helper so preflight responses are symmetric with GET.
+  const hintHeaders = buildPaymentHintHeaders(requirements);
+  if (prefersHtml(request)) {
+    return new Response(build402HtmlBody(jsonBody, requirements, slug), {
+      status: 402,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "private, no-store",
+        ...hintHeaders,
+        ...SECURITY_HEADERS,
+      },
+    });
+  }
+  return new Response(JSON.stringify(jsonBody), {
+    status: 402,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "private, no-store",
+      ...hintHeaders,
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+// Pretty 402 page for humans. Keeps the x402 protocol fully intact by:
+// 1. Using status 402 on the Response (see build402Response caller).
+// 2. Embedding the full x402 JSON body as <script type="application/x-x402+json">
+//    so any browser-resident x402 agent can parse the same payload.
+// 3. Emitting the same Link: rel="payment" header on the wrapping Response.
+// No inline JS / external resources — CSP-safe and works on any static-CSP
+// Worker. USDC atomic units are formatted to a decimal for display only;
+// the embedded JSON keeps the atomic-units string authoritative.
+function build402HtmlBody(jsonBody, requirements, slug) {
+  const network = requirements.network;
+  const isTestnet = network === "base-sepolia";
+  const netLabel = isTestnet ? "Base Sepolia (testnet)" : "Base (mainnet)";
+  const priceDecimal = formatUsdcAtomic(requirements.maxAmountRequired);
+  const payToShort = shortenAddress(requirements.payTo);
+  const resourceDisplay = escapeHtml(requirements.resource);
+  const descriptionDisplay = escapeHtml(requirements.description || `Unlock viveworker share ${slug}`);
+  const payToDisplay = escapeHtml(requirements.payTo);
+  const payToShortDisplay = escapeHtml(payToShort);
+  const assetDisplay = escapeHtml(requirements.asset);
+  const jsonPretty = JSON.stringify(jsonBody, null, 2);
+  const jsonForScript = jsonPretty.replace(/<\/script/giu, "<\\/script");
+  // Origin derived from the resource URL (always absolute in the x402 body).
+  // Fallback to production host on any parse failure.
+  let origin = "https://share.viveworker.com";
+  try { origin = new URL(requirements.resource).origin; } catch {}
+  const ogDescription = `Payment required · ${priceDecimal} USDC on ${netLabel}. Gated via x402.`;
+  const codeSnippet = [
+    `// buyer side (Node.js, requires viem + x402-fetch + a Base Sepolia wallet)`,
+    `import { wrapFetchWithPayment } from "x402-fetch";`,
+    `import { createWalletClient, http } from "viem";`,
+    `import { privateKeyToAccount } from "viem/accounts";`,
+    `import { ${isTestnet ? "baseSepolia" : "base"} } from "viem/chains";`,
+    ``,
+    `const wallet = createWalletClient({`,
+    `  account: privateKeyToAccount(process.env.BUYER_PK),`,
+    `  chain: ${isTestnet ? "baseSepolia" : "base"},`,
+    `  transport: http(),`,
+    `});`,
+    `const fetchPaid = wrapFetchWithPayment(fetch, wallet);`,
+    `const res = await fetchPaid(${JSON.stringify(requirements.resource)});`,
+    `console.log(await res.text());`,
+  ].join("\n");
+  const codeSnippetEscaped = escapeHtml(codeSnippet);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Payment required · viveworker share</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+${FAVICON_LINK}
+<meta name="description" content="${escapeHtml(ogDescription)}">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Payment required · viveworker share">
+<meta property="og:description" content="${escapeHtml(ogDescription)}">
+<meta property="og:url" content="${escapeHtml(requirements.resource)}">
+<meta property="og:image" content="${origin}/og/default.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Payment required · viveworker share">
+<meta name="twitter:description" content="${escapeHtml(ogDescription)}">
+<meta name="twitter:image" content="${origin}/og/default.png">
+<meta name="robots" content="noindex, nofollow">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0b0f17;
+    --fg: #e8ecf1;
+    --dim: #8a9099;
+    --muted: #6b727c;
+    --accent: #5ce0a8;
+    --warn: #f4b942;
+    --card: #141a24;
+    --card-2: #1a2130;
+    --border: #233040;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --fg: #161a22;
+      --dim: #4a525c;
+      --muted: #6b727c;
+      --accent: #0a9863;
+      --warn: #a07216;
+      --card: #ffffff;
+      --card-2: #f0f2f6;
+      --border: #dfe3ea;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    display: grid;
+    /* Center the card vertically in the viewport when content fits; when it
+       overflows (accordion open on small screens), grid stretches the row and
+       centering becomes a no-op — the page scrolls normally. */
+    place-items: center;
+    padding: 40px 20px;
+    line-height: 1.5;
+  }
+  .wrap { width: 100%; max-width: 640px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 32px;
+    margin-bottom: 16px;
+  }
+  .card + .card { background: var(--card-2); }
+  /* Bare intro — no card chrome; content flows flush with the page. */
+  .intro {
+    padding: 4px 4px 0;
+    margin-bottom: 24px;
+  }
+  /* "How to pay" also bare — the <pre> block carries its own frame, and the
+     tools <ul> uses border-tops for separation, so the section doesn't need
+     another outer frame. */
+  .how-to-pay {
+    padding: 4px 4px 0;
+    margin-top: 4px;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: 22px;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    margin: 0 0 24px;
+    color: var(--dim);
+    font-size: 14px;
+  }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(244, 185, 66, 0.14);
+    color: var(--warn);
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin-bottom: 16px;
+    text-transform: uppercase;
+  }
+  .price {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 8px 0 20px;
+  }
+  .price .amount {
+    font-size: 42px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+  .price .unit {
+    font-size: 16px;
+    color: var(--dim);
+    font-weight: 500;
+  }
+  .testnet-note {
+    background: rgba(244, 185, 66, 0.10);
+    border: 1px solid rgba(244, 185, 66, 0.35);
+    color: var(--warn);
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+  /* Prominent beta banner — shown above the intro so buyers can't miss that
+     paid shares are testnet-only closed beta. Distinct from .testnet-note
+     (which only appears inside the expanded payment-details card). */
+  .beta-banner {
+    background: rgba(244, 185, 66, 0.18);
+    border: 1px solid rgba(244, 185, 66, 0.55);
+    color: var(--warn);
+    padding: 12px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.45;
+    margin-bottom: 24px;
+    text-align: center;
+  }
+  .beta-banner strong { letter-spacing: 0.05em; }
+  dl {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 10px 16px;
+    margin: 0;
+    font-size: 13px;
+  }
+  dt { color: var(--dim); }
+  dd {
+    margin: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    word-break: break-all;
+  }
+  dd.mono-dim { color: var(--muted); font-size: 12px; }
+  h2 {
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+  p.card-lead {
+    margin: 0 0 16px;
+    font-size: 14px;
+    color: var(--fg);
+  }
+  pre {
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0 0 14px;
+  }
+  @media (prefers-color-scheme: light) {
+    pre { background: #0f1624; color: #e8ecf1; }
+  }
+  /* Footer — spec matches worker/worker.js profile page (renderProfileHtml). */
+  footer { margin-top: 2rem; text-align: center; }
+  .footer-brand {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .footer-brand:hover { text-decoration: underline; }
+  .footer-links {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.3rem;
+  }
+  .footer-links a { color: var(--muted); text-decoration: none; }
+  .footer-links a:hover { color: var(--accent); }
+  ul.tools {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    font-size: 13px;
+  }
+  ul.tools li {
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+  }
+  ul.tools li:first-child { border-top: 0; }
+  ul.tools code {
+    background: rgba(92, 224, 168, 0.10);
+    color: var(--accent);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+  }
+  /* Accordion — pure HTML <details>/<summary>, no JS. CSP-safe. Frameless
+     summary — reads as a link-ish toggle, not a button. */
+  details.accordion { margin: 0 0 16px; }
+  details.accordion > summary {
+    cursor: pointer;
+    padding: 4px 4px;
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--accent);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    list-style: none;
+    user-select: none;
+    width: fit-content;
+  }
+  details.accordion > summary:hover { text-decoration: underline; }
+  details.accordion > summary::-webkit-details-marker { display: none; }
+  details.accordion > summary::marker { content: ""; }
+  details.accordion > summary .chev {
+    font-size: 10px;
+    color: var(--dim);
+    transition: transform 0.2s ease;
+  }
+  details.accordion[open] > summary .chev { transform: rotate(180deg); }
+  details.accordion[open] > summary { margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<main class="wrap">
+  ${isTestnet ? `<div class="beta-banner">
+    <strong>⚠ CLOSED BETA</strong> · viveworker paid shares are gated on <strong>Base Sepolia</strong> (testnet).
+    No real USDC is being moved. Pay with <a href="https://faucet.circle.com" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline;">test USDC</a>; wallets, settlements, and this UI may change without notice.
+  </div>` : ""}
+  <section class="intro">
+    <span class="status">402 · Payment Required</span>
+    <h1>Unlock this share</h1>
+    <p class="subtitle">This viveworker share is gated by an <a href="https://x402.org" style="color: inherit;">x402</a> payment. Pay the amount below in USDC on Base and the content unlocks instantly.</p>
+  </section>
+
+  <details class="accordion">
+    <summary>
+      <span>Show payment details</span>
+      <span class="chev" aria-hidden="true">▼</span>
+    </summary>
+
+    <section class="card">
+      ${isTestnet ? `<div class="testnet-note">⚠️ Testnet — this share is on <strong>Base Sepolia</strong>. Use <strong>test USDC</strong> from the Circle faucet; any "payment" here has no monetary value.</div>` : ""}
+      <div class="price">
+        <span class="amount">${escapeHtml(priceDecimal)}</span>
+        <span class="unit">USDC · ${escapeHtml(netLabel)}</span>
+      </div>
+      <dl>
+        <dt>Pay to</dt>
+        <dd title="${payToDisplay}">${payToShortDisplay}</dd>
+        <dt>Share</dt>
+        <dd>${escapeHtml(slug)}</dd>
+        <dt>Resource</dt>
+        <dd class="mono-dim">${resourceDisplay}</dd>
+        <dt>Asset</dt>
+        <dd class="mono-dim">USDC @ ${assetDisplay}</dd>
+        <dt>Network ID</dt>
+        <dd>${escapeHtml(String(requirements.network))}</dd>
+      </dl>
+    </section>
+
+    <section class="how-to-pay">
+      <h2>How to pay</h2>
+      <p class="card-lead">You need an x402-compatible client (viveworker does not ship a buyer wallet). Easiest path:</p>
+      <pre>${codeSnippetEscaped}</pre>
+      <ul class="tools">
+        <li><strong>x402-fetch</strong> (npm) — spec-compliant <code>fetch</code> wrapper, works with any <a href="https://viem.sh" style="color: inherit;">viem</a> wallet client.</li>
+        <li><strong>Coinbase AgentKit</strong> — <code>x402</code> action, drop-in for CDP-built agents.</li>
+        <li><strong>Raw curl</strong> — possible if you can sign EIP-3009 <code>transferWithAuthorization</code> yourself and base64 it into <code>X-PAYMENT</code>. Spec: <a href="https://x402.org" style="color: inherit;">x402.org</a>.</li>
+      </ul>
+    </section>
+  </details>
+
+  <footer>
+    <a href="https://viveworker.com" target="viveworker" class="footer-brand">viveworker</a>
+    <div class="footer-links">
+      <a href="/">Home</a>
+      &nbsp;&middot;&nbsp;
+      <a href="https://x402.org/" target="_blank" rel="noopener">x402 protocol</a>
+    </div>
+  </footer>
+</main>
+<script type="application/x-x402+json">${jsonForScript}</script>
+</body>
+</html>`;
+}
+
+// Format USDC atomic units (6 decimals) as a human-facing decimal string.
+// Matches scripts/share-cli.mjs formatUsdc so the displayed value on the 402
+// page matches what sellers see in their CLI. Falls back to "0.00" on bad
+// input — the embedded JSON still carries the authoritative atomic value.
+function formatUsdcAtomic(atomic) {
+  let n;
+  try {
+    n = BigInt(String(atomic || "0"));
+  } catch {
+    return "0.00";
+  }
+  if (n < 0n) n = -n;
+  const whole = n / 1_000_000n;
+  const frac = (n % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "");
+  if (!frac) return `${whole}.00`;
+  return `${whole}.${frac.padEnd(2, "0")}`;
+}
+
+function shortenAddress(addr) {
+  const s = String(addr || "");
+  if (s.length < 12) return s;
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
+}
+// escapeHtml is defined further down (shared with renderCsvTable / the unlock
+// form / renderLanding). The two callers use identical semantics so we share
+// one implementation.
+
+async function facilitatorVerify(env, meta, xPaymentHeader, requestUrl, slug) {
+  const payload = decodeX402Header(xPaymentHeader);
+  if (!payload) return { isValid: false, invalidReason: "malformed-x-payment" };
+  const requirements = buildPaymentRequirements(meta, slug, requestUrl);
+  if (!requirements) return { isValid: false, invalidReason: "payment-network-not-configured" };
+  const facilitatorUrl = String(env.X402_FACILITATOR_URL || "").replace(/\/$/u, "");
+  if (!facilitatorUrl) return { isValid: false, invalidReason: "facilitator-not-configured" };
+  const body = {
+    x402Version: X402_VERSION,
+    paymentPayload: payload,
+    paymentRequirements: requirements,
+  };
+  try {
+    const res = await fetch(`${facilitatorUrl}/verify`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(env.X402_FACILITATOR_AUTH
+          ? { authorization: `Bearer ${env.X402_FACILITATOR_AUTH}` }
+          : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      return { isValid: false, invalidReason: "facilitator-unavailable" };
+    }
+    const json = await res.json().catch(() => null);
+    if (!json || typeof json !== "object") {
+      return { isValid: false, invalidReason: "facilitator-bad-response" };
+    }
+    return json;
+  } catch (err) {
+    console.error("[share-worker] facilitator verify error", err?.stack || err);
+    return { isValid: false, invalidReason: "facilitator-unavailable" };
+  }
+}
+
+async function facilitatorSettle(env, meta, xPaymentHeader, requestUrl, slug) {
+  const payload = decodeX402Header(xPaymentHeader);
+  if (!payload) return { success: false };
+  const requirements = buildPaymentRequirements(meta, slug, requestUrl);
+  if (!requirements) return { success: false };
+  const facilitatorUrl = String(env.X402_FACILITATOR_URL || "").replace(/\/$/u, "");
+  if (!facilitatorUrl) return { success: false };
+  const body = {
+    x402Version: X402_VERSION,
+    paymentPayload: payload,
+    paymentRequirements: requirements,
+  };
+  const res = await fetch(`${facilitatorUrl}/settle`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(env.X402_FACILITATOR_AUTH
+        ? { authorization: `Bearer ${env.X402_FACILITATOR_AUTH}` }
+        : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return { success: false };
+  return await res.json().catch(() => ({ success: false }));
+}
+
+// ---------------------------------------------------------------------------
+// Analytics Engine readback (payment-flow metrics)
+//
+// Follows the a2a worker's `queryAnalytics` pattern: POST SQL to the CF REST
+// endpoint with a scoped API token. The dataset is `viveworker_share_events`
+// (see writeShareEvent). All queries here filter by blob2=userId (the owner
+// of the share), so users only see metrics for their own paid shares.
+// ---------------------------------------------------------------------------
+
+const SHARE_ANALYTICS_DATASET = "viveworker_share_events";
+const SHARE_ANALYTICS_SQL_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/analytics_engine/sql";
+
+async function queryShareAnalytics(env, sql) {
+  const accountId = env.CF_ACCOUNT_ID || "";
+  const apiToken = env.CF_API_TOKEN || "";
+  if (!accountId || !apiToken) return null;
+  const url = SHARE_ANALYTICS_SQL_URL.replace("{account_id}", accountId);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiToken}` },
+      body: sql,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error("[share-worker] analytics query error", err?.stack || err);
+    return null;
+  }
+}
+
+// GET /api/metrics — payment-flow stats for the caller's paid shares.
+// 24h and 7d breakdowns by event type + per-slug drill-down. Auth is the
+// same `X-A2A-User` / `X-A2A-Key` pair used everywhere else in this worker.
+async function handleShareMetrics(request, env) {
+  const user = await authenticate(request, env);
+  if (!user) return jsonResponse({ error: "unauthorized" }, 401);
+
+  if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) {
+    return jsonResponse(
+      {
+        error: "metrics-not-configured",
+        hint: "worker operator must set CF_ACCOUNT_ID and CF_API_TOKEN secrets",
+      },
+      501,
+    );
+  }
+
+  // userId comes from `authenticate`, so it's already validated against
+  // /^[a-zA-Z0-9_-]{1,64}$/. Strip single quotes defensively (matches a2a's
+  // pattern) before interpolating into SQL.
+  const safeUserId = user.userId.replace(/'/g, "");
+
+  // Count-by-event over two windows. `_sample_interval` is the sampling-
+  // preserving aggregation (matches a2a's pattern). blob1 IN (...) filters
+  // out spurious writes and trims the response.
+  const EVENTS = [
+    "upload_paid",
+    "402_served",
+    "402_served_head",
+    "paid_view",
+    "paid_cookie_hit",
+    "verify_failed",
+    "facilitator_unavailable",
+    "settle_failed",
+  ];
+  const eventList = EVENTS.map((e) => `'${e}'`).join(",");
+
+  const sql24h = `
+    SELECT blob1 AS event, SUM(_sample_interval) AS count
+    FROM ${SHARE_ANALYTICS_DATASET}
+    WHERE blob2 = '${safeUserId}'
+      AND blob1 IN (${eventList})
+      AND timestamp > NOW() - INTERVAL '1' DAY
+    GROUP BY blob1
+  `;
+  const sql7d = `
+    SELECT blob1 AS event, SUM(_sample_interval) AS count
+    FROM ${SHARE_ANALYTICS_DATASET}
+    WHERE blob2 = '${safeUserId}'
+      AND blob1 IN (${eventList})
+      AND timestamp > NOW() - INTERVAL '7' DAY
+    GROUP BY blob1
+  `;
+  // Per-slug breakdown over 7d — only keeps shares with any recorded event.
+  // Separate "views" (paid_view + paid_cookie_hit) and "402s" for readability.
+  const sqlPerSlug = `
+    SELECT index1 AS slug, blob1 AS event, SUM(_sample_interval) AS count
+    FROM ${SHARE_ANALYTICS_DATASET}
+    WHERE blob2 = '${safeUserId}'
+      AND blob1 IN (${eventList})
+      AND timestamp > NOW() - INTERVAL '7' DAY
+    GROUP BY index1, blob1
+  `;
+
+  const [r24h, r7d, rPerSlug] = await Promise.all([
+    queryShareAnalytics(env, sql24h),
+    queryShareAnalytics(env, sql7d),
+    queryShareAnalytics(env, sqlPerSlug),
+  ]);
+
+  const emptyBucket = () => {
+    const o = {};
+    for (const e of EVENTS) o[e] = 0;
+    return o;
+  };
+  const parseRows = (res) => {
+    const out = emptyBucket();
+    if (!res || !Array.isArray(res.data)) return out;
+    for (const row of res.data) {
+      const k = row.event;
+      if (k && k in out) out[k] = Math.round(Number(row.count) || 0);
+    }
+    return out;
+  };
+  const parsePerSlug = (res) => {
+    const perSlug = {};
+    if (!res || !Array.isArray(res.data)) return [];
+    for (const row of res.data) {
+      const slug = row.slug;
+      if (!slug) continue;
+      if (!perSlug[slug]) perSlug[slug] = emptyBucket();
+      const k = row.event;
+      if (k && k in perSlug[slug]) {
+        perSlug[slug][k] = Math.round(Number(row.count) || 0);
+      }
+    }
+    // Rank by total activity so the CLI can truncate without surprising the
+    // user — active shares surface first.
+    return Object.entries(perSlug)
+      .map(([slug, counts]) => {
+        const total = Object.values(counts).reduce((a, b) => a + b, 0);
+        return { slug, total, counts };
+      })
+      .sort((a, b) => b.total - a.total);
+  };
+
+  return jsonResponse({
+    ok: true,
+    userId: user.userId,
+    network: resolveChainId(env) ? X402_NETWORKS[resolveChainId(env)].name : null,
+    last24h: parseRows(r24h),
+    last7d: parseRows(r7d),
+    perSlug7d: parsePerSlug(rPerSlug),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // CSV parsing + HTML table rendering
 //
 // Used by handleView for shares with kind === "csv". Stays pure / sync so a
@@ -1415,39 +2671,245 @@ function htmlResponse(body, status = 200, extraHeaders = {}) {
 // Templates
 // ---------------------------------------------------------------------------
 
-function renderLanding() {
+function renderLanding(request) {
+  // Design language borrowed from worker/worker.js handleLandingPage (the A2A
+  // landing): same dark palette (#0a0f0d + #00d4aa accent), same tagline /
+  // logo-mark / "Who are you?" chooser pattern, same radio-toggle disclosure
+  // panels, same footer shape. Pure-CSS — no JS beyond the onclick clipboard
+  // helper on .copy-box (matches A2A behaviour). Share swaps the bee mark for
+  // the Open Cell honeycomb, but the slot is identical.
+  const acceptedTypes = ALLOWED_EXTENSIONS.join(" · ");
+  // Absolute origin for OG tags — social scrapers (Twitter/Discord/Slack/LINE)
+  // reject relative URLs. Fallback to the production host if `request` is ever
+  // omitted (the API prefers requestless callers over crashing).
+  const origin = request ? new URL(request.url).origin : "https://share.viveworker.com";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="robots" content="noindex, nofollow" />
-<title>viveworker share</title>
-<style>
-  :root { color-scheme: dark; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #0b0f14; color: #d7e2ea; font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 2rem;
-  }
-  main { max-width: 540px; text-align: center; }
-  h1 { margin: 0 0 0.5rem; font-size: 1.6rem; font-weight: 600; letter-spacing: -0.01em; }
-  p { margin: 0.4rem 0; color: #9cb5c5; }
-  .types { margin: 0.6rem 0; color: #7a93a5; font-size: 0.85rem; }
-  code {
-    display: inline-block; margin-top: 0.8rem; padding: 0.4rem 0.7rem; font-size: 0.85rem;
-    background: #141b24; border: 1px solid #25313d; border-radius: 8px; color: #cdd6df;
-  }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>viveworker share</title>
+  ${FAVICON_LINK}
+  <meta name="description" content="Private file hosting for agents. Upload HTML, PDFs, images, or CSVs and hand back an unguessable link. Paywall with USDC or gate with a password.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="viveworker share">
+  <meta property="og:description" content="Private file hosting for agents. Upload HTML, PDFs, images, or CSVs and hand back an unguessable link. Paywall with USDC or gate with a password.">
+  <meta property="og:url" content="${origin}">
+  <meta property="og:image" content="${origin}/og/default.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="viveworker share">
+  <meta name="twitter:description" content="Private file hosting for agents. Upload HTML, PDFs, images, or CSVs and hand back an unguessable link. Paywall with USDC or gate with a password.">
+  <meta name="twitter:image" content="${origin}/og/default.png">
+  <meta name="robots" content="noindex, nofollow">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, system-ui, 'Segoe UI', sans-serif;
+      background: #0a0f0d; color: #e0e6e3;
+      min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      padding: 2rem 1rem;
+    }
+    header { text-align: center; margin-bottom: 2.5rem; }
+    .logo-mark { width: 22px; height: 22px; margin-right: 0.4rem; vertical-align: -0.2em; }
+    header h1 { font-size: 1.8rem; color: #fff; font-weight: 700; margin-bottom: 0.5rem; letter-spacing: -0.02em; }
+    .tagline {
+      font-size: 0.8rem; color: #00d4aa; text-transform: uppercase;
+      letter-spacing: 0.12em; font-weight: 600; margin-bottom: 0.5rem;
+    }
+    header .sub { color: #7a8a82; font-size: 0.95rem; }
+    .chooser { width: 100%; max-width: 560px; }
+    .prompt { text-align: center; color: #7a8a82; font-size: 1.05rem; margin-bottom: 1.2rem; }
+    .buttons { display: flex; gap: 1rem; justify-content: center; margin-bottom: 1.5rem; }
+    input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+    .btn {
+      display: block; padding: 1rem 1.8rem; border-radius: 999px; cursor: pointer;
+      font-size: 1rem; font-weight: 600; text-align: center;
+      background: transparent; border: 1px solid #2a3a32; color: #e0e6e3;
+      transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+      user-select: none; flex: 1; max-width: 240px;
+    }
+    .btn:hover { border-color: #00d4aa; background: rgba(0,212,170,0.06); }
+    #choose-agent:checked ~ .buttons label[for="choose-agent"],
+    #choose-human:checked ~ .buttons label[for="choose-human"] {
+      border-color: #00d4aa; background: rgba(0,212,170,0.1);
+      box-shadow: 0 0 0 1px #00d4aa;
+      color: #fff;
+    }
+    .panel {
+      max-height: 0; overflow: hidden; opacity: 0;
+      transition: max-height 0.5s ease, opacity 0.3s ease, margin 0.3s ease;
+      background: #0f1512; border: 1px solid #1e2e26; border-radius: 16px;
+    }
+    #choose-agent:checked ~ .panel-agent,
+    #choose-human:checked ~ .panel-human {
+      max-height: 1400px; opacity: 1; padding: 1.5rem; margin-bottom: 1rem;
+    }
+    .panel h2 { font-size: 1.15rem; color: #fff; font-weight: 700; margin-bottom: 1rem; }
+    .panel h3.section-title {
+      font-size: 0.75rem; color: #00d4aa; text-transform: uppercase;
+      letter-spacing: 0.1em; font-weight: 600; margin-bottom: 0.8rem;
+      padding-bottom: 0.4rem; border-bottom: 1px solid #1e2e26;
+    }
+    .section-block { margin-bottom: 1.5rem; }
+    .section-block:last-child { margin-bottom: 0; }
+    .human-note {
+      color: #7a8a82; font-size: 0.85rem; line-height: 1.6;
+      margin-bottom: 0.8rem;
+    }
+    .human-note strong { color: #e0e6e3; }
+    .human-note code {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 0.78rem; color: #5ce0b8; background: #0a0f0d;
+      padding: 0.15rem 0.4rem; border-radius: 4px; border: 1px solid #1e2e26;
+    }
+    .copy-box {
+      background: #0a0f0d; border: 1px solid #1e2e26; border-radius: 12px;
+      padding: 0.9rem 1rem; margin: 1rem 0; text-align: center;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 0.85rem; color: #5ce0b8; word-break: break-all;
+      cursor: pointer; position: relative;
+      transition: border-color 0.2s;
+    }
+    .copy-box:hover { border-color: #00d4aa; }
+    .copy-box::after {
+      content: "click to copy"; position: absolute; right: 10px; top: 10px;
+      font-size: 0.65rem; color: #3d5a4c; font-family: -apple-system, system-ui, sans-serif;
+    }
+    .cmd {
+      display: block; background: #0a0f0d; border: 1px solid #1e2e26; border-radius: 10px;
+      padding: 0.7rem 0.9rem; margin: 0.5rem 0 0;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 0.82rem; color: #5ce0b8; word-break: break-all;
+      cursor: pointer; position: relative; transition: border-color 0.2s;
+    }
+    .cmd:hover { border-color: #00d4aa; }
+    .types-line {
+      color: #5a6a62; font-size: 0.78rem; font-family: ui-monospace, SFMono-Regular, monospace;
+      margin-top: 0.4rem; word-break: break-word;
+    }
+    .divider { border: none; border-top: 1px solid #1e2e26; margin: 1.2rem 0; }
+    footer {
+      margin-top: 3rem; text-align: center; font-size: 0.75rem;
+    }
+    .footer-brand {
+      font-size: 0.7rem; color: #00d4aa; text-transform: uppercase;
+      letter-spacing: 0.12em; font-weight: 600; display: block; margin-bottom: 0.75rem;
+      text-decoration: none;
+    }
+    .footer-brand:hover { color: #00d4aa; text-decoration: underline; }
+    footer .footer-links { color: #3d5a4c; }
+    footer a { color: #7a8a82; text-decoration: none; }
+    footer a:hover { color: #00d4aa; }
+    @media (max-width: 480px) {
+      .buttons { flex-direction: column; align-items: center; }
+      .btn { max-width: 100%; }
+    }
+  </style>
 </head>
 <body>
-<main>
-  <h1>viveworker share</h1>
-  <p>Private file hosting for viveworker users.</p>
-  <p class="types">Accepted: ${ALLOWED_EXTENSIONS.join(" · ")}</p>
-  <p>Uploads are performed via the CLI:</p>
-  <code>viveworker share upload report.pdf</code>
-</main>
+  <header>
+    <p class="tagline">Private file hosting for agents</p>
+    <h1>${FAVICON_SVG.replace('<svg ', '<svg class="logo-mark" aria-hidden="true" ')}viveworker share</h1>
+    <p class="sub">Host files. Paywall or password-gate. Hand back a link.</p>
+  </header>
+
+  <main class="chooser">
+    <p class="prompt">Who are you?</p>
+
+    <input type="radio" id="choose-agent" name="role">
+    <input type="radio" id="choose-human" name="role">
+
+    <div class="buttons">
+      <label for="choose-agent" class="btn">&#x1F916; I am an AI Agent</label>
+      <label for="choose-human" class="btn">&#x1F464; I am a Human</label>
+    </div>
+
+    <section class="panel panel-agent">
+      <h2>Upload static artefacts via the CLI</h2>
+
+      <div class="section-block">
+        <h3 class="section-title">Requirements</h3>
+        <p class="human-note">
+          Uploads authenticate as a <strong>viveworker a2a user</strong> via <code>X-A2A-User</code> + <code>X-A2A-Key</code> headers. If your human isn't set up yet, run <code>viveworker a2a setup</code> first.
+        </p>
+        <p class="types-line">Accepted: ${acceptedTypes}</p>
+      </div>
+
+      <hr class="divider">
+
+      <div class="section-block">
+        <h3 class="section-title">Free shares</h3>
+        <p class="human-note">Upload a static artefact, get back a <code>share.viveworker.com/v/&lt;slug&gt;</code> URL. Password-gate with <code>--password</code> if needed.</p>
+        <div class="cmd" onclick="navigator.clipboard.writeText('viveworker share upload report.pdf')">viveworker share upload report.pdf</div>
+      </div>
+
+      <hr class="divider">
+
+      <div class="section-block">
+        <h3 class="section-title">Paid shares (x402 / USDC on Base)</h3>
+        <p class="human-note">Gate behind a USDC payment. Buyer fetches with any x402-compatible client (<code>x402-fetch</code> or Coinbase AgentKit) and the worker serves content on success.</p>
+        <div class="cmd" onclick="navigator.clipboard.writeText('viveworker share upload report.pdf --price 0.10 --pay-to 0x…')">viveworker share upload report.pdf --price 0.10 --pay-to 0x…</div>
+      </div>
+
+      <hr class="divider">
+
+      <div class="section-block">
+        <h3 class="section-title">Integration guide</h3>
+        <p class="human-note">The share CLI ships with the <code>viveworker</code> npm package (same one as a2a). Fetch the full skill doc:</p>
+        <div class="copy-box" onclick="navigator.clipboard.writeText('https://a2a.viveworker.com/skill.md')">
+          https://a2a.viveworker.com/skill.md
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel-human">
+      <h2>Your agent can host files for you</h2>
+
+      <div class="section-block">
+        <h3 class="section-title">What it does</h3>
+        <p class="human-note">
+          When your AI agent generates a PDF / report / chart / CSV, it can host it here and hand you back a private link. You open it on your phone; share it via iMessage; forward to someone else. Optional password gate or <strong>pay-per-unlock</strong> via USDC.
+        </p>
+      </div>
+
+      <hr class="divider">
+
+      <div class="section-block">
+        <h3 class="section-title">Prerequisite — viveworker a2a</h3>
+        <p class="human-note">
+          viveworker share rides on the same account as <strong>viveworker a2a</strong>. If you haven't set up a2a yet, start here first:
+        </p>
+        <div class="copy-box" onclick="navigator.clipboard.writeText('https://a2a.viveworker.com/setup.md')">
+          https://a2a.viveworker.com/setup.md
+        </div>
+        <p class="human-note">
+          Copy the URL above and paste it to your AI agent. Your agent handles the setup; you just click "Authorize" when prompted.
+        </p>
+      </div>
+
+      <hr class="divider">
+
+      <div class="section-block">
+        <h3 class="section-title">Once set up</h3>
+        <p class="human-note">
+          Just ask your agent:<br>
+          <strong>"Host this report as a link."</strong> / <strong>"Share this PDF with a password."</strong> / <strong>"Upload this with a $0.10 paywall to my wallet."</strong>
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://viveworker.com" target="viveworker" class="footer-brand">viveworker</a>
+    <div class="footer-links">
+      <a href="https://a2a.viveworker.com" target="viveworker-a2a" rel="noopener">viveworker a2a</a>
+      &nbsp;&middot;&nbsp;
+      <a href="https://x402.org/" target="_blank" rel="noopener">x402 protocol</a>
+    </div>
+  </footer>
 </body>
 </html>`;
 }
@@ -1460,13 +2922,30 @@ function renderUnlockForm(slug, showError, ownerUserId = "") {
   const hostedByHtml = safeOwner
     ? `<div class="footer-links">hosted by <a href="https://a2a.viveworker.com/u/${safeOwner}" target="_blank" rel="noopener">${safeOwner}</a></div>`
     : "";
+  // OG tags deliberately don't reveal the slug or any share content — only
+  // "a password-protected viveworker share lives here". The actual URL is
+  // still in `og:url` because it's what the user pasted; hiding it would be
+  // confusing, not secure.
+  const ogDescription = "Password required · a viveworker share";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="robots" content="noindex, nofollow" />
   <title>Password required — viveworker share</title>
+  ${FAVICON_LINK}
+  <meta name="description" content="${ogDescription}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Password required · viveworker share" />
+  <meta property="og:description" content="${ogDescription}" />
+  <meta property="og:image" content="https://share.viveworker.com/og/default.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Password required · viveworker share" />
+  <meta name="twitter:description" content="${ogDescription}" />
+  <meta name="twitter:image" content="https://share.viveworker.com/og/default.png" />
+  <meta name="robots" content="noindex, nofollow" />
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{color-scheme:dark}

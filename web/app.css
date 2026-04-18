@@ -623,12 +623,15 @@ code {
   white-space: nowrap;
 }
 
+/* When a badge renders an SVG icon instead of a text label (e.g. the
+ * password / paid markers on the File Share settings page), tighten the
+ * padding and size the icon to match the surrounding line height. The SVG
+ * inherits color via currentColor, so the badge's `color` rule drives it. */
 .settings-compose-badge svg {
   width: 0.85rem;
   height: 0.85rem;
   display: block;
 }
-
 .settings-compose-badge:has(> svg) {
   padding: 0.18rem 0.3rem;
 }
@@ -641,6 +644,13 @@ code {
 .settings-compose-badge--reply {
   background: rgba(160, 120, 255, 0.18);
   color: rgba(190, 160, 255, 0.92);
+}
+
+/* Paid-share marker on the A2A Share settings page. Amber tone echoes the
+ * 💰 emoji and the CLOSED BETA banner on the 402 HTML. */
+.settings-compose-badge--paid {
+  background: rgba(240, 180, 40, 0.2);
+  color: rgba(255, 210, 110, 0.95);
 }
 
 .settings-compose-entry {
