@@ -611,6 +611,7 @@ code {
 
 .settings-compose-badge {
   display: inline-flex;
+  align-items: center;
   align-self: flex-start;
   flex: 0 0 auto;
   padding: 0.12rem 0.42rem;
@@ -620,6 +621,16 @@ code {
   letter-spacing: 0.03em;
   line-height: 1.3;
   white-space: nowrap;
+}
+
+.settings-compose-badge svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  display: block;
+}
+
+.settings-compose-badge:has(> svg) {
+  padding: 0.18rem 0.3rem;
 }
 
 .settings-compose-badge--post {

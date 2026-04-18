@@ -3619,8 +3619,9 @@ function renderSettingsA2aSharePage(context) {
   const visible = items.slice(0, visibleCount);
   const hasMore = items.length > visibleCount;
   const filesList = visible.map((item) => {
+    const passwordLabel = L("settings.a2aShare.passwordProtected");
     const lock = item.hasPassword
-      ? `<span class="settings-compose-badge settings-compose-badge--reply" title="${escapeHtml(L("settings.a2aShare.passwordProtected"))}">🔒</span>`
+      ? `<span class="settings-compose-badge settings-compose-badge--reply" role="img" title="${escapeHtml(passwordLabel)}" aria-label="${escapeHtml(passwordLabel)}">${renderIcon("lock")}</span>`
       : "";
     const label = escapeHtml(item.originalName || item.slug);
     const link = item.url
@@ -6857,6 +6858,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M8 12h8"/><path d="M10.5 17h3"/></svg>`;
     case "check":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6.8 12.5 3.2 3.2 7.2-7.4"/></svg>`;
+    case "lock":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>`;
     case "back":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`;
     case "chevron-down":
