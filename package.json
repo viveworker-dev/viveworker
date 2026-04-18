@@ -1,7 +1,7 @@
 {
   "name": "viveworker",
   "version": "0.5.5",
-  "description": "Local mobile companion for Codex Desktop and Claude Desktop — approvals, code review, Moltbook drafts, and A2A (Agent-to-Agent) task relay on your LAN.",
+  "description": "Open mobile control surface for Codex, Claude, Thread Sharing, File Share, Moltbook, and A2A tasks on your trusted LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
   "keywords": [
@@ -20,9 +20,13 @@
     "questions",
     "code-review",
     "moltbook",
+    "file-share",
+    "thread-sharing",
     "ai-agents",
     "a2a",
     "agent-to-agent",
+    "a2a-relay",
+    "agent-control-plane",
     "lan",
     "companion-app",
     "vivecoding"
@@ -47,6 +51,7 @@
     "scripts/a2a-handler.mjs",
     "scripts/a2a-executor.mjs",
     "scripts/a2a-relay-client.mjs",
+    "scripts/share-cli.mjs",
     "scripts/lib",
     "web",
     "README.md",

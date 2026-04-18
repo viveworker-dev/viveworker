@@ -1,7 +1,10 @@
 /**
  * a2a-cli.mjs — CLI for viveworker A2A relay operations.
  *
- * Usage:
+ * Recommended usage:
+ *   viveworker enable a2a --user-id <id> [--relay-url <url>] [--timeout <seconds>]
+ *
+ * Direct usage:
  *   viveworker a2a setup --user-id <id> [--relay-url <url>] [--timeout <seconds>]
  *
  * The `setup` command:
@@ -9,7 +12,7 @@
  *   2. Opens the GitHub OAuth URL in the user's browser
  *   3. Polls for completion (user approves in browser)
  *   4. Writes credentials to ~/.viveworker/a2a.env
- *   5. Bridge can then be restarted to auto-connect
+ *   5. The running bridge auto-detects the credentials within ~30 seconds
  */
 
 import { promises as fs } from "node:fs";
@@ -39,6 +42,7 @@ export async function runA2ACli(args) {
       return handleCard(args.slice(1));
     default:
       console.log("Commands:");
+      console.log("  viveworker enable a2a   --user-id <id> [--description <text>] [--skills <csv>]");
       console.log("  viveworker a2a setup    --user-id <id> [--description <text>] [--skills <csv>]");
       console.log("  viveworker a2a activity [--state-file <path>]");
       console.log("  viveworker a2a card     [--description <text>] [--skills <csv>] [--avatar <url-or-emoji>]");
@@ -62,7 +66,7 @@ async function handleSetup(args) {
   const avatar = flags["avatar"] || "";
 
   if (!userId) {
-    throw new Error("--user-id is required\nUsage: viveworker a2a setup --user-id <id>");
+    throw new Error("--user-id is required\nUsage: viveworker enable a2a --user-id <id>");
   }
 
   console.log(`\n🔗 viveworker A2A Relay Setup`);
@@ -152,7 +156,8 @@ async function handleSetup(args) {
   await fs.writeFile(A2A_ENV_FILE, updated, { mode: 0o600 });
 
   console.log(`✅ Credentials saved\n`);
-  console.log(`🚀 Setup complete! Restart your viveworker bridge to connect.`);
+  console.log(`🚀 Setup complete! If your bridge is already running, it will reconnect within about 30 seconds.`);
+  console.log(`   If not, run: npx viveworker start`);
   console.log(`   Your A2A endpoint: ${result.relayUrl}/u/${result.userId}\n`);
 }
 
@@ -267,7 +272,7 @@ async function handleCard(args) {
     try {
       currentEnv = await fs.readFile(A2A_ENV_FILE, "utf8");
     } catch {
-      throw new Error(`No a2a.env found at ${A2A_ENV_FILE}. Run 'viveworker a2a setup' first.`);
+      throw new Error(`No a2a.env found at ${A2A_ENV_FILE}. Run 'viveworker enable a2a --user-id <id>' first.`);
     }
 
     const currentDesc = envValue(currentEnv, "A2A_DESCRIPTION");
@@ -287,7 +292,7 @@ async function handleCard(args) {
   try {
     currentEnv = await fs.readFile(A2A_ENV_FILE, "utf8");
   } catch {
-    throw new Error(`No a2a.env found at ${A2A_ENV_FILE}. Run 'viveworker a2a setup' first.`);
+    throw new Error(`No a2a.env found at ${A2A_ENV_FILE}. Run 'viveworker enable a2a --user-id <id>' first.`);
   }
 
   const updates = {};

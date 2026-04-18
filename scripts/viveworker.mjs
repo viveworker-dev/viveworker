@@ -81,6 +81,12 @@ async function main(cliOptions) {
     case "setup":
       await runSetup(cliOptions);
       return;
+    case "pair":
+      await runPair(cliOptions);
+      return;
+    case "enable":
+      await runEnable(cliOptions);
+      return;
     case "start":
       await runStart(cliOptions);
       return;
@@ -219,6 +225,14 @@ async function runSetup(cliOptions) {
 
   await fs.writeFile(envFile, `${envLines.join("\n")}\n`, "utf8");
 
+  progress.update("cli.setup.progress.providers");
+  const providerSetup = await autoConfigureProvidersDuringSetup({
+    cliOptions,
+    envFile,
+    sessionSecret,
+    codexHome: existing.CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
+  });
+
   if (!cliOptions.noLaunchd) {
     progress.update("cli.setup.progress.launchd");
     const plist = buildLaunchAgentPlist({
@@ -258,8 +272,9 @@ async function runSetup(cliOptions) {
   let caDownloadLocalUrl = `${publicBaseUrl}${caPath}`;
   let caDownloadIpUrl = `${fallbackBaseUrl}${caPath}`;
   let temporaryCaServer = null;
+  const shouldPromptCaTrust = Boolean(webPushEnabled && canShowCaDownload && !cliOptions.pair && tlsAssets?.ranMkcertInstall);
 
-  if (cliOptions.installMkcert && canShowCaDownload) {
+  if (shouldPromptCaTrust) {
     temporaryCaServer = await startTemporaryCaDownloadServer({
       rootCaFile: mkcertRootCaFile,
       preferredPort: port + 1,
@@ -289,77 +304,184 @@ async function runSetup(cliOptions) {
     }
   }
 
+  printCliSection(locale, "cli.section.ready", [
+    t(locale, "cli.setup.primaryUrl", { url: publicBaseUrl }),
+    t(locale, "cli.setup.fallbackUrl", { url: fallbackBaseUrl }),
+    t(locale, "cli.setup.pairingCode", { code: pairCode }),
+    t(locale, webPushEnabled ? "cli.setup.webPushEnabled" : "cli.setup.webPushDisabled"),
+    ...getSetupProviderSummaryLines(locale, providerSetup),
+  ]);
+  printCliSection(locale, "cli.section.needsAttention", [
+    allowInsecureHttpLan ? t(locale, "cli.setup.warning.insecureHttpLan") : "",
+    healthy && !pairingReady ? t(locale, "cli.setup.warning.stalePairingServer", { port }) : "",
+  ]);
+  printCliSection(locale, "cli.section.next", [
+    cliOptions.pair ? t(locale, "cli.setup.pairRefresh.copy") : "",
+    cliOptions.pair ? t(locale, "cli.setup.pairRefresh.reminder") : "",
+    webPushEnabled
+      ? t(locale, shouldPromptCaTrust ? "cli.setup.instructions.afterCa" : "cli.setup.instructions.https")
+      : allowInsecureHttpLan
+        ? t(locale, "cli.setup.instructions.insecureHttpLan")
+        : t(locale, "cli.setup.instructions.localOnlyHttp"),
+  ]);
+  printCliSection(locale, "cli.section.pairingLinks", [
+    t(locale, "cli.setup.pairingUrlLocal", { url: `${publicBaseUrl}${pairPath}` }),
+    t(locale, "cli.setup.pairingUrlIp", { url: `${fallbackBaseUrl}${pairPath}` }),
+  ]);
+  if (canShowCaDownload && !shouldPromptCaTrust && !cliOptions.pair) {
+    printCliSection(locale, "cli.section.caDownload", [
+      t(locale, "cli.setup.caDownloadLocal", { url: caDownloadLocalUrl }),
+      t(locale, "cli.setup.caDownloadIp", { url: caDownloadIpUrl }),
+    ]);
+  }
   console.log("");
-  if (cliOptions.pair) {
-    console.log(t(locale, "cli.setup.pairRefresh.title"));
-    console.log(t(locale, "cli.setup.pairRefresh.copy"));
-    console.log(t(locale, "cli.setup.pairRefresh.reminder"));
-    console.log("");
-  }
-  console.log(t(locale, "cli.setup.primaryUrl", { url: publicBaseUrl }));
-  console.log(t(locale, "cli.setup.fallbackUrl", { url: fallbackBaseUrl }));
-  console.log(t(locale, "cli.setup.pairingCode", { code: pairCode }));
-  console.log(t(locale, "cli.setup.pairingUrlLocal", { url: `${publicBaseUrl}${pairPath}` }));
-  console.log(t(locale, "cli.setup.pairingUrlIp", { url: `${fallbackBaseUrl}${pairPath}` }));
-  console.log(t(locale, webPushEnabled ? "cli.setup.webPushEnabled" : "cli.setup.webPushDisabled"));
-  if (allowInsecureHttpLan) {
-    console.log(t(locale, "cli.setup.warning.insecureHttpLan"));
-  }
-  if (canShowCaDownload && !cliOptions.installMkcert && !cliOptions.pair) {
-    console.log(t(locale, "cli.setup.caDownloadLocal", { url: caDownloadLocalUrl }));
-    console.log(t(locale, "cli.setup.caDownloadIp", { url: caDownloadIpUrl }));
-  }
-  console.log("");
-  if (webPushEnabled) {
-    console.log(t(locale, cliOptions.installMkcert ? "cli.setup.instructions.afterCa" : "cli.setup.instructions.https"));
-  } else if (allowInsecureHttpLan) {
-    console.log(t(locale, "cli.setup.instructions.insecureHttpLan"));
-  } else {
-    console.log(t(locale, "cli.setup.instructions.localOnlyHttp"));
-  }
-  console.log("");
-  console.log(t(locale, "cli.setup.qrPairing"));
+  console.log(t(locale, "cli.section.qrPairing"));
   await printQrCode(`${publicBaseUrl}${pairPath}`);
-  if (canShowCaDownload && !cliOptions.installMkcert && !cliOptions.pair) {
+  if (canShowCaDownload && !shouldPromptCaTrust && !cliOptions.pair) {
     console.log("");
-    console.log(t(locale, "cli.setup.qrCaDownload"));
+    console.log(t(locale, "cli.section.qrCaDownload"));
     await printQrCode(caDownloadIpUrl);
   }
 
-  const claudeSettingsPath = resolvePath(
+  await maybeRunLegacySetupFeatureAliases(cliOptions, { envFile, locale, sessionSecret, port });
+}
+
+async function runPair(cliOptions) {
+  const setup = await loadExistingSetup(cliOptions);
+  const progress = createCliProgressReporter(setup.locale);
+  progress.update("cli.start.progress.refreshPairing");
+  await refreshPairingCredentials(setup.envFile, setup.config, { force: true });
+  progress.clear();
+  await runStart(cliOptions);
+  const nextConfig = await ensureDefaultLocalePersisted(setup.envFile, cliOptions);
+  printCliTitle(setup.locale, "cli.pair.done");
+  printCliSection(setup.locale, "cli.section.ready", [
+    t(setup.locale, "cli.setup.primaryUrl", { url: String(nextConfig.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "").trim() || "(not configured)" }),
+    t(setup.locale, "cli.setup.pairingCode", { code: String(nextConfig.PAIRING_CODE || "").trim() || "(missing)" }),
+  ]);
+  printCliSection(setup.locale, "cli.section.next", [
+    t(setup.locale, "cli.setup.pairRefresh.copy"),
+    t(setup.locale, "cli.setup.pairRefresh.reminder"),
+  ]);
+  await printPairingInfo(setup.locale, nextConfig, { sectioned: true });
+  const pairToken = String(nextConfig.PAIRING_TOKEN || "").trim();
+  if (pairToken && nextConfig.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL) {
+    console.log("");
+    console.log(t(setup.locale, "cli.section.qrPairing"));
+    await printQrCode(
+      `${String(nextConfig.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "").trim()}/app?pairToken=${encodeURIComponent(pairToken)}`
+    );
+  }
+}
+
+async function runEnable(cliOptions) {
+  const target = String(cliOptions.enableTarget || "").trim().toLowerCase();
+  if (!target) {
+    throw new Error("Usage: viveworker enable <claude|a2a|moltbook|scout> [...]");
+  }
+
+  switch (target) {
+    case "claude":
+      await runEnableClaude(cliOptions);
+      return;
+    case "a2a": {
+      const { runA2ACli } = await import("./a2a-cli.mjs");
+      await runA2ACli(["setup", ...(cliOptions.enableArgs || [])]);
+      return;
+    }
+    case "moltbook":
+      await runEnableMoltbook(cliOptions);
+      return;
+    case "scout":
+      await runEnableScout(cliOptions);
+      return;
+    default:
+      throw new Error(`Unknown feature: ${target}`);
+  }
+}
+
+async function runEnableClaude(cliOptions) {
+  const setup = await loadExistingSetup(cliOptions);
+  const settingsFile = resolvePath(
     cliOptions.claudeSettingsFile || path.join(os.homedir(), ".claude", "settings.json")
   );
-  const claudeHomeExists = await fileExists(path.dirname(claudeSettingsPath));
-  if (cliOptions.claudeSettingsFile || claudeHomeExists) {
-    await installClaudeHooks({
-      envFile,
-      claudeSettingsFile: cliOptions.claudeSettingsFile,
-      sessionSecret,
-    });
-  } else {
-    console.log("");
-    console.log(t(locale, "cli.setup.claudeHooksSkipped"));
+  if (!cliOptions.claudeSettingsFile && !(await fileExists(path.dirname(settingsFile)))) {
+    throw new Error("Claude Desktop settings were not found. Install Claude Desktop first or pass --settings-file.");
   }
-
-  if (cliOptions.moltbook) {
-    try {
-      await installMoltbookWatcher({ cliOptions, sessionSecret, port });
-    } catch (error) {
-      console.log("");
-      console.log(`Moltbook watcher install failed: ${error.message}`);
-    }
+  if (!setup.config.SESSION_SECRET) {
+    throw new Error("SESSION_SECRET is missing. Run `npx viveworker doctor --fix` or `npx viveworker setup` first.");
   }
+  const settingsPath = await installClaudeHooks({
+    envFile: setup.envFile,
+    claudeSettingsFile: cliOptions.claudeSettingsFile,
+    sessionSecret: setup.config.SESSION_SECRET,
+    suppressOutput: true,
+  });
+  printCliTitle(setup.locale, "cli.enable.claude.title");
+  printCliSection(setup.locale, "cli.section.changed", [
+    t(setup.locale, "cli.enable.claude.changed", { path: settingsPath }),
+  ]);
+  printCliSection(setup.locale, "cli.section.next", [
+    t(setup.locale, "cli.enable.claude.next"),
+  ]);
+}
 
+async function runEnableMoltbook(cliOptions) {
+  const setup = await loadExistingSetup(cliOptions);
+  if (!setup.config.SESSION_SECRET) {
+    throw new Error("SESSION_SECRET is missing. Run `npx viveworker doctor --fix` or `npx viveworker setup` first.");
+  }
+  const watcherResult = await installMoltbookWatcher({
+    cliOptions,
+    sessionSecret: setup.config.SESSION_SECRET,
+    port: Number(setup.config.NATIVE_APPROVAL_SERVER_PORT) || defaultServerPort,
+    suppressOutput: true,
+  });
+  let scoutResult = null;
+  if (!cliOptions.noScout) {
+    scoutResult = await installMoltbookScout({ cliOptions, suppressOutput: true });
+  }
+  printCliTitle(setup.locale, "cli.enable.moltbook.title");
+  printCliSection(setup.locale, "cli.section.changed", [
+    t(setup.locale, "cli.enable.moltbook.watcher", { path: watcherResult.plistPath }),
+    t(setup.locale, "cli.enable.moltbook.env", { path: watcherResult.moltbookEnvFile }),
+    scoutResult ? t(setup.locale, "cli.enable.moltbook.scout", { interval: scoutResult.interval }) : t(setup.locale, "cli.enable.moltbook.watcherOnly"),
+  ]);
+  printCliSection(setup.locale, "cli.section.needsAttention", [
+    watcherResult.warning || "",
+    scoutResult?.warning || "",
+    scoutResult?.manualNote || "",
+    scoutResult && !scoutResult.hasPersona ? t(setup.locale, "cli.enable.moltbook.personaTip") : "",
+  ]);
+  printCliSection(setup.locale, "cli.section.next", [
+    t(setup.locale, "cli.enable.moltbook.next"),
+  ]);
+}
+
+async function runEnableScout(cliOptions) {
+  const setup = await loadExistingSetup(cliOptions);
   if (cliOptions.autoScoutUninstall) {
-    await uninstallMoltbookScout();
-  } else if (cliOptions.autoScout) {
-    try {
-      await installMoltbookScout({ cliOptions });
-    } catch (error) {
-      console.log("");
-      console.log(`Moltbook auto-scout install failed: ${error.message}`);
-    }
+    const uninstallResult = await uninstallMoltbookScout({ suppressOutput: true });
+    printCliTitle(setup.locale, "cli.enable.scout.removed");
+    printCliSection(setup.locale, "cli.section.changed", [uninstallResult.message]);
+    return;
   }
+  const scoutResult = await installMoltbookScout({ cliOptions, suppressOutput: true });
+  printCliTitle(setup.locale, "cli.enable.scout.title");
+  printCliSection(setup.locale, "cli.section.changed", [
+    t(setup.locale, "cli.enable.scout.installed", { interval: scoutResult.interval }),
+    scoutResult.harness.kind === "manual"
+      ? t(setup.locale, "cli.enable.scout.manualHarness")
+      : t(setup.locale, "cli.enable.scout.harness", { path: scoutResult.harness.bin }),
+  ]);
+  printCliSection(setup.locale, "cli.section.needsAttention", [
+    scoutResult.warning || "",
+    scoutResult.manualNote || "",
+    !scoutResult.hasPersona ? t(setup.locale, "cli.enable.moltbook.personaTip") : "",
+  ]);
+  printCliSection(setup.locale, "cli.section.next", [
+    t(setup.locale, "cli.enable.scout.next"),
+  ]);
 }
 
 async function detectScoutHarness(preferred) {
@@ -382,7 +504,7 @@ async function detectScoutHarness(preferred) {
   return { kind: "manual", bin: "" };
 }
 
-async function uninstallMoltbookScout() {
+async function uninstallMoltbookScout({ suppressOutput = false } = {}) {
   const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${"com.viveworker.moltbook-scout"}.plist`);
   const { spawn } = await import("node:child_process");
   await new Promise((resolve) => {
@@ -392,15 +514,23 @@ async function uninstallMoltbookScout() {
   });
   try {
     await fs.unlink(plistPath);
-    console.log("");
-    console.log(`Moltbook auto-scout uninstalled (removed ${plistPath}).`);
+    const message = `Moltbook auto-scout removed: ${plistPath}`;
+    if (!suppressOutput) {
+      console.log("");
+      console.log(message);
+    }
+    return { removed: true, plistPath, message };
   } catch {
-    console.log("");
-    console.log(`No auto-scout plist found at ${plistPath}.`);
+    const message = `No auto-scout plist was installed at ${plistPath}.`;
+    if (!suppressOutput) {
+      console.log("");
+      console.log(message);
+    }
+    return { removed: false, plistPath, message };
   }
 }
 
-async function installMoltbookScout({ cliOptions }) {
+async function installMoltbookScout({ cliOptions, suppressOutput = false }) {
   const moltbookEnvFile = path.join(os.homedir(), ".viveworker", "moltbook.env");
   try {
     await fs.access(moltbookEnvFile);
@@ -481,6 +611,7 @@ async function installMoltbookScout({ cliOptions }) {
     p.on("exit", () => resolve());
     p.on("error", () => resolve());
   });
+  let warning = "";
   try {
     await new Promise((resolve, reject) => {
       const p = spawn("launchctl", ["bootstrap", `gui/${process.getuid()}`, plistPath], { stdio: "ignore" });
@@ -488,33 +619,45 @@ async function installMoltbookScout({ cliOptions }) {
       p.on("error", reject);
     });
   } catch (error) {
+    warning = `Moltbook scout plist was written, but launchctl bootstrap failed: ${error.message}. Run manually: launchctl bootstrap gui/$(id -u) ${plistPath}`;
+  }
+  const manualNote = harness.kind === "manual"
+    ? `Neither 'codex' nor 'claude' CLI was found. The scheduled task will only run scout and print candidates to the log. Install Codex CLI (npm i -g @openai/codex) or Claude Code CLI to enable automated drafting.`
+    : "";
+  const result = {
+    plistPath,
+    interval,
+    harness,
+    hasPersona,
+    personaPath,
+    warning,
+    manualNote,
+    logsPath: "/tmp/viveworker-moltbook-scout.{out,err}.log",
+  };
+  if (!suppressOutput) {
     console.log("");
-    console.log(`Moltbook scout plist written but launchctl bootstrap failed: ${error.message}`);
-    console.log(`Run manually: launchctl bootstrap gui/$(id -u) ${plistPath}`);
+    console.log(`Moltbook auto-scout installed (${harness.kind}).`);
+    console.log(`  plist:    ${plistPath}`);
+    console.log(`  interval: ${interval}s`);
+    if (manualNote) {
+      console.log(`  note:     ${manualNote}`);
+    } else {
+      console.log(`  harness:  ${harness.bin}`);
+    }
+    console.log(`  logs:     ${result.logsPath}`);
+    if (!hasPersona) {
+      console.log(`  tip:      No persona file found. Run 'npx viveworker moltbook persona init' to describe your agent — draft quality improves a lot.`);
+    } else {
+      console.log(`  persona:  ${personaPath}`);
+    }
+    if (warning) {
+      console.log(`  warning:  ${warning}`);
+    }
   }
-
-  console.log("");
-  console.log(`Moltbook auto-scout installed (${harness.kind}).`);
-  console.log(`  plist:    ${plistPath}`);
-  console.log(`  interval: ${interval}s`);
-  if (harness.kind === "manual") {
-    console.log(
-      `  note:     Neither 'codex' nor 'claude' CLI was found. The scheduled task will only run scout and print candidates to the log. Install Codex CLI (npm i -g @openai/codex) or Claude Code CLI to enable automated drafting.`
-    );
-  } else {
-    console.log(`  harness:  ${harness.bin}`);
-  }
-  console.log(`  logs:     /tmp/viveworker-moltbook-scout.{out,err}.log`);
-  if (!hasPersona) {
-    console.log(
-      `  tip:      No persona file found. Run 'npx viveworker moltbook persona init' to describe your agent — draft quality improves a lot.`
-    );
-  } else {
-    console.log(`  persona:  ${personaPath}`);
-  }
+  return result;
 }
 
-async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
+async function installMoltbookWatcher({ cliOptions, sessionSecret, port, suppressOutput = false }) {
   if (!cliOptions.moltbookApiKey || !cliOptions.moltbookAgentId) {
     throw new Error(
       "--moltbook requires --moltbook-api-key and --moltbook-agent-id"
@@ -564,6 +707,7 @@ async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
   await fs.writeFile(plistPath, plistBody, "utf8");
 
   // Reload the agent if launchctl is available
+  let warning = "";
   try {
     const { spawn } = await import("node:child_process");
     await new Promise((resolve) => {
@@ -577,20 +721,28 @@ async function installMoltbookWatcher({ cliOptions, sessionSecret, port }) {
       load.on("error", reject);
     });
   } catch (error) {
-    console.log("");
-    console.log(`Moltbook watcher plist written but launchctl load failed: ${error.message}`);
-    console.log(`Run manually: launchctl load ${plistPath}`);
-    return;
+    warning = `Moltbook watcher plist was written, but launchctl load failed: ${error.message}. Run manually: launchctl load ${plistPath}`;
   }
-
-  console.log("");
-  console.log(`Moltbook watcher installed.`);
-  console.log(`  env:  ${moltbookEnvFile}`);
-  console.log(`  plist: ${plistPath}`);
-  console.log(`  logs: /tmp/viveworker-moltbook-watcher.{out,err}.log`);
+  const result = {
+    moltbookEnvFile,
+    plistPath,
+    logsPath: "/tmp/viveworker-moltbook-watcher.{out,err}.log",
+    warning,
+  };
+  if (!suppressOutput) {
+    console.log("");
+    console.log(`Moltbook watcher installed.`);
+    console.log(`  env:  ${moltbookEnvFile}`);
+    console.log(`  plist: ${plistPath}`);
+    console.log(`  logs: ${result.logsPath}`);
+    if (warning) {
+      console.log(`  warning: ${warning}`);
+    }
+  }
+  return result;
 }
 
-async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret }) {
+async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret, suppressOutput = false }) {
   const hookScript = path.join(packageRoot, "scripts", "viveworker-claude-hook.mjs");
   const nodePath = process.execPath;
   const settingsFile = resolvePath(
@@ -638,8 +790,12 @@ async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret }
   await fs.mkdir(path.dirname(settingsFile), { recursive: true });
   await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2) + "\n", "utf8");
 
-  console.log("");
-  console.log(`Claude hooks installed: ${settingsFile}`);
+  if (!suppressOutput) {
+    console.log("");
+    console.log(`Claude hooks installed: ${settingsFile}`);
+  }
+
+  return settingsFile;
 }
 
 async function runStart(cliOptions) {
@@ -675,12 +831,22 @@ async function runStart(cliOptions) {
       ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
       : true;
     progress.done(healthy && pairingReady ? "cli.start.launchdStarted" : "cli.start.launchdStartedPending");
-    if (healthy && !pairingReady) {
-      console.log("");
-      console.log(t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort }));
-    }
+    printCliTitle(locale, "cli.start.title");
+    printCliSection(locale, "cli.section.ready", [
+      t(locale, "cli.status.baseUrl", { value: config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "(not configured)" }),
+      t(locale, "cli.start.readyLaunchd"),
+      t(locale, "cli.status.health", { value: t(locale, healthy ? "cli.status.ok" : "cli.status.failed") }),
+    ]);
+    printCliSection(locale, "cli.section.needsAttention", [
+      healthy && !pairingReady
+        ? t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort })
+        : "",
+    ]);
+    printCliSection(locale, "cli.section.next", [
+      rotatedPairing.rotated ? t(locale, "cli.start.nextPairing") : "",
+    ]);
     if (rotatedPairing.rotated) {
-      await printPairingInfo(locale, config);
+      await printPairingInfo(locale, config, { sectioned: true });
     }
     return;
   }
@@ -697,12 +863,22 @@ async function runStart(cliOptions) {
     ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
     : true;
   progress.done(healthy && pairingReady ? "cli.start.bridgeStarted" : "cli.start.bridgeStartedPending");
-  if (healthy && !pairingReady) {
-    console.log("");
-    console.log(t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort }));
-  }
+  printCliTitle(locale, "cli.start.title");
+  printCliSection(locale, "cli.section.ready", [
+    t(locale, "cli.status.baseUrl", { value: config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "(not configured)" }),
+    t(locale, "cli.start.readyBridge"),
+    t(locale, "cli.status.health", { value: t(locale, healthy ? "cli.status.ok" : "cli.status.failed") }),
+  ]);
+  printCliSection(locale, "cli.section.needsAttention", [
+    healthy && !pairingReady
+      ? t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort })
+      : "",
+  ]);
+  printCliSection(locale, "cli.section.next", [
+    rotatedPairing.rotated ? t(locale, "cli.start.nextPairing") : "",
+  ]);
   if (rotatedPairing.rotated) {
-    await printPairingInfo(locale, config);
+    await printPairingInfo(locale, config, { sectioned: true });
   }
 }
 
@@ -710,15 +886,22 @@ async function runStop(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
+  const locale = await resolveCliLocale(cliOptions);
   if (await fileExists(launchAgentPath)) {
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
-    console.log(t(await resolveCliLocale(cliOptions), "cli.stop.launchdStopped"));
+    printCliTitle(locale, "cli.stop.title");
+    printCliSection(locale, "cli.section.changed", [
+      t(locale, "cli.stop.changedLaunchd"),
+    ]);
     return;
   }
 
   const pid = await maybeReadPid(pidFile);
   if (!pid) {
-    console.log(t(await resolveCliLocale(cliOptions), "cli.stop.noProcess"));
+    printCliTitle(locale, "cli.stop.alreadyStopped");
+    printCliSection(locale, "cli.section.ready", [
+      t(locale, "cli.stop.noProcess"),
+    ]);
     return;
   }
 
@@ -730,7 +913,10 @@ async function runStop(cliOptions) {
     }
   }
   await fs.rm(pidFile, { force: true });
-  console.log(t(await resolveCliLocale(cliOptions), "cli.stop.stopped", { pid }));
+  printCliTitle(locale, "cli.stop.title");
+  printCliSection(locale, "cli.section.changed", [
+    t(locale, "cli.stop.changedPid", { pid }),
+  ]);
 }
 
 async function runStatus(cliOptions) {
@@ -745,15 +931,17 @@ async function runStatus(cliOptions) {
   const httpsEnabled = isHttpsUrl(baseUrl);
   const locale = await resolveCliLocale(cliOptions, config);
 
-  console.log(t(locale, "cli.status.envFile", { value: envFile }));
-  console.log(t(locale, "cli.status.baseUrl", { value: baseUrl || "(not configured)" }));
-  console.log(t(locale, "cli.status.webPush", { value: t(locale, webPushEnabled ? "cli.status.enabled" : "cli.status.disabled") }));
-  console.log(t(locale, "cli.status.https", { value: t(locale, httpsEnabled ? "cli.status.enabled" : "cli.status.disabled") }));
+  const readyLines = [
+    t(locale, "cli.status.envFile", { value: envFile }),
+    t(locale, "cli.status.baseUrl", { value: baseUrl || "(not configured)" }),
+    t(locale, "cli.status.webPush", { value: t(locale, webPushEnabled ? "cli.status.enabled" : "cli.status.disabled") }),
+    t(locale, "cli.status.https", { value: t(locale, httpsEnabled ? "cli.status.enabled" : "cli.status.disabled") }),
+  ];
   if (webPushEnabled) {
-    console.log(t(locale, "cli.status.tlsCert", { value: config.TLS_CERT_FILE || "(missing)" }));
-    console.log(t(locale, "cli.status.tlsKey", { value: config.TLS_KEY_FILE || "(missing)" }));
+    readyLines.push(t(locale, "cli.status.tlsCert", { value: config.TLS_CERT_FILE || "(missing)" }));
+    readyLines.push(t(locale, "cli.status.tlsKey", { value: config.TLS_KEY_FILE || "(missing)" }));
   }
-  console.log(
+  readyLines.push(
     t(locale, "cli.status.launchAgent", {
       value: (await fileExists(launchAgentPath)) ? launchAgentPath : "(not installed)",
     })
@@ -764,23 +952,25 @@ async function runStatus(cliOptions) {
       ["launchctl", "print", `gui/${process.getuid()}/${defaultLabel}`],
       { ignoreError: true }
     );
-    console.log(
+    readyLines.push(
       t(locale, "cli.status.launchd", {
         value: t(locale, printed.ok ? "cli.status.installed" : "cli.status.notRunning"),
       })
     );
   } else {
     const pid = await maybeReadPid(pidFile);
-    console.log(t(locale, "cli.status.pid", { value: pid || "(not running)" }));
+    readyLines.push(t(locale, "cli.status.pid", { value: pid || "(not running)" }));
   }
 
+  let healthOutput = "";
   if (healthUrl) {
     const health = await execCommand(buildHealthCheckArgs(healthUrl), { ignoreError: true });
-    console.log(t(locale, "cli.status.health", { value: t(locale, health.ok ? "cli.status.ok" : "cli.status.failed") }));
-    if (health.stdout) {
-      console.log(health.stdout.trim());
-    }
+    readyLines.push(t(locale, "cli.status.health", { value: t(locale, health.ok ? "cli.status.ok" : "cli.status.failed") }));
+    healthOutput = health.stdout.trim();
   }
+  printCliTitle(locale, "cli.status.title");
+  printCliSection(locale, "cli.section.ready", readyLines);
+  printCliSection(locale, "cli.section.details", summarizeHealthOutput(healthOutput));
 }
 
 async function runDoctor(cliOptions) {
@@ -850,14 +1040,38 @@ async function runDoctor(cliOptions) {
   }
 
   if (issues.length === 0) {
-    console.log(t(locale, "cli.doctor.ok"));
+    printCliTitle(locale, "cli.doctor.ok");
+    printCliSection(locale, "cli.section.ready", [
+      t(locale, "cli.status.baseUrl", { value: baseUrl || "(not configured)" }),
+      healthUrl ? t(locale, "cli.status.health", { value: t(locale, "cli.status.ok") }) : "",
+    ]);
     return;
   }
 
-  console.log(t(locale, "cli.doctor.foundIssues"));
-  for (const issue of issues) {
-    console.log(`- ${issue}`);
+  printCliTitle(locale, "cli.doctor.titleIssues");
+  printCliSection(locale, "cli.section.needsAttention", issues);
+
+  if (!cliOptions.doctorFix) {
+    printCliSection(locale, "cli.section.next", [
+      t(locale, "cli.doctor.nextFix"),
+    ]);
+    return;
   }
+
+  if (!(await fileExists(envFile))) {
+    throw new Error("No viveworker config was found. Run `npx viveworker setup` first.");
+  }
+
+  console.log("");
+  console.log(t(locale, "cli.doctor.fixing"));
+  const appliedChanges = await repairDoctorIssues(cliOptions, { envFile, config, locale, hostname, localHostname, chosenIp, webPushEnabled, allowInsecureHttpLan });
+  printCliTitle(locale, "cli.doctor.titleFix");
+  printCliSection(locale, "cli.section.changed", appliedChanges);
+  printCliSection(locale, "cli.section.next", [
+    t(locale, "cli.doctor.nextRestarting"),
+  ]);
+  console.log(t(locale, "cli.doctor.fixed"));
+  await runStart(cliOptions);
 }
 
 async function runUpdate(cliOptions) {
@@ -893,40 +1107,248 @@ async function runUpdate(cliOptions) {
 
   // 3. Restart bridge
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
+  let restartedBridge = false;
   if (await fileExists(launchAgentPath)) {
     progress.update("cli.update.progress.restartBridge");
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     await execCommand(["launchctl", "kickstart", "-k", `gui/${process.getuid()}/${defaultLabel}`], { ignoreError: true });
+    restartedBridge = true;
   }
 
   // 4. Restart moltbook-watcher if present
   const watcherLabel = "com.viveworker.moltbook-watcher";
   const watcherPlistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${watcherLabel}.plist`);
+  let restartedWatcher = false;
   if (await fileExists(watcherPlistPath)) {
     progress.update("cli.update.progress.restartWatcher");
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, watcherPlistPath], { ignoreError: true });
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, watcherPlistPath], { ignoreError: true });
+    restartedWatcher = true;
   }
 
   // 5. Restart moltbook-scout if present
   const scoutLabel = "com.viveworker.moltbook-scout";
   const scoutPlistPath = path.join(os.homedir(), "Library", "LaunchAgents", `${scoutLabel}.plist`);
+  let restartedScout = false;
   if (await fileExists(scoutPlistPath)) {
     progress.update("cli.update.progress.restartScout");
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, scoutPlistPath], { ignoreError: true });
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, scoutPlistPath], { ignoreError: true });
+    restartedScout = true;
   }
 
   progress.done("cli.update.done", { version: latestVersion });
+  printCliTitle(locale, "cli.update.title");
+  printCliSection(locale, "cli.section.changed", [
+    t(locale, "cli.update.changedVersion", { current: currentVersion, latest: latestVersion }),
+    restartedBridge ? t(locale, "cli.update.changedBridge") : "",
+    restartedWatcher ? t(locale, "cli.update.changedWatcher") : "",
+    restartedScout ? t(locale, "cli.update.changedScout") : "",
+  ]);
+  printCliSection(locale, "cli.section.next", [
+    t(locale, "cli.update.next"),
+  ]);
+}
+
+async function loadExistingSetup(cliOptions) {
+  const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+  const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
+  const logFile = resolvePath(cliOptions.logFile || path.join(configDir, "logs", "viveworker.log"));
+  const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
+  const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
+  const locale = await resolveCliLocale(cliOptions);
+  if (!(await fileExists(envFile))) {
+    throw new Error("No viveworker config was found. Run `npx viveworker setup` first.");
+  }
+  const config = await ensureDefaultLocalePersisted(envFile, cliOptions);
+  return { configDir, envFile, logFile, pidFile, launchAgentPath, locale, config };
+}
+
+async function refreshPairingCredentials(envFile, config = {}, { force = false } = {}) {
+  const now = Date.now();
+  const rotated = shouldRotatePairing({
+    force,
+    pairingCode: config.PAIRING_CODE,
+    pairingToken: config.PAIRING_TOKEN,
+    pairingExpiresAtMs: config.PAIRING_EXPIRES_AT_MS,
+  }, now);
+
+  if (!rotated) {
+    return { rotated: false };
+  }
+
+  const nextPairing = generatePairingCredentials(now);
+  const currentText = (await fileExists(envFile)) ? await fs.readFile(envFile, "utf8") : "";
+  const nextText = upsertEnvText(currentText, {
+    PAIRING_CODE: nextPairing.pairingCode,
+    PAIRING_TOKEN: nextPairing.pairingToken,
+    PAIRING_EXPIRES_AT_MS: String(nextPairing.pairingExpiresAtMs),
+  });
+  await fs.mkdir(path.dirname(envFile), { recursive: true });
+  await fs.writeFile(envFile, nextText, "utf8");
+
+  return {
+    rotated: true,
+    ...nextPairing,
+  };
+}
+
+async function maybeRunLegacySetupFeatureAliases(cliOptions, { envFile, locale, sessionSecret, port }) {
+  const legacyActions = [];
+  if (cliOptions.moltbook) {
+    legacyActions.push("moltbook");
+  }
+  if (cliOptions.autoScout || cliOptions.autoScoutUninstall) {
+    legacyActions.push("scout");
+  }
+
+  if (legacyActions.length === 0) {
+    return;
+  }
+
+  console.log("");
+  console.log(t(locale, "cli.setup.legacyFeatureFlags", {
+    commands: legacyActions.map((action) => `viveworker enable ${action}`).join(", "),
+  }));
+
+  if (cliOptions.moltbook) {
+    try {
+      await installMoltbookWatcher({ cliOptions, sessionSecret, port });
+    } catch (error) {
+      console.log("");
+      console.log(`Moltbook watcher install failed: ${error.message}`);
+    }
+  }
+
+  if (cliOptions.autoScoutUninstall) {
+    await uninstallMoltbookScout();
+  } else if (cliOptions.autoScout) {
+    try {
+      await installMoltbookScout({ cliOptions });
+    } catch (error) {
+      console.log("");
+      console.log(`Moltbook auto-scout install failed: ${error.message}`);
+    }
+  }
+}
+
+async function repairDoctorIssues(cliOptions, { envFile, config, locale, hostname, localHostname, chosenIp, webPushEnabled, allowInsecureHttpLan }) {
+  const updates = {};
+  const changed = [];
+
+  if (!config.SESSION_SECRET) {
+    updates.SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+    changed.push(t(locale, "cli.doctor.fixed.sessionSecret"));
+  }
+  if (!config.PAIRING_CODE || !config.PAIRING_TOKEN) {
+    const nextPairing = generatePairingCredentials();
+    updates.PAIRING_CODE = nextPairing.pairingCode;
+    updates.PAIRING_TOKEN = nextPairing.pairingToken;
+    updates.PAIRING_EXPIRES_AT_MS = String(nextPairing.pairingExpiresAtMs);
+    changed.push(t(locale, "cli.doctor.fixed.pairing"));
+  }
+  if (!config.DEFAULT_LOCALE) {
+    updates.DEFAULT_LOCALE = locale;
+    changed.push(t(locale, "cli.doctor.fixed.locale"));
+  }
+  if (!config.NATIVE_APPROVAL_SERVER_HOST) {
+    updates.NATIVE_APPROVAL_SERVER_HOST = webPushEnabled || allowInsecureHttpLan ? "0.0.0.0" : "127.0.0.1";
+    changed.push(t(locale, "cli.doctor.fixed.host"));
+  }
+  if (!config.NATIVE_APPROVAL_SERVER_PORT) {
+    updates.NATIVE_APPROVAL_SERVER_PORT = String(defaultServerPort);
+    changed.push(t(locale, "cli.doctor.fixed.port"));
+  }
+  if (!config.VIVEWORKER_HOSTNAME) {
+    updates.VIVEWORKER_HOSTNAME = hostname;
+    changed.push(t(locale, "cli.doctor.fixed.hostname"));
+  }
+  if (!config.DEVICE_TRUST_TTL_MS) {
+    updates.DEVICE_TRUST_TTL_MS = String(30 * 24 * 60 * 60 * 1000);
+    changed.push(t(locale, "cli.doctor.fixed.deviceTrust"));
+  }
+  if (!config.WEB_UI_ENABLED) {
+    updates.WEB_UI_ENABLED = "1";
+    changed.push(t(locale, "cli.doctor.fixed.webUi"));
+  }
+  if (!config.AUTH_REQUIRED) {
+    updates.AUTH_REQUIRED = "1";
+    changed.push(t(locale, "cli.doctor.fixed.auth"));
+  }
+  if (!config.CHOICE_PAGE_SIZE) {
+    updates.CHOICE_PAGE_SIZE = "5";
+    changed.push(t(locale, "cli.doctor.fixed.choicePageSize"));
+  }
+  if (!config.MAX_HISTORY_ITEMS) {
+    updates.MAX_HISTORY_ITEMS = "100";
+    changed.push(t(locale, "cli.doctor.fixed.maxHistory"));
+  }
+  if (!config.NATIVE_APPROVALS) {
+    updates.NATIVE_APPROVALS = "1";
+    changed.push(t(locale, "cli.doctor.fixed.nativeApprovals"));
+  }
+
+  const nextPort = Number(updates.NATIVE_APPROVAL_SERVER_PORT || config.NATIVE_APPROVAL_SERVER_PORT) || defaultServerPort;
+  const nextHostname = updates.VIVEWORKER_HOSTNAME || config.VIVEWORKER_HOSTNAME || hostname;
+  if (!config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL) {
+    const scheme = webPushEnabled ? "https" : "http";
+    const publicHost = webPushEnabled || allowInsecureHttpLan
+      ? (nextHostname.endsWith(".local") ? nextHostname : `${nextHostname}.local`)
+      : "127.0.0.1";
+    updates.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL = `${scheme}://${publicHost}:${nextPort}`;
+    changed.push(t(locale, "cli.doctor.fixed.baseUrl"));
+  }
+
+  const nextConfig = { ...config, ...updates };
+  if (webPushEnabled) {
+    const tlsCertFile = resolvePath(
+      nextConfig.TLS_CERT_FILE || path.join(path.dirname(envFile), "tls", "cert.pem")
+    );
+    const tlsKeyFile = resolvePath(
+      nextConfig.TLS_KEY_FILE || path.join(path.dirname(envFile), "tls", "key.pem")
+    );
+    const progress = createCliProgressReporter(locale);
+    const tlsAssets = await ensureWebPushAssets({
+      cliOptions,
+      existing: nextConfig,
+      hostname: nextHostname,
+      localHostname: nextHostname.endsWith(".local") ? nextHostname : `${nextHostname}.local`,
+      locale,
+      progress,
+      chosenIp,
+      tlsCertFile,
+      tlsKeyFile,
+    });
+    progress.clear();
+    updates.TLS_CERT_FILE = tlsAssets.certFile;
+    updates.TLS_KEY_FILE = tlsAssets.keyFile;
+    updates.WEB_PUSH_VAPID_PUBLIC_KEY = tlsAssets.vapidPublicKey;
+    updates.WEB_PUSH_VAPID_PRIVATE_KEY = tlsAssets.vapidPrivateKey;
+    changed.push(t(locale, "cli.doctor.fixed.webPushAssets"));
+    if (!nextConfig.WEB_PUSH_SUBJECT) {
+      updates.WEB_PUSH_SUBJECT = "mailto:viveworker@example.com";
+      changed.push(t(locale, "cli.doctor.fixed.webPushSubject"));
+    }
+  }
+
+  const currentText = (await fileExists(envFile)) ? await fs.readFile(envFile, "utf8") : "";
+  const nextText = upsertEnvText(currentText, updates);
+  await fs.writeFile(envFile, nextText, "utf8");
+  return changed;
 }
 
 function parseArgs(argv) {
   const parsed = {
     command: "help",
+    enableTarget: "",
+    enableArgs: [],
     enableNtfy: false,
     enableWebPush: false,
     disableWebPush: false,
+    noAutoMkcert: false,
+    noAutoClaude: false,
+    noScout: false,
     allowInsecureHttpLan: false,
     installMkcert: false,
     noLaunchd: false,
@@ -950,6 +1372,7 @@ function parseArgs(argv) {
     locale: "",
     mkcertTrustStores: "",
     claudeSettingsFile: "",
+    doctorFix: false,
     moltbook: false,
     moltbookApiKey: "",
     moltbookAgentId: "",
@@ -967,6 +1390,15 @@ function parseArgs(argv) {
     argv = argv.slice(1);
   }
 
+  if (parsed.command === "enable" && argv[0] && !argv[0].startsWith("-")) {
+    parsed.enableTarget = argv[0];
+    argv = argv.slice(1);
+    if (parsed.enableTarget === "a2a") {
+      parsed.enableArgs = argv.slice();
+      return parsed;
+    }
+  }
+
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     const next = argv[index + 1] ?? "";
@@ -976,6 +1408,12 @@ function parseArgs(argv) {
       parsed.enableWebPush = true;
     } else if (arg === "--disable-web-push") {
       parsed.disableWebPush = true;
+    } else if (arg === "--no-auto-mkcert") {
+      parsed.noAutoMkcert = true;
+    } else if (arg === "--no-auto-claude") {
+      parsed.noAutoClaude = true;
+    } else if (arg === "--no-scout") {
+      parsed.noScout = true;
     } else if (arg === "--allow-insecure-http-lan") {
       parsed.allowInsecureHttpLan = true;
     } else if (arg === "--install-mkcert") {
@@ -1030,6 +1468,8 @@ function parseArgs(argv) {
     } else if (arg === "--locale") {
       parsed.locale = next;
       index += 1;
+    } else if (arg === "--fix") {
+      parsed.doctorFix = true;
     } else if (arg === "--vapid-public-key") {
       parsed.vapidPublicKey = next;
       index += 1;
@@ -1038,8 +1478,22 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === "--pair") {
       parsed.pair = true;
+    } else if (arg === "--settings-file") {
+      parsed.claudeSettingsFile = next;
+      index += 1;
     } else if (arg === "--claude-settings-file") {
       parsed.claudeSettingsFile = next;
+      index += 1;
+    } else if (arg === "--api-key") {
+      parsed.moltbook = true;
+      parsed.moltbookApiKey = next;
+      index += 1;
+    } else if (arg === "--agent-id") {
+      parsed.moltbook = true;
+      parsed.moltbookAgentId = next;
+      index += 1;
+    } else if (arg === "--agent-name") {
+      parsed.moltbookAgentName = next;
       index += 1;
     } else if (arg === "--moltbook") {
       parsed.moltbook = true;
@@ -1056,6 +1510,20 @@ function parseArgs(argv) {
       index += 1;
     } else if (arg === "--auto-scout") {
       parsed.autoScout = true;
+    } else if (arg === "--uninstall") {
+      parsed.autoScoutUninstall = true;
+    } else if (arg === "--interval") {
+      parsed.autoScoutInterval = Number(next) || 120;
+      index += 1;
+    } else if (arg === "--harness") {
+      parsed.autoScoutHarness = next;
+      index += 1;
+    } else if (arg === "--submolts") {
+      parsed.autoScoutSubmolts = next;
+      index += 1;
+    } else if (arg === "--max-daily") {
+      parsed.autoScoutMaxDaily = Number(next) || 0;
+      index += 1;
     } else if (arg === "--auto-scout-uninstall") {
       parsed.autoScoutUninstall = true;
     } else if (arg === "--auto-scout-interval") {
@@ -1090,6 +1558,8 @@ function printHelp() {
 
 ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.setup")}
+  ${t(locale, "cli.help.pair")}
+  ${t(locale, "cli.help.enable")}
   ${t(locale, "cli.help.start")}
   ${t(locale, "cli.help.stop")}
   ${t(locale, "cli.help.status")}
@@ -1103,6 +1573,8 @@ ${t(locale, "cli.help.commonOptions")}
   --config-dir <path>
   --disable-web-push
   --enable-web-push
+  --no-auto-mkcert
+  --no-auto-claude
   --allow-insecure-http-lan
   --install-mkcert
   --mkcert-trust-stores <system[,java][,nss]>
@@ -1115,6 +1587,13 @@ ${t(locale, "cli.help.commonOptions")}
   --enable-ntfy
   --no-launchd
   --pair
+
+${t(locale, "cli.help.featureOptions")}
+  ${t(locale, "cli.help.enableClaude")}
+  ${t(locale, "cli.help.enableA2a")}
+  ${t(locale, "cli.help.enableMoltbook")}
+  ${t(locale, "cli.help.enableScout")}
+  ${t(locale, "cli.help.doctorFix")}
 `);
 }
 
@@ -1285,6 +1764,119 @@ async function maybeRotateStartupPairing(envFile, config = {}) {
     rotated: true,
     ...nextPairing,
   };
+}
+
+async function autoConfigureProvidersDuringSetup({ cliOptions, envFile, sessionSecret, codexHome }) {
+  const codex = await detectCodexAvailability(codexHome);
+  const explicitClaudeSettingsFile = cliOptions.claudeSettingsFile
+    ? resolvePath(cliOptions.claudeSettingsFile)
+    : "";
+  const defaultClaudeSettingsFile = resolvePath(path.join(os.homedir(), ".claude", "settings.json"));
+  const claudeSettingsFile = explicitClaudeSettingsFile || defaultClaudeSettingsFile;
+
+  if (!explicitClaudeSettingsFile && cliOptions.noAutoClaude) {
+    return {
+      codex,
+      claude: {
+        status: "skipped",
+        settingsFile: "",
+        message: "",
+      },
+    };
+  }
+
+  const claudeDetected = explicitClaudeSettingsFile
+    ? true
+    : await detectClaudeAvailability(defaultClaudeSettingsFile);
+
+  if (!claudeDetected) {
+    return {
+      codex,
+      claude: {
+        status: "not_detected",
+        settingsFile: "",
+        message: "",
+      },
+    };
+  }
+
+  try {
+    const installedPath = await installClaudeHooks({
+      envFile,
+      claudeSettingsFile,
+      sessionSecret,
+      suppressOutput: true,
+    });
+    return {
+      codex,
+      claude: {
+        status: "enabled",
+        settingsFile: installedPath,
+        message: "",
+      },
+    };
+  } catch (error) {
+    return {
+      codex,
+      claude: {
+        status: "failed",
+        settingsFile: claudeSettingsFile,
+        message: error?.message || String(error),
+      },
+    };
+  }
+}
+
+async function detectCodexAvailability(codexHome) {
+  const candidates = Array.from(new Set([
+    resolvePath(codexHome || path.join(os.homedir(), ".codex")),
+    "/Applications/Codex.app",
+    path.join(os.homedir(), "Applications", "Codex.app"),
+  ]));
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) {
+      return {
+        detected: true,
+        path: candidate,
+      };
+    }
+  }
+  return {
+    detected: false,
+    path: "",
+  };
+}
+
+async function detectClaudeAvailability(settingsFile) {
+  return (await fileExists(settingsFile)) || (await fileExists(path.dirname(settingsFile)));
+}
+
+function getSetupProviderSummaryLines(locale, providerSetup) {
+  const lines = [
+    t(locale, providerSetup.codex.detected
+      ? "cli.setup.providers.codexReady"
+      : "cli.setup.providers.codexNotDetected"),
+  ];
+  switch (providerSetup.claude.status) {
+    case "enabled":
+      lines.push(t(locale, "cli.setup.providers.claudeEnabled", {
+        path: providerSetup.claude.settingsFile,
+      }));
+      break;
+    case "skipped":
+      lines.push(t(locale, "cli.setup.providers.claudeSkipped"));
+      break;
+    case "failed":
+      lines.push(t(locale, "cli.setup.providers.claudeFailed", {
+        message: providerSetup.claude.message,
+      }));
+      break;
+    case "not_detected":
+    default:
+      lines.push(t(locale, "cli.setup.providers.claudeNotDetected"));
+      break;
+  }
+  return lines;
 }
 
 async function findLocalIpv4Addresses() {
@@ -1688,13 +2280,15 @@ async function ensureWebPushAssets({
     throw new Error("TLS_CERT_FILE and TLS_KEY_FILE must both exist.");
   }
 
+  let ranMkcertInstall = false;
+
   if (!certExists) {
     if (manualCertOverride) {
       throw new Error("The provided TLS certificate or key file does not exist.");
     }
 
     let mkcertPath = await findExecutable("mkcert");
-    if (!mkcertPath && cliOptions.installMkcert) {
+    if (!mkcertPath && !cliOptions.noAutoMkcert) {
       mkcertPath = await installMkcertForMac(progress, locale);
     }
     if (!mkcertPath) {
@@ -1716,6 +2310,7 @@ async function ensureWebPushAssets({
       streamOutput: true,
       beforeStreamOutput: () => progress?.clear(),
     });
+    ranMkcertInstall = true;
     progress?.update("cli.setup.progress.generateCert");
     await fs.mkdir(path.dirname(tlsCertFile), { recursive: true });
     await execCommand([
@@ -1740,6 +2335,7 @@ async function ensureWebPushAssets({
         streamOutput: true,
         beforeStreamOutput: () => progress?.clear(),
       });
+      ranMkcertInstall = true;
     }
   }
 
@@ -1757,6 +2353,7 @@ async function ensureWebPushAssets({
       keyFile: tlsKeyFile,
       vapidPublicKey,
       vapidPrivateKey,
+      ranMkcertInstall,
     };
   }
 
@@ -1767,6 +2364,7 @@ async function ensureWebPushAssets({
     keyFile: tlsKeyFile,
     vapidPublicKey: generated.publicKey,
     vapidPrivateKey: generated.privateKey,
+    ranMkcertInstall,
   };
 }
 
@@ -1874,7 +2472,7 @@ function escapeXml(value) {
     .replace(/"/gu, "&quot;");
 }
 
-async function printPairingInfo(locale, config) {
+async function printPairingInfo(locale, config, { sectioned = false } = {}) {
   const baseUrl = String(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "").trim();
   const pairCode = String(config.PAIRING_CODE || "").trim();
   const pairToken = String(config.PAIRING_TOKEN || "").trim();
@@ -1885,6 +2483,14 @@ async function printPairingInfo(locale, config) {
   const pairPath = `/app?pairToken=${encodeURIComponent(pairToken)}`;
   const ips = await findLocalIpv4Addresses();
   const fallbackBaseUrl = buildFallbackBaseUrl(baseUrl, ips[0] || "127.0.0.1");
+
+  if (sectioned) {
+    printCliSection(locale, "cli.section.pairingLinks", [
+      t(locale, "cli.setup.pairingUrlLocal", { url: `${baseUrl}${pairPath}` }),
+      t(locale, "cli.setup.pairingUrlIp", { url: `${fallbackBaseUrl}${pairPath}` }),
+    ]);
+    return;
+  }
 
   console.log("");
   console.log(t(locale, "cli.setup.pairingCode", { code: pairCode }));
@@ -1899,5 +2505,40 @@ function buildFallbackBaseUrl(baseUrl, ipAddress) {
     return url.toString().replace(/\/$/u, "");
   } catch {
     return baseUrl;
+  }
+}
+
+function summarizeHealthOutput(rawValue) {
+  const text = String(rawValue || "").trim();
+  if (!text) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return [text];
+    }
+    return Object.entries(parsed)
+      .filter(([key]) => key !== "ok")
+      .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+  } catch {
+    return [text];
+  }
+}
+
+function printCliTitle(locale, key, vars = {}) {
+  console.log("");
+  console.log(t(locale, key, vars));
+}
+
+function printCliSection(locale, key, lines = [], vars = {}) {
+  const filtered = (lines || []).filter((line) => String(line || "").trim());
+  if (filtered.length === 0) {
+    return;
+  }
+  console.log("");
+  console.log(t(locale, key, vars));
+  for (const line of filtered) {
+    console.log(`- ${line}`);
   }
 }

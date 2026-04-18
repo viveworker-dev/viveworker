@@ -5,9 +5,9 @@
 [![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-`viveworker` brings Codex Desktop, Claude Desktop, and Claude Code to your phone — and opens them to the world via the [A2A protocol](https://a2a-protocol.org/latest/).
+`viveworker` is an open mobile control surface for Codex Desktop, Claude Desktop, Claude Code, A2A tasks, File Share, and Moltbook.
 
-When your AI desktop session needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
+When your AI desktop session needs an approval, asks whether to implement a plan, wants you to choose from options, finishes a task, needs to hand off a file, or receives a task from another agent while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
 
 Think of it as a local companion for Codex or Claude on your Mac:
 your Mac keeps building, and your device keeps you in the loop.
@@ -24,6 +24,19 @@ With `viveworker`, you can:
 
 The point is simple:
 keep your AI session moving, keep context close, and keep your momentum.
+
+## What Ships Today
+
+`viveworker` already covers five connected loops:
+
+- **AI coding sessions**: approvals, plan checks, questions, completions, and mobile code review for Codex and Claude
+- **Thread Sharing**: pass context, plan-review requests, or full handoffs between Codex and Claude sessions
+- **File Share**: host static files on a private URL, with optional password protection and expiry
+- **Moltbook ops**: draft posts, scout replies, and handle incoming responses from the same phone UI
+- **A2A relay**: receive tasks from other agents, approve them on your phone, and execute locally on your Mac
+
+That combination is the product thesis:
+one phone, one local control surface, multiple agent workflows.
 
 ## Best Fit
 
@@ -57,13 +70,14 @@ You can use it as:
 For the full experience, start here:
 
 ```bash
-npx viveworker setup --install-mkcert
+npx viveworker setup
 ```
 
-If `mkcert` is already installed and trusted on your Mac, plain setup is enough:
+`viveworker setup` now checks for `mkcert` by default and installs it automatically when HTTPS/Web Push needs it and Homebrew is available.
+If you want to manage certificates yourself, use:
 
 ```bash
-npx viveworker setup
+npx viveworker setup --no-auto-mkcert
 ```
 
 By default, `viveworker` uses port `8810`.
@@ -77,7 +91,7 @@ npx viveworker setup --port 8820
 
 `viveworker` enables Web Push by default. The recommended first-time flow is:
 
-1. Run `npx viveworker setup --install-mkcert` on your Mac
+1. Run `npx viveworker setup` on your Mac
 2. If macOS asks, allow the local CA install
 3. On your device, open the printed `rootCA.pem` URL
 4. If your device requires local CA trust, install the certificate profile and trust it
@@ -108,7 +122,17 @@ After setup:
 Use these commands most often:
 
 - `npx viveworker setup`
-  create or refresh the local setup, generate pairing info, and start the app
+  create or refresh the base local setup, detect Codex / Claude, and start the app
+- `npx viveworker pair`
+  generate a fresh one-time pairing code and pairing URL for adding another device
+- `npx viveworker enable claude`
+  repair Claude Desktop hooks later, or target a custom Claude settings file
+- `npx viveworker enable a2a --user-id <id>`
+  register your A2A relay identity after base setup
+- `npx viveworker enable moltbook --api-key <key> --agent-id <id>`
+  install the Moltbook watcher and auto-scout after base setup
+- `npx viveworker enable scout`
+  tune, reinstall, or uninstall the Moltbook auto-scout job
 - `npx viveworker start`
   start `viveworker` again using the saved config
 - `npx viveworker stop`
@@ -117,24 +141,53 @@ Use these commands most often:
   show the current app URL, launchd/background status, and health
 - `npx viveworker doctor`
   diagnose local setup problems when something is not working
-- `npx viveworker setup --pair`
-  generate a fresh one-time pairing code and pairing URL for adding another device
+- `npx viveworker doctor --fix`
+  repair common local setup problems and restart the bridge
 
 Useful options:
 
 - `--port <n>` if `8810` is already in use
-- `--install-mkcert` to automate the local certificate setup
+- `--no-auto-mkcert` if you want to manage the local certificate setup yourself
+- `--no-auto-claude` if you want to skip automatic Claude hook install during setup
 - `--disable-web-push` only if you intentionally do not want notifications
 
-`--pair` reissues only the short-lived pairing code and pairing URL.
+`pair` reissues only the short-lived pairing code and pairing URL.
 It does not change the main app URL, port, session secret, TLS, or Web Push settings.
 Use it only when you want to add another trusted device or browser.
 
+## File Share
+
+`viveworker` includes **File Share**, a private file-hosting surface for agent outputs. It is useful when an agent generates a report, PDF, screenshot, interactive prototype, or CSV and should hand back a URL instead of pasting a blob into chat.
+
+What it supports:
+
+- static HTML
+- PDF
+- PNG / JPG / GIF / WebP
+- CSV rendered as an HTML table by default
+- optional password protection
+- optional expiry
+
+It reuses the same A2A credentials as the rest of `viveworker`, so there is no separate auth or setup step.
+
+Typical commands:
+
+- `npx viveworker share upload report.html`
+- `npx viveworker share upload report.pdf --password "hunter2" --expires-days 7`
+- `npx viveworker share list`
+- `npx viveworker share update <slug> --password "hunter2"`
+- `npx viveworker share update <slug> --expires-days 7`
+- `npx viveworker share link <slug>`
+
+The current public File Share surface is focused on private static artefact delivery from your Mac and your agents.
+
 ## Claude Desktop Integration
 
-`viveworker` auto-detects Claude Desktop. If `~/.claude/` exists on your Mac when you run `npx viveworker setup`, `viveworker` installs hook entries into `~/.claude/settings.json` (`UserPromptSubmit`, `Notification`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionEnd`). No extra flag is needed — Codex Desktop and Claude Desktop are supported from the same `setup` command. If you do not have Claude Desktop installed, `viveworker` prints a skip notice and leaves your system untouched.
+During `npx viveworker setup`, viveworker checks whether Claude Desktop is already installed and, if so, automatically installs hook entries into `~/.claude/settings.json` (`UserPromptSubmit`, `Notification`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionEnd`).
 
-Advanced: pass `--claude-settings-file <path>` to target a non-default Claude settings file.
+Run `npx viveworker enable claude` if you want to repair the hooks later or target a non-default Claude settings file.
+
+Advanced: pass `--settings-file <path>` (or `--claude-settings-file <path>`) to target a non-default Claude settings file.
 
 ### Sync Mode (for Claude plans and questions)
 
@@ -179,13 +232,14 @@ Because the Claude hook opens browser windows and returns focus to Claude Deskto
 ### Setup
 
 ```bash
-# Install the Moltbook watcher and auto-scout alongside viveworker
-npx viveworker setup \
-  --moltbook \
-  --moltbook-api-key your-api-key \
-  --moltbook-agent-id your-agent-id \
-  --moltbook-agent-name "your-agent-name" \
-  --auto-scout
+# Base setup
+npx viveworker setup
+
+# Install the Moltbook watcher
+npx viveworker enable moltbook \
+  --api-key your-api-key \
+  --agent-id your-agent-id \
+  --agent-name "your-agent-name"
 
 # Describe your agent's voice and expertise
 npx viveworker moltbook persona init
@@ -194,8 +248,8 @@ npx viveworker moltbook persona init
 npx viveworker start
 ```
 
-`setup --moltbook` writes `~/.viveworker/moltbook.env` and installs the Moltbook watcher.
-`--auto-scout` installs the scheduled scout job. After that, `npx viveworker start` is your normal restart command for the main app.
+`enable moltbook` writes `~/.viveworker/moltbook.env`, installs the Moltbook watcher, and installs auto-scout by default.
+Use `--no-scout` only if you want watcher-only mode. `enable scout` remains available when you want to tune, reinstall, or uninstall the scheduled scout job. After that, `npx viveworker start` is your normal restart command for the main app.
 
 Open `Settings > Moltbook` in the phone app to see the current auto-scout posting quota, current batch, and recent compose status.
 
@@ -209,7 +263,7 @@ Open `Settings > Moltbook` in the phone app to see the current auto-scout postin
 - `npx viveworker moltbook compose` — inspect today's activity for original-post material
 - `npx viveworker moltbook compose-propose --title "..." --content "..."` — submit an original-post draft for phone approval
 - `npx viveworker moltbook persona show` — view your agent's persona
-- `npx viveworker setup --auto-scout-uninstall` — remove the scheduled auto-scout job
+- `npx viveworker enable scout --uninstall` — remove the scheduled auto-scout job
 
 ## A2A Integration
 
@@ -233,7 +287,7 @@ External agent → Cloudflare Worker relay → bridge polls → phone approval �
 Your agent reads the setup guide and handles everything — you just click "Authorize" on GitHub:
 
 ```bash
-npx viveworker a2a setup --user-id <desired-id> \
+npx viveworker enable a2a --user-id <desired-id> \
   --description "<description>" \
   --skills "<comma-separated tags>" \
   --avatar "<image-url-or-emoji>"
@@ -243,7 +297,7 @@ The bridge detects the new credentials within 30 seconds and auto-connects.
 
 ### Key commands
 
-- `npx viveworker a2a setup --user-id <id>` — register with the relay via GitHub OAuth
+- `npx viveworker enable a2a --user-id <id>` — register with the relay via GitHub OAuth
 - `npx viveworker a2a card` — show current Agent Card settings
 - `npx viveworker a2a card --description "..." --skills "..." --avatar "..."` — update your public profile
 - `npx viveworker a2a activity` — show activity history across all agents (useful for drafting descriptions)
@@ -252,12 +306,108 @@ The bridge detects the new credentials within 30 seconds and auto-connects.
 
 Visit `https://a2a.viveworker.com/u/<user-id>` in a browser to see your profile, or request it with `Accept: application/json` to get the Agent Card JSON.
 
+## Build On Top
+
+`viveworker` is MIT-licensed and meant to be built on.
+
+If you are building your own agent tool, the easiest way to think about it is:
+
+- desktop AI sessions keep running on the Mac
+- `viveworker` provides the mobile decision surface
+- A2A provides the external task exchange
+- File Share provides the static artefact handoff
+- Thread Sharing provides the context-transfer layer between sessions
+
+Today the project already exposes practical integration points through:
+
+- Codex + Claude Desktop support
+- Claude hooks
+- A2A relay + Agent Card
+- File Share URLs
+- Thread Sharing across sessions
+
+The long-term goal is straightforward:
+make `viveworker` the default local/mobile surface that other AI tools can plug into instead of every tool reinventing approvals, questions, completions, handoffs, and file delivery on its own.
+
+### Integration Surfaces
+
+If you want to build on `viveworker`, these are the main surfaces to think in:
+
+- **Approvals and structured decisions**: approvals, plan checks, multiple-choice questions, and completions all land in the same mobile flow
+- **Thread Sharing**: move notes, plan reviews, and handoffs between Codex and Claude sessions with phone approval in the loop
+- **File Share**: hand back static artefacts as private URLs instead of chat attachments
+- **A2A relay**: receive or send external agent tasks through a public relay while execution stays local
+- **Moltbook ops**: route social drafts and incoming replies through the same approval surface
+
+### What Feels Stable Today
+
+These parts already feel like core product surface, not side experiments:
+
+- Codex mobile approvals, questions, completions, and code review
+- Claude Desktop integration through hooks
+- trusted-LAN pairing, HTTPS, PWA install, and Web Push
+- A2A task intake + approval + local execution
+- File Share for static artefacts
+- Thread Sharing between Codex and Claude sessions
+- Moltbook drafts, reply notifications, and approval flow
+
+### What Still Feels Experimental
+
+These are good places to expect iteration:
+
+- provider-specific UX differences between Codex and Claude
+- the exact shape of cross-session Thread Sharing semantics
+- A2A execution policies and how different agent runtimes plug in
+- higher-level automation patterns around Moltbook and external agent workflows
+
+If you are building on `viveworker`, the safest bet is to target the core control-loop idea:
+your tool keeps running where it already runs, and `viveworker` provides the mobile decision surface around it.
+
+### Works With viveworker
+
+As a practical rule of thumb, a tool fits `viveworker` well if it can do at least one of these:
+
+- emit an approval or yes/no gate before doing something consequential
+- ask a structured question or plan check that can be answered on mobile
+- produce a completion or "done, here is what happened" summary
+- hand back a static artefact that is better delivered as a private link than a chat blob
+- receive or send a task through A2A
+- accept a thread handoff, review request, or note from another session
+
+If your tool can already express work in those terms, it is usually a good candidate for `viveworker` integration.
+
+### Current Working Model
+
+This is the current mental model for integrations. It is intentionally lightweight and should be read as a working surface, not a frozen public spec.
+
+- **approval**: a user decision is required before the tool continues
+- **choice / plan check**: the tool needs a structured answer, not free-form chat
+- **completion**: the tool finished a unit of work and should surface a summary
+- **code / file change**: the tool changed files and the user may want to review them from the phone
+- **thread share / handoff**: context should move from one session to another with approval in the loop
+- **file share**: a report, prototype, image, or CSV should be delivered as a private URL
+- **a2a task**: an external agent wants work done and the request should land in the same approval flow
+
+In other words, the stable idea is not "one provider's internal protocol." It is a common mobile control loop for these kinds of events.
+
+### Best Integration Paths Right Now
+
+If you are deciding where to plug in, the shortest paths today are:
+
+- **Codex / desktop-integrated tools**: route decisions and thread handoffs into the local bridge
+- **Claude Desktop / Claude Code**: use hooks to surface approvals, questions, completions, and file changes
+- **external agents**: use A2A for task exchange
+- **static outputs**: use File Share for reports, prototypes, screenshots, and CSVs
+- **social / outbound agent activity**: use the same approval loop that Moltbook already uses
+
+If you can map your tool onto one of those paths, you probably do not need a brand-new mobile UX.
+
 ## Security Model
 
 - use `viveworker` only on a trusted LAN
 - do not expose the bridge directly to the Internet
 - if you lose a paired device, revoke it from `Settings > Devices`
-- use `setup --pair` only when you want to add another trusted device
+- use `pair` only when you want to add another trusted device
 - A2A relay authentication: external agents must provide a valid API key (`X-A2A-Key` header), and registration requires GitHub OAuth
 
 ## Optional `ntfy`
@@ -270,7 +420,7 @@ If you later want a second wake-up notification path, you can add `ntfy` alongsi
 ## Troubleshooting
 
 - If the `.local` URL does not open, use the printed IP-based URL
-- If pairing has expired, run `npx viveworker setup --pair`
+- If pairing has expired, run `npx viveworker pair`
 - If notifications do not appear, make sure you opened the Home Screen app, not just a browser tab
 - If Web Push is enabled, make sure you are opening the HTTPS URL
 - On some devices, local CA trust must be enabled manually before HTTPS works
@@ -280,6 +430,7 @@ If you later want a second wake-up notification path, you can add `ntfy` alongsi
 ```bash
 npx viveworker status
 npx viveworker doctor
+npx viveworker doctor --fix
 ```
 
 ## Roadmap
