@@ -3316,7 +3316,7 @@ function renderSettingsDevicePage(context) {
           </div>
           <div class="settings-command-card">
             <span class="settings-command-card__label">${escapeHtml(L("settings.device.addAnother.commandLabel"))}</span>
-            <code class="settings-command-card__value">npx viveworker setup --pair</code>
+            <code class="settings-command-card__value">npx viveworker pair</code>
           </div>
         </div>
       </section>
