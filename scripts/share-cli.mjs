@@ -179,6 +179,97 @@ async function handleUpload(args) {
   console.log("");
 }
 
+function maybeOptimizeUpload({ absolute, ext, bytes }) {
+  if (ext !== ".html" && ext !== ".htm") {
+    return { bytes, info: null };
+  }
+
+  const source = bytes.toString("utf8");
+  const optimized = optimizeBundledStandaloneHtml(source);
+  if (!optimized) {
+    return { bytes, info: null };
+  }
+
+  const optimizedBytes = Buffer.from(optimized.html, "utf8");
+  if (optimizedBytes.length >= bytes.length) {
+    return { bytes, info: null };
+  }
+
+  return {
+    bytes: optimizedBytes,
+    info: {
+      kind: "bundled-standalone-html",
+      removedFonts: optimized.removedFonts,
+      originalBytes: bytes.length,
+      optimizedBytes: optimizedBytes.length,
+      file: absolute,
+    },
+  };
+}
+
+function optimizeBundledStandaloneHtml(source) {
+  const manifestTagPattern = /(<script\b[^>]*type="__bundler\/manifest"[^>]*>)([\s\S]*?)(<\/script>)/i;
+  const templateTagPattern = /(<script\b[^>]*type="__bundler\/template"[^>]*>)([\s\S]*?)(<\/script>)/i;
+  const manifestMatch = source.match(manifestTagPattern);
+  const templateMatch = source.match(templateTagPattern);
+  if (!manifestMatch || !templateMatch) {
+    return null;
+  }
+
+  let manifest;
+  let template;
+  try {
+    manifest = JSON.parse(manifestMatch[2]);
+    template = JSON.parse(templateMatch[2]);
+  } catch {
+    return null;
+  }
+
+  const fontUuids = Object.entries(manifest)
+    .filter(([, entry]) => entry?.mime === "font/woff2")
+    .map(([uuid]) => uuid);
+  if (fontUuids.length === 0) {
+    return null;
+  }
+
+  for (const uuid of fontUuids) {
+    delete manifest[uuid];
+    const escapedUuid = escapeRegExp(uuid);
+    template = template.replace(
+      new RegExp(`@font-face\\s*\\{[^{}]*${escapedUuid}[^{}]*\\}`, "g"),
+      "",
+    );
+    template = template.split(uuid).join("");
+  }
+
+  let html = source.replace(
+    manifestTagPattern,
+    (_, openTag, _json, closeTag) => `${openTag}${stringifyForHtmlScriptTag(manifest)}${closeTag}`,
+  );
+  html = html.replace(
+    templateTagPattern,
+    (_, openTag, _json, closeTag) => `${openTag}${stringifyForHtmlScriptTag(template)}${closeTag}`,
+  );
+
+  return {
+    html,
+    removedFonts: fontUuids.length,
+  };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stringifyForHtmlScriptTag(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003C")
+    .replace(/>/g, "\\u003E")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 // ---------------------------------------------------------------------------
 // list
 // ---------------------------------------------------------------------------
