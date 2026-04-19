@@ -168,12 +168,21 @@ What it supports:
 - optional password protection
 - optional expiry
 
+HTML uploads are optimized by default when possible.
+This is especially useful for bundled standalone HTML exports that carry large embedded font payloads.
+`viveworker share upload` will try to shrink those files locally before upload, which often makes otherwise-too-large deck or prototype exports shareable without extra prep.
+
+If you want the original HTML bytes untouched, use `--no-optimize`.
+When optimization strips embedded fonts, layout and typography may change slightly, but the goal is to preserve a usable standalone share URL.
+
 It reuses the same A2A credentials as the rest of `viveworker`, so there is no separate auth or setup step.
 
 Typical commands:
 
 - `npx viveworker share upload report.html`
+- `npx viveworker share upload deck_standalone.html`
 - `npx viveworker share upload report.pdf --password "hunter2" --expires-days 7`
+- `npx viveworker share upload deck_standalone.html --no-optimize`
 - `npx viveworker share list`
 - `npx viveworker share update <slug> --password "hunter2"`
 - `npx viveworker share update <slug> --expires-days 7`
