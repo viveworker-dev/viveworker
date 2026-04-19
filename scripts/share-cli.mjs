@@ -7,7 +7,7 @@
  *   .html .htm .pdf .png .jpg .jpeg .gif .webp .csv
  *
  * Commands:
- *   viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]
+ *   viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--no-optimize] [--json]
  *   viveworker share list [--json]
  *   viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]
  *   viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]
@@ -71,7 +71,7 @@ export async function runShareCli(args) {
 
 function printHelp() {
   console.log("Commands:");
-  console.log("  viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--json]");
+  console.log("  viveworker share upload <file> [--password <pw>] [--expires-days <n>] [--no-optimize] [--json]");
   console.log("  viveworker share list [--json]");
   console.log("  viveworker share update <slug> [--password <pw>] [--no-password] [--expires-days <n>] [--json]");
   console.log("  viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
@@ -79,6 +79,7 @@ function printHelp() {
   console.log("");
   console.log(`Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}`);
   console.log("CSV files are rendered as an HTML table on view; append ?raw=1 for bytes.");
+  console.log("HTML uploads are optimized by default when possible (use --no-optimize to disable).");
   console.log("");
   console.log("Credentials are read from ~/.viveworker/a2a.env (same as `viveworker a2a`).");
 }
@@ -107,9 +108,6 @@ async function handleUpload(args) {
   if (stat.size === 0) {
     throw new Error(`File is empty: ${filePath}`);
   }
-  if (stat.size > MAX_FILE_SIZE) {
-    throw new Error(`File too large (${stat.size} bytes, max ${MAX_FILE_SIZE})`);
-  }
   const ext = path.extname(absolute).toLowerCase();
   if (!ALLOWED_EXTENSIONS.includes(ext)) {
     throw new Error(
@@ -134,7 +132,18 @@ async function handleUpload(args) {
 
   const { apiKey, userId, shareUrl } = await resolveCredentials();
 
-  const bytes = await fs.readFile(absolute);
+  const originalBytes = await fs.readFile(absolute);
+  const optimization =
+    flags["no-optimize"] || flags["noOptimize"]
+      ? { bytes: originalBytes, info: null }
+      : maybeOptimizeUpload({ absolute, ext, bytes: originalBytes });
+  const bytes = optimization.bytes;
+  if (bytes.length > MAX_FILE_SIZE) {
+    const detail = optimization.info
+      ? ` after optimization to ${formatSize(bytes.length)}`
+      : "";
+    throw new Error(`File too large (${originalBytes.length} bytes, max ${MAX_FILE_SIZE})${detail}`);
+  }
   const form = new FormData();
   const blob = new Blob([bytes], { type: mime });
   const file = new File([blob], path.basename(absolute), { type: mime });
@@ -164,6 +173,15 @@ async function handleUpload(args) {
   console.log("");
   console.log(`✅ Uploaded ${body.originalName || path.basename(absolute)} (${formatSize(body.size)})`);
   console.log("");
+  if (optimization.info) {
+    console.log(
+      `   Optimized HTML: ${formatSize(optimization.info.originalBytes)} → ${formatSize(optimization.info.optimizedBytes)}`
+    );
+    console.log(
+      `   Removed embedded fonts: ${optimization.info.removedFonts}`
+    );
+    console.log("");
+  }
   console.log(`   ${body.url}`);
   console.log("");
   if (body.hasPassword) console.log(`   🔒 Password-protected`);
