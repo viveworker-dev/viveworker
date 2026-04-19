@@ -312,6 +312,48 @@ Uses `A2A_API_KEY` and `A2A_RELAY_USER_ID` from `~/.viveworker/a2a.env`. Overrid
 | CLI | `scripts/share-cli.mjs` |
 | Subcommand dispatch | `scripts/viveworker.mjs` |
 
+## viveworker stats
+
+One-shot adoption / usage snapshot. Aggregates four signals into a single readout:
+
+```bash
+# Human-readable summary
+node scripts/viveworker.mjs stats
+
+# Structured (pipe to jq / save to file / feed a dashboard)
+node scripts/viveworker.mjs stats --json
+
+# Point at a non-default npm package name
+node scripts/viveworker.mjs stats --pkg some-other-pkg
+```
+
+Sections (each renders independently; an outage in one doesn't break the rest):
+
+| Section | Source | What it shows |
+|---|---|---|
+| 📦 npm | `api.npmjs.org/downloads/range/last-month/<pkg>` + `registry.npmjs.org/<pkg>` | last 7d / prev 7d / last 30d downloads, week-over-week Δ%, latest version, publish count last 7d, per-day histogram in `--json`. **Caveat**: npm download totals are heavily mirror-driven — each new version publish triggers ~100 mirror re-fetches. Correlate `publishCountLast7` with suspiciously big daily spikes before reading too much into absolute numbers. |
+| 🛰 a2a relay | `GET /stats/global` (public) + `GET /stats/<userId>` (X-A2A-Key) on `a2a.viveworker.com` | global user count, global 30d task counters, your own 30d + all-time task counters (received / completed / failed / rejected / canceled). |
+| 🔗 share worker | `GET /api/list` on `share.viveworker.com` | live file count, quota (bytes + files), how many shares are password-gated or paid-gated. |
+| 💬 moltbook (local) | `~/.viveworker/moltbook-inbox/*.json`, `moltbook-verify-history.jsonl`, `moltbook-scout-state.json` | inbox totals by status (replied / pending / skipped) + 7d/30d volume; verification attempts with solver-only vs solver+LLM success rates; scout 7d outcome breakdown (proposed / avoid-skipped / already-replied). |
+
+### Credentials
+
+Reuses `~/.viveworker/a2a.env` (same file `viveworker a2a` and `viveworker share` use). Missing file or missing `A2A_RELAY_USER_ID` / `A2A_API_KEY` → the a2a and share sections fall back to public-only (for a2a) or skip (for share), but npm and moltbook-local still render. No separate setup.
+
+### When to use
+
+- User asks "how's adoption / traction looking?" or "download numbers?"
+- You just published a new npm version and want to watch mirror fallout
+- You want a single-command sanity check before a demo or status update
+- You want to feed a weekly metric snapshot into a report (use `--json`)
+
+### Architecture
+
+| Component | Location |
+|-----------|----------|
+| CLI | `scripts/stats-cli.mjs` |
+| Subcommand dispatch | `scripts/viveworker.mjs` |
+
 ## Thread sharing (cross-thread context transfer)
 
 Share context between AI tool sessions (Codex ↔ Claude Code) with user approval on the paired phone.

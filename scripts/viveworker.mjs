@@ -64,6 +64,17 @@ if (rawArgs[0] === "share") {
   }
 }
 
+if (rawArgs[0] === "stats") {
+  const { runStatsCli } = await import("./stats-cli.mjs");
+  try {
+    await runStatsCli(rawArgs.slice(1));
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+  }
+}
+
 const cli = parseArgs(rawArgs);
 
 try {
