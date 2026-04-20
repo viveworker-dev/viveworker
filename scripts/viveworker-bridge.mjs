@@ -263,8 +263,23 @@ function clearDeviceLocaleOverride(state, deviceId) {
   return true;
 }
 
+function autoPilotWriteLaneState(state) {
+  return {
+    content: state?.autoPilotWriteLaneContent === true,
+    uiTests: state?.autoPilotWriteLaneUiTests === true,
+    source: state?.autoPilotWriteLaneSource === true,
+  };
+}
+
+function hasAnyAutoPilotWriteLaneEnabled(state) {
+  const lanes = autoPilotWriteLaneState(state);
+  return lanes.content || lanes.uiTests || lanes.source;
+}
+
 function buildSessionLocalePayload(config, state, deviceId) {
   const resolved = resolveDeviceLocaleInfo(config, state, deviceId);
+  const writeLanes = autoPilotWriteLaneState(state);
+  const trustedWritesEnabled = hasAnyAutoPilotWriteLaneEnabled(state);
   return {
     locale: resolved.locale,
     localeSource: resolved.source,
@@ -273,6 +288,12 @@ function buildSessionLocalePayload(config, state, deviceId) {
     deviceDetectedLocale: resolved.detectedLocale || null,
     deviceOverrideLocale: resolved.overrideLocale || null,
     claudeAwayMode: state?.claudeAwayMode === true,
+    autoPilotTrustedReads: state?.autoPilotTrustedReads === true,
+    autoPilotTrustedWrites: trustedWritesEnabled,
+    autoPilotTrustedWritesShadow: false,
+    autoPilotWriteLaneContent: writeLanes.content,
+    autoPilotWriteLaneUiTests: writeLanes.uiTests,
+    autoPilotWriteLaneSource: writeLanes.source,
     moltbookEnabled: Boolean(config.moltbookApiKey),
     a2aEnabled: Boolean(config.a2aApiKey),
     a2aRelayEnabled: Boolean(config.a2aRelayUrl && config.a2aRelayUserId),
@@ -770,6 +791,425 @@ function tokenizeShellWords(commandText) {
   return tokens;
 }
 
+function isPathWithinRoot(rootPath, candidatePath) {
+  const normalizedRoot = cleanText(rootPath || "");
+  const normalizedCandidate = cleanText(candidatePath || "");
+  if (!normalizedRoot || !normalizedCandidate) {
+    return false;
+  }
+  const relativePath = path.relative(normalizedRoot, normalizedCandidate);
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function isSensitiveCommandPath(candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized) {
+    return true;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  if (segments.some((segment) => [".ssh", ".aws", ".gnupg", ".azure", ".kube"].includes(segment))) {
+    return true;
+  }
+  if (basename === ".npmrc" || basename === ".netrc" || basename === ".env" || basename.startsWith(".env.")) {
+    return true;
+  }
+  if (basename.endsWith(".pem") || basename.endsWith(".key") || basename.endsWith(".p12") || basename.endsWith(".pfx")) {
+    return true;
+  }
+  if (/^id_[a-z0-9._-]+$/iu.test(basename) || basename.includes("secret") || basename.includes("credential")) {
+    return true;
+  }
+  return false;
+}
+
+function resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }) {
+  const rawToken = cleanText(token || "");
+  const normalizedCwd = cleanText(cwd || "");
+  const normalizedWorkspaceRoot = cleanText(workspaceRoot || normalizedCwd);
+  if (!rawToken || !normalizedCwd || !normalizedWorkspaceRoot) {
+    return null;
+  }
+  if (rawToken === "-" || rawToken.startsWith("~") || rawToken.startsWith("http://") || rawToken.startsWith("https://")) {
+    return null;
+  }
+  const resolved = path.resolve(normalizedCwd, rawToken);
+  if (!isPathWithinRoot(normalizedWorkspaceRoot, resolved)) {
+    return null;
+  }
+  if (isSensitiveCommandPath(resolved)) {
+    return null;
+  }
+  return resolved;
+}
+
+function isGitObjectPathToken(token) {
+  const normalized = cleanText(token || "");
+  if (!normalized || normalized.startsWith("-")) {
+    return false;
+  }
+  return /^[^:\s][^:\s]*:.+/u.test(normalized);
+}
+
+function isLiteralGitPathspecToken(token) {
+  const normalized = cleanText(token || "");
+  if (!normalized || normalized === "--" || normalized.startsWith(":(") || normalized.startsWith(":/")) {
+    return false;
+  }
+  if (/[*?[\]{}]/u.test(normalized)) {
+    return false;
+  }
+  return !isGitObjectPathToken(normalized);
+}
+
+function isAllowedGitMetadataOnlyFlag(token) {
+  const normalized = cleanText(token || "");
+  if (!normalized) {
+    return false;
+  }
+  return [
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    "--summary",
+    "--compact-summary",
+    "--oneline",
+    "--no-patch",
+    "-s",
+  ].includes(normalized);
+}
+
+function hasDisallowedGitPatchOutput(tokens) {
+  return tokens.some((token) => {
+    const normalized = cleanText(token || "");
+    if (!normalized) {
+      return false;
+    }
+    return (
+      normalized === "-p" ||
+      normalized === "--patch" ||
+      normalized === "--patch-with-stat" ||
+      normalized === "--raw" ||
+      normalized === "--cc" ||
+      normalized === "--combined-all-paths" ||
+      normalized === "--binary" ||
+      normalized === "--word-diff" ||
+      normalized.startsWith("--word-diff=") ||
+      normalized === "-U" ||
+      normalized.startsWith("-U") ||
+      normalized === "--unified" ||
+      normalized.startsWith("--unified=")
+    );
+  });
+}
+
+function extractGitPathspecTokens(tokens) {
+  const separatorIndex = tokens.indexOf("--");
+  if (separatorIndex < 0) {
+    return [];
+  }
+  return tokens.slice(separatorIndex + 1).filter(Boolean);
+}
+
+function resolveTrustedDiffSectionPath({ token, cwd, workspaceRoot }) {
+  const normalizedToken = cleanText(token || "");
+  if (!normalizedToken) {
+    return null;
+  }
+  const preferredWorkspace = resolveTrustedReadTargetPath({
+    token: normalizedToken,
+    cwd: workspaceRoot,
+    workspaceRoot,
+  });
+  if (preferredWorkspace) {
+    return preferredWorkspace;
+  }
+  return resolveTrustedReadTargetPath({
+    token: normalizedToken,
+    cwd,
+    workspaceRoot,
+  });
+}
+
+function extractTrustedReadFileRefs(command, tokens, cwd, workspaceRoot) {
+  const normalizedCommand = cleanText(command || "");
+  if (!normalizedCommand) {
+    return null;
+  }
+
+  if (normalizedCommand === "pwd" || (normalizedCommand === "git" && cleanText(tokens[1] || "") === "status")) {
+    const resolved = resolveTrustedReadTargetPath({ token: ".", cwd, workspaceRoot });
+    return resolved ? normalizeTimelineFileRefs([resolved]) : null;
+  }
+
+  if (normalizedCommand === "git") {
+    const gitSubcommand = cleanText(tokens[1] || "");
+    if (!["diff", "show"].includes(gitSubcommand)) {
+      return null;
+    }
+    if (tokens.some((token) => token === "-C" || token.startsWith("-C") || token === "--output" || token.startsWith("--output="))) {
+      return null;
+    }
+    const commandArgs = tokens.slice(2);
+    if (commandArgs.some((token) => isGitObjectPathToken(token))) {
+      return null;
+    }
+    const explicitPathspecs = extractGitPathspecTokens(tokens);
+    if (explicitPathspecs.length > 0) {
+      if (explicitPathspecs.some((token) => !isLiteralGitPathspecToken(token))) {
+        return null;
+      }
+      const resolvedPaths = explicitPathspecs
+        .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+        .filter(Boolean);
+      return resolvedPaths.length === explicitPathspecs.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+    }
+    if (hasDisallowedGitPatchOutput(commandArgs)) {
+      return null;
+    }
+    const metadataOnly = commandArgs.some((token) => isAllowedGitMetadataOnlyFlag(token));
+    if (!metadataOnly) {
+      return null;
+    }
+    const resolved = resolveTrustedReadTargetPath({ token: ".", cwd, workspaceRoot });
+    return resolved ? normalizeTimelineFileRefs([resolved]) : null;
+  }
+
+  if (normalizedCommand === "ls") {
+    const pathArgs = tokens.slice(1).filter((token) => !String(token || "").startsWith("-"));
+    if (pathArgs.length === 0) {
+      const resolved = resolveTrustedReadTargetPath({ token: ".", cwd, workspaceRoot });
+      return resolved ? normalizeTimelineFileRefs([resolved]) : null;
+    }
+    const resolvedPaths = pathArgs
+      .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+      .filter(Boolean);
+    return resolvedPaths.length === pathArgs.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+  }
+
+  if (normalizedCommand === "find") {
+    if (tokens.some((token) => ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"].includes(token))) {
+      return null;
+    }
+    const pathArgs = [];
+    for (const token of tokens.slice(1)) {
+      if (!token || token === "--") continue;
+      if (token === "!" || token === "(" || token === ")") break;
+      if (token.startsWith("-")) break;
+      pathArgs.push(token);
+    }
+    const effectivePaths = pathArgs.length ? pathArgs : ["."];
+    const resolvedPaths = effectivePaths
+      .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+      .filter(Boolean);
+    return resolvedPaths.length === effectivePaths.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+  }
+
+  if (normalizedCommand === "sed") {
+    if (!tokens.includes("-n") || tokens.includes("-i") || tokens.includes("--in-place")) {
+      return null;
+    }
+    let script = "";
+    const fileArgs = [];
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (!token) continue;
+      if (!script) {
+        if (token === "-e") {
+          script = tokens[index + 1] || "";
+          index += 1;
+          continue;
+        }
+        if (token.startsWith("-")) {
+          continue;
+        }
+        script = token;
+        continue;
+      }
+      if (!token.startsWith("-")) {
+        fileArgs.push(token);
+      }
+    }
+    if (!script || !/^[0-9,$; p-]+$/u.test(script) || fileArgs.length === 0) {
+      return null;
+    }
+    const resolvedPaths = fileArgs
+      .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+      .filter(Boolean);
+    return resolvedPaths.length === fileArgs.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+  }
+
+  if (normalizedCommand === "rg") {
+    let seenPattern = false;
+    const fileArgs = [];
+    for (const token of tokens.slice(1)) {
+      if (!seenPattern) {
+        if (token === "--") {
+          seenPattern = true;
+          continue;
+        }
+        if (String(token || "").startsWith("-")) {
+          continue;
+        }
+        seenPattern = true;
+        continue;
+      }
+      if (!String(token || "").startsWith("-")) {
+        fileArgs.push(token);
+      }
+    }
+    const effectivePaths = fileArgs.length ? fileArgs : ["."];
+    const resolvedPaths = effectivePaths
+      .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+      .filter(Boolean);
+    return resolvedPaths.length === effectivePaths.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+  }
+
+  if (["cat", "nl", "head", "tail", "wc"].includes(normalizedCommand)) {
+    const fileArgs = tokens.slice(1).filter((token) => !String(token || "").startsWith("-"));
+    if (fileArgs.length === 0) {
+      return null;
+    }
+    const resolvedPaths = fileArgs
+      .map((token) => resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }))
+      .filter(Boolean);
+    return resolvedPaths.length === fileArgs.length ? normalizeTimelineFileRefs(resolvedPaths) : null;
+  }
+
+  return null;
+}
+
+function stripAllowedTrustedReadRedirections(tokens) {
+  const filtered = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = String(tokens[index] || "");
+    if (!token) {
+      continue;
+    }
+    if (token === "2>" || token === "2>>") {
+      const target = String(tokens[index + 1] || "");
+      if (target !== "/dev/null") {
+        return null;
+      }
+      index += 1;
+      continue;
+    }
+    if (/^2>>?\/dev\/null$/u.test(token)) {
+      continue;
+    }
+    if (token.includes(">") || token.includes("<")) {
+      return null;
+    }
+    filtered.push(token);
+  }
+  return filtered;
+}
+
+function isAllowedTrustedReadPostProcessStage(stageTokens) {
+  if (!Array.isArray(stageTokens) || stageTokens.length === 0) {
+    return false;
+  }
+  const [command, ...args] = stageTokens.map((token) => cleanText(token || ""));
+  if (!command) {
+    return false;
+  }
+  if (command === "head" || command === "tail") {
+    if (args.length === 0) {
+      return true;
+    }
+    if (args.length === 1 && /^-\d+$/u.test(args[0])) {
+      return true;
+    }
+    if (args.length === 2 && args[0] === "-n" && /^\d+$/u.test(args[1])) {
+      return true;
+    }
+    return false;
+  }
+  if (command === "wc") {
+    return args.length === 0 || (args.length === 1 && args[0] === "-l");
+  }
+  return false;
+}
+
+function normalizeTrustedReadTokens(tokens) {
+  const strippedTokens = stripAllowedTrustedReadRedirections(tokens);
+  if (!strippedTokens || strippedTokens.length === 0) {
+    return null;
+  }
+  if (strippedTokens.some((token) => {
+    const value = String(token || "");
+    return (
+      ["||", "&&", ";", "&"].includes(value) ||
+      value.includes("`") ||
+      value.includes("$(")
+    );
+  })) {
+    return null;
+  }
+  const stages = [];
+  let currentStage = [];
+  for (const token of strippedTokens) {
+    if (token === "|") {
+      if (currentStage.length === 0) {
+        return null;
+      }
+      stages.push(currentStage);
+      currentStage = [];
+      continue;
+    }
+    currentStage.push(token);
+  }
+  if (currentStage.length === 0) {
+    return null;
+  }
+  stages.push(currentStage);
+  if (stages.length === 0) {
+    return null;
+  }
+  if (stages.slice(1).some((stageTokens) => !isAllowedTrustedReadPostProcessStage(stageTokens))) {
+    return null;
+  }
+  return stages[0];
+}
+
+function evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot }) {
+  const normalizedCwd = cleanText(cwd || "");
+  const normalizedWorkspaceRoot = cleanText(workspaceRoot || normalizedCwd);
+  const normalizedCommandText = unwrapShellCommand(commandText);
+  const rawTokens = tokenizeShellWords(normalizedCommandText);
+  if (!normalizedCommandText || !normalizedCwd || !normalizedWorkspaceRoot || rawTokens.length === 0) {
+    return null;
+  }
+
+  if (!isPathWithinRoot(normalizedWorkspaceRoot, path.resolve(normalizedCwd))) {
+    return null;
+  }
+
+  const tokens = normalizeTrustedReadTokens(rawTokens);
+  if (!tokens || tokens.length === 0) {
+    return null;
+  }
+
+  const command = cleanText(tokens[0]);
+  if (!command || /^[A-Za-z_][A-Za-z0-9_]*=.*/u.test(command)) {
+    return null;
+  }
+
+  const fileRefs = extractTrustedReadFileRefs(command, tokens, normalizedCwd, normalizedWorkspaceRoot);
+  if (!fileRefs) {
+    return null;
+  }
+
+  return {
+    command,
+    commandText: normalizedCommandText,
+    fileRefs,
+  };
+}
+
 function unwrapShellCommand(commandText) {
   const normalized = String(commandText || "").trim();
   if (!normalized) {
@@ -846,6 +1286,14 @@ function extractReadFileRefsFromCommand(commandText) {
   }
 
   return [];
+}
+
+function autoPilotApprovalMessage(locale, commandText) {
+  const prefix = t(locale, "server.message.autoPilotTrustedReadApproved");
+  const commandBlock = cleanText(commandText || "")
+    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${cleanText(commandText || "")}\n\`\`\``
+    : "";
+  return [prefix, commandBlock].filter(Boolean).join("\n\n");
 }
 
 function extractUpdatedFileRefsByType(outputText, patchText = "") {
@@ -5134,6 +5582,28 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
         request,
         approval: existing,
       });
+      const existingAutoPilotWriteCandidate =
+        existing.kind === "file"
+          ? maybeAutoApproveTrustedWriteCandidate({ runtime, state, approval: existing })
+          : null;
+      if (existingAutoPilotWriteCandidate) {
+        try {
+          await autoApproveTrustedWrite({
+            config,
+            runtime,
+            state,
+            approval: existing,
+            candidate: existingAutoPilotWriteCandidate,
+          });
+          continue;
+        } catch (error) {
+          existing.resolved = false;
+          existing.resolving = false;
+          runtime.nativeApprovalsByRequestKey.set(requestKey, existing);
+          runtime.nativeApprovalsByToken.set(existing.token, existing);
+          console.error(`[auto-pilot-write-error] ${requestKey} | ${error.message}`);
+        }
+      }
       if (changed) {
         const fileKeys = isPlainObject(existing.rawParams) ? Object.keys(existing.rawParams).join(",") : "";
         console.log(
@@ -5155,6 +5625,57 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
 
     runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
     runtime.nativeApprovalsByToken.set(approval.token, approval);
+
+    const nativeAutoPilotMatch =
+      approval.kind === "command"
+        ? maybeAutoApproveTrustedRead({
+            state,
+            commandText: approval.rawParams?.command ?? approval.rawParams?.cmd ?? "",
+            cwd: approval.rawParams?.cwd ?? approval.rawParams?.grantRoot ?? "",
+            workspaceRoot: approval.rawParams?.grantRoot ?? approval.rawParams?.cwd ?? "",
+          })
+        : null;
+    if (nativeAutoPilotMatch) {
+      try {
+        await autoApproveTrustedRead({
+          config,
+          runtime,
+          state,
+          approval,
+          policyMatch: nativeAutoPilotMatch,
+        });
+        continue;
+      } catch (error) {
+        approval.resolved = false;
+        approval.resolving = false;
+        runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
+        runtime.nativeApprovalsByToken.set(approval.token, approval);
+        console.error(`[auto-pilot-error] ${requestKey} | ${error.message}`);
+      }
+    }
+
+    const nativeAutoPilotWriteCandidate =
+      approval.kind === "file"
+        ? maybeAutoApproveTrustedWriteCandidate({ runtime, state, approval })
+        : null;
+    if (nativeAutoPilotWriteCandidate) {
+      try {
+        await autoApproveTrustedWrite({
+          config,
+          runtime,
+          state,
+          approval,
+          candidate: nativeAutoPilotWriteCandidate,
+        });
+        continue;
+      } catch (error) {
+        approval.resolved = false;
+        approval.resolving = false;
+        runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
+        runtime.nativeApprovalsByToken.set(approval.token, approval);
+        console.error(`[auto-pilot-write-error] ${requestKey} | ${error.message}`);
+      }
+    }
 
     if (previousKeys.has(requestKey)) {
       const fileKeys = isPlainObject(approval.rawParams) ? Object.keys(approval.rawParams).join(",") : "";
@@ -5633,6 +6154,8 @@ async function buildNativeApprovalPayload({ config, runtime, conversationId, req
     ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
     approvalIds,
     rawParams,
+    cwd: cleanText(rawParams?.cwd ?? rawParams?.grantRoot ?? ""),
+    workspaceRoot: cleanText(rawParams?.grantRoot ?? rawParams?.cwd ?? ""),
     fileRefs: normalizeTimelineFileRefs(mergedDelta?.fileRefs ?? []),
     diffText: normalizeTimelineDiffText(mergedDelta?.diffText ?? ""),
     diffAvailable: Boolean(mergedDelta?.diffAvailable),
@@ -5669,6 +6192,8 @@ async function refreshNativeApprovalFromRequest({ config, runtime, conversationI
     ownerClientId: approval.ownerClientId,
     approvalIds: approval.approvalIds,
     rawParams: approval.rawParams,
+    cwd: approval.cwd,
+    workspaceRoot: approval.workspaceRoot,
     fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
     diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
     diffAvailable: Boolean(approval.diffAvailable),
@@ -5688,6 +6213,8 @@ async function refreshNativeApprovalFromRequest({ config, runtime, conversationI
   approval.ownerClientId = payload.ownerClientId;
   approval.approvalIds = payload.approvalIds;
   approval.rawParams = payload.rawParams;
+  approval.cwd = payload.cwd;
+  approval.workspaceRoot = payload.workspaceRoot;
   approval.fileRefs = payload.fileRefs;
   approval.diffText = payload.diffText;
   approval.diffAvailable = payload.diffAvailable;
@@ -5707,6 +6234,8 @@ async function refreshNativeApprovalFromRequest({ config, runtime, conversationI
     ownerClientId: approval.ownerClientId,
     approvalIds: approval.approvalIds,
     rawParams: approval.rawParams,
+    cwd: approval.cwd,
+    workspaceRoot: approval.workspaceRoot,
     fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
     diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
     diffAvailable: Boolean(approval.diffAvailable),
@@ -9988,9 +10517,10 @@ function buildTimelineResponse(runtime, state, config, locale) {
   };
 }
 
-function buildPendingApprovalDetail(runtime, approval, locale) {
+function buildPendingApprovalDetail(runtime, state, approval, locale) {
   const previousContext = buildPreviousApprovalContext(runtime, approval);
   const approvalKind = cleanText(approval.kind || "");
+  const autoPilotReview = buildAutoPilotManualReview(runtime, state, approval, locale);
   const detail = {
     kind: "approval",
     approvalKind,
@@ -10007,6 +10537,7 @@ function buildPendingApprovalDetail(runtime, approval, locale) {
     diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
     diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
     previousContext,
+    autoPilotReview,
     readOnly: approval.readOnly === true,
     actions: approval.readOnly === true
       ? []
@@ -10029,6 +10560,193 @@ function buildPendingApprovalDetail(runtime, approval, locale) {
     detail.actions = [];
   }
   return detail;
+}
+
+function buildAutoPilotManualReview(runtime, state, approval, locale) {
+  if (!isPlainObject(approval) || approval.readOnly === true) {
+    return null;
+  }
+  if (cleanText(approval.kind || "") !== "file") {
+    return null;
+  }
+  return buildAutoPilotWriteManualReview(runtime, state, approval, locale);
+}
+
+function buildAutoPilotWriteManualReview(runtime, state, approval, locale) {
+  const writesEnabled = isAutoPilotTrustedWritesEnabled(state);
+  if (!writesEnabled) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDisabled"),
+    };
+  }
+
+  const cwd = cleanText(approval?.cwd || approval?.rawParams?.cwd || approval?.rawParams?.grantRoot || "");
+  const workspaceRoot = cleanText(approval?.workspaceRoot || approval?.rawParams?.grantRoot || cwd);
+  if (!cwd || !workspaceRoot) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeMissingWorkspace"),
+    };
+  }
+
+  const diffText = normalizeTimelineDiffText(approval?.diffText ?? "");
+  if (!diffText) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeMissingDiff"),
+    };
+  }
+
+  const rawFileRefs = normalizeTimelineFileRefs(approval?.fileRefs ?? []);
+  if (rawFileRefs.length === 0) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeMissingFiles"),
+    };
+  }
+
+  const resolvedFileRefs = resolveTrustedWriteFileRefs({
+    fileRefs: approval?.fileRefs ?? [],
+    cwd,
+    workspaceRoot,
+  });
+  if (!resolvedFileRefs) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeInvalidFiles"),
+    };
+  }
+
+  const counts = diffLineCounts(diffText);
+  const totalChangedLines =
+    Math.max(0, Number(counts.addedLines) || 0) +
+    Math.max(0, Number(counts.removedLines) || 0);
+  if (totalChangedLines === 0) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeMissingDiff"),
+    };
+  }
+  if (totalChangedLines > 120) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDiffTooLarge"),
+    };
+  }
+
+  const diffSections = splitUnifiedDiffTextByFile(diffText);
+  if (diffSections.length === 0) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDiffUnreadable"),
+    };
+  }
+  if (diffSections.length > 3) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDiffTooLarge"),
+    };
+  }
+
+  if (
+    /^(?:new file mode|deleted file mode|rename from|rename to|old mode|new mode|similarity index|dissimilarity index|GIT binary patch|Binary files )/mu.test(diffText)
+  ) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDangerousDiff"),
+    };
+  }
+
+  const diffSectionRefs = resolveTrustedWriteDiffSectionFileRefs({
+    diffSections,
+    cwd,
+    workspaceRoot,
+  });
+  if (!diffSectionRefs || !sameNormalizedFileRefSet(diffSectionRefs, resolvedFileRefs)) {
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeDiffMismatch"),
+    };
+  }
+
+  const lanes = autoPilotWriteLaneState(state);
+  const isContentOnly = resolvedFileRefs.every((fileRef) => isAutoPilotContentWritePath(fileRef));
+  if (isContentOnly) {
+    if (!lanes.content) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeContentDisabled"),
+      };
+    }
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeNoLaneMatch"),
+    };
+  }
+
+  const isUiTestsOnly = resolvedFileRefs.every((fileRef) => isAutoPilotUiTestWritePath(fileRef));
+  if (isUiTestsOnly) {
+    if (!lanes.uiTests) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeUiDisabled"),
+      };
+    }
+    if (totalChangedLines > 80) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeUiTooLarge"),
+      };
+    }
+    if (hasUnsafeUiOrTestWriteDiff(diffText)) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeUiUnsafe"),
+      };
+    }
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeNoLaneMatch"),
+    };
+  }
+
+  const isSourceOnly = resolvedFileRefs.every((fileRef) => isAutoPilotSourceWritePath(fileRef));
+  if (isSourceOnly) {
+    if (!lanes.source) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeSourceDisabled"),
+      };
+    }
+    if (totalChangedLines > 40) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeSourceTooLarge"),
+      };
+    }
+    if (hasUnsafeSourceWriteDiff(diffText)) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeSourceUnsafe"),
+      };
+    }
+    if (!hasRecentSourceReadContinuity({ runtime, state, approval, resolvedFileRefs })) {
+      return {
+        title: t(locale, "detail.autoPilot.manualTitle"),
+        body: t(locale, "detail.autoPilot.writeSourceContinuity"),
+      };
+    }
+    return {
+      title: t(locale, "detail.autoPilot.manualTitle"),
+      body: t(locale, "detail.autoPilot.writeNoLaneMatch"),
+    };
+  }
+
+  return {
+    title: t(locale, "detail.autoPilot.manualTitle"),
+    body: t(locale, "detail.autoPilot.writeNoLaneMatch"),
+  };
 }
 
 function buildPreviousApprovalContext(runtime, approval) {
@@ -10993,6 +11711,532 @@ function findClaudePendingApprovalForTool(runtime, threadId, toolName, fingerpri
   return match;
 }
 
+function maybeAutoApproveTrustedRead({ state, commandText, cwd, workspaceRoot }) {
+  if (state?.autoPilotTrustedReads !== true) {
+    return null;
+  }
+  return evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot });
+}
+
+function isAutoPilotTrustedWritesEnabled(state) {
+  return hasAnyAutoPilotWriteLaneEnabled(state);
+}
+
+function isDeniedTrustedWritePath(candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized) {
+    return true;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  if (isSensitiveCommandPath(normalized)) {
+    return true;
+  }
+  if (segments.some((segment) => [".github", ".gitlab", ".terraform", ".claude", ".husky", ".vscode"].includes(segment))) {
+    return true;
+  }
+  if (
+    [
+      "package.json",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "bun.lockb",
+      "cargo.toml",
+      "cargo.lock",
+      "gemfile",
+      "gemfile.lock",
+      "podfile",
+      "podfile.lock",
+      "composer.json",
+      "composer.lock",
+      "pipfile",
+      "pipfile.lock",
+      "poetry.lock",
+      "requirements.txt",
+      "dockerfile",
+      "wrangler.toml",
+      "tsconfig.json",
+      "tsconfig.tsbuildinfo",
+    ].includes(basename)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isAutoPilotContentWritePath(candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized || isDeniedTrustedWritePath(normalized)) {
+    return false;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  const extension = path.extname(basename);
+  if ([".md", ".mdx", ".txt", ".rst", ".adoc"].includes(extension)) {
+    return true;
+  }
+  if (["license", "notice", "copying", "readme", "changelog", "contributing"].includes(path.basename(basename, extension))) {
+    return true;
+  }
+  if (segments.includes("i18n") && [".js", ".ts", ".json", ".yaml", ".yml"].includes(extension)) {
+    return true;
+  }
+  if (segments.includes("messages") && extension === ".json") {
+    return true;
+  }
+  return false;
+}
+
+function isAutoPilotUiTestWritePath(candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized || isDeniedTrustedWritePath(normalized)) {
+    return false;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  const extension = path.extname(basename);
+  if ([".css", ".scss", ".sass", ".less", ".styl", ".pcss"].includes(extension)) {
+    return true;
+  }
+  if (segments.includes("__tests__") || /\.(test|spec)\.[cm]?[jt]sx?$/u.test(basename)) {
+    return true;
+  }
+  if ((segments.includes("web") || segments.includes("components")) && [".js", ".jsx", ".ts", ".tsx", ".html"].includes(extension)) {
+    return true;
+  }
+  return false;
+}
+
+function isAutoPilotSourceWritePath(candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized || isDeniedTrustedWritePath(normalized)) {
+    return false;
+  }
+  if (isAutoPilotContentWritePath(normalized) || isAutoPilotUiTestWritePath(normalized)) {
+    return false;
+  }
+  const extension = path.extname(normalized.toLowerCase());
+  return [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(extension);
+}
+
+function extractAddedDiffLines(diffText) {
+  return normalizeTimelineDiffText(diffText)
+    .split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"));
+}
+
+function addedDiffLinesContain(diffText, pattern) {
+  return extractAddedDiffLines(diffText).some((line) => pattern.test(line.slice(1)));
+}
+
+function hasUnsafeUiOrTestWriteDiff(diffText) {
+  const patterns = [
+    /\bprocess\.env\b/u,
+    /\b(?:child_process|spawn|exec|execFile|fork)\b/u,
+    /\bfs\.(?:write|append|rm|unlink|rename|chmod|chown|copyFile|cp)\b/u,
+    /\b(?:fetch|axios|XMLHttpRequest)\s*\(/u,
+    /\bcrypto\b/u,
+    /\b(?:secret|token|password|privateKey|credential)\b/iu,
+  ];
+  return (
+    addedDiffLinesContain(diffText, /^\s*(?:import\s|export\s+.*\s+from\s)/u) ||
+    addedDiffLinesContain(diffText, /\brequire\s*\(/u) ||
+    patterns.some((pattern) => addedDiffLinesContain(diffText, pattern))
+  );
+}
+
+function hasUnsafeSourceWriteDiff(diffText) {
+  const patterns = [
+    /\bprocess\.env\b/u,
+    /\b(?:child_process|spawn|exec|execFile|fork)\b/u,
+    /\bfs\.(?:write|append|rm|unlink|rename|chmod|chown|copyFile|cp)\b/u,
+    /\b(?:fetch|axios|XMLHttpRequest)\s*\(/u,
+    /\b(?:net|tls|dgram|http2?)\b/u,
+    /\bcrypto\b/u,
+    /\b(?:secret|token|password|privateKey|credential)\b/iu,
+  ];
+  return (
+    addedDiffLinesContain(diffText, /^\s*(?:import\s|export\s+.*\s+from\s)/u) ||
+    addedDiffLinesContain(diffText, /\brequire\s*\(/u) ||
+    patterns.some((pattern) => addedDiffLinesContain(diffText, pattern))
+  );
+}
+
+const AUTO_PILOT_SOURCE_CONTINUITY_WINDOW_MS = 15 * 60 * 1000;
+
+function isReadContinuityTimelineEntry(entry) {
+  if (!isPlainObject(entry)) {
+    return false;
+  }
+  if (cleanText(entry.kind || "") === "file_event" && cleanText(entry.fileEventType || "") === "read") {
+    return true;
+  }
+  return (
+    cleanText(entry.kind || "") === "approval" &&
+    cleanText(entry.outcome || "") === "approved" &&
+    !normalizeTimelineDiffText(entry.diffText ?? "") &&
+    normalizeTimelineFileRefs(entry.fileRefs ?? []).length > 0
+  );
+}
+
+function resolveRecentReadContinuityFileRefs({ entry, cwd, workspaceRoot }) {
+  const normalizedRefs = normalizeTimelineFileRefs(entry?.fileRefs ?? []);
+  if (normalizedRefs.length === 0) {
+    return [];
+  }
+  const resolvedRefs = [];
+  for (const fileRef of normalizedRefs) {
+    const resolved = resolveTrustedReadTargetPath({
+      token: fileRef,
+      cwd,
+      workspaceRoot,
+    });
+    if (resolved) {
+      resolvedRefs.push(resolved);
+    }
+  }
+  return normalizeTimelineFileRefs(resolvedRefs);
+}
+
+function hasRecentSourceReadContinuity({ runtime, state, approval, resolvedFileRefs }) {
+  const normalizedTargets = normalizeTimelineFileRefs(resolvedFileRefs ?? []);
+  if (normalizedTargets.length !== 1) {
+    return false;
+  }
+  const targetFileRef = normalizedTargets[0];
+  const conversationId = cleanText(approval?.conversationId || "");
+  const cwd = cleanText(approval?.cwd || approval?.rawParams?.cwd || approval?.rawParams?.grantRoot || "");
+  const workspaceRoot = cleanText(approval?.workspaceRoot || approval?.rawParams?.grantRoot || cwd);
+  if (!cwd || !workspaceRoot) {
+    return false;
+  }
+  const timelineEntries =
+    Array.isArray(runtime?.recentTimelineEntries) && runtime.recentTimelineEntries.length > 0
+      ? runtime.recentTimelineEntries
+      : normalizeTimelineEntries(state?.recentTimelineEntries ?? [], 40);
+  const now = Date.now();
+  for (const entry of timelineEntries) {
+    if (!isReadContinuityTimelineEntry(entry)) {
+      continue;
+    }
+    const createdAtMs = Number(entry?.createdAtMs) || 0;
+    if (!createdAtMs || now - createdAtMs > AUTO_PILOT_SOURCE_CONTINUITY_WINDOW_MS) {
+      continue;
+    }
+    const entryThreadId = cleanText(entry?.threadId || extractConversationIdFromStableId(entry?.stableId) || "");
+    if (conversationId && entryThreadId && entryThreadId !== conversationId) {
+      continue;
+    }
+    const entryFileRefs = resolveRecentReadContinuityFileRefs({
+      entry,
+      cwd,
+      workspaceRoot,
+    });
+    if (entryFileRefs.includes(targetFileRef)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function classifyTrustedWriteLane({ runtime, state, approval, resolvedFileRefs, diffText, totalChangedLines }) {
+  const lanes = autoPilotWriteLaneState(state);
+  if (
+    lanes.content &&
+    resolvedFileRefs.length >= 1 &&
+    resolvedFileRefs.length <= 3 &&
+    totalChangedLines <= 120 &&
+    resolvedFileRefs.every((fileRef) => isAutoPilotContentWritePath(fileRef))
+  ) {
+    return "content";
+  }
+  if (
+    lanes.uiTests &&
+    resolvedFileRefs.length >= 1 &&
+    resolvedFileRefs.length <= 2 &&
+    totalChangedLines <= 80 &&
+    resolvedFileRefs.every((fileRef) => isAutoPilotUiTestWritePath(fileRef)) &&
+    !hasUnsafeUiOrTestWriteDiff(diffText)
+  ) {
+    return "ui_tests";
+  }
+  if (
+    lanes.source &&
+    resolvedFileRefs.length === 1 &&
+    totalChangedLines <= 40 &&
+    resolvedFileRefs.every((fileRef) => isAutoPilotSourceWritePath(fileRef)) &&
+    !hasUnsafeSourceWriteDiff(diffText) &&
+    hasRecentSourceReadContinuity({ runtime, state, approval, resolvedFileRefs })
+  ) {
+    return "source";
+  }
+  return "";
+}
+
+function resolveTrustedWriteFileRefs({ fileRefs, cwd, workspaceRoot }) {
+  const normalizedRefs = normalizeTimelineFileRefs(fileRefs ?? []);
+  if (normalizedRefs.length === 0 || normalizedRefs.length > 3) {
+    return null;
+  }
+  const resolvedRefs = [];
+  for (const fileRef of normalizedRefs) {
+    const resolved = resolveTrustedReadTargetPath({
+      token: fileRef,
+      cwd,
+      workspaceRoot,
+    });
+    if (!resolved || isDeniedTrustedWritePath(resolved)) {
+      return null;
+    }
+    resolvedRefs.push(resolved);
+  }
+  return normalizeTimelineFileRefs(resolvedRefs);
+}
+
+function sameNormalizedFileRefSet(leftRefs, rightRefs) {
+  const left = normalizeTimelineFileRefs(leftRefs ?? []);
+  const right = normalizeTimelineFileRefs(rightRefs ?? []);
+  if (left.length !== right.length) {
+    return false;
+  }
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
+}
+
+function resolveTrustedWriteDiffSectionFileRefs({ diffSections, cwd, workspaceRoot }) {
+  const resolvedSections = [];
+  for (const section of diffSections) {
+    const paths = extractUnifiedDiffSectionPaths(section);
+    const sectionFileRef = cleanText(paths.newFileRef || paths.oldFileRef || "");
+    if (!sectionFileRef) {
+      return null;
+    }
+    if (paths.oldFileRef && paths.newFileRef && cleanText(paths.oldFileRef) !== cleanText(paths.newFileRef)) {
+      return null;
+    }
+    const resolved = resolveTrustedDiffSectionPath({
+      token: sectionFileRef,
+      cwd,
+      workspaceRoot,
+    });
+    if (!resolved || isDeniedTrustedWritePath(resolved)) {
+      return null;
+    }
+    resolvedSections.push(resolved);
+  }
+  return normalizeTimelineFileRefs(resolvedSections);
+}
+
+function evaluateTrustedWriteApprovalCandidate({ runtime, state, approval }) {
+  const cwd = cleanText(approval?.cwd || approval?.rawParams?.cwd || approval?.rawParams?.grantRoot || "");
+  const workspaceRoot = cleanText(approval?.workspaceRoot || approval?.rawParams?.grantRoot || cwd);
+  const resolvedFileRefs = resolveTrustedWriteFileRefs({
+    fileRefs: approval?.fileRefs ?? [],
+    cwd,
+    workspaceRoot,
+  });
+  const diffText = normalizeTimelineDiffText(approval?.diffText ?? "");
+  if (!cwd || !workspaceRoot || !resolvedFileRefs || !diffText) {
+    return null;
+  }
+  const counts = diffLineCounts(diffText);
+  const totalChangedLines =
+    Math.max(0, Number(counts.addedLines) || 0) +
+    Math.max(0, Number(counts.removedLines) || 0);
+  if (totalChangedLines === 0 || totalChangedLines > 120) {
+    return null;
+  }
+  const diffSections = splitUnifiedDiffTextByFile(diffText);
+  if (diffSections.length === 0 || diffSections.length > 3) {
+    return null;
+  }
+  if (
+    /^(?:new file mode|deleted file mode|rename from|rename to|old mode|new mode|similarity index|dissimilarity index|GIT binary patch|Binary files )/mu.test(diffText)
+  ) {
+    return null;
+  }
+  const diffSectionRefs = resolveTrustedWriteDiffSectionFileRefs({
+    diffSections,
+    cwd,
+    workspaceRoot,
+  });
+  if (!diffSectionRefs || !sameNormalizedFileRefSet(diffSectionRefs, resolvedFileRefs)) {
+    return null;
+  }
+  const lane = classifyTrustedWriteLane({
+    runtime,
+    state: state ?? approval?.stateSnapshot ?? null,
+    approval,
+    resolvedFileRefs: diffSectionRefs,
+    diffText,
+    totalChangedLines,
+  });
+  if (!lane) {
+    return null;
+  }
+  return {
+    fileRefs: diffSectionRefs,
+    diffText,
+    diffAddedLines: Math.max(0, Number(counts.addedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(counts.removedLines) || 0),
+    totalChangedLines,
+    lane,
+  };
+}
+
+function maybeAutoApproveTrustedWriteCandidate({ runtime, state, approval }) {
+  if (!isAutoPilotTrustedWritesEnabled(state)) {
+    return null;
+  }
+  if (cleanText(approval?.kind || "") !== "file") {
+    return null;
+  }
+  return evaluateTrustedWriteApprovalCandidate({
+    runtime,
+    state,
+    approval: { ...approval, stateSnapshot: state },
+  });
+}
+
+function autoPilotTrustedWriteMessage(locale, approval, candidate) {
+  const prefix = t(locale, "server.message.autoPilotTrustedWriteApproved");
+  const fileBlock = candidate?.fileRefs?.length
+    ? `${t(locale, "server.message.filesLabel")}\n\`\`\`text\n${candidate.fileRefs.join("\n")}\n\`\`\``
+    : "";
+  const sizeLine =
+    candidate && Number.isFinite(candidate.diffAddedLines) && Number.isFinite(candidate.diffRemovedLines)
+      ? `${t(locale, "server.message.diffSummaryLabel")} +${candidate.diffAddedLines} / -${candidate.diffRemovedLines}`
+      : "";
+  const originalMessage = cleanText(approval?.messageText || "");
+  return [prefix, sizeLine, fileBlock, originalMessage].filter(Boolean).join("\n\n");
+}
+
+async function recordAutoApprovedTrustedRead({
+  config,
+  runtime,
+  state,
+  approval,
+  policyMatch,
+}) {
+  const stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "approval",
+    stableId: `approval:${approval.requestKey}:autopilot`,
+    token: approval.token,
+    title: approval.title,
+    threadLabel: approval.threadLabel || "",
+    messageText: autoPilotApprovalMessage(config.defaultLocale, policyMatch.commandText),
+    summary: t(config.defaultLocale, "server.message.autoPilotTrustedReadSummary"),
+    fileRefs: normalizeTimelineFileRefs(policyMatch.fileRefs ?? approval.fileRefs ?? []),
+    diffText: "",
+    diffSource: "",
+    diffAvailable: false,
+    diffAddedLines: 0,
+    diffRemovedLines: 0,
+    outcome: "approved",
+    provider: approval.provider || "codex",
+  });
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function recordAutoApprovedTrustedWrite({
+  config,
+  runtime,
+  state,
+  approval,
+  candidate,
+}) {
+  const stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "approval",
+    stableId: `approval:${approval.requestKey}:autopilot-write:${candidate.lane || "content"}`,
+    token: approval.token,
+    title: approval.title,
+    threadLabel: approval.threadLabel || "",
+    messageText: autoPilotTrustedWriteMessage(config.defaultLocale, approval, candidate),
+    summary: t(config.defaultLocale, "server.message.autoPilotTrustedWriteSummary"),
+    fileRefs: candidate.fileRefs,
+    diffText: candidate.diffText,
+    diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
+    diffAvailable: true,
+    diffAddedLines: candidate.diffAddedLines,
+    diffRemovedLines: candidate.diffRemovedLines,
+    outcome: "approved",
+    provider: approval.provider || "codex",
+  });
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function autoApproveTrustedRead({
+  config,
+  runtime,
+  state,
+  approval,
+  policyMatch,
+}) {
+  if (approval.provider === "claude" && approval.resolveClaudeWaiter) {
+    approval.resolveClaudeWaiter({
+      permissionDecision: "allow",
+      permissionDecisionReason: t(config.defaultLocale, "server.message.autoPilotTrustedReadReason"),
+    });
+  } else if (approval.provider !== "claude") {
+    await runtime.ipcClient?.sendApprovalDecision(approval, "accept");
+  }
+  approval.resolved = true;
+  approval.resolving = false;
+  runtime.nativeApprovalsByToken.delete(approval.token);
+  runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+  await recordAutoApprovedTrustedRead({
+    config,
+    runtime,
+    state,
+    approval,
+    policyMatch,
+  });
+  console.log(`[auto-pilot-approved] ${approval.requestKey} | ${policyMatch.command}`);
+}
+
+async function autoApproveTrustedWrite({
+  config,
+  runtime,
+  state,
+  approval,
+  candidate,
+}) {
+  if (approval.provider === "claude" && approval.resolveClaudeWaiter) {
+    approval.resolveClaudeWaiter({
+      permissionDecision: "allow",
+      permissionDecisionReason: t(config.defaultLocale, "server.message.autoPilotTrustedWriteReason"),
+    });
+  } else if (approval.provider !== "claude") {
+    await runtime.ipcClient?.sendApprovalDecision(approval, "accept");
+  }
+  approval.resolved = true;
+  approval.resolving = false;
+  runtime.nativeApprovalsByToken.delete(approval.token);
+  runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+  await recordAutoApprovedTrustedWrite({
+    config,
+    runtime,
+    state,
+    approval,
+    candidate,
+  });
+  console.log(`[auto-pilot-approved-write] ${approval.requestKey} | files=${candidate.fileRefs.length} | lines=${candidate.totalChangedLines}`);
+}
+
 async function handleNativeApprovalDecision({ config, runtime, state, approval, decision }) {
   if (approval.resolveClaudeWaiter) {
     if (approval.provider === "claude" && approval.kind === "plan") {
@@ -11113,7 +12357,7 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   if (kind === "approval") {
     const approval = runtime.nativeApprovalsByToken.get(token);
     if (approval) {
-      return buildPendingApprovalDetail(runtime, approval, locale);
+      return buildPendingApprovalDetail(runtime, state, approval, locale);
     }
     const historicalApproval = historyItemByToken(runtime, kind, token);
     return historicalApproval ? buildHistoryDetail(historicalApproval, locale, runtime) : null;
@@ -11782,6 +13026,74 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         await syncClaudeAwayModeSentinel(config, enabled);
         return writeJson(res, 200, { ok: true, enabled });
+      }
+
+      if (url.pathname === "/api/settings/auto-pilot" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        let payload;
+        try {
+          payload = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+        const trustedReadsEnabled =
+          typeof payload?.trustedReadsEnabled === "boolean"
+            ? payload.trustedReadsEnabled === true
+            : state.autoPilotTrustedReads === true;
+        const hasLaneUpdate =
+          typeof payload?.writeLaneContentEnabled === "boolean" ||
+          typeof payload?.writeLaneUiTestsEnabled === "boolean" ||
+          typeof payload?.writeLaneSourceEnabled === "boolean";
+        const legacyTrustedWritesEnabled =
+          typeof payload?.trustedWritesEnabled === "boolean"
+            ? payload.trustedWritesEnabled === true
+            : typeof payload?.trustedWritesShadowEnabled === "boolean"
+              ? payload.trustedWritesShadowEnabled === true
+              : null;
+        const currentLanes = autoPilotWriteLaneState(state);
+        const writeLaneContentEnabled =
+          typeof payload?.writeLaneContentEnabled === "boolean"
+            ? payload.writeLaneContentEnabled === true
+            : !hasLaneUpdate && legacyTrustedWritesEnabled != null
+              ? legacyTrustedWritesEnabled
+              : currentLanes.content;
+        const writeLaneUiTestsEnabled =
+          typeof payload?.writeLaneUiTestsEnabled === "boolean"
+            ? payload.writeLaneUiTestsEnabled === true
+            : currentLanes.uiTests;
+        const writeLaneSourceEnabled =
+          typeof payload?.writeLaneSourceEnabled === "boolean"
+            ? payload.writeLaneSourceEnabled === true
+            : currentLanes.source;
+        const trustedWritesEnabled =
+          writeLaneContentEnabled || writeLaneUiTestsEnabled || writeLaneSourceEnabled;
+        if (
+          state.autoPilotTrustedReads !== trustedReadsEnabled ||
+          state.autoPilotWriteLaneContent !== writeLaneContentEnabled ||
+          state.autoPilotWriteLaneUiTests !== writeLaneUiTestsEnabled ||
+          state.autoPilotWriteLaneSource !== writeLaneSourceEnabled ||
+          isAutoPilotTrustedWritesEnabled(state) !== trustedWritesEnabled
+        ) {
+          state.autoPilotTrustedReads = trustedReadsEnabled;
+          state.autoPilotTrustedWrites = trustedWritesEnabled;
+          state.autoPilotTrustedWritesShadow = false;
+          state.autoPilotWriteLaneContent = writeLaneContentEnabled;
+          state.autoPilotWriteLaneUiTests = writeLaneUiTestsEnabled;
+          state.autoPilotWriteLaneSource = writeLaneSourceEnabled;
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          trustedReadsEnabled,
+          trustedWritesEnabled,
+          trustedWritesShadowEnabled: false,
+          writeLaneContentEnabled,
+          writeLaneUiTestsEnabled,
+          writeLaneSourceEnabled,
+        });
       }
 
       if (url.pathname === "/api/settings/a2a-executor" && req.method === "POST") {
@@ -12640,6 +13952,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
           diffSource: String(body.diffSource || "claude_permission_request"),
           diffAddedLines: Math.max(0, Number(body.diffAddedLines) || 0),
           diffRemovedLines: Math.max(0, Number(body.diffRemovedLines) || 0),
+          cwd: body.cwd ? String(body.cwd) : "",
+          workspaceRoot: body.cwd ? String(body.cwd) : "",
           createdAtMs: Number(body.createdAtMs) || Date.now(),
           resolved: false,
           resolving: false,
@@ -12652,6 +13966,59 @@ function createNativeApprovalServer({ config, runtime, state }) {
           notifyOnly: body.notifyOnly === true,
           readOnly: body.notifyOnly === true,
         };
+
+        const claudeAutoPilotMatch =
+          approval.kind === "command"
+            ? maybeAutoApproveTrustedRead({
+                state,
+                commandText: body?.toolInput?.command ?? "",
+                cwd: body.cwd ? String(body.cwd) : "",
+                workspaceRoot: body.cwd ? String(body.cwd) : "",
+              })
+            : null;
+        if (claudeAutoPilotMatch) {
+          try {
+            await recordAutoApprovedTrustedRead({
+              config,
+              runtime,
+              state,
+              approval,
+              policyMatch: claudeAutoPilotMatch,
+            });
+            console.log(`[auto-pilot-approved] ${approval.requestKey} | ${claudeAutoPilotMatch.command}`);
+            return writeJson(res, 200, {
+              permissionDecision: "allow",
+              permissionDecisionReason: t(config.defaultLocale, "server.message.autoPilotTrustedReadReason"),
+            });
+          } catch (error) {
+            console.error(`[auto-pilot-error] ${approval.requestKey} | ${error.message}`);
+          }
+        }
+
+        const claudeAutoPilotWriteCandidate =
+          approval.kind === "file"
+            ? maybeAutoApproveTrustedWriteCandidate({ runtime, state, approval })
+            : null;
+        if (claudeAutoPilotWriteCandidate) {
+          try {
+            await recordAutoApprovedTrustedWrite({
+              config,
+              runtime,
+              state,
+              approval,
+              candidate: claudeAutoPilotWriteCandidate,
+            });
+            console.log(
+              `[auto-pilot-approved-write] ${approval.requestKey} | files=${claudeAutoPilotWriteCandidate.fileRefs.length} | lines=${claudeAutoPilotWriteCandidate.totalChangedLines}`
+            );
+            return writeJson(res, 200, {
+              permissionDecision: "allow",
+              permissionDecisionReason: t(config.defaultLocale, "server.message.autoPilotTrustedWriteReason"),
+            });
+          } catch (error) {
+            console.error(`[auto-pilot-write-error] ${approval.requestKey} | ${error.message}`);
+          }
+        }
 
         runtime.nativeApprovalsByToken.set(token, approval);
         runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
@@ -15443,6 +16810,23 @@ async function loadState(stateFile) {
   try {
     const raw = await fs.readFile(stateFile, "utf8");
     const parsed = JSON.parse(raw);
+    const hasExplicitWriteLaneState =
+      typeof parsed.autoPilotWriteLaneContent === "boolean" ||
+      typeof parsed.autoPilotWriteLaneUiTests === "boolean" ||
+      typeof parsed.autoPilotWriteLaneSource === "boolean";
+    const legacyTrustedWritesEnabled = parsed.autoPilotTrustedWrites === true || parsed.autoPilotTrustedWritesShadow === true;
+    const autoPilotWriteLaneContent =
+      typeof parsed.autoPilotWriteLaneContent === "boolean"
+        ? parsed.autoPilotWriteLaneContent === true
+        : !hasExplicitWriteLaneState && legacyTrustedWritesEnabled;
+    const autoPilotWriteLaneUiTests =
+      typeof parsed.autoPilotWriteLaneUiTests === "boolean"
+        ? parsed.autoPilotWriteLaneUiTests === true
+        : false;
+    const autoPilotWriteLaneSource =
+      typeof parsed.autoPilotWriteLaneSource === "boolean"
+        ? parsed.autoPilotWriteLaneSource === true
+        : false;
     return {
       fileOffsets: parsed.fileOffsets ?? {},
       seenEvents: parsed.seenEvents ?? {},
@@ -15468,6 +16852,12 @@ async function loadState(stateFile) {
       pairingConsumedAt: Number(parsed.pairingConsumedAt) || 0,
       pairingConsumedCredential: cleanText(parsed.pairingConsumedCredential ?? ""),
       claudeAwayMode: parsed.claudeAwayMode === true,
+      autoPilotTrustedReads: parsed.autoPilotTrustedReads === true,
+      autoPilotTrustedWrites: autoPilotWriteLaneContent || autoPilotWriteLaneUiTests || autoPilotWriteLaneSource,
+      autoPilotTrustedWritesShadow: false,
+      autoPilotWriteLaneContent,
+      autoPilotWriteLaneUiTests,
+      autoPilotWriteLaneSource,
       a2aAcceptPublicTasks: parsed.a2aAcceptPublicTasks === true,
     };
   } catch {
@@ -15496,6 +16886,12 @@ async function loadState(stateFile) {
       pairingConsumedAt: 0,
       pairingConsumedCredential: "",
       claudeAwayMode: false,
+      autoPilotTrustedReads: false,
+      autoPilotTrustedWrites: false,
+      autoPilotTrustedWritesShadow: false,
+      autoPilotWriteLaneContent: false,
+      autoPilotWriteLaneUiTests: false,
+      autoPilotWriteLaneSource: false,
     };
   }
 }
