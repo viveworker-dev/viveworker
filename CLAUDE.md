@@ -367,6 +367,36 @@ When the user asks to share context across threads, for example:
 - "Share just the recent conversation"
 - "Share the entire thread"
 
+### Natural-language triggers
+
+When the user says things like:
+- 「それを Codex の〇〇 に伝えて / 渡して / 共有して」
+- 「〇〇 スレッドに forward して」
+- "send that to codex [label]"
+- "share that with [thread]"
+
+…treat it as a request to POST the agent's **most recent assistant message** to the named thread as a `shareType: "message"`, reusing the existing `/api/threads/share` endpoint documented below.
+
+**Resolution rules:**
+
+1. **"それ" / "that"** — default to the agent's most recent assistant message in the current session (the reply the user just read). If the user points elsewhere explicitly ("the plan I wrote 3 turns ago"), use that span instead.
+
+2. **Thread name** — call `GET /api/threads/list`, then match against the `label` field:
+   - Unique exact or case-insensitive substring match → send directly.
+   - Multiple matches → list the top candidates with `conversationId`, `tool`, and `lastSeenAtMs`, ask the user to pick.
+   - No match → tell the user and list a few candidates as a hint.
+   - If the user said "Codex" but the matched thread's `tool` is `claude-code` (or vice versa), surface the mismatch before sending.
+
+3. **`shareType`** — default `"message"`. Upgrade only if the trigger explicitly asks:
+   - 「handoff として」/ "as a handoff" → `"handoff"`, fill in `summary`/`completed`/`remaining`/`decisions`/`modifiedFiles` from conversation context.
+   - 「plan review として」/ "as a plan review" → `"plan_review"`, fill in `plan`/`context`/`files`.
+
+4. **`sourceLabel`** — auto-fill as `"<Tool name> (<cwd basename>)"`, e.g. `"Claude Code (viveworker)"`.
+
+5. **Codex disconnected** (`codexConnected: false`) — still send (will fall through to the file inbox), but warn the user that delivery happens only once Codex reconnects.
+
+6. **Always report back** the `shareId` and remind the user they can edit/approve/deny on the phone before delivery.
+
 ### Prerequisites
 
 - The bridge must be running (`viveworker start`).
