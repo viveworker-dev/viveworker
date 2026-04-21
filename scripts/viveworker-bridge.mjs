@@ -12,6 +12,7 @@ import process from "node:process";
 import { createInterface } from "node:readline";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 import webPush from "web-push";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
@@ -38,6 +39,152 @@ const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
+
+// Shared memo for buildDiffThreadGroups. Each call spawns 3 git subprocesses
+// per tracked repo (`git diff --name-status`, `git status --porcelain`,
+// `git diff`) plus a `git rev-parse` per unique dir — roughly 10+ subprocess
+// spawns for a typical multi-repo state. Both /api/inbox/diff and
+// /api/items/diff_thread/:token call this function; when the user taps a
+// detail right after the inbox finished loading, the computation is
+// duplicated unnecessarily. Short TTL + explicit invalidation when
+// recentCodeEvents mutates keeps the result fresh without the recompute cost.
+// Hoisted here so code-event migration at startup can call
+// invalidateDiffThreadGroupsCache() before any of the use sites below
+// execute, avoiding a temporal-dead-zone ReferenceError on `let`.
+const DIFF_THREAD_GROUPS_CACHE_TTL_MS = 3000;
+let diffThreadGroupsCache = null;
+let diffThreadGroupsPending = null;
+
+function invalidateDiffThreadGroupsCache() {
+  diffThreadGroupsCache = null;
+  // Don't touch diffThreadGroupsPending — an in-flight build reflects the
+  // state at the time it started, and callers racing the rebuild would
+  // otherwise pile up their own subprocess spawns.
+}
+
+async function getDiffThreadGroupsCached(runtime, state, config) {
+  const now = Date.now();
+  if (
+    diffThreadGroupsCache &&
+    now - diffThreadGroupsCache.computedAtMs < DIFF_THREAD_GROUPS_CACHE_TTL_MS
+  ) {
+    return diffThreadGroupsCache.groups;
+  }
+  if (diffThreadGroupsPending) {
+    return diffThreadGroupsPending;
+  }
+  diffThreadGroupsPending = (async () => {
+    try {
+      const groups = await buildDiffThreadGroups(runtime, state, config);
+      diffThreadGroupsCache = { groups, computedAtMs: Date.now() };
+      return groups;
+    } finally {
+      diffThreadGroupsPending = null;
+    }
+  })();
+  return diffThreadGroupsPending;
+}
+
+// Coalesced state persistence. The full state JSON is ~8 MB on disk (dominated
+// by `recentCodeEvents` and `recentTimelineEntries` caches); JSON.stringify
+// blocks the event loop ~70 ms and fs.writeFile takes another ~80 ms. Before
+// this helper, every tiny mutation (push subscribe/unsubscribe/test, locale
+// change, claude-away toggle, A2A toggles, …) awaited a ~150 ms
+// serialize+write before the HTTP response fired — and the event-loop block
+// delayed every concurrent request on the same server too. That's what made
+// the settings/notification buttons feel sluggish: the click → visible
+// response round-trip paid the cost of re-serializing 5 MB of code-event
+// history every time.
+//
+// `scheduleSaveState` queues a write within SAVE_STATE_DEBOUNCE_MS and returns
+// synchronously, so HTTP handlers can respond immediately after mutating
+// in-memory state. Multiple mutations within the window coalesce into one
+// write. `flushPendingStateWrite` drains on graceful shutdown.
+//
+// Durability trade-off: at most ~SAVE_STATE_MAX_DELAY_MS of in-memory
+// mutations can be lost on a hard crash. Callers that require stronger
+// guarantees (pairing, revocation, the periodic scan loop) still `await
+// saveState(...)` directly — only the hot settings/notification paths opt in
+// to the coalescer.
+const SAVE_STATE_DEBOUNCE_MS = 500;
+const SAVE_STATE_MAX_DELAY_MS = 1500;
+let saveStateTimer = null;
+let saveStateFirstScheduleAtMs = 0;
+let saveStateInFlight = null;
+let saveStateDirty = false;
+
+function scheduleSaveState(config, state) {
+  if (!config?.stateFile) return;
+  if (saveStateInFlight) {
+    // An in-flight write already reflects the current (or earlier) state.
+    // Mark dirty so the .finally handler starts another write when it
+    // finishes — overlapping writes would just stomp on each other.
+    saveStateDirty = true;
+    return;
+  }
+  const now = Date.now();
+  if (!saveStateFirstScheduleAtMs) {
+    saveStateFirstScheduleAtMs = now;
+  }
+  if (saveStateTimer) {
+    clearTimeout(saveStateTimer);
+  }
+  const elapsed = now - saveStateFirstScheduleAtMs;
+  const remaining = SAVE_STATE_MAX_DELAY_MS - elapsed;
+  const delay = Math.max(0, Math.min(SAVE_STATE_DEBOUNCE_MS, remaining));
+  saveStateTimer = setTimeout(() => {
+    saveStateTimer = null;
+    saveStateFirstScheduleAtMs = 0;
+    startSaveStateFlush(config, state);
+  }, delay);
+}
+
+function startSaveStateFlush(config, state) {
+  saveStateDirty = false;
+  const promise = (async () => {
+    try {
+      await saveState(config.stateFile, state);
+    } catch (error) {
+      console.error(`[save-state-error] ${error.message}`);
+    }
+  })();
+  saveStateInFlight = promise;
+  promise.finally(() => {
+    if (saveStateInFlight === promise) {
+      saveStateInFlight = null;
+    }
+    if (saveStateDirty) {
+      // A mutation arrived mid-flight. Start the follow-up write
+      // synchronously — we've already held the original debounce window,
+      // so tacking on another 500 ms would defeat coalescing. Going
+      // through scheduleSaveState() instead would also introduce a timer
+      // that flushPendingStateWrite() would have to know about.
+      saveStateDirty = false;
+      startSaveStateFlush(config, state);
+    }
+  });
+}
+
+async function flushPendingStateWrite(config, state) {
+  // Promote any pending debounce timer to an immediate flush.
+  if (saveStateTimer) {
+    clearTimeout(saveStateTimer);
+    saveStateTimer = null;
+    saveStateFirstScheduleAtMs = 0;
+    startSaveStateFlush(config, state);
+  }
+  // Drain the in-flight write plus any cascades triggered by saveStateDirty.
+  // Bounded so a pathological re-entrancy bug can't hang shutdown.
+  for (let iter = 0; iter < 4 && (saveStateInFlight || saveStateDirty); iter += 1) {
+    if (saveStateInFlight) {
+      await saveStateInFlight.catch(() => {});
+    }
+    if (saveStateDirty && !saveStateInFlight) {
+      saveStateDirty = false;
+      startSaveStateFlush(config, state);
+    }
+  }
+}
 
 const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
@@ -2305,9 +2452,40 @@ function normalizeTimelineEntries(rawItems, maxItems) {
   const perProviderCount = {};
   const knownProviders = new Set(["codex", "claude", "moltbook", "a2a", "viveworker"]);
   const saturatedProviders = new Set();
+  // Content-based dedup for user_message entries: the same logical user turn
+  // can surface through two independent readers (rollout session files and
+  // ~/.codex/history.jsonl) that compute different stableIds
+  // (`user_message:<threadId>:<turn_id|ISO-ts>` vs
+  // `user_message:<threadId>:<integer-id|unix-seconds>`), so the stableId-only
+  // filter above doesn't catch them. Collapse entries with the same
+  // (threadId, messageText) pair when their createdAtMs are within 60 s —
+  // wide enough to absorb rollout-vs-history-file flush skew (we've seen
+  // several seconds in the wild) but narrow enough not to collapse a genuine
+  // repeat (e.g. user retries the same "run tests" command minutes apart).
+  // Literal here rather than a named const because this function is first
+  // called at top-level module init (line ~302) which runs before any const
+  // declared below would leave the TDZ.
+  const userMessageDedupWindowMs = 60_000;
+  const userMessageIndex = new Map();
   for (const item of normalized) {
     if (seen.has(item.stableId)) {
       continue;
+    }
+    if (item.kind === "user_message") {
+      const threadKey = cleanText(item.threadId || "");
+      const textKey = cleanText(item.messageText || "");
+      if (threadKey && textKey) {
+        const key = `${threadKey}\u0001${textKey}`;
+        const existingMs = userMessageIndex.get(key);
+        const itemMs = Number(item.createdAtMs || 0);
+        if (
+          existingMs !== undefined &&
+          Math.abs(existingMs - itemMs) <= userMessageDedupWindowMs
+        ) {
+          continue;
+        }
+        userMessageIndex.set(key, itemMs);
+      }
     }
     const prov = item.provider || "codex";
     if (saturatedProviders.has(prov)) {
@@ -2352,6 +2530,7 @@ function migrateRecentCodeEventsState({ config, runtime, state }) {
   const previousItems = Array.isArray(state.recentCodeEvents) ? normalizeCodeEvents(state.recentCodeEvents, config.maxCodeEvents) : [];
   runtime.recentCodeEvents = nextItems;
   state.recentCodeEvents = nextItems;
+  invalidateDiffThreadGroupsCache();
   return JSON.stringify(nextItems) !== JSON.stringify(previousItems);
 }
 
@@ -2563,6 +2742,9 @@ function recordCodeEvent({ config, runtime, state, entry }) {
     );
   runtime.recentCodeEvents = nextItems;
   state.recentCodeEvents = nextItems;
+  if (changed) {
+    invalidateDiffThreadGroupsCache();
+  }
   return changed;
 }
 
@@ -2614,6 +2796,9 @@ function syncRecentCodeEventsFromTimeline({ config, runtime, state }) {
     );
   runtime.recentCodeEvents = nextItems;
   state.recentCodeEvents = nextItems;
+  if (changed) {
+    invalidateDiffThreadGroupsCache();
+  }
   return changed;
 }
 
@@ -8724,10 +8909,26 @@ function markDevicePaired(state, config, deviceId, metadata = {}, now = Date.now
   return JSON.stringify(previous ?? null) !== JSON.stringify(next);
 }
 
+const TOUCH_DEVICE_TRUST_DEBOUNCE_MS = 60_000;
+
 function touchDeviceTrust(state, config, deviceId, now = Date.now()) {
   const normalizedDeviceId = cleanText(deviceId || "");
   const current = getActiveDeviceTrustRecord(state, config, normalizedDeviceId, now);
   if (!normalizedDeviceId || !current) {
+    return false;
+  }
+
+  // Debounce: `lastAuthenticatedAtMs` is bumped to `now` on every
+  // authenticated request. Without this guard, every `/api/session`
+  // (and `/api/bootstrap`) call flags the record as "changed" and the
+  // caller runs a full `saveState`, which synchronously stringifies an
+  // 8+ MB state.json on the main thread and starves the event loop —
+  // driving TLS handshake latency for any in-flight connection into the
+  // seconds range. Skip the write when we've touched it recently; the
+  // next real change (pairing, revocation, locale update, etc.) still
+  // goes through unchanged.
+  const previousTouch = Number(current.lastAuthenticatedAtMs) || 0;
+  if (previousTouch > 0 && now - previousTouch < TOUCH_DEVICE_TRUST_DEBOUNCE_MS) {
     return false;
   }
 
@@ -8850,6 +9051,22 @@ function buildDeviceSummary({ config, state, deviceId, record, currentDeviceId, 
     standalone: subscription?.standalone === true || record?.standalone === true,
     locale: localeInfo.locale || "",
     displayName: buildDeviceDisplayName({ record, localeInfo, deviceId, locale }),
+  };
+}
+
+// Shared between `/api/session` and `/api/bootstrap` so both return an
+// identical session shape.
+function buildSessionPayload({ config, state, session }) {
+  return {
+    authenticated: Boolean(session.authenticated),
+    expiresAtMs: Number(session.expiresAtMs) || 0,
+    pairingAvailable: isPairingAvailableForState(config, state),
+    webPushEnabled: config.webPushEnabled,
+    httpsEnabled: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
+    appVersion: appPackageVersion,
+    deviceId: session.deviceId || null,
+    temporaryPairing: session.temporaryPairing === true,
+    ...buildSessionLocalePayload(config, state, session.deviceId),
   };
 }
 
@@ -9608,7 +9825,7 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
 }
 
 async function buildDiffInboxItems(runtime, state, config, locale) {
-  return (await buildDiffThreadGroups(runtime, state, config)).map((group) => ({
+  return (await getDiffThreadGroupsCached(runtime, state, config)).map((group) => ({
     kind: "diff_thread",
     token: group.token,
     threadId: group.threadId,
@@ -9767,11 +9984,21 @@ async function buildDiffThreadGroups(runtime, state, config) {
     .sort((left, right) => Number(right.latestChangedAtMs ?? 0) - Number(left.latestChangedAtMs ?? 0));
 }
 
-async function buildInboxResponse(runtime, state, config, locale) {
+// Split into two halves so `/api/inbox` (pending + completed) returns
+// without waiting on the diff build, which spawns `git` subprocesses per
+// tracked repo inside `buildCurrentUnstagedChangesForRepo`. The diff half
+// is served from `/api/inbox/diff` and fetched separately by the PWA so
+// it doesn't block first paint of the inbox/completed lists.
+function buildInboxFastResponse(runtime, state, config, locale) {
   return {
     pending: buildPendingInboxItems(runtime, state, config, locale),
-    diff: await buildDiffInboxItems(runtime, state, config, locale),
     completed: buildCompletedInboxItems(runtime, state, config, locale),
+  };
+}
+
+async function buildInboxDiffResponse(runtime, state, config, locale) {
+  return {
+    diff: await buildDiffInboxItems(runtime, state, config, locale),
   };
 }
 
@@ -11047,7 +11274,7 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
 
 async function buildApiItemDetail({ config, runtime, state, kind, token, locale }) {
   if (kind === "diff_thread") {
-    const group = (await buildDiffThreadGroups(runtime, state, config)).find((entry) => entry.token === token);
+    const group = (await getDiffThreadGroupsCached(runtime, state, config)).find((entry) => entry.token === token);
     return group ? buildDiffThreadDetail(group, locale) : null;
   }
   if (kind === "file_event") {
@@ -11343,21 +11570,81 @@ function contentTypeForFile(filePath) {
   }
 }
 
-async function serveWebAsset(res, urlPath) {
+// Per-file cache of {raw, gzip, mtimeMs}. Gzip of the ~464KB app shell
+// (app.js 278KB + app.css 76KB + i18n.js 110KB) takes a few ms to compute,
+// and without this the bridge would recompress on every request. Keyed by
+// resolved filePath so /app and /index.html share a cache slot.
+const WEB_ASSET_CACHE = new Map();
+const GZIPPABLE_EXTENSIONS = new Set([
+  ".js",
+  ".mjs",
+  ".css",
+  ".html",
+  ".htm",
+  ".json",
+  ".webmanifest",
+  ".svg",
+  ".txt",
+  ".map",
+]);
+const MIN_GZIP_BYTES = 512;
+
+async function loadWebAssetEntry(filePath) {
+  const stat = await fs.stat(filePath);
+  const cached = WEB_ASSET_CACHE.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached;
+  }
+  const raw = await fs.readFile(filePath);
+  const extension = path.extname(filePath).toLowerCase();
+  let gzip = null;
+  if (GZIPPABLE_EXTENSIONS.has(extension) && raw.length >= MIN_GZIP_BYTES) {
+    try {
+      gzip = zlib.gzipSync(raw, { level: 6 });
+    } catch {
+      gzip = null;
+    }
+  }
+  const entry = {
+    raw,
+    gzip,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    contentType: contentTypeForFile(filePath),
+  };
+  WEB_ASSET_CACHE.set(filePath, entry);
+  return entry;
+}
+
+function clientAcceptsGzip(req) {
+  const header = req?.headers?.["accept-encoding"];
+  if (!header) return false;
+  const value = Array.isArray(header) ? header.join(",") : String(header);
+  return /\bgzip\b/i.test(value);
+}
+
+async function serveWebAsset(res, urlPath, req) {
   const filePath = resolveWebAsset(urlPath);
   if (!filePath) {
     return false;
   }
 
   try {
-    const body = await fs.readFile(filePath);
+    const entry = await loadWebAssetEntry(filePath);
+    const wantsGzip = entry.gzip && clientAcceptsGzip(req);
     res.statusCode = 200;
-    res.setHeader("Content-Type", contentTypeForFile(filePath));
+    res.setHeader("Content-Type", entry.contentType);
     res.setHeader("Cache-Control", "no-store, max-age=0");
     if (urlPath === "/sw.js") {
       res.setHeader("Service-Worker-Allowed", "/");
     }
-    res.end(body);
+    if (wantsGzip) {
+      res.setHeader("Content-Encoding", "gzip");
+      res.setHeader("Vary", "Accept-Encoding");
+      res.end(entry.gzip);
+    } else {
+      res.end(entry.raw);
+    }
     return true;
   } catch {
     return false;
@@ -11492,7 +11779,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         url.pathname === "/sw.js" ||
         url.pathname.startsWith("/icons/")
       ) {
-        const served = await serveWebAsset(res, url.pathname);
+        const served = await serveWebAsset(res, url.pathname, req);
         if (served) {
           return;
         }
@@ -11632,16 +11919,41 @@ function createNativeApprovalServer({ config, runtime, state }) {
         if (session.authenticated && session.restoredFromDevice) {
           setSessionCookie(res, config);
         }
+        return writeJson(res, 200, buildSessionPayload({ config, state, session }));
+      }
+
+      // Collapses the PWA's boot-time fan-out (session + inbox + timeline
+      // + devices) into a single HTTPS round-trip. iOS Safari tears down
+      // connections aggressively, so each parallel fetch pays its own
+      // TLS handshake — and `JSON.stringify(state)` hiccups on other
+      // requests make those handshakes bursty. One endpoint = one
+      // handshake + one response, which drops the "Completed list is
+      // blank for several seconds after launch" latency floor.
+      if (url.pathname === "/api/bootstrap" && req.method === "GET") {
+        const session = readSession(req, config, state);
+        const localeInfo = resolveDeviceLocaleInfo(config, state, session.deviceId);
+        if (session.authenticated && session.deviceId) {
+          const trustChanged = touchDeviceTrust(state, config, session.deviceId);
+          const metadataChanged = updateCurrentDeviceSnapshot(state, config, session.deviceId, {
+            userAgent: requestUserAgent(req),
+            lastLocale: localeInfo.locale,
+          });
+          if (trustChanged || metadataChanged) {
+            await saveState(config.stateFile, state);
+          }
+        }
+        if (session.authenticated && session.restoredFromDevice) {
+          setSessionCookie(res, config);
+        }
+        const sessionPayload = buildSessionPayload({ config, state, session });
+        if (!session.authenticated) {
+          return writeJson(res, 200, { session: sessionPayload });
+        }
         return writeJson(res, 200, {
-          authenticated: Boolean(session.authenticated),
-          expiresAtMs: Number(session.expiresAtMs) || 0,
-          pairingAvailable: isPairingAvailableForState(config, state),
-          webPushEnabled: config.webPushEnabled,
-          httpsEnabled: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
-          appVersion: appPackageVersion,
-          deviceId: session.deviceId || null,
-          temporaryPairing: session.temporaryPairing === true,
-          ...buildSessionLocalePayload(config, state, session.deviceId),
+          session: sessionPayload,
+          inbox: buildInboxFastResponse(runtime, state, config, localeInfo.locale),
+          timeline: buildTimelineResponse(runtime, state, config, localeInfo.locale),
+          devices: buildDevicesResponse({ config, state, session, locale: localeInfo.locale }),
         });
       }
 
@@ -11756,7 +12068,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           lastLocale: resolveDeviceLocaleInfo(config, state, session.deviceId).locale,
         }) || changed;
         if (changed) {
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
         }
         return writeJson(res, 200, {
           ok: true,
@@ -11778,7 +12090,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const enabled = payload?.enabled === true;
         if (state.claudeAwayMode !== enabled) {
           state.claudeAwayMode = enabled;
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
         }
         await syncClaudeAwayModeSentinel(config, enabled);
         return writeJson(res, 200, { ok: true, enabled });
@@ -11797,7 +12109,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const preference = valid.has(payload?.preference) ? payload.preference : "auto";
         if (state.a2aExecutorPreference !== preference) {
           state.a2aExecutorPreference = preference;
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
         }
         return writeJson(res, 200, { ok: true, preference });
       }
@@ -11975,11 +12287,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const accept = body?.accept === true;
         config.a2aAcceptPublicTasks = accept;
         state.a2aAcceptPublicTasks = accept;
-        try {
-          await saveState(config.stateFile, state);
-        } catch (error) {
-          console.error(`[a2a-public-tasks-save] ${error.message}`);
-        }
+        scheduleSaveState(config, state);
         // Re-register with relay to propagate the flag.
         if (config.a2aRelayUrl && config.a2aRelayUserId) {
           try {
@@ -12393,7 +12701,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           lastLocale: resolveDeviceLocaleInfo(config, state, session.deviceId).locale,
         });
         if (changed || metadataChanged) {
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
         }
         return writeJson(res, 200, {
           ok: true,
@@ -12416,7 +12724,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           changed = deletePushSubscriptionsForDevice(state, session.deviceId) || changed;
         }
         if (changed) {
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
         }
         return writeJson(res, 200, { ok: true, subscribed: false });
       }
@@ -12428,13 +12736,13 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         try {
           await sendPushTestToDevice({ config, state, session });
-          await saveState(config.stateFile, state);
+          scheduleSaveState(config, state);
           return writeJson(res, 200, { ok: true });
         } catch (error) {
           const statusCode = Number(error?.statusCode) || 0;
           if (statusCode === 404 || statusCode === 410) {
             deletePushSubscriptionsForDevice(state, session.deviceId);
-            await saveState(config.stateFile, state);
+            scheduleSaveState(config, state);
             return writeJson(res, 410, { error: "push-subscription-expired" });
           }
           return writeJson(res, 500, {
@@ -13089,7 +13397,16 @@ function createNativeApprovalServer({ config, runtime, state }) {
           return;
         }
         const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
-        return writeJson(res, 200, await buildInboxResponse(runtime, state, config, locale));
+        return writeJson(res, 200, buildInboxFastResponse(runtime, state, config, locale));
+      }
+
+      if (url.pathname === "/api/inbox/diff" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+        return writeJson(res, 200, await buildInboxDiffResponse(runtime, state, config, locale));
       }
 
       if (url.pathname === "/api/timeline" && req.method === "GET") {
@@ -15520,7 +15837,11 @@ async function syncClaudeAwayModeSentinel(config, enabled) {
 }
 
 async function saveState(stateFile, state) {
-  const output = JSON.stringify(state, null, 2);
+  // No indent. The state file is ~8 MB and humans don't read it; pretty-print
+  // just costs a few extra ms of stringify and ~10% more bytes on disk. The
+  // single newline at the end keeps diffs/hexdumps working on the off chance
+  // someone cats the file.
+  const output = JSON.stringify(state);
   await fs.mkdir(path.dirname(stateFile), { recursive: true });
   await fs.writeFile(stateFile, `${output}\n`, "utf8");
 }
@@ -16128,6 +16449,7 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
   ) {
     runtime.recentCodeEvents = nextCodeEvents;
     state.recentCodeEvents = nextCodeEvents;
+    invalidateDiffThreadGroupsCache();
     changed = true;
   }
 
@@ -16660,7 +16982,16 @@ async function main() {
       try {
         const dirty = await scanOnce({ config, runtime, state });
         if (dirty) {
-          await saveState(config.stateFile, state);
+          // Fire-and-forget via the debouncer rather than awaiting — the
+          // ~8 MB state file used to block the scan loop for ~50-100 ms on
+          // every dirty iteration, which directly delays the next rollout /
+          // history.jsonl read and therefore how quickly new user_message
+          // entries reach the phone. runtime/state.recentTimelineEntries are
+          // already updated synchronously inside recordTimelineEntry, so the
+          // /api/timeline response sees fresh data the moment the client
+          // next polls, regardless of when the disk write lands. Pending
+          // writes are drained in the `finally` block below on SIGINT/SIGTERM.
+          scheduleSaveState(config, state);
         }
       } catch (error) {
         console.error(`[scan-error] ${error.message}`);
@@ -16737,5 +17068,10 @@ async function main() {
     if (approvalServer) {
       await stopHttpServer(approvalServer);
     }
+
+    // Drain any state mutations that were queued via scheduleSaveState but
+    // not yet written to disk — otherwise SIGINT/SIGTERM mid-debounce would
+    // silently drop the last ~500 ms of settings/notification changes.
+    await flushPendingStateWrite(config, state);
   }
 }

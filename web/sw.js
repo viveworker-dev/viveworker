@@ -1,4 +1,4 @@
-const CACHE_NAME = "viveworker-v25";
+const CACHE_NAME = "viveworker-v32";
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
 const APP_ASSETS = ["/app.css", "/app.js", "/i18n.js"];
@@ -44,12 +44,12 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (APP_ROUTES.has(url.pathname)) {
-    event.respondWith(networkFirst(event.request, "/app"));
+    event.respondWith(staleWhileRevalidate(event, "/app"));
     return;
   }
 
   if (CACHED_PATHS.has(url.pathname)) {
-    event.respondWith(networkFirst(event.request, url.pathname));
+    event.respondWith(staleWhileRevalidate(event, url.pathname));
   }
 });
 
@@ -182,19 +182,37 @@ async function notifyClients(type) {
   }
 }
 
-async function networkFirst(request, cacheKey) {
+// Cache-first with background revalidation. Flips the previous networkFirst
+// strategy: instead of blocking first paint on a fresh fetch of the ~450KB
+// app shell (HTML + app.js + app.css + i18n.js) every launch, we serve the
+// cached copy immediately and refresh it in the background for the next
+// visit. Updates still land quickly because the SW itself is served fresh
+// from the bridge (`/sw.js` is excluded from this handler above), and a new
+// SW's `install` event pre-populates the cache with the latest assets
+// before `activate`/`clients.claim()` triggers a reload in page script.
+async function staleWhileRevalidate(event, cacheKey) {
   const cache = await caches.open(CACHE_NAME);
-  try {
-    const response = await fetch(request, { cache: "no-store" });
-    if (response && response.ok) {
-      await cache.put(cacheKey, response.clone());
-    }
-    return response;
-  } catch {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      return cached;
-    }
-    return Response.error();
+  const cached = await cache.match(cacheKey);
+
+  const networkPromise = fetch(event.request, { cache: "no-store" })
+    .then(async (response) => {
+      if (response && response.ok) {
+        await cache.put(cacheKey, response.clone());
+      }
+      return response;
+    })
+    .catch(() => null);
+
+  if (cached) {
+    // Keep the SW alive long enough to persist the background refresh even
+    // if the page navigates away right after first paint.
+    event.waitUntil(networkPromise);
+    return cached;
   }
+
+  const response = await networkPromise;
+  if (response) {
+    return response;
+  }
+  return Response.error();
 }

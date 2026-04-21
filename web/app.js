@@ -14,6 +14,12 @@ const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
 const state = {
   session: null,
   inbox: null,
+  // Flips to true after the first /api/inbox/diff response resolves
+  // (success OR failure). Until then the Code/diff tab shows skeleton
+  // shimmer cards instead of the "no entries" empty state, because the
+  // initial diff scan spawns git subprocesses per tracked repo and can
+  // take 1–3 seconds — the empty state was misleading during that window.
+  inboxDiffLoaded: false,
   timeline: null,
   devices: [],
   currentTab: "inbox",
@@ -101,14 +107,19 @@ boot().catch((error) => {
 
 async function boot() {
   updateManifestHref(initialPairToken);
-  await registerServiceWorker();
+  // SW register + update() can take hundreds of ms and does not need to gate
+  // first paint. Fire and forget; the `controllerchange` reload handler wired
+  // up inside `registerServiceWorker` still picks up new versions.
+  registerServiceWorker().catch(() => {});
   navigator.serviceWorker?.addEventListener("message", handleServiceWorkerMessage);
   window.addEventListener("resize", handleViewportChange, { passive: true });
   window.addEventListener("focus", handlePotentialExternalNavigation, { passive: true });
   window.addEventListener("pageshow", handlePotentialExternalNavigation, { passive: true });
   document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
 
-  await refreshSession();
+  // Single round-trip for session + inbox(pending/completed) + timeline +
+  // devices. See `refreshBootstrap` for why we collapsed the boot fan-out.
+  await refreshBootstrap();
 
   if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
     try {
@@ -119,7 +130,7 @@ async function boot() {
     } catch (error) {
       state.pairError = error.message || String(error);
     }
-    await refreshSession();
+    await refreshBootstrap();
   }
 
   syncPairingTokenState(desiredBootstrapPairingToken());
@@ -146,8 +157,6 @@ async function boot() {
   }
 
   await consumePendingNotificationIntent();
-  await syncDetectedLocalePreference();
-  await refreshAuthenticatedState();
   // `?focusPending=claude` marks this tab as the Claude-hook-opened popup:
   // auto-navigate to the newest unresolved Claude pending (plan/question)
   // detail view — but only when the user is not already in the middle of
@@ -156,9 +165,36 @@ async function boot() {
   if (initialFocusPending === "claude" && !state.currentItem) {
     state.claudePopupMode = true;
   }
-  maybeAutoFocusClaudePending();
+
+  // Bootstrap already populated session + inbox(pending/completed) +
+  // timeline + devices, so the shell renders with real data on first
+  // paint. No null-state fallback needed here.
   ensureCurrentSelection();
+  maybeAutoFocusClaudePending();
   await renderShell();
+
+  // Diff fetch runs as a background phase because `/api/inbox/diff`
+  // spawns `git` subprocesses per tracked repo and can stall for several
+  // seconds. The Code/diff tab lights up when this resolves.
+  refreshInboxDiff()
+    .then(async () => {
+      if (!shouldDeferRenderForActiveInteraction()) {
+        await renderShell();
+      }
+    })
+    .catch(() => {});
+
+  // Remote status probes (push/moltbook/a2a-relay/a2a-share — the share
+  // worker round-trip alone can block up to 10s). Re-renders when it
+  // resolves.
+  refreshAuthenticatedStateRemote()
+    .then(async () => {
+      if (!shouldDeferRenderForActiveInteraction()) {
+        await renderShell();
+      }
+    })
+    .catch(() => {});
+  syncDetectedLocalePreference().catch(() => {});
 
   setInterval(async () => {
     if (!state.session?.authenticated) {
@@ -168,11 +204,41 @@ async function boot() {
     if (consumedNotificationIntent) {
       return;
     }
-    await refreshAuthenticatedState();
+    // Split the poll tick into a fast local fan-out and a slow background
+    // fan-out. The fast calls are all in-memory bridge lookups (inbox,
+    // timeline, devices, push status, relay status) and typically resolve in
+    // under ~100 ms over localhost; rendering immediately after them keeps
+    // new user_message entries reaching the timeline within one scan tick.
+    // The slow calls — /api/inbox/diff (git subprocesses), moltbook scout
+    // status (cross-origin to moltbook.com on cache miss), and especially
+    // /api/share/status (10 s upstream timeout to share.viveworker.com) —
+    // used to gate the render on every poll, so a single share-worker
+    // cache miss stalled timeline updates for up to 10 seconds. Now they
+    // run in the background and trigger a second render when they resolve.
+    await Promise.all([
+      refreshInbox(),
+      refreshTimeline(),
+      refreshDevices(),
+      refreshPushStatus(),
+      fetchA2aRelayStatus(),
+    ]);
+    ensureCurrentSelection();
     maybeAutoFocusClaudePending();
     if (!shouldDeferRenderForActiveInteraction()) {
       await renderShell();
     }
+
+    Promise.allSettled([
+      refreshInboxDiff(),
+      fetchMoltbookScoutStatus(),
+      fetchA2aShareStatus(),
+    ])
+      .then(async () => {
+        if (!shouldDeferRenderForActiveInteraction()) {
+          await renderShell();
+        }
+      })
+      .catch(() => {});
   }, 3000);
 }
 
@@ -215,7 +281,9 @@ function handleViewportChange() {
 }
 
 async function refreshAuthenticatedState() {
-  await refreshInbox();
+  // Fire the two inbox halves in parallel so the diff's git subprocesses
+  // don't serialize behind pending+completed (or vice versa).
+  await Promise.all([refreshInbox(), refreshInboxDiff()]);
   await refreshTimeline();
   await refreshDevices();
   await refreshPushStatus();
@@ -225,10 +293,67 @@ async function refreshAuthenticatedState() {
   ensureCurrentSelection();
 }
 
+// Boot-time split: the first paint should not wait on cross-origin status
+// probes. `Local` covers in-memory bridge lookups (fast). `Remote` covers
+// everything that can stall on an external service (push config,
+// moltbook/a2a worker calls — the a2a share worker has a 10s timeout) and
+// runs in the background after the shell renders.
+async function refreshAuthenticatedStateLocal() {
+  await Promise.all([refreshInbox(), refreshTimeline(), refreshDevices()]);
+  ensureCurrentSelection();
+}
+
+async function refreshAuthenticatedStateRemote() {
+  await Promise.allSettled([
+    refreshPushStatus(),
+    fetchMoltbookScoutStatus(),
+    fetchA2aRelayStatus(),
+    fetchA2aShareStatus(),
+  ]);
+}
+
 async function refreshSession() {
   state.session = await apiGet("/api/session");
   syncPairingTokenState(desiredBootstrapPairingToken());
   applyResolvedLocale();
+}
+
+// One-shot boot fetch: hits `/api/bootstrap` which bundles session,
+// inbox (pending + completed), timeline, and devices into a single
+// HTTPS round-trip. Saves 3 additional TLS handshakes versus calling
+// the four endpoints in parallel, which is the dominant boot cost on
+// iOS PWAs where connection reuse is aggressive. Leaves the diff and
+// external-status probes as separate background phases in `boot()`.
+async function refreshBootstrap() {
+  const bootstrap = await apiGet("/api/bootstrap");
+  state.session = bootstrap?.session || null;
+  syncPairingTokenState(desiredBootstrapPairingToken());
+  applyResolvedLocale();
+
+  if (!state.session?.authenticated) {
+    state.devices = [];
+    state.deviceError = "";
+    return;
+  }
+
+  const fastInbox = bootstrap?.inbox || {};
+  const previousDiff = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
+  state.inbox = {
+    pending: Array.isArray(fastInbox.pending) ? fastInbox.pending : [],
+    completed: Array.isArray(fastInbox.completed) ? fastInbox.completed : [],
+    diff: previousDiff,
+  };
+  syncDiffThreadFilter();
+  syncCompletedThreadFilter();
+  syncInboxSubtab();
+
+  state.timeline = bootstrap?.timeline || null;
+  syncTimelineThreadFilter();
+  syncTimelineKindFilter();
+
+  const devicesPayload = bootstrap?.devices;
+  state.devices = Array.isArray(devicesPayload?.devices) ? devicesPayload.devices : [];
+  state.deviceError = "";
 }
 
 async function syncDetectedLocalePreference() {
@@ -248,16 +373,47 @@ async function syncDetectedLocalePreference() {
   applyResolvedLocale();
 }
 
-async function setLocaleOverride(nextLocale) {
-  const result = await apiPost("/api/session/locale", {
-    detectedLocale: state.detectedLocale,
-    overrideLocale: nextLocale || null,
+// Two-phase override: flip state.session + applyResolvedLocale synchronously
+// so the caller can renderShell() in the new language before the POST
+// round-trip, then reconcile with the server response. On failure the
+// previous session snapshot is restored so the UI rolls back.
+function applyLocaleOverrideOptimistically(nextLocale) {
+  if (!state.session) return null;
+  const previousSession = { ...state.session };
+  const optimistic = resolveLocalePreference({
+    overrideLocale: nextLocale || "",
+    detectedLocale: state.session?.deviceDetectedLocale || state.detectedLocale,
+    defaultLocale: state.session?.defaultLocale || DEFAULT_LOCALE,
+    fallbackLocale: DEFAULT_LOCALE,
   });
   state.session = {
     ...state.session,
-    ...result,
+    deviceOverrideLocale: nextLocale || "",
+    locale: optimistic.locale,
+    localeSource: optimistic.source,
   };
   applyResolvedLocale();
+  return previousSession;
+}
+
+async function persistLocaleOverride(nextLocale, previousSession) {
+  try {
+    const result = await apiPost("/api/session/locale", {
+      detectedLocale: state.detectedLocale,
+      overrideLocale: nextLocale || null,
+    });
+    state.session = {
+      ...state.session,
+      ...result,
+    };
+    applyResolvedLocale();
+  } catch (error) {
+    if (previousSession) {
+      state.session = previousSession;
+      applyResolvedLocale();
+    }
+    throw error;
+  }
 }
 
 function applyResolvedLocale() {
@@ -385,10 +541,39 @@ async function getClientPushState() {
 }
 
 async function refreshInbox() {
-  state.inbox = await apiGet("/api/inbox");
+  const fast = await apiGet("/api/inbox");
+  // `/api/inbox` now returns only `{ pending, completed }`. The `diff`
+  // half lives at `/api/inbox/diff` because it spawns `git` subprocesses
+  // server-side and was blocking first paint of the completed/pending
+  // lists. Preserve whatever diff entries we already have in memory so
+  // polling doesn't wipe the diff tab between diff refetches.
+  const previousDiff = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
+  state.inbox = {
+    pending: Array.isArray(fast?.pending) ? fast.pending : [],
+    completed: Array.isArray(fast?.completed) ? fast.completed : [],
+    diff: previousDiff,
+  };
   syncDiffThreadFilter();
   syncCompletedThreadFilter();
   syncInboxSubtab();
+}
+
+async function refreshInboxDiff() {
+  try {
+    const response = await apiGet("/api/inbox/diff");
+    const previous = state.inbox || { pending: [], completed: [] };
+    state.inbox = {
+      pending: Array.isArray(previous.pending) ? previous.pending : [],
+      completed: Array.isArray(previous.completed) ? previous.completed : [],
+      diff: Array.isArray(response?.diff) ? response.diff : [],
+    };
+    syncDiffThreadFilter();
+    syncInboxSubtab();
+  } finally {
+    // Always flip off the skeleton — a persistent error shouldn't leave the
+    // Code tab perpetually shimmering. The next poll cycle will retry.
+    state.inboxDiffLoaded = true;
+  }
 }
 
 async function refreshTimeline() {
@@ -914,6 +1099,10 @@ async function logout({ revokeCurrentDeviceTrust = false } = {}) {
 function resetAuthenticatedState() {
   state.session = null;
   state.inbox = null;
+  // Reset the diff-loaded flag so the next sign-in shows the skeleton
+  // again during the fresh /api/inbox/diff fetch instead of flashing the
+  // empty state from the previous session's terminal value.
+  state.inboxDiffLoaded = false;
   state.timeline = null;
   state.devices = [];
   state.currentItem = null;
@@ -2007,9 +2196,16 @@ function renderTimelinePanel({ entries, desktop }) {
 function renderDiffPanel({ entries, desktop }) {
   const meta = tabMeta("diff");
   const listClassName = desktop ? "diff-list diff-list--desktop" : "diff-list";
-  const bodyHtml = entries.length
-    ? `<div class="${listClassName}">${entries.map((entry) => renderDiffEntry(entry)).join("")}</div>`
-    : renderEmptyList("diff");
+  let bodyHtml;
+  if (entries.length) {
+    bodyHtml = `<div class="${listClassName}">${entries.map((entry) => renderDiffEntry(entry)).join("")}</div>`;
+  } else if (!state.inboxDiffLoaded) {
+    // First /api/inbox/diff still in flight — show shimmer cards so the
+    // user sees something is happening instead of "no entries".
+    bodyHtml = renderDiffSkeleton(listClassName);
+  } else {
+    bodyHtml = renderEmptyList("diff");
+  }
 
   if (!desktop) {
     return `
@@ -2034,6 +2230,31 @@ function renderDiffPanel({ entries, desktop }) {
       </div>
       <p class="screen-copy">${escapeHtml(meta.description)}</p>
       ${bodyHtml}
+    </div>
+  `;
+}
+
+// Placeholder shimmer shown while the first /api/inbox/diff response is
+// pending. Shape mirrors `.diff-entry` so the tab doesn't visually jump when
+// real entries land. Three cards with decreasing prominence is enough to
+// signal activity without pretending to be a specific number of results.
+function renderDiffSkeleton(listClassName) {
+  const card = `
+    <div class="diff-entry diff-entry--skeleton" aria-hidden="true">
+      <div class="diff-entry__header">
+        <span class="diff-skeleton-line diff-skeleton-line--thread"></span>
+        <span class="diff-skeleton-line diff-skeleton-line--time"></span>
+      </div>
+      <span class="diff-skeleton-line diff-skeleton-line--title"></span>
+      <div class="diff-entry__files">
+        <span class="diff-skeleton-chip"></span>
+        <span class="diff-skeleton-chip diff-skeleton-chip--narrow"></span>
+      </div>
+    </div>
+  `;
+  return `
+    <div class="${listClassName}" role="status" aria-busy="true" aria-label="${escapeHtml(L("common.loading"))}">
+      ${card}${card}${card}
     </div>
   `;
 }
@@ -5622,6 +5843,16 @@ function bindShellInteractions() {
       const action = button.dataset.pushAction;
       state.pushError = "";
       state.pushNotice = "";
+      // Immediate visual feedback — enable/disable inherently wait on
+      // Web Push APIs (permission prompt → pushManager.subscribe() →
+      // server POST → refreshPushStatus), which can take 1–3 seconds.
+      // Without this the button just sat there looking inert the whole
+      // time. The .is-loading + aria-busy pair matches the pattern used
+      // by approval action buttons elsewhere in this file.
+      const wasDisabled = button.disabled;
+      button.classList.add("is-loading");
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
       try {
         if (action === "enable") {
           await enableNotifications();
@@ -5640,6 +5871,12 @@ function bindShellInteractions() {
         await refreshPushStatus();
       } catch (error) {
         state.pushError = error.message || String(error);
+        // Restore this specific button on failure; renderShell() below
+        // would rebuild it anyway but leaving it disabled between
+        // exception and render flashes a dead button.
+        button.classList.remove("is-loading");
+        button.disabled = wasDisabled;
+        button.removeAttribute("aria-busy");
       }
       await renderShell();
     });
@@ -5648,29 +5885,59 @@ function bindShellInteractions() {
   for (const checkbox of document.querySelectorAll("[data-claude-away-checkbox]")) {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
-      try {
-        const result = await apiPost("/api/settings/claude-away-mode", { enabled: next });
-        if (state.session) {
-          state.session.claudeAwayMode = result?.enabled === true;
-        }
-        await refreshAuthenticatedState();
-      } catch (error) {
-        state.pushError = error.message || String(error);
+      const previous = state.session?.claudeAwayMode === true;
+      // Optimistic flip — the server round-trip and the old post-toggle
+      // refreshAuthenticatedState() (7 endpoints) used to gate the UI
+      // update. Flip state now, POST in background, roll back on error.
+      if (state.session) {
+        state.session.claudeAwayMode = next;
       }
       await renderShell();
+      try {
+        const result = await apiPost("/api/settings/claude-away-mode", { enabled: next });
+        if (state.session && result && Object.prototype.hasOwnProperty.call(result, "enabled")) {
+          const reconciled = result.enabled === true;
+          if (reconciled !== next) {
+            state.session.claudeAwayMode = reconciled;
+            await renderShell();
+          }
+        }
+      } catch (error) {
+        if (state.session) {
+          state.session.claudeAwayMode = previous;
+        }
+        state.pushError = error.message || String(error);
+        await renderShell();
+      }
     });
   }
 
   for (const checkbox of document.querySelectorAll("[data-a2a-public-checkbox]")) {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
-      try {
-        await apiPost("/api/a2a/public-tasks", { accept: next });
-        state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
-      } catch (error) {
-        state.pushError = error.message || String(error);
+      const previous = state.a2aRelayStatus?.acceptPublicTasks === true;
+      // Optimistic flip — POST + a follow-up GET of the (remote-worker)
+      // relay-status endpoint used to gate the visual update. Flip the
+      // local flag, render, then reconcile in background.
+      if (state.a2aRelayStatus) {
+        state.a2aRelayStatus = { ...state.a2aRelayStatus, acceptPublicTasks: next };
       }
       await renderShell();
+      try {
+        await apiPost("/api/a2a/public-tasks", { accept: next });
+        apiGet("/api/a2a/relay-status")
+          .then((fresh) => {
+            state.a2aRelayStatus = fresh;
+            renderShell();
+          })
+          .catch(() => {});
+      } catch (error) {
+        if (state.a2aRelayStatus) {
+          state.a2aRelayStatus = { ...state.a2aRelayStatus, acceptPublicTasks: previous };
+        }
+        state.pushError = error.message || String(error);
+        await renderShell();
+      }
     });
   }
 
@@ -5678,13 +5945,24 @@ function bindShellInteractions() {
     radio.addEventListener("change", async () => {
       if (!radio.checked) return;
       const preference = radio.value || "auto";
-      try {
-        await apiPost("/api/settings/a2a-executor", { preference });
-        await refreshSession();
-      } catch (error) {
-        state.pushError = error.message || String(error);
+      const previous = state.session?.a2aExecutorPreference || "ask";
+      // Optimistic flip — the POST + refreshSession() GET used to gate
+      // any re-render that depends on the preference (e.g. downstream
+      // picker defaults). Flip locally and reconcile in background.
+      if (state.session) {
+        state.session.a2aExecutorPreference = preference;
       }
       await renderShell();
+      try {
+        await apiPost("/api/settings/a2a-executor", { preference });
+        refreshSession().catch(() => {});
+      } catch (error) {
+        if (state.session) {
+          state.session.a2aExecutorPreference = previous;
+        }
+        state.pushError = error.message || String(error);
+        await renderShell();
+      }
     });
   }
 
@@ -5718,14 +5996,27 @@ function bindShellInteractions() {
     button.addEventListener("click", async () => {
       state.pushError = "";
       state.pushNotice = "";
+      const nextLocale = button.dataset.localeOption || "";
+      // Flip language synchronously and render before the POST — the
+      // UI switches in one frame instead of waiting on the round-trip
+      // plus the 7-endpoint refreshAuthenticatedState() that followed.
+      const previousSession = applyLocaleOverrideOptimistically(nextLocale);
+      await renderShell();
       try {
-        await setLocaleOverride(button.dataset.localeOption || "");
-        await refreshSession();
-        await refreshAuthenticatedState();
+        await persistLocaleOverride(nextLocale, previousSession);
+        // Server-rendered inbox/timeline strings (kind labels, summaries)
+        // are localised; refresh them in the background so the user
+        // doesn't wait. Polling would eventually pick this up anyway,
+        // but this makes the switch feel instant.
+        Promise.all([
+          refreshInbox().catch(() => {}),
+          refreshInboxDiff().catch(() => {}),
+          refreshTimeline().catch(() => {}),
+        ]).then(() => renderShell());
       } catch (error) {
         state.pushError = error.message || String(error);
+        await renderShell();
       }
-      await renderShell();
     });
   }
 
