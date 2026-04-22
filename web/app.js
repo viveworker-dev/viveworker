@@ -6,6 +6,8 @@ const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice"]);
+const EXTERNAL_TARGET_TABS = new Set(["inbox", "timeline", "diff"]);
+const EXTERNAL_TARGET_INBOX_SUBTABS = new Set(["pending", "completed"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
@@ -83,6 +85,8 @@ let detailLoadSequence = 0;
 const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
+const initialTargetTab = params.get("tab") || "";
+const initialTargetSubtab = params.get("subtab") || "";
 const initialPairToken = params.get("pairToken") || "";
 const initialFocusPending = params.get("focusPending") || "";
 let didReloadForServiceWorker = false;
@@ -137,10 +141,12 @@ async function boot() {
 
   const parsedInitialItem = parseItemRef(initialItem);
   if (parsedInitialItem) {
+    const targetTab = sanitizeExternalTargetTab(initialTargetTab) || tabForItemKind(parsedInitialItem.kind, state.currentTab);
+    const targetSubtab = sanitizeExternalTargetInboxSubtab(initialTargetSubtab);
     state.currentItem = parsedInitialItem;
-    state.currentTab = tabForItemKind(parsedInitialItem.kind, state.currentTab);
+    state.currentTab = targetTab;
     if (state.currentTab === "inbox") {
-      state.inboxSubtab = inboxSubtabForItemKind(parsedInitialItem.kind);
+      state.inboxSubtab = inboxSubtabForItemKind(parsedInitialItem.kind, targetSubtab);
     }
     state.detailOpen = true;
     if (isFastPathItemRef(parsedInitialItem)) {
@@ -2126,6 +2132,12 @@ function renderCompletedCompletionCard(entry, sourceTab) {
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
   const pillLabel = item.kind === "completion" ? L("common.task") : kindInfo.label;
   const pillTone = item.kind === "completion" ? "completion" : kindInfo.tone;
+  const compactSummary = normalizeClientText(summaryText);
+  const useThreadAsPrimaryTitle = Boolean(threadLabel) && /^\d+$/u.test(compactSummary);
+  const titleText = useThreadAsPrimaryTitle ? threadLabel : (summaryText || L("common.untitledItem"));
+  const secondarySummaryHtml = useThreadAsPrimaryTitle
+    ? `<p class="item-card__summary">${escapeHtml(summaryText)}</p>`
+    : "";
 
   return `
     <button
@@ -2147,7 +2159,8 @@ function renderCompletedCompletionCard(entry, sourceTab) {
       </div>
       <div class="item-card__content">
         ${threadLabel ? `<p class="item-card__thread">${escapeHtml(threadLabel)}</p>` : ""}
-        <h3 class="item-card__title">${escapeHtml(summaryText || L("common.untitledItem"))}</h3>
+        <h3 class="item-card__title">${escapeHtml(titleText)}</h3>
+        ${secondarySummaryHtml}
       </div>
     </button>
   `;
@@ -3260,6 +3273,13 @@ function settingsPageMeta(page) {
         description: L("settings.awayMode.copy"),
         icon: "settings",
       };
+    case "autoPilot":
+      return {
+        id: "autoPilot",
+        title: L("settings.autoPilot.title"),
+        description: L("settings.autoPilot.copy"),
+        icon: "approval",
+      };
     case "moltbook":
       return {
         id: "moltbook",
@@ -3317,6 +3337,15 @@ function renderSettingsRoot(context, { mobile }) {
       icon: "settings",
       title: L("settings.awayMode.title"),
       value: state.session?.claudeAwayMode === true ? L("settings.claudeAway.on") : L("settings.claudeAway.off"),
+    }),
+    renderSettingsNavRow({
+      page: "autoPilot",
+      icon: "approval",
+      title: L("settings.autoPilot.title"),
+      value:
+        state.session?.autoPilotTrustedReads === true || state.session?.autoPilotTrustedWrites === true
+          ? L("common.enabled")
+          : L("common.disabled"),
     }),
   ].filter(Boolean);
   const deviceRows = [
@@ -3418,6 +3447,9 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "awayMode":
       content = renderSettingsAwayModePage();
+      break;
+    case "autoPilot":
+      content = renderSettingsAutoPilotPage();
       break;
     case "moltbook":
       content = renderSettingsMoltbookPage(context);
@@ -3640,6 +3672,456 @@ function renderSettingsAwayModePage() {
         </label>
       `])}
       <p class="settings-page-copy muted">${escapeHtml(L("settings.awayMode.codexNote"))}</p>
+    </div>
+  `;
+}
+
+function renderSettingsAutoPilotPage() {
+  const trustedReadsEnabled = state.session?.autoPilotTrustedReads === true;
+  const trustedReadsStateLabel = trustedReadsEnabled ? L("common.enabled") : L("common.disabled");
+  const writeLaneContentEnabled = state.session?.autoPilotWriteLaneContent === true;
+  const writeLaneUiTestsEnabled = state.session?.autoPilotWriteLaneUiTests === true;
+  const writeLaneSourceEnabled = state.session?.autoPilotWriteLaneSource === true;
+  const trustedWritesEnabled =
+    writeLaneContentEnabled || writeLaneUiTestsEnabled || writeLaneSourceEnabled || state.session?.autoPilotTrustedWrites === true;
+  const trustedWritesStateLabel = trustedWritesEnabled ? L("common.enabled") : L("common.disabled");
+  const recentEntries = recentAutoPilotEntries();
+  const suggestions = recentAutoPilotSuggestions();
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup("", [`
+        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-toggle>
+          <input type="checkbox" class="reply-mode-switch__input" ${trustedReadsEnabled ? "checked" : ""} data-auto-pilot-checkbox />
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.autoPilot.trustedReadsTitle"))}</span>
+              <span class="reply-mode-switch__state">${escapeHtml(trustedReadsStateLabel)}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.trustedReadsDescription"))}</span>
+          </span>
+        </label>
+      `, `
+        <div class="settings-toggle-subhead" role="presentation">
+          <span class="settings-toggle-subhead__title">${escapeHtml(L("settings.autoPilot.trustedWritesTitle"))}</span>
+          <span class="settings-toggle-subhead__state">${escapeHtml(trustedWritesStateLabel)}</span>
+        </div>
+      `, `
+        <div class="settings-toggle-subcopy muted">${escapeHtml(L("settings.autoPilot.trustedWritesDescription"))}</div>
+      `, `
+        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="content">
+          <input type="checkbox" class="reply-mode-switch__input" ${writeLaneContentEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="content" />
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.autoPilot.writeLaneContentTitle"))}</span>
+              <span class="reply-mode-switch__state">${escapeHtml(writeLaneContentEnabled ? L("common.enabled") : L("common.disabled"))}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneContentDescription"))}</span>
+          </span>
+        </label>
+      `, `
+        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="ui-tests">
+          <input type="checkbox" class="reply-mode-switch__input" ${writeLaneUiTestsEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="ui-tests" />
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.autoPilot.writeLaneUiTestsTitle"))}</span>
+              <span class="reply-mode-switch__state">${escapeHtml(writeLaneUiTestsEnabled ? L("common.enabled") : L("common.disabled"))}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneUiTestsDescription"))}</span>
+          </span>
+        </label>
+      `, `
+        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="source">
+          <input type="checkbox" class="reply-mode-switch__input" ${writeLaneSourceEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="source" />
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.autoPilot.writeLaneSourceTitle"))}</span>
+              <span class="reply-mode-switch__state">${escapeHtml(writeLaneSourceEnabled ? L("common.enabled") : L("common.disabled"))}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneSourceDescription"))}</span>
+          </span>
+        </label>
+      `], { listClassName: "settings-list settings-list--toggle-group" })}
+      <p class="settings-page-copy muted">${escapeHtml(L("settings.autoPilot.scopeNote"))}</p>
+      ${
+        suggestions.length
+          ? renderSettingsGroup(
+              L("settings.autoPilot.suggestionsTitle"),
+              suggestions.map((suggestion) => renderSettingsAutoPilotSuggestion(suggestion))
+            )
+          : ""
+      }
+      ${
+        recentEntries.length
+          ? renderSettingsGroup(
+              L("settings.autoPilot.recentTitle"),
+              recentEntries.map((item) => renderSettingsAutoPilotRecentEntry(item))
+            )
+          : `
+            <section class="settings-group">
+              <p class="settings-group__title">${escapeHtml(L("settings.autoPilot.recentTitle"))}</p>
+              <div class="settings-copy-block settings-copy-block--compact">
+                <p class="muted">${escapeHtml(L("settings.autoPilot.recentEmpty"))}</p>
+              </div>
+            </section>
+          `
+      }
+    </div>
+  `;
+}
+
+function recentAutoPilotEntries(limit = 5) {
+  const entries = Array.isArray(state.timeline?.entries) ? state.timeline.entries : [];
+  return entries
+    .filter((entry) => isAutoPilotApprovalEntry(entry))
+    .sort((a, b) => (Number(b.createdAtMs) || 0) - (Number(a.createdAtMs) || 0))
+    .slice(0, limit);
+}
+
+function isAutoPilotApprovalEntry(entry) {
+  const stableId = normalizeClientText(entry?.stableId || "");
+  return (
+    normalizeClientText(entry?.kind || "") === "approval" &&
+    normalizeClientText(entry?.outcome || "") === "approved" &&
+    (stableId.endsWith(":autopilot") || stableId.includes(":autopilot-write"))
+  );
+}
+
+function autoPilotEntryMode(item) {
+  const stableId = normalizeClientText(item?.stableId || "");
+  return stableId.includes(":autopilot-write") ? "write" : "read";
+}
+
+function autoPilotEntryWriteLane(item) {
+  const stableId = normalizeClientText(item?.stableId || "");
+  const match = stableId.match(/:autopilot-write:([a-z_-]+)$/u);
+  return normalizeClientText(match?.[1] || "");
+}
+
+function isManualApprovedWriteEntry(entry) {
+  const stableId = normalizeClientText(entry?.stableId || "");
+  return (
+    normalizeClientText(entry?.kind || "") === "approval" &&
+    normalizeClientText(entry?.outcome || "") === "approved" &&
+    !stableId.includes(":autopilot") &&
+    normalizeClientFileRefs(entry?.fileRefs).length > 0 &&
+    normalizeClientText(entry?.diffText || "").length > 0
+  );
+}
+
+function autoPilotDeniedWritePathClient(fileRef) {
+  const normalized = normalizeClientText(fileRef || "");
+  if (!normalized) {
+    return true;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  if (
+    segments.some((segment) => [".ssh", ".aws", ".gnupg", ".azure", ".kube", ".github", ".gitlab", ".terraform", ".claude", ".husky", ".vscode"].includes(segment))
+  ) {
+    return true;
+  }
+  if (basename === ".npmrc" || basename === ".netrc" || basename === ".env" || basename.startsWith(".env.")) {
+    return true;
+  }
+  if (basename.endsWith(".pem") || basename.endsWith(".key") || basename.endsWith(".p12") || basename.endsWith(".pfx")) {
+    return true;
+  }
+  if (
+    [
+      "package.json",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "bun.lockb",
+      "cargo.toml",
+      "cargo.lock",
+      "gemfile",
+      "gemfile.lock",
+      "podfile",
+      "podfile.lock",
+      "composer.json",
+      "composer.lock",
+      "pipfile",
+      "pipfile.lock",
+      "poetry.lock",
+      "requirements.txt",
+      "dockerfile",
+      "wrangler.toml",
+      "tsconfig.json",
+      "tsconfig.tsbuildinfo",
+    ].includes(basename)
+  ) {
+    return true;
+  }
+  return /^id_[a-z0-9._-]+$/iu.test(basename) || basename.includes("secret") || basename.includes("credential");
+}
+
+function autoPilotContentWritePathClient(fileRef) {
+  const normalized = normalizeClientText(fileRef || "");
+  if (!normalized || autoPilotDeniedWritePathClient(normalized)) {
+    return false;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  const extension = basename.includes(".") ? `.${basename.split(".").pop().toLowerCase()}` : "";
+  const basenameWithoutExtension = extension ? basename.slice(0, -extension.length) : basename;
+  if ([".md", ".mdx", ".txt", ".rst", ".adoc"].includes(extension)) {
+    return true;
+  }
+  if (["license", "notice", "copying", "readme", "changelog", "contributing"].includes(basenameWithoutExtension.toLowerCase())) {
+    return true;
+  }
+  if (segments.includes("i18n") && [".js", ".ts", ".json", ".yaml", ".yml"].includes(extension)) {
+    return true;
+  }
+  if (segments.includes("messages") && extension === ".json") {
+    return true;
+  }
+  return false;
+}
+
+function autoPilotUiTestsWritePathClient(fileRef) {
+  const normalized = normalizeClientText(fileRef || "");
+  if (!normalized || autoPilotDeniedWritePathClient(normalized)) {
+    return false;
+  }
+  const lower = normalized.toLowerCase();
+  const segments = lower.split(/[\\/]+/u).filter(Boolean);
+  const basename = segments[segments.length - 1] || "";
+  const extension = basename.includes(".") ? `.${basename.split(".").pop().toLowerCase()}` : "";
+  if ([".css", ".scss", ".sass", ".less", ".styl", ".pcss"].includes(extension)) {
+    return true;
+  }
+  if (segments.includes("__tests__") || /\.(test|spec)\.[cm]?[jt]sx?$/u.test(basename)) {
+    return true;
+  }
+  if ((segments.includes("web") || segments.includes("components")) && [".js", ".jsx", ".ts", ".tsx", ".html"].includes(extension)) {
+    return true;
+  }
+  return false;
+}
+
+function autoPilotSourceWritePathClient(fileRef) {
+  const normalized = normalizeClientText(fileRef || "");
+  if (!normalized || autoPilotDeniedWritePathClient(normalized)) {
+    return false;
+  }
+  if (autoPilotContentWritePathClient(normalized) || autoPilotUiTestsWritePathClient(normalized)) {
+    return false;
+  }
+  return /\.(?:[cm]?[jt]sx?)$/u.test(normalized);
+}
+
+function diffAddedLinesClient(diffText) {
+  return String(diffText || "")
+    .replace(/\r\n/gu, "\n")
+    .split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1));
+}
+
+function addedDiffLinesContainClient(diffText, pattern) {
+  return diffAddedLinesClient(diffText).some((line) => pattern.test(line));
+}
+
+function hasUnsafeUiOrTestWriteDiffClient(diffText) {
+  const patterns = [
+    /\bprocess\.env\b/u,
+    /\b(?:child_process|spawn|exec|execFile|fork)\b/u,
+    /\bfs\.(?:write|append|rm|unlink|rename|chmod|chown|copyFile|cp)\b/u,
+    /\b(?:fetch|axios|XMLHttpRequest)\s*\(/u,
+    /\bcrypto\b/u,
+    /\b(?:secret|token|password|privateKey|credential)\b/iu,
+  ];
+  return (
+    addedDiffLinesContainClient(diffText, /^\s*(?:import\s|export\s+.*\s+from\s)/u) ||
+    addedDiffLinesContainClient(diffText, /\brequire\s*\(/u) ||
+    patterns.some((pattern) => addedDiffLinesContainClient(diffText, pattern))
+  );
+}
+
+function hasUnsafeSourceWriteDiffClient(diffText) {
+  const patterns = [
+    /\bprocess\.env\b/u,
+    /\b(?:child_process|spawn|exec|execFile|fork)\b/u,
+    /\bfs\.(?:write|append|rm|unlink|rename|chmod|chown|copyFile|cp)\b/u,
+    /\b(?:fetch|axios|XMLHttpRequest)\s*\(/u,
+    /\b(?:net|tls|dgram|http2?)\b/u,
+    /\bcrypto\b/u,
+    /\b(?:secret|token|password|privateKey|credential)\b/iu,
+  ];
+  return (
+    addedDiffLinesContainClient(diffText, /^\s*(?:import\s|export\s+.*\s+from\s)/u) ||
+    addedDiffLinesContainClient(diffText, /\brequire\s*\(/u) ||
+    patterns.some((pattern) => addedDiffLinesContainClient(diffText, pattern))
+  );
+}
+
+function classifyManualWriteLaneSuggestion(entry) {
+  const fileRefs = normalizeClientFileRefs(entry?.fileRefs);
+  const diffText = normalizeClientText(entry?.diffText || "");
+  const added = Math.max(0, Number(entry?.diffAddedLines) || 0);
+  const removed = Math.max(0, Number(entry?.diffRemovedLines) || 0);
+  const totalChangedLines = added + removed;
+  if (!fileRefs.length || !diffText || totalChangedLines === 0) {
+    return "";
+  }
+  if (/^(?:new file mode|deleted file mode|rename from|rename to|old mode|new mode|similarity index|dissimilarity index|GIT binary patch|Binary files )/mu.test(diffText)) {
+    return "";
+  }
+  if (
+    fileRefs.length >= 1 &&
+    fileRefs.length <= 3 &&
+    totalChangedLines <= 120 &&
+    fileRefs.every((fileRef) => autoPilotContentWritePathClient(fileRef))
+  ) {
+    return "content";
+  }
+  if (
+    fileRefs.length >= 1 &&
+    fileRefs.length <= 2 &&
+    totalChangedLines <= 80 &&
+    fileRefs.every((fileRef) => autoPilotUiTestsWritePathClient(fileRef)) &&
+    !hasUnsafeUiOrTestWriteDiffClient(diffText)
+  ) {
+    return "ui_tests";
+  }
+  if (
+    fileRefs.length === 1 &&
+    totalChangedLines <= 40 &&
+    fileRefs.every((fileRef) => autoPilotSourceWritePathClient(fileRef)) &&
+    !hasUnsafeSourceWriteDiffClient(diffText)
+  ) {
+    return "source";
+  }
+  return "";
+}
+
+function isWriteLaneEnabled(lane) {
+  return lane === "content"
+    ? state.session?.autoPilotWriteLaneContent === true
+    : lane === "ui_tests"
+      ? state.session?.autoPilotWriteLaneUiTests === true
+      : state.session?.autoPilotWriteLaneSource === true;
+}
+
+function recentAutoPilotSuggestions(limit = 40, minCount = 3) {
+  const entries = Array.isArray(state.timeline?.entries) ? state.timeline.entries : [];
+  const counts = new Map();
+  for (const entry of entries
+    .filter((item) => isManualApprovedWriteEntry(item))
+    .sort((a, b) => (Number(b.createdAtMs) || 0) - (Number(a.createdAtMs) || 0))
+    .slice(0, limit)) {
+    const lane = classifyManualWriteLaneSuggestion(entry);
+    if (!lane || isWriteLaneEnabled(lane)) {
+      continue;
+    }
+    counts.set(lane, (counts.get(lane) || 0) + 1);
+  }
+  return ["content", "ui_tests", "source"]
+    .map((lane) => ({ lane, count: counts.get(lane) || 0 }))
+    .filter((item) => item.count >= minCount);
+}
+
+function firstMarkdownCodeFence(text) {
+  const match = String(text || "").match(/```(?:\w+)?\n([\s\S]*?)\n```/u);
+  return normalizeClientText(match?.[1] || "");
+}
+
+function truncateUiText(value, maxGlyphs = 92) {
+  const normalized = normalizeClientText(value || "");
+  if (!normalized) {
+    return "";
+  }
+  const glyphs = Array.from(normalized);
+  return glyphs.length > maxGlyphs ? `${glyphs.slice(0, maxGlyphs).join("")}…` : normalized;
+}
+
+function autoPilotEntryHeadline(item) {
+  const mode = autoPilotEntryMode(item);
+  if (mode === "read") {
+    return truncateUiText(firstMarkdownCodeFence(item?.messageText || "") || item?.summary || item?.title || "");
+  }
+
+  const fileRefs = normalizeClientFileRefs(item?.fileRefs);
+  const primaryRef = fileRefs[0] || item?.summary || item?.title || "";
+  const extraCount = Math.max(0, fileRefs.length - 1);
+  const stats =
+    Number.isFinite(Number(item?.diffAddedLines)) && Number.isFinite(Number(item?.diffRemovedLines))
+      ? ` (+${Math.max(0, Number(item?.diffAddedLines) || 0)} / -${Math.max(0, Number(item?.diffRemovedLines) || 0)})`
+      : "";
+  return truncateUiText(`${primaryRef}${extraCount > 0 ? ` +${extraCount}` : ""}${stats}`);
+}
+
+function renderSettingsAutoPilotRecentEntry(item) {
+  const mode = autoPilotEntryMode(item);
+  const badgeLabel = mode === "write" ? L("settings.autoPilot.recentWrite") : L("settings.autoPilot.recentRead");
+  const badgeClass = mode === "write" ? "settings-compose-badge--write" : "settings-compose-badge--read";
+  const iconName = mode === "write" ? "file-event" : "approval";
+  const iconToneClass = mode === "write" ? "settings-icon-entry__icon--write" : "settings-icon-entry__icon--read";
+  const headline = autoPilotEntryHeadline(item) || L("common.untitledItem");
+  const threadLabel = resolvedThreadLabel(item?.threadId || "", item?.threadLabel || "");
+  const laneLabel = ({
+    content: L("settings.autoPilot.recentContent"),
+    "ui_tests": L("settings.autoPilot.recentUiTests"),
+    source: L("settings.autoPilot.recentSource"),
+  }[autoPilotEntryWriteLane(item)] || "");
+  const metaParts = [providerDisplayName(item?.provider), formatTimelineTimestamp(item?.createdAtMs)].filter(Boolean);
+
+  return `
+    <button
+      type="button"
+      class="settings-compose-entry settings-icon-entry settings-autopilot-entry"
+      data-open-item-kind="${escapeHtml(item.kind)}"
+      data-open-item-token="${escapeHtml(item.token)}"
+      data-source-tab="timeline"
+    >
+      <span class="settings-icon-entry__icon ${iconToneClass}" aria-hidden="true">${renderIcon(iconName)}</span>
+      <span class="settings-icon-entry__body">
+        <span class="settings-icon-entry__title-row">
+          <span class="settings-compose-entry__title">${escapeHtml(headline)}</span>
+          <span class="settings-compose-badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
+          ${mode === "write" && laneLabel ? `<span class="settings-compose-badge settings-compose-badge--lane">${escapeHtml(laneLabel)}</span>` : ""}
+        </span>
+        <span class="settings-autopilot-entry__meta">${escapeHtml(metaParts.join(" · "))}</span>
+        ${threadLabel ? `<span class="settings-autopilot-entry__thread">${escapeHtml(threadLabel)}</span>` : ""}
+      </span>
+    </button>
+  `;
+}
+
+function renderSettingsAutoPilotSuggestion({ lane, count }) {
+  const title =
+    lane === "content"
+      ? L("settings.autoPilot.suggestionContentTitle")
+      : lane === "ui_tests"
+        ? L("settings.autoPilot.suggestionUiTestsTitle")
+        : L("settings.autoPilot.suggestionSourceTitle");
+  const body =
+    lane === "content"
+      ? L("settings.autoPilot.suggestionContentBody", { count })
+      : lane === "ui_tests"
+        ? L("settings.autoPilot.suggestionUiTestsBody", { count })
+        : L("settings.autoPilot.suggestionSourceBody", { count });
+  return `
+    <div class="settings-suggestion-card">
+      <div class="settings-suggestion-card__header">
+        <div>
+          <p class="settings-suggestion-card__title">${escapeHtml(title)}</p>
+          <p class="settings-suggestion-card__body">${escapeHtml(body)}</p>
+        </div>
+        <button
+          type="button"
+          class="primary settings-suggestion-card__action"
+          data-auto-pilot-suggest-lane="${escapeHtml(lane)}"
+        >${escapeHtml(L("settings.autoPilot.suggestionEnable"))}</button>
+      </div>
     </div>
   `;
 }
@@ -4089,6 +4571,7 @@ function renderStandardDetailDesktop(detail) {
       <h2 class="detail-title detail-title--desktop">${renderDetailTitle(detail)}</h2>
       ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "thread_share" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
+      ${renderAutoPilotManualReview(detail)}
       ${renderInterruptedDetailNotice(detail)}
       ${renderMoltbookReplyComposer(detail)}
       ${renderMoltbookDraftComposer(detail)}
@@ -4128,6 +4611,7 @@ function renderStandardDetailMobile(detail) {
         <div class="mobile-detail-scroll mobile-detail-scroll--detail">
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
           ${renderPreviousContextCard(detail, { mobile: true })}
+          ${renderAutoPilotManualReview(detail, { mobile: true })}
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
           ${renderMoltbookReplyComposer(detail, { mobile: true })}
           ${renderMoltbookDraftComposer(detail, { mobile: true })}
@@ -4304,6 +4788,25 @@ function renderPreviousContextCard(detail, options = {}) {
       </div>
       <p class="detail-context-card__kind">${escapeHtml(contextKind.label)}</p>
       <div class="detail-body detail-body--context markdown">${context.messageHtml}</div>
+    </section>
+  `;
+}
+
+function renderAutoPilotManualReview(detail, options = {}) {
+  const review = detail?.autoPilotReview;
+  if (!review?.title || !review?.body) {
+    return "";
+  }
+  return `
+    <section class="detail-card detail-card--autopilot ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-context-card__header">
+        <div class="detail-context-card__eyebrow">
+          <span class="detail-context-card__icon" aria-hidden="true">${renderIcon("settings")}</span>
+          <span>${escapeHtml(L("detail.autoPilotManualEyebrow"))}</span>
+        </div>
+      </div>
+      <p class="detail-context-card__kind">${escapeHtml(review.title)}</p>
+      <p class="detail-autopilot-copy">${escapeHtml(review.body)}</p>
     </section>
   `;
 }
@@ -5947,6 +6450,77 @@ function bindShellInteractions() {
     });
   }
 
+  function applyAutoPilotSettingsResult(result) {
+    if (!state.session) {
+      return;
+    }
+    state.session.autoPilotTrustedReads = result?.trustedReadsEnabled === true;
+    state.session.autoPilotTrustedWrites = result?.trustedWritesEnabled === true;
+    state.session.autoPilotWriteLaneContent = result?.writeLaneContentEnabled === true;
+    state.session.autoPilotWriteLaneUiTests = result?.writeLaneUiTestsEnabled === true;
+    state.session.autoPilotWriteLaneSource = result?.writeLaneSourceEnabled === true;
+  }
+
+  for (const checkbox of document.querySelectorAll("[data-auto-pilot-checkbox]")) {
+    checkbox.addEventListener("change", async () => {
+      const next = checkbox.checked === true;
+      try {
+        const result = await apiPost("/api/settings/auto-pilot", { trustedReadsEnabled: next });
+        applyAutoPilotSettingsResult(result);
+        await refreshAuthenticatedState();
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
+  for (const checkbox of document.querySelectorAll("[data-auto-pilot-write-lane-checkbox]")) {
+    checkbox.addEventListener("change", async () => {
+      const next = checkbox.checked === true;
+      const lane = normalizeClientText(checkbox.getAttribute("data-auto-pilot-write-lane-checkbox") || "");
+      const payload =
+        lane === "content"
+          ? { writeLaneContentEnabled: next }
+          : lane === "ui-tests"
+            ? { writeLaneUiTestsEnabled: next }
+            : { writeLaneSourceEnabled: next };
+      try {
+        const result = await apiPost("/api/settings/auto-pilot", payload);
+        applyAutoPilotSettingsResult(result);
+        await refreshAuthenticatedState();
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-auto-pilot-suggest-lane]")) {
+    button.addEventListener("click", async () => {
+      const lane = normalizeClientText(button.getAttribute("data-auto-pilot-suggest-lane") || "");
+      const payload =
+        lane === "content"
+          ? { writeLaneContentEnabled: true }
+          : lane === "ui_tests"
+            ? { writeLaneUiTestsEnabled: true }
+            : lane === "source"
+              ? { writeLaneSourceEnabled: true }
+              : null;
+      if (!payload) {
+        return;
+      }
+      try {
+        const result = await apiPost("/api/settings/auto-pilot", payload);
+        applyAutoPilotSettingsResult(result);
+        await refreshAuthenticatedState();
+      } catch (error) {
+        state.pushError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
   for (const checkbox of document.querySelectorAll("[data-a2a-public-checkbox]")) {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
@@ -6746,6 +7320,9 @@ function pendingInboxCount() {
 }
 
 function tabForItemKind(kind, fallback) {
+  if (kind === "completion" || kind === "plan_ready" || kind === "moltbook_draft" || kind === "moltbook_reply" || kind === "thread_share" || kind === "a2a_task" || kind === "a2a_task_result") {
+    return "inbox";
+  }
   if (kind === "diff_thread") {
     return "diff";
   }
@@ -6755,22 +7332,20 @@ function tabForItemKind(kind, fallback) {
   if (TIMELINE_MESSAGE_KINDS.has(kind)) {
     return "timeline";
   }
-  if (kind === "completion") {
-    return "inbox";
-  }
   if (fallback === "timeline") {
     return "timeline";
   }
   return kind === "approval" || kind === "plan" || kind === "choice"
     ? "inbox"
-    : fallback || "inbox";
+    : "inbox";
 }
 
 function inboxSubtabForItemKind(kind, sourceSubtab = "") {
   if (normalizeClientText(sourceSubtab || "") === "completed") {
     return "completed";
   }
-  return kind === "completion" || kind === "assistant_final" ? "completed" : "pending";
+  const completedKinds = new Set(["completion", "assistant_final", "plan_ready", "moltbook_reply", "thread_share", "a2a_task_result"]);
+  return completedKinds.has(kind) ? "completed" : "pending";
 }
 
 function kindMeta(kind, item) {
@@ -7500,6 +8075,16 @@ function parseItemRef(value) {
   return kind && token ? { kind, token } : null;
 }
 
+function sanitizeExternalTargetTab(value) {
+  const normalized = normalizeClientText(value || "");
+  return EXTERNAL_TARGET_TABS.has(normalized) ? normalized : "";
+}
+
+function sanitizeExternalTargetInboxSubtab(value) {
+  const normalized = normalizeClientText(value || "");
+  return EXTERNAL_TARGET_INBOX_SUBTABS.has(normalized) ? normalized : "";
+}
+
 async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   if (!state.session?.authenticated) {
     return;
@@ -7516,10 +8101,16 @@ async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   if (!itemRef) {
     return;
   }
+  const explicitTargetTab = sanitizeExternalTargetTab(nextUrl.searchParams.get("tab"));
+  const explicitTargetSubtab = sanitizeExternalTargetInboxSubtab(nextUrl.searchParams.get("subtab"));
+  const targetTab = explicitTargetTab || tabForItemKind(itemRef.kind, state.currentTab);
+  const targetSubtab = targetTab === "inbox" ? inboxSubtabForItemKind(itemRef.kind, explicitTargetSubtab) : "";
 
   const sameItem =
     Boolean(state.currentItem) &&
     isSameItemRef(state.currentItem, itemRef) &&
+    state.currentTab === targetTab &&
+    (targetTab !== "inbox" || state.inboxSubtab === targetSubtab) &&
     (isDesktopLayout() || state.detailOpen);
   if (sameItem) {
     if (allowRefresh) {
@@ -7533,7 +8124,8 @@ async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   openItem({
     kind: itemRef.kind,
     token: itemRef.token,
-    sourceTab: tabForItemKind(itemRef.kind, state.currentTab),
+    sourceTab: targetTab,
+    sourceSubtab: targetSubtab,
   });
   if (isFastPathItemRef(itemRef)) {
     state.launchItemIntent = {

@@ -220,6 +220,29 @@ Run `npx viveworker enable claude` if you want to repair the hooks later or targ
 
 Advanced: pass `--settings-file <path>` (or `--claude-settings-file <path>`) to target a non-default Claude settings file.
 
+## Auto Pilot
+
+`viveworker` also includes **Auto Pilot**, a conservative auto-approval layer for the current workspace.
+
+You can enable it from `Settings > Auto Pilot`.
+
+Today it exposes two families of policy:
+
+- **Safe reads**: auto-approve common workspace-only read commands such as `rg`, `find`, `git diff`, `git show`, `sed -n`, `head`, `tail`, and `wc`
+- **Low-risk writes**: auto-approve small file changes only when they fit one of these lanes:
+  - `Content & copy`
+  - `UI & tests`
+  - `Small code patches (beta)`
+
+Important boundaries:
+
+- Auto Pilot is scoped to the **current workspace only**
+- secrets, config, deploy, auth, payment, networked changes, and anything outside the current workspace stay manual
+- `Small code patches (beta)` is stricter than the other write lanes and expects a recent read of the same file in the same thread
+
+When Auto Pilot does not approve something, the request stays in the normal phone approval flow.
+The approval detail view also explains why it stayed manual, so it is easier to tune and trust over time.
+
 ### Sync Mode (for Claude plans and questions)
 
 Claude Desktop exposes approval hooks but has no native IPC for answering `ExitPlanMode` / `AskUserQuestion` prompts remotely. To let you answer plans and questions from your paired device, `viveworker` offers **Sync mode** (toggle in `Settings`, formerly "Away mode"):
