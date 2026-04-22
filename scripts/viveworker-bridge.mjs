@@ -312,6 +312,7 @@ const backfilledAmbientSuggestionsStateChanged = backfillAmbientSuggestionsState
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
 const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
 const backfilledMoltbookInboxChanged = await backfillMoltbookInboxHistory({ config, runtime, state });
+const recoveredMissingProviderStateChanged = await recoverMissingProviderStateFromBackup({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
 runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
 
@@ -2804,21 +2805,32 @@ function normalizeHistoryItems(rawItems, maxItems) {
     .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
   const deduped = [];
   const seen = new Set();
+  const perProviderCount = {};
+  const knownProviders = new Set(["codex", "claude", "moltbook", "a2a", "viveworker"]);
   for (const item of normalized) {
     if (seen.has(item.stableId)) {
       continue;
     }
+    const provider = normalizeProvider(item.provider);
+    if (!knownProviders.has(provider)) {
+      knownProviders.add(provider);
+    }
+    const providerCount = perProviderCount[provider] ?? 0;
+    if (providerCount >= maxItems) {
+      continue;
+    }
     seen.add(item.stableId);
     deduped.push(item);
-    if (deduped.length >= maxItems) {
-      break;
-    }
+    perProviderCount[provider] = providerCount + 1;
   }
   return deduped;
 }
 
 function normalizeHistoryItem(raw) {
   if (!isPlainObject(raw)) {
+    return null;
+  }
+  if (shouldHideClaudeInternalItem(raw)) {
     return null;
   }
 
@@ -2832,8 +2844,10 @@ function normalizeHistoryItem(raw) {
   const threadLabel = skipHistoryThreadLabelRewrite
     ? rawThreadLabel
     : preferTitleOnlyJsonThreadLabel(rawThreadLabel, threadId, raw.messageText, raw.summary, raw.detailText, raw.message);
+  const rawTitle = cleanText(raw.title ?? "");
   const title =
-    cleanText(raw.title ?? "") || (threadLabel ? formatTitle(kindTitle(DEFAULT_LOCALE, kind), threadLabel) : kindTitle(DEFAULT_LOCALE, kind));
+    (!isFallbackTimelineTitle(rawTitle, kind, threadId) ? rawTitle : "") ||
+    (threadLabel ? formatTitle(kindTitle(DEFAULT_LOCALE, kind), threadLabel) : kindTitle(DEFAULT_LOCALE, kind));
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
   const summary = normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "";
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
@@ -2843,7 +2857,7 @@ function normalizeHistoryItem(raw) {
 
   const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
 
-  return {
+  const normalized = {
     stableId,
     token: cleanText(raw.token ?? "") || historyToken(stableId),
     kind,
@@ -2871,6 +2885,7 @@ function normalizeHistoryItem(raw) {
     ...(raw.instruction != null ? { instruction: cleanText(raw.instruction) } : {}),
     ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
   };
+  return shouldHideClaudeInternalItem(normalized) ? null : normalized;
 }
 
 function historyToken(stableId) {
@@ -3010,6 +3025,9 @@ function normalizeTimelineEntry(raw) {
   if (!isPlainObject(raw)) {
     return null;
   }
+  if (shouldHideClaudeInternalItem(raw)) {
+    return null;
+  }
 
   const stableId = cleanText(raw.stableId ?? raw.id ?? "");
   const kind = cleanText(raw.kind ?? "");
@@ -3047,14 +3065,15 @@ function normalizeTimelineEntry(raw) {
           raw.detailText,
           raw.message
         );
+  const rawTitle = cleanText(raw.title ?? "");
   const title =
-    cleanText(raw.title ?? "") ||
+    (!isFallbackTimelineTitle(rawTitle, kind, threadId) ? rawTitle : "") ||
     (kind === "file_event" ? fileEventTitle(DEFAULT_LOCALE, fileEventType) : "") ||
     threadLabel ||
     kindTitle(DEFAULT_LOCALE, kind);
   const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
 
-  return {
+  const normalized = {
     stableId,
     token: cleanText(raw.token ?? "") || historyToken(stableId),
     kind,
@@ -3100,6 +3119,7 @@ function normalizeTimelineEntry(raw) {
     ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
     ...(suggestions.length > 0 ? { suggestions } : {}),
   };
+  return shouldHideClaudeInternalItem(normalized) ? null : normalized;
 }
 
 function recordTimelineEntry({ config, runtime, state, entry }) {
@@ -3473,13 +3493,21 @@ function pendingChoiceStableId(userInputRequest) {
   return `choice:${userInputRequest.requestKey}`;
 }
 
-function buildAppItemUrl(config, kind, token) {
+function buildAppItemUrl(config, kind, token, options = {}) {
   const url = new URL(`${config.nativeApprovalPublicBaseUrl}/app`);
   url.searchParams.set("item", `${kind}:${token}`);
+  const tab = cleanText(options.tab || "");
+  const subtab = cleanText(options.subtab || "");
+  if (tab) {
+    url.searchParams.set("tab", tab);
+  }
+  if (subtab) {
+    url.searchParams.set("subtab", subtab);
+  }
   return url.toString();
 }
 
-function buildPushPayload({ config, kind, token, stableId, title, body }) {
+function buildPushPayload({ config, kind, token, stableId, title, body, tab = "", subtab = "" }) {
   return {
     title: withNotificationIcon(kind, title),
     body: formatNotificationBody(body, config.completionDetailThresholdChars) || body || title,
@@ -3488,7 +3516,7 @@ function buildPushPayload({ config, kind, token, stableId, title, body }) {
       kind,
       token,
       stableId,
-      url: buildAppItemUrl(config, kind, token),
+      url: buildAppItemUrl(config, kind, token, { tab, subtab }),
     },
   };
 }
@@ -3608,7 +3636,7 @@ function pushDeliveryKey(deviceId, stableId) {
   return `${cleanText(deviceId || "")}:${cleanText(stableId || "")}`;
 }
 
-async function deliverWebPushItem({ config, state, kind, token, stableId, title, body, buildLocalizedContent = null }) {
+async function deliverWebPushItem({ config, state, kind, token, stableId, title, body, tab = "", subtab = "", buildLocalizedContent = null }) {
   if (!config.webPushEnabled || config.dryRun) {
     return false;
   }
@@ -3643,6 +3671,8 @@ async function deliverWebPushItem({ config, state, kind, token, stableId, title,
           stableId,
           title: localizedContent?.title || title,
           body: localizedContent?.body || body,
+          tab,
+          subtab,
         })
       );
       await webPush.sendNotification(
@@ -3726,17 +3756,23 @@ async function scanOnce({ config, runtime, state }) {
   }
 
   if (config.webUiEnabled) {
+    let claudeTranscriptChanged = false;
     if (now - runtime.lastClaudeScanAt >= config.directoryScanIntervalMs) {
       runtime.claudeKnownFiles = await listClaudeTranscriptFiles(config.claudeProjectsDir);
       runtime.lastClaudeScanAt = now;
     }
+    let claudeSessionTitlesChanged = false;
     if (now - runtime.lastClaudeSessionTitleScanAt >= config.directoryScanIntervalMs) {
-      await refreshClaudeSessionTitles(runtime);
+      claudeSessionTitlesChanged = await refreshClaudeSessionTitles(runtime);
       runtime.lastClaudeSessionTitleScanAt = now;
     }
     for (const filePath of runtime.claudeKnownFiles) {
       const changed = await processClaudeTranscriptFile({ filePath, config, runtime, state, now });
+      claudeTranscriptChanged = claudeTranscriptChanged || changed;
       dirty = dirty || changed;
+    }
+    if (claudeTranscriptChanged || claudeSessionTitlesChanged) {
+      dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
     }
   }
 
@@ -3963,6 +3999,7 @@ function fileEventCallIdFromStableId(stableId) {
 }
 
 async function refreshClaudeSessionTitles(runtime) {
+  let changed = false;
   // Read ~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json
   // Each file maps cliSessionId → title (auto-generated by Claude Desktop).
   const baseDir = path.join(
@@ -4000,7 +4037,10 @@ async function refreshClaudeSessionTitles(runtime) {
             const cliSessionId = cleanText(data?.cliSessionId || "");
             const title = cleanText(data?.title || "");
             if (cliSessionId && title) {
-              runtime.claudeSessionTitles.set(cliSessionId, title);
+              if (runtime.claudeSessionTitles.get(cliSessionId) !== title) {
+                runtime.claudeSessionTitles.set(cliSessionId, title);
+                changed = true;
+              }
             }
           } catch {
             // skip unreadable/invalid
@@ -4011,6 +4051,49 @@ async function refreshClaudeSessionTitles(runtime) {
   } catch {
     // base dir missing — Claude Desktop not installed
   }
+
+  for (const filePath of runtime.claudeKnownFiles ?? []) {
+    let lines;
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      lines = raw.split("\n");
+    } catch {
+      continue;
+    }
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) continue;
+      let record;
+      try {
+        record = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (record?.entrypoint !== "sdk-cli" || record?.type !== "user") {
+        continue;
+      }
+      const threadId = cleanText(record?.sessionId || "");
+      const message = record?.message || {};
+      let text = "";
+      if (typeof message.content === "string") {
+        text = message.content;
+      } else if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (block?.type === "text" && block.text) {
+            text += block.text;
+          }
+        }
+      }
+      const derivedTitle = deriveClaudeSdkCliThreadLabel(text, threadId);
+      if (threadId && derivedTitle && runtime.claudeSessionTitles.get(threadId) !== derivedTitle) {
+        runtime.claudeSessionTitles.set(threadId, derivedTitle);
+        changed = true;
+      }
+      break;
+    }
+  }
+
+  return changed;
 }
 
 async function listClaudeTranscriptFiles(claudeProjectsDir) {
@@ -4130,8 +4213,10 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
       fileState.threadLabel = path.basename(record.cwd);
     }
 
-    // Only process Claude Desktop sessions
-    if (record.entrypoint !== "claude-desktop") continue;
+    // Accept both Claude Desktop sessions and the current sdk-cli sessions
+    // that Claude emits for agent-driven work. The latter regressed the
+    // timeline/completed views because they were silently skipped here.
+    if (record.entrypoint !== "claude-desktop" && record.entrypoint !== "sdk-cli") continue;
 
     const type = record.type;
     if (type !== "user" && type !== "assistant") continue;
@@ -4159,6 +4244,15 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     }
     text = cleanText(text);
     if (!text) continue;
+    if (type === "user" && record.entrypoint === "sdk-cli") {
+      const derivedThreadLabel = deriveClaudeSdkCliThreadLabel(text, threadId);
+      if (derivedThreadLabel) {
+        fileState.threadLabel = derivedThreadLabel;
+        if (threadId) {
+          runtime.claudeSessionTitles.set(threadId, derivedThreadLabel);
+        }
+      }
+    }
     // Skip Claude Code internal system messages (task notifications, system
     // reminders, etc.) — these are XML-like tags injected into the
     // conversation that should not appear on the user-facing timeline.
@@ -4220,6 +4314,7 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
             config,
             state,
             kind: "assistant_final",
+            tab: "timeline",
             token: entry.token,
             stableId: entry.stableId,
             title: threadLabel || "Claude",
@@ -4239,6 +4334,129 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
   // Clear startup cutoff after first scan so subsequent incremental reads are unfiltered
   fileState.startupCutoffMs = 0;
   return dirty;
+}
+
+async function loadRecoveryBackupState(stateFile) {
+  const dir = path.dirname(stateFile);
+  const base = path.basename(stateFile);
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!entry.name.startsWith(`${base}.bak-`)) continue;
+    const filePath = path.join(dir, entry.name);
+    try {
+      const stat = await fs.stat(filePath);
+      candidates.push({ filePath, mtimeMs: Number(stat.mtimeMs) || 0 });
+    } catch {
+      // ignore unreadable backup
+    }
+  }
+
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  for (const candidate of candidates) {
+    try {
+      const raw = await fs.readFile(candidate.filePath, "utf8");
+      return JSON.parse(raw);
+    } catch {
+      // try next backup
+    }
+  }
+  return null;
+}
+
+function providerSetForItems(items) {
+  return new Set(
+    (Array.isArray(items) ? items : [])
+      .map((item) => normalizeProvider(item?.provider))
+      .filter(Boolean)
+  );
+}
+
+function missingRecoveryProviders(items) {
+  const present = providerSetForItems(items);
+  return ["claude", "a2a"].filter((provider) => !present.has(provider));
+}
+
+function selectRecoveryItems(items, missingProviders) {
+  const wanted = new Set(missingProviders);
+  return (Array.isArray(items) ? items : []).filter((item) => wanted.has(normalizeProvider(item?.provider)));
+}
+
+async function recoverMissingProviderStateFromBackup({ config, runtime, state }) {
+  const missingHistoryProviders = missingRecoveryProviders(state.recentHistoryItems ?? runtime.recentHistoryItems);
+  const missingTimelineProviders = missingRecoveryProviders(state.recentTimelineEntries ?? runtime.recentTimelineEntries);
+  const shouldRecoverCodeEvents = !Array.isArray(state.recentCodeEvents) || state.recentCodeEvents.length === 0;
+
+  if (missingHistoryProviders.length === 0 && missingTimelineProviders.length === 0 && !shouldRecoverCodeEvents) {
+    return false;
+  }
+
+  const backup = await loadRecoveryBackupState(config.stateFile);
+  if (!backup) {
+    return false;
+  }
+
+  let changed = false;
+
+  if (missingHistoryProviders.length > 0) {
+    const mergedHistory = normalizeHistoryItems(
+      [
+        ...(state.recentHistoryItems ?? runtime.recentHistoryItems ?? []),
+        ...selectRecoveryItems(backup.recentHistoryItems, missingHistoryProviders),
+      ],
+      config.maxHistoryItems
+    );
+    if (JSON.stringify(mergedHistory) !== JSON.stringify(state.recentHistoryItems ?? runtime.recentHistoryItems ?? [])) {
+      state.recentHistoryItems = mergedHistory;
+      runtime.recentHistoryItems = mergedHistory;
+      changed = true;
+    }
+  }
+
+  if (missingTimelineProviders.length > 0) {
+    const mergedTimeline = normalizeTimelineEntries(
+      [
+        ...(state.recentTimelineEntries ?? runtime.recentTimelineEntries ?? []),
+        ...selectRecoveryItems(backup.recentTimelineEntries, missingTimelineProviders),
+      ],
+      config.maxTimelineEntries
+    );
+    if (JSON.stringify(mergedTimeline) !== JSON.stringify(state.recentTimelineEntries ?? runtime.recentTimelineEntries ?? [])) {
+      state.recentTimelineEntries = mergedTimeline;
+      runtime.recentTimelineEntries = mergedTimeline;
+      changed = true;
+    }
+  }
+
+  if (shouldRecoverCodeEvents) {
+    const mergedCodeEvents = normalizeCodeEvents(
+      [
+        ...(state.recentCodeEvents ?? runtime.recentCodeEvents ?? []),
+        ...(Array.isArray(backup.recentCodeEvents) ? backup.recentCodeEvents : []),
+      ],
+      config.maxCodeEvents
+    );
+    if (JSON.stringify(mergedCodeEvents) !== JSON.stringify(state.recentCodeEvents ?? runtime.recentCodeEvents ?? [])) {
+      state.recentCodeEvents = mergedCodeEvents;
+      runtime.recentCodeEvents = mergedCodeEvents;
+      invalidateDiffThreadGroupsCache();
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    console.log(
+      `[state-recovery] recovered history=${missingHistoryProviders.join(",") || "none"} timeline=${missingTimelineProviders.join(",") || "none"} code=${shouldRecoverCodeEvents ? "yes" : "no"}`
+    );
+  }
+  return changed;
 }
 
 async function processSqliteCompletionLog({ config, runtime, state, now }) {
@@ -5459,6 +5677,8 @@ async function processScannedEvent({ config, runtime, state, event }) {
         config,
         state,
         kind: "completion",
+        tab: "inbox",
+        subtab: "completed",
         token: historyToken(event.id),
         stableId: event.id,
         title: event.title,
@@ -5893,6 +6113,8 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
         config,
         state,
         kind: "approval",
+        tab: "inbox",
+        subtab: "pending",
         token: approval.token,
         stableId: pendingApprovalStableId(approval),
         title: approval.title,
@@ -6016,6 +6238,8 @@ async function syncPlanImplementationRequests({
           config,
           state,
           kind: "plan",
+          tab: "inbox",
+          subtab: "pending",
           token: planRequest.token,
           stableId: pendingPlanStableId(planRequest),
           title: planRequest.title,
@@ -6221,6 +6445,8 @@ async function syncGenericUserInputRequests({
           config,
           state,
           kind: "choice",
+          tab: "inbox",
+          subtab: "pending",
           token: userInputRequest.token,
           stableId: pendingChoiceStableId(userInputRequest),
           title: userInputRequest.title,
@@ -8479,6 +8705,67 @@ function getNativeThreadLabel({ runtime, conversationId, cwd }) {
     return truncate(cleanText(path.basename(cwd)), 90) || shortId(normalizedConversationId);
   }
   return shortId(normalizedConversationId) || t(DEFAULT_LOCALE, "server.fallback.codexTask", { provider: providerDisplayName(DEFAULT_LOCALE, "codex") });
+}
+
+function isFallbackConversationLabel(label, conversationId) {
+  const normalizedLabel = cleanText(label || "");
+  const normalizedConversationId = cleanText(conversationId || "");
+  if (!normalizedLabel) {
+    return true;
+  }
+  if (normalizedConversationId && normalizedLabel === shortId(normalizedConversationId)) {
+    return true;
+  }
+  return false;
+}
+
+function deriveClaudeSdkCliThreadLabel(messageText, conversationId = "") {
+  const cleaned = stripNotificationMarkup(stripEnvironmentContextBlocks(messageText || ""));
+  const single = cleanText(cleaned);
+  if (!single || /^\d+$/u.test(single)) {
+    return "";
+  }
+
+  if (/^You are scoring Moltbook posts? for an AI agent\b/iu.test(single)) {
+    return "Moltbook scoring";
+  }
+  if (/^Codex from another agent:/iu.test(single)) {
+    return truncate(cleanText(single.replace(/^Codex from another agent:\s*/iu, "")), 90) || "Cross-agent task";
+  }
+
+  const firstSentence = cleanText(single.split(/(?<=[.!?。！？])\s+/u)[0] || "");
+  const candidate = firstSentence || single;
+  if (!candidate || candidate === shortId(conversationId)) {
+    return "";
+  }
+  return truncate(candidate, 90);
+}
+
+function isHiddenClaudeInternalScoringText(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single) {
+    return false;
+  }
+  return /^You are scoring Moltbook posts? for an AI agent\b/iu.test(single);
+}
+
+function shouldHideClaudeInternalItem(item) {
+  if (!isPlainObject(item)) {
+    return false;
+  }
+  if (normalizeProvider(item.provider) !== "claude") {
+    return false;
+  }
+  const threadLabel = cleanText(item.threadLabel ?? "");
+  if (threadLabel === "Moltbook scoring") {
+    return true;
+  }
+  return (
+    isHiddenClaudeInternalScoringText(item.messageText) ||
+    isHiddenClaudeInternalScoringText(item.summary) ||
+    isHiddenClaudeInternalScoringText(item.detailText) ||
+    isHiddenClaudeInternalScoringText(item.message)
+  );
 }
 
 function threadStateArchiveStatus(threadState) {
@@ -13774,6 +14061,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
           await deliverWebPushItem({
             config, state,
             kind: "thread_share",
+            tab: "inbox",
+            subtab: "pending",
             token,
             stableId: `thread_share:${shareId}`,
             title: `Thread Share: ${sourceLabel || sourceTool || "agent"} → ${targetLabel || targetTool}`,
@@ -13871,6 +14160,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
                 await deliverWebPushItem({
                   config, state,
                   kind: "thread_share",
+                  tab: "inbox",
+                  subtab: "completed",
                   token: share.token,
                   stableId: `thread_share_fallback:${share.shareId}`,
                   title: "Thread Share: target unreachable",
@@ -14335,6 +14626,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
           config,
           state,
           kind: "approval",
+          tab: "inbox",
+          subtab: "pending",
           token: approval.token,
           stableId: pendingApprovalStableId(approval),
           title: approval.title,
@@ -14464,6 +14757,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
             config,
             state,
             kind: "moltbook_reply",
+            tab: "inbox",
+            subtab: "pending",
             token,
             stableId: `moltbook_reply:${item.sourceId}`,
             title: item.title,
@@ -14645,6 +14940,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
             config,
             state,
             kind: "moltbook_draft",
+            tab: "inbox",
+            subtab: "pending",
             token,
             stableId: `moltbook_draft:${sourceId}`,
             title: pushTitle,
@@ -14741,6 +15038,8 @@ function createNativeApprovalServer({ config, runtime, state }) {
               try {
                 await deliverWebPushItem({
                   config, state, kind: "moltbook_draft", token: draft.token,
+                  tab: "inbox",
+                  subtab: "completed",
                   stableId: `moltbook_draft_failed:${draft.sourceId}`,
                   title: "Draft post failed",
                   body: String(postError.message || "").slice(0, 160),
@@ -16853,6 +17152,8 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     const pushTitle = draft.draftType === "original_post" ? finalTitle : `Reply → ${draft.postTitle || "Moltbook"}`;
     await deliverWebPushItem({
       config, state, kind: "moltbook_draft", token: draft.token,
+      tab: "inbox",
+      subtab: "completed",
       stableId: `moltbook_draft_posted:${draft.sourceId}`,
       title: "Moltbook posted",
       body: truncate(singleLine(pushTitle), 160),
@@ -18036,8 +18337,8 @@ function extractTitleOnlyJsonTitle(value) {
 }
 
 function preferTitleOnlyJsonThreadLabel(rawThreadLabel, conversationId, ...candidates) {
-  const preferredThreadLabel = sanitizeResolvedThreadLabel(rawThreadLabel, conversationId);
-  if (preferredThreadLabel) {
+    const preferredThreadLabel = sanitizeResolvedThreadLabel(rawThreadLabel, conversationId);
+  if (preferredThreadLabel && !isFallbackConversationLabel(preferredThreadLabel, conversationId)) {
     return preferredThreadLabel;
   }
   for (const candidate of candidates) {
@@ -18045,8 +18346,12 @@ function preferTitleOnlyJsonThreadLabel(rawThreadLabel, conversationId, ...candi
     if (titleOnlyJsonTitle) {
       return titleOnlyJsonTitle;
     }
+    const derivedSdkCliLabel = deriveClaudeSdkCliThreadLabel(candidate, conversationId);
+    if (derivedSdkCliLabel) {
+      return derivedSdkCliLabel;
+    }
   }
-  return cleanText(rawThreadLabel || "");
+  return cleanText(preferredThreadLabel || rawThreadLabel || "");
 }
 
 function stripMarkdownLinks(value) {
@@ -18116,6 +18421,25 @@ function shortId(value) {
     return "";
   }
   return text.length > 8 ? text.slice(0, 8) : text;
+}
+
+function isFallbackTimelineTitle(rawTitle, kind, threadId) {
+  const normalizedTitle = cleanText(rawTitle || "");
+  const normalizedKind = cleanText(kind || "");
+  const normalizedThreadId = cleanText(threadId || "");
+  if (!normalizedTitle) {
+    return true;
+  }
+  if (normalizedThreadId && normalizedTitle === shortId(normalizedThreadId)) {
+    return true;
+  }
+  if (normalizedTitle === kindTitle(DEFAULT_LOCALE, normalizedKind)) {
+    return true;
+  }
+  if (normalizedThreadId && normalizedTitle === formatTitle(kindTitle(DEFAULT_LOCALE, normalizedKind), shortId(normalizedThreadId))) {
+    return true;
+  }
+  return false;
 }
 
 function sleep(ms) {
@@ -18272,6 +18596,7 @@ async function main() {
       migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
       backfilledMoltbookInboxChanged ||
+      recoveredMissingProviderStateChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {
       await saveState(config.stateFile, state);

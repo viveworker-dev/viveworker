@@ -6,6 +6,8 @@ const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice"]);
+const EXTERNAL_TARGET_TABS = new Set(["inbox", "timeline", "diff"]);
+const EXTERNAL_TARGET_INBOX_SUBTABS = new Set(["pending", "completed"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
@@ -83,6 +85,8 @@ let detailLoadSequence = 0;
 const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
+const initialTargetTab = params.get("tab") || "";
+const initialTargetSubtab = params.get("subtab") || "";
 const initialPairToken = params.get("pairToken") || "";
 const initialFocusPending = params.get("focusPending") || "";
 let didReloadForServiceWorker = false;
@@ -137,10 +141,12 @@ async function boot() {
 
   const parsedInitialItem = parseItemRef(initialItem);
   if (parsedInitialItem) {
+    const targetTab = sanitizeExternalTargetTab(initialTargetTab) || tabForItemKind(parsedInitialItem.kind, state.currentTab);
+    const targetSubtab = sanitizeExternalTargetInboxSubtab(initialTargetSubtab);
     state.currentItem = parsedInitialItem;
-    state.currentTab = tabForItemKind(parsedInitialItem.kind, state.currentTab);
+    state.currentTab = targetTab;
     if (state.currentTab === "inbox") {
-      state.inboxSubtab = inboxSubtabForItemKind(parsedInitialItem.kind);
+      state.inboxSubtab = inboxSubtabForItemKind(parsedInitialItem.kind, targetSubtab);
     }
     state.detailOpen = true;
     if (isFastPathItemRef(parsedInitialItem)) {
@@ -2126,6 +2132,12 @@ function renderCompletedCompletionCard(entry, sourceTab) {
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
   const pillLabel = item.kind === "completion" ? L("common.task") : kindInfo.label;
   const pillTone = item.kind === "completion" ? "completion" : kindInfo.tone;
+  const compactSummary = normalizeClientText(summaryText);
+  const useThreadAsPrimaryTitle = Boolean(threadLabel) && /^\d+$/u.test(compactSummary);
+  const titleText = useThreadAsPrimaryTitle ? threadLabel : (summaryText || L("common.untitledItem"));
+  const secondarySummaryHtml = useThreadAsPrimaryTitle
+    ? `<p class="item-card__summary">${escapeHtml(summaryText)}</p>`
+    : "";
 
   return `
     <button
@@ -2147,7 +2159,8 @@ function renderCompletedCompletionCard(entry, sourceTab) {
       </div>
       <div class="item-card__content">
         ${threadLabel ? `<p class="item-card__thread">${escapeHtml(threadLabel)}</p>` : ""}
-        <h3 class="item-card__title">${escapeHtml(summaryText || L("common.untitledItem"))}</h3>
+        <h3 class="item-card__title">${escapeHtml(titleText)}</h3>
+        ${secondarySummaryHtml}
       </div>
     </button>
   `;
@@ -7272,6 +7285,9 @@ function pendingInboxCount() {
 }
 
 function tabForItemKind(kind, fallback) {
+  if (kind === "completion" || kind === "plan_ready" || kind === "moltbook_draft" || kind === "moltbook_reply" || kind === "thread_share" || kind === "a2a_task" || kind === "a2a_task_result") {
+    return "inbox";
+  }
   if (kind === "diff_thread") {
     return "diff";
   }
@@ -7281,22 +7297,20 @@ function tabForItemKind(kind, fallback) {
   if (TIMELINE_MESSAGE_KINDS.has(kind)) {
     return "timeline";
   }
-  if (kind === "completion") {
-    return "inbox";
-  }
   if (fallback === "timeline") {
     return "timeline";
   }
   return kind === "approval" || kind === "plan" || kind === "choice"
     ? "inbox"
-    : fallback || "inbox";
+    : "inbox";
 }
 
 function inboxSubtabForItemKind(kind, sourceSubtab = "") {
   if (normalizeClientText(sourceSubtab || "") === "completed") {
     return "completed";
   }
-  return kind === "completion" || kind === "assistant_final" ? "completed" : "pending";
+  const completedKinds = new Set(["completion", "assistant_final", "plan_ready", "moltbook_reply", "thread_share", "a2a_task_result"]);
+  return completedKinds.has(kind) ? "completed" : "pending";
 }
 
 function kindMeta(kind, item) {
@@ -8024,6 +8038,16 @@ function parseItemRef(value) {
   return kind && token ? { kind, token } : null;
 }
 
+function sanitizeExternalTargetTab(value) {
+  const normalized = normalizeClientText(value || "");
+  return EXTERNAL_TARGET_TABS.has(normalized) ? normalized : "";
+}
+
+function sanitizeExternalTargetInboxSubtab(value) {
+  const normalized = normalizeClientText(value || "");
+  return EXTERNAL_TARGET_INBOX_SUBTABS.has(normalized) ? normalized : "";
+}
+
 async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   if (!state.session?.authenticated) {
     return;
@@ -8040,10 +8064,16 @@ async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   if (!itemRef) {
     return;
   }
+  const explicitTargetTab = sanitizeExternalTargetTab(nextUrl.searchParams.get("tab"));
+  const explicitTargetSubtab = sanitizeExternalTargetInboxSubtab(nextUrl.searchParams.get("subtab"));
+  const targetTab = explicitTargetTab || tabForItemKind(itemRef.kind, state.currentTab);
+  const targetSubtab = targetTab === "inbox" ? inboxSubtabForItemKind(itemRef.kind, explicitTargetSubtab) : "";
 
   const sameItem =
     Boolean(state.currentItem) &&
     isSameItemRef(state.currentItem, itemRef) &&
+    state.currentTab === targetTab &&
+    (targetTab !== "inbox" || state.inboxSubtab === targetSubtab) &&
     (isDesktopLayout() || state.detailOpen);
   if (sameItem) {
     if (allowRefresh) {
@@ -8057,7 +8087,8 @@ async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
   openItem({
     kind: itemRef.kind,
     token: itemRef.token,
-    sourceTab: tabForItemKind(itemRef.kind, state.currentTab),
+    sourceTab: targetTab,
+    sourceSubtab: targetSubtab,
   });
   if (isFastPathItemRef(itemRef)) {
     state.launchItemIntent = {
