@@ -55,6 +55,7 @@ const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
+const HAZBASE_METADATA_TIMEOUT_MS = 1500;
 
 // Shared memo for buildDiffThreadGroups. Each call spawns 3 git subprocesses
 // per tracked repo (`git diff --name-status`, `git status --porcelain`,
@@ -13908,18 +13909,18 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     return writeJson(res, 200, { enabled: false });
   }
   const hazbase = normalizeHazbaseState(state.hazbase);
-  let payments = null;
-  let chains = null;
-  let error = "";
-  try {
-    payments = await listSupportedPayments();
-  } catch (err) {
-    error = err?.message || String(err);
+  const [paymentsResult, chainsResult] = await Promise.allSettled([
+    fetchHazbaseMetadata(config, "/api/meta/payments"),
+    fetchHazbaseMetadata(config, "/api/meta/chains"),
+  ]);
+  const payments = paymentsResult.status === "fulfilled" ? paymentsResult.value : null;
+  const chains = chainsResult.status === "fulfilled" ? chainsResult.value : null;
+  const errors = [];
+  if (paymentsResult.status === "rejected") {
+    errors.push(paymentsResult.reason?.message || String(paymentsResult.reason || "payments metadata unavailable"));
   }
-  try {
-    chains = await listSupportedChains();
-  } catch (err) {
-    error = error || err?.message || String(err);
+  if (chainsResult.status === "rejected") {
+    errors.push(chainsResult.reason?.message || String(chainsResult.reason || "chains metadata unavailable"));
   }
   const supportedChains = Array.isArray(chains?.chains)
     ? chains.chains.filter((entry) => Number(entry.chainId) === 8453 || Number(entry.chainId) === 84532)
@@ -13943,7 +13944,7 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     supportedChains,
     defaultPaymentNetwork: payments?.defaultNetwork || "base-sepolia",
     payoutAddresses,
-    error,
+    error: errors.join(" | "),
   });
 }
 
@@ -17540,6 +17541,35 @@ function configureHazbaseClient(config) {
     setHazbaseApiEndpoint(config.hazbaseApiUrl || "https://passkey.hazbase.com");
   } catch (error) {
     console.error(`[hazbase-config] ${error.message}`);
+  }
+}
+
+async function fetchHazbaseMetadata(config, endpoint, timeoutMs = HAZBASE_METADATA_TIMEOUT_MS) {
+  const baseUrl = stripTrailingSlash(config?.hazbaseApiUrl || "");
+  if (!baseUrl) return null;
+  const timeout = Math.max(250, Number(timeoutMs) || HAZBASE_METADATA_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  timer.unref?.();
+  try {
+    const response = await fetch(`${baseUrl}${endpoint}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(`${endpoint} failed: ${cleanText(errorText || response.statusText || "upstream error")}`);
+    }
+    const payload = await response.json().catch(() => null);
+    return payload?.data ?? payload ?? null;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`${endpoint} timed out after ${timeout}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

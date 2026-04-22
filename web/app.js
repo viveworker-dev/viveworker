@@ -7504,6 +7504,15 @@ async function switchTab(tab) {
     syncCurrentItemUrl(state.currentItem);
   }
   await renderShell();
+  if (tab === "settings") {
+    void fetchHazbaseStatus()
+      .then(() => {
+        if (state.currentTab === "settings") {
+          renderCurrentSurface();
+        }
+      })
+      .catch(() => {});
+  }
 }
 
 function openItem({ kind, token, sourceTab, sourceSubtab }) {
