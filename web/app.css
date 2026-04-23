@@ -646,13 +646,13 @@ code {
   color: rgba(190, 160, 255, 0.92);
 }
 
-<<<<<<< HEAD
 /* Paid-share marker on the A2A Share settings page. Amber tone echoes the
  * 💰 emoji and the CLOSED BETA banner on the 402 HTML. */
 .settings-compose-badge--paid {
   background: rgba(240, 180, 40, 0.2);
   color: rgba(255, 210, 110, 0.95);
-=======
+}
+
 .settings-compose-badge--read {
   background: rgba(91, 203, 255, 0.16);
   color: rgba(162, 230, 255, 0.95);
@@ -667,7 +667,6 @@ code {
   background: rgba(255, 255, 255, 0.05);
   color: rgba(220, 232, 240, 0.9);
   box-shadow: inset 0 0 0 1px rgba(156, 181, 197, 0.12);
->>>>>>> fix/timeline
 }
 
 .settings-compose-entry {

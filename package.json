@@ -1,10 +1,6 @@
 {
   "name": "viveworker",
-<<<<<<< HEAD
   "version": "0.7.0-beta.1",
-=======
-  "version": "0.6.4",
->>>>>>> fix/timeline
   "description": "Open mobile control surface for Codex, Claude, Thread Sharing, File Share, Moltbook, and A2A tasks on your trusted LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
