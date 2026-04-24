@@ -63,6 +63,31 @@ const state = {
   hazbaseStatus: null,
   hazbaseNotice: "",
   hazbaseError: "",
+  // Session-only flag: once the Sepolia wallet is ready, the mainnet step
+  // is hidden behind a subtle opt-in link (most beta users won't activate
+  // it). Flipping this reveals the full mainnet step card for the rest of
+  // the session. Not persisted — reopening Wallet next visit starts hidden
+  // again, which is the desired default for the closed beta.
+  hazbaseMainnetOptIn: false,
+  // Sign-in OTP flow is a two-step send→verify dance. Showing both
+  // buttons side-by-side confused users; they clicked "Verify" before
+  // ever requesting a code. We gate the verify button behind a
+  // successful send by tracking that a code was just issued in this
+  // session (plus the email it was sent to, so verify doesn't re-prompt).
+  // Both reset on successful verify (or on page reload — losing the flag
+  // just means the user re-clicks "send", which is idempotent on the
+  // server side). Email + code are also mirrored here so re-renders
+  // triggered by polls/notices don't wipe what the user was typing —
+  // the <input value="..."> attributes read these back.
+  hazbaseOtpRequested: false,
+  hazbaseOtpEmail: "",
+  hazbaseOtpCode: "",
+  // Wallet logout is reversible in principle (same account + same passkey
+  // re-derives the same smart account address), but it still wipes the
+  // current session + any in-flight approvals and forces an OTP round-trip
+  // to recover — cheap to gate behind an explicit confirm. Session-only
+  // flag; flipped by the signOut button and cleared on confirm/cancel.
+  hazbaseLogoutConfirmOpen: false,
   a2aTaskExecutorPick: "codex",
   pushNotice: "",
   pushError: "",
@@ -91,6 +116,17 @@ async function loadHazbasePasskeyModule() {
     hazbasePasskeyModulePromise = import("./hazbase-passkey.js");
   }
   return hazbasePasskeyModulePromise;
+}
+
+function hazbasePasskeyHostSupport() {
+  const protocol = normalizeClientText(window.location?.protocol || "");
+  const hostname = normalizeClientText(window.location?.hostname || "").toLowerCase();
+  const eligible = protocol === "https:" && Boolean(hostname) && hostname.endsWith(".local");
+  return {
+    eligible,
+    hostname,
+    detail: eligible ? "" : L("settings.hazbase.passkey.localHostRequired"),
+  };
 }
 
 const app = document.querySelector("#app");
@@ -1205,6 +1241,7 @@ async function renderShell() {
       ${renderImageViewerModal()}
       ${renderInstallGuideModal()}
       ${renderLogoutConfirmModal()}
+      ${renderHazbaseLogoutConfirmModal()}
     </div>
   `;
 
@@ -1304,6 +1341,17 @@ function shouldDeferRenderForActiveInteraction() {
     activeElement instanceof HTMLInputElement &&
     activeElement.matches("[data-moltbook-draft-title]")
   ) {
+    return true;
+  }
+  if (
+    activeElement instanceof HTMLInputElement &&
+    activeElement.matches("[data-hazbase-input]")
+  ) {
+    // User is mid-edit on the wallet sign-in email/OTP field. A poll tick
+    // that re-renders here would blur the input and interrupt typing
+    // (state mirroring restores value + caret position, but the blur
+    // itself is still jarring, especially on iOS where it also dismisses
+    // the keyboard).
     return true;
   }
   if (
@@ -4450,27 +4498,21 @@ function renderSettingsWalletPage(context) {
     `;
   }
   const flow = deriveHazbaseWalletFlow(hazbase);
-  const statusLabel = hazbase.signedIn
-    ? L("settings.hazbase.status.signedIn")
-    : L("settings.hazbase.status.signedOut");
-  const summaryRows = [
-    renderSettingsInfoRow(L("settings.row.hazbaseStatus"), statusLabel),
-    renderSettingsInfoRow(L("settings.row.hazbaseEmail"), hazbase.email || "—"),
-    renderSettingsInfoRow(
-      L("settings.row.hazbasePasskey"),
-      flow.hasPasskey ? L("settings.hazbase.passkey.ready") : L("settings.hazbase.passkey.missing"),
-    ),
-    renderSettingsInfoRow(
-      L("settings.row.hazbaseBaseSepolia"),
-      flow.baseSepolia?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
-      { stacked: true, mono: Boolean(flow.baseSepolia?.smartAccountAddress) },
-    ),
-    renderSettingsInfoRow(
-      L("settings.row.hazbaseBase"),
-      flow.baseMainnet?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
-      { stacked: true, mono: Boolean(flow.baseMainnet?.smartAccountAddress) },
-    ),
-  ];
+
+  // Progressive disclosure. Previous layout rendered the full status summary
+  // plus all four full-sized step cards at once; new account flows were
+  // dominated by locked-looking cards and it was hard to tell which step was
+  // actionable. Now we:
+  //  - skip `locked` steps entirely (still-unreachable actions add noise),
+  //  - collapse `complete` steps to a compact one-line row that keeps the
+  //    verified value visible (email / address) without a full card,
+  //  - keep the single `current`/`pending` step in the full action card so
+  //    the CTA is unambiguous,
+  //  - hide the optional mainnet step behind a subtle opt-in link until the
+  //    user explicitly requests it (see `state.hazbaseMainnetOptIn`).
+  // The compact rows also replace the former "Current status" summary group
+  // above the flow, so signed-in email / passkey state / addresses are no
+  // longer duplicated.
   const guideRows = [
     renderHazbaseWalletBanner(flow),
     state.hazbaseNotice
@@ -4479,17 +4521,77 @@ function renderSettingsWalletPage(context) {
     state.hazbaseError
       ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--error"><p>${escapeHtml(state.hazbaseError)}</p></div>`
       : "",
-    `<div class="wallet-step-list">${flow.steps.map((step) => renderHazbaseWalletStepCard(step)).join("")}</div>`,
+    renderHazbaseWalletStepList(flow),
   ].filter(Boolean);
   const advancedActions = hazbase.signedIn
     ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout">${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
     : "";
+  // Render the wallet flow without `renderSettingsGroup`'s `.settings-list`
+  // wrapper. The banner (`.settings-copy-block`), notice/error blocks, and
+  // each step card (`.wallet-step-card`) already have their own rounded
+  // frame — wrapping them in another `.settings-list` produced a visible
+  // "box inside a box" nest. The title (`.settings-group__title`) still
+  // sits above a flat stack of sibling cards via `.wallet-setup-stack`.
+  const flowTitle = L("settings.wallet.flow.title");
+  // Brand attribution. The wallet stack (factory + validator + bundler +
+  // paymaster) is provided by hazBase; the link points to their LP so
+  // curious users can discover what's running the signing path.
+  const poweredBy = `
+    <p class="wallet-powered-by muted">
+      powered by <a href="https://lp.hazbase.com" target="_blank" rel="noopener noreferrer">hazBase</a>
+    </p>
+  `;
   return `
     <div class="settings-page">
-      ${renderSettingsGroup(L("settings.wallet.summary.title"), summaryRows)}
-      ${renderSettingsGroup(L("settings.wallet.flow.title"), guideRows)}
+      <section class="settings-group">
+        ${flowTitle ? `<p class="settings-group__title">${escapeHtml(flowTitle)}</p>` : ""}
+        <div class="wallet-setup-stack">
+          ${guideRows.join("")}
+        </div>
+      </section>
       ${advancedActions ? renderSettingsActionPanel(advancedActions, L("settings.wallet.advanced.title")) : ""}
+      ${poweredBy}
     </div>
+  `;
+}
+
+function renderHazbaseWalletStepList(flow) {
+  const rendered = [];
+  for (const step of flow.steps) {
+    // Step 4 (Base mainnet) is hidden while hazbase's closed beta keeps
+    // chainId 8453 out of `WALLET_GATEWAY_CHAINS_JSON` — calling bootstrap
+    // against mainnet currently returns `unsupported_chain`, so there's no
+    // path for the user to complete the step. Step 3 (Base Sepolia) is the
+    // true completion boundary; the ready banner already keys off
+    // `coreReady = signedIn && hasPasskey && hasBaseSepolia`. Drop this
+    // guard (and restore the opt-in reveal) once mainnet is enabled
+    // server-side.
+    if (step.number === 4) {
+      continue;
+    }
+
+    // Locked steps don't render. Revealing them only adds grayed-out
+    // placeholders below the active step; users mistake the placeholder
+    // status chips for inactive buttons.
+    if (step.status === "locked") {
+      continue;
+    }
+
+    const mode = step.status === "complete" ? "compact" : "full";
+    rendered.push(renderHazbaseWalletStepCard(step, { mode }));
+  }
+  return `<div class="wallet-step-list">${rendered.join("")}</div>`;
+}
+
+function renderHazbaseWalletMainnetOptIn() {
+  return `
+    <button class="wallet-mainnet-optin" type="button" data-hazbase-action="mainnet-opt-in">
+      <span class="wallet-mainnet-optin__body">
+        <span class="wallet-mainnet-optin__label">${escapeHtml(L("settings.wallet.mainnet.optIn"))}</span>
+        <span class="wallet-mainnet-optin__hint muted">${escapeHtml(L("settings.wallet.mainnet.optInHint"))}</span>
+      </span>
+      <span class="wallet-mainnet-optin__chevron" aria-hidden="true">→</span>
+    </button>
   `;
 }
 
@@ -4498,6 +4600,7 @@ function deriveHazbaseWalletFlow(hazbase) {
   const baseSepolia = accounts.find((entry) => Number(entry.chainId) === 84532) || null;
   const baseMainnet = accounts.find((entry) => Number(entry.chainId) === 8453) || null;
   const signedIn = Boolean(hazbase.signedIn);
+  const passkeyHost = hazbasePasskeyHostSupport();
   const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
   const hasBaseSepolia = Boolean(baseSepolia?.smartAccountAddress);
   const hasBaseMainnet = Boolean(baseMainnet?.smartAccountAddress);
@@ -4523,28 +4626,57 @@ function deriveHazbaseWalletFlow(hazbase) {
         icon: "approval",
         title: L("settings.wallet.step.signIn.title"),
         copy: L("settings.wallet.step.signIn.copy"),
-        detail: signedIn ? hazbase.email || L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
+        detail: signedIn
+          ? hazbase.email || L("settings.hazbase.status.signedIn")
+          : state.hazbaseOtpRequested
+            ? L("settings.hazbase.status.otpAwaitingVerify")
+            : L("settings.hazbase.status.signedOut"),
         status: signedIn ? "complete" : "current",
+        // Inline form: email input (always visible pre-sign-in) and the
+        // one-time password input (revealed after a successful send).
+        // Putting the field immediately above its submit button is the
+        // whole point — users don't have to guess "what does this button
+        // ask me?" before clicking.
+        form: signedIn
+          ? ""
+          : renderHazbaseSignInForm({
+              email: state.hazbaseOtpEmail || hazbase.email || "",
+              otpRequested: Boolean(state.hazbaseOtpRequested),
+              code: state.hazbaseOtpCode || "",
+            }),
+        // Sequential flow: before a code is requested, only the primary
+        // "send" action is visible. After a successful send we swap the
+        // primary CTA to "verify" and demote "send" to a quieter "resend"
+        // option in case the email never arrives. This keeps the user's
+        // next move unambiguous.
         actions: signedIn
           ? []
-          : [
-              actionButton("settings.hazbase.action.requestOtp", "request-otp", { primary: true }),
-              actionButton("settings.hazbase.action.verifyOtp", "verify-otp"),
-            ],
+          : state.hazbaseOtpRequested
+            ? [
+                actionButton("settings.hazbase.action.verifyOtp", "verify-otp", { primary: true }),
+                actionButton("settings.hazbase.action.resendOtp", "request-otp"),
+              ]
+            : [
+                actionButton("settings.hazbase.action.requestOtp", "request-otp", { primary: true }),
+              ],
       },
       {
         number: 2,
         icon: "lock",
         title: L("settings.wallet.step.passkey.title"),
         copy: L("settings.wallet.step.passkey.copy"),
-        detail: hasPasskey ? L("settings.hazbase.passkey.ready") : L("settings.hazbase.passkey.missing"),
+        detail: hasPasskey
+          ? L("settings.hazbase.passkey.ready")
+          : passkeyHost.eligible
+            ? L("settings.hazbase.passkey.missing")
+            : passkeyHost.detail,
         status: hasPasskey ? "complete" : signedIn ? "current" : "locked",
         actions: hasPasskey
           ? []
           : [
               actionButton("settings.hazbase.action.registerPasskey", "register-passkey", {
-                primary: signedIn,
-                disabled: !signedIn,
+                primary: signedIn && passkeyHost.eligible,
+                disabled: !signedIn || !passkeyHost.eligible,
               }),
             ],
       },
@@ -4587,20 +4719,45 @@ function deriveHazbaseWalletFlow(hazbase) {
 
 function renderHazbaseWalletBanner(flow) {
   const title = flow.coreReady ? L("settings.wallet.ready.title") : L("settings.wallet.flow.banner.title");
-  const copy = flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy");
   const className = flow.coreReady
     ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--ready"
     : "settings-copy-block settings-copy-block--stacked wallet-flow-banner";
+  // Ready state: surface the smart-account address prominently so the user
+  // can see at a glance which wallet agents will use as `--pay-to` when
+  // gating paid shares / A2A payouts. The address is the single most
+  // actionable fact on this page once setup is complete — muted filler
+  // copy buries it.
+  const payoutAddress = flow.baseSepolia?.smartAccountAddress || "";
+  const copyLabel = L("settings.wallet.ready.copyAddress");
+  const body = flow.coreReady && payoutAddress
+    ? `
+      <p class="wallet-flow-banner__copy muted">${escapeHtml(L("settings.wallet.ready.payoutIntro"))}</p>
+      <button
+        class="wallet-flow-banner__address"
+        type="button"
+        data-wallet-address-copy="${escapeHtml(payoutAddress)}"
+        aria-label="${escapeHtml(copyLabel)}: ${escapeHtml(payoutAddress)}"
+      >
+        <span class="wallet-flow-banner__address-text">${escapeHtml(payoutAddress)}</span>
+        <span class="wallet-flow-banner__address-icon-slot">
+          <span class="wallet-flow-banner__address-icon wallet-flow-banner__address-icon--copy" aria-hidden="true">${renderIcon("copy")}</span>
+          <span class="wallet-flow-banner__address-icon wallet-flow-banner__address-icon--check" aria-hidden="true">${renderIcon("check")}</span>
+        </span>
+      </button>
+    `
+    : `<p class="wallet-flow-banner__copy muted">${escapeHtml(
+        flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy"),
+      )}</p>`;
   return `
     <div class="${className}">
       <p class="wallet-flow-banner__eyebrow">${escapeHtml(L("settings.hazbase.title"))}</p>
       <p class="wallet-flow-banner__title">${escapeHtml(title)}</p>
-      <p class="wallet-flow-banner__copy muted">${escapeHtml(copy)}</p>
+      ${body}
     </div>
   `;
 }
 
-function renderHazbaseWalletStepCard(step) {
+function renderHazbaseWalletStepCard(step, { mode = "full" } = {}) {
   const statusMeta = {
     complete: { label: L("settings.wallet.status.complete"), icon: "completed" },
     current: { label: L("settings.wallet.status.current"), icon: "pending" },
@@ -4608,6 +4765,25 @@ function renderHazbaseWalletStepCard(step) {
     optional: { label: L("settings.wallet.status.optional"), icon: "coin" },
     pending: { label: L("settings.wallet.status.pending"), icon: "pending" },
   }[step.status] || { label: L("settings.wallet.status.pending"), icon: "pending" };
+
+  if (mode === "compact") {
+    // Compact row for finished steps. Keeps the check icon + title + one-line
+    // detail visible (so the user can scan what's done at a glance) but
+    // drops the copy/actions to stop the page from being four blocks tall.
+    const detailClass = step.monoDetail
+      ? "wallet-step-card__compact-detail wallet-step-card__compact-detail--mono"
+      : "wallet-step-card__compact-detail";
+    return `
+      <div class="wallet-step-card wallet-step-card--compact wallet-step-card--${escapeHtml(step.status)}">
+        <span class="wallet-step-card__compact-icon" aria-hidden="true">${renderIcon(statusMeta.icon)}</span>
+        <div class="wallet-step-card__compact-body">
+          <p class="wallet-step-card__compact-title">${escapeHtml(step.title)}</p>
+          ${step.detail ? `<p class="${detailClass}">${escapeHtml(step.detail)}</p>` : ""}
+        </div>
+        <span class="wallet-step-card__compact-status" aria-hidden="true">${escapeHtml(statusMeta.label)}</span>
+      </div>
+    `;
+  }
 
   return `
     <article class="wallet-step-card wallet-step-card--${escapeHtml(step.status)}">
@@ -4626,9 +4802,72 @@ function renderHazbaseWalletStepCard(step) {
       </div>
       <p class="wallet-step-card__copy">${escapeHtml(step.copy)}</p>
       <p class="wallet-step-card__detail ${step.monoDetail ? "wallet-step-card__detail--mono" : ""}">${escapeHtml(step.detail)}</p>
+      ${step.form || ""}
       ${step.actions.length ? `<div class="wallet-step-card__actions">${step.actions.join("")}</div>` : ""}
     </article>
   `;
+}
+
+// Sign-in form sits inside step 1 when the user hasn't signed in yet.
+// Email field is always rendered (editable so users can correct a typo
+// and resend); OTP field only appears once a code has been issued. Both
+// inputs carry value="..." sourced from state so a poll-triggered
+// re-render doesn't wipe what the user was typing mid-edit.
+function renderHazbaseSignInForm({ email, otpRequested, code }) {
+  // Once the OTP has been sent we lock the email field so accidental edits
+  // can't invalidate the pending code. A small "change email" link is shown
+  // as the intentional escape hatch — clicking it reverts the form to the
+  // pre-sent state (code discarded, email stays for easy typo recovery).
+  const emailLocked = Boolean(otpRequested);
+  const emailLabelRow = emailLocked
+    ? `<span class="wallet-step-card__field-label-row">
+        <span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.emailLabel"))}</span>
+        <button
+          type="button"
+          class="wallet-step-card__field-link"
+          data-hazbase-action="change-email"
+        >${escapeHtml(L("settings.hazbase.action.changeEmail"))}</button>
+      </span>`
+    : `<span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.emailLabel"))}</span>`;
+  const emailField = `
+    <label class="wallet-step-card__field">
+      ${emailLabelRow}
+      <input
+        type="email"
+        class="wallet-step-card__field-input${emailLocked ? " wallet-step-card__field-input--locked" : ""}"
+        data-hazbase-input="otp-email"
+        value="${escapeHtml(email || "")}"
+        placeholder="${escapeHtml(L("settings.hazbase.field.emailPlaceholder"))}"
+        autocomplete="email"
+        inputmode="email"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        ${emailLocked ? "disabled aria-disabled=\"true\"" : ""}
+      />
+    </label>
+  `;
+  const otpField = otpRequested
+    ? `
+    <label class="wallet-step-card__field">
+      <span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.otpLabel"))}</span>
+      <input
+        type="text"
+        class="wallet-step-card__field-input wallet-step-card__field-input--mono"
+        data-hazbase-input="otp-code"
+        value="${escapeHtml(code || "")}"
+        placeholder="${escapeHtml(L("settings.hazbase.field.otpPlaceholder"))}"
+        autocomplete="one-time-code"
+        inputmode="numeric"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        maxlength="12"
+      />
+    </label>
+  `
+    : "";
+  return `<div class="wallet-step-card__form">${emailField}${otpField}</div>`;
 }
 
 function formatRelativeAge(ms) {
@@ -6134,6 +6373,35 @@ function renderImageViewerModal() {
   `;
 }
 
+function renderHazbaseLogoutConfirmModal() {
+  if (!state.hazbaseLogoutConfirmOpen) {
+    return "";
+  }
+  const email = state.hazbaseStatus?.email || "";
+  // Mirror the session-logout dialog's shape but drop the split-choice
+  // options — wallet sign-out is a single binary (log out or don't), no
+  // "keep this device trusted" toggle applies.
+  // Note: the backdrop uses a dedicated `data-close-hazbase-logout-confirm`
+  // marker (bound in bindSharedUi) rather than a `data-hazbase-action`.
+  // If we reused the action dispatcher here, an inside-card click would
+  // bubble up to the backdrop's handler and run a second async dispatch
+  // in parallel with the button's own handler — which races against the
+  // API call. The mirror approach matches the session-logout modal.
+  return `
+    <div class="modal-backdrop" data-close-hazbase-logout-confirm>
+      <section class="modal-card modal-card--confirm" role="dialog" aria-modal="true" aria-labelledby="hazbase-logout-confirm-title">
+        <div class="helper-copy">
+          <strong id="hazbase-logout-confirm-title">${escapeHtml(L("settings.hazbase.logout.confirm.title"))}</strong>
+          <p class="muted">${escapeHtml(L("settings.hazbase.logout.confirm.copy"))}</p>
+          ${email ? `<p class="muted"><code>${escapeHtml(email)}</code></p>` : ""}
+        </div>
+        <button class="secondary secondary--wide" type="button" data-hazbase-action="logout-confirm">${escapeHtml(L("settings.hazbase.logout.confirm.confirmLabel"))}</button>
+        <button class="ghost ghost--wide" type="button" data-close-hazbase-logout-confirm>${escapeHtml(L("common.cancel"))}</button>
+      </section>
+    </div>
+  `;
+}
+
 function renderLogoutConfirmModal() {
   if (!state.logoutConfirmOpen || !state.session?.authenticated) {
     return "";
@@ -6873,22 +7141,39 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
     const action = button.dataset.hazbaseAction || "";
     try {
       if (action === "request-otp") {
-        const fallbackEmail = state.hazbaseStatus?.email || "";
-        const email = window.prompt(L("settings.hazbase.prompt.email"), fallbackEmail) || "";
-        if (!email.trim()) return;
-        const result = await apiPost("/api/hazbase/request-otp", { email: email.trim() });
+        // Read from the DOM input, not just state. The state mirror is
+        // populated on every keystroke, but a pre-filled value (returning
+        // user whose email came back from hazbase status) never fires
+        // `input`, so state stays empty while the DOM shows the address.
+        // Treat DOM as authoritative and fall back to state.
+        const emailInput = document.querySelector('[data-hazbase-input="otp-email"]');
+        const email = (emailInput?.value || state.hazbaseOtpEmail || "").trim();
+        if (!email) throw new Error(L("error.hazbaseEmailRequired"));
+        const result = await apiPost("/api/hazbase/request-otp", { email });
+        state.hazbaseOtpEmail = email;
+        state.hazbaseOtpRequested = true;
+        state.hazbaseOtpCode = "";
         state.hazbaseNotice = result?.debugCode
           ? `${L("settings.hazbase.notice.otpRequested")} (${result.debugCode})`
           : L("settings.hazbase.notice.otpRequested");
       } else if (action === "verify-otp") {
-        const fallbackEmail = state.hazbaseStatus?.email || "";
-        const email = window.prompt(L("settings.hazbase.prompt.email"), fallbackEmail) || "";
-        if (!email.trim()) return;
-        const code = window.prompt(L("settings.hazbase.prompt.otp"), "") || "";
-        if (!code.trim()) return;
-        await apiPost("/api/hazbase/verify-otp", { email: email.trim(), code: code.trim() });
+        // Same pattern — DOM wins, state fallback covers the rare case
+        // where the field was removed/re-added between type and click.
+        const emailInput = document.querySelector('[data-hazbase-input="otp-email"]');
+        const codeInput = document.querySelector('[data-hazbase-input="otp-code"]');
+        const email = (emailInput?.value || state.hazbaseOtpEmail || "").trim();
+        const code = (codeInput?.value || state.hazbaseOtpCode || "").trim();
+        if (!email) throw new Error(L("error.hazbaseEmailRequired"));
+        if (!code) throw new Error(L("error.hazbaseOtpRequired"));
+        await apiPost("/api/hazbase/verify-otp", { email, code });
+        state.hazbaseOtpRequested = false;
+        state.hazbaseOtpEmail = "";
+        state.hazbaseOtpCode = "";
         state.hazbaseNotice = L("settings.hazbase.notice.otpVerified");
       } else if (action === "register-passkey") {
+        if (!hazbasePasskeyHostSupport().eligible) {
+          throw new Error(L("error.hazbasePasskeyLocalHostRequired"));
+        }
         const { createPasskeyRegistrationCredential } = await loadHazbasePasskeyModule();
         const challenge = await apiPost("/api/hazbase/passkey/register/challenge", {});
         const credential = await createPasskeyRegistrationCredential(challenge);
@@ -6898,6 +7183,9 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         });
         state.hazbaseNotice = L("settings.hazbase.notice.passkeyRegistered");
       } else if (action === "bootstrap-base-sepolia" || action === "bootstrap-base") {
+        if (!hazbasePasskeyHostSupport().eligible) {
+          throw new Error(L("error.hazbasePasskeyLocalHostRequired"));
+        }
         const { createPasskeyAssertionCredential } = await loadHazbasePasskeyModule();
         const chainId = action === "bootstrap-base" ? 8453 : 84532;
         const challenge = await apiPost("/api/hazbase/passkey/assert/challenge", { purpose: "bootstrap" });
@@ -6910,14 +7198,96 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         await apiPost("/api/hazbase/account/bootstrap", { chainId });
         state.hazbaseNotice = L("settings.hazbase.notice.walletBootstrapped", { chainId });
       } else if (action === "logout") {
+        // Gate wallet logout behind an explicit confirm — the modal's
+        // "confirm" button dispatches `logout-confirm`, which actually
+        // hits the API. Short-circuit here so the initial click only
+        // opens the dialog.
+        state.hazbaseLogoutConfirmOpen = true;
+        await renderShell();
+        return;
+      } else if (action === "logout-confirm") {
+        state.hazbaseLogoutConfirmOpen = false;
         await apiPost("/api/hazbase/logout", {});
         state.hazbaseNotice = L("settings.hazbase.notice.signedOut");
+      } else if (action === "change-email") {
+        // Flip the form back to pre-send mode. We keep the email so typo
+        // recovery ("hoshin" → "hoshino") stays one edit away, but drop
+        // the now-stale OTP code. No server call — hazbase invalidates
+        // the previous OTP automatically when a fresh one is requested.
+        state.hazbaseOtpRequested = false;
+        state.hazbaseOtpCode = "";
+        state.hazbaseNotice = "";
+        state.hazbaseError = "";
+        await renderShell();
+        // Move focus back to the (now re-enabled) email input so the user
+        // can start editing immediately.
+        document.querySelector('[data-hazbase-input="otp-email"]')?.focus();
+        return;
+      } else if (action === "mainnet-opt-in") {
+        // Pure client-side reveal — the mainnet step is always in the flow
+        // data, we just hide it behind an opt-in link to keep the default
+        // path (testnet only) focused. No network call; no status refetch.
+        state.hazbaseMainnetOptIn = true;
+        await renderShell();
+        return;
       }
       await fetchHazbaseStatus();
     } catch (error) {
       state.hazbaseError = error.message || String(error);
     }
     await renderShell();
+  });
+}
+
+// Mirror every keystroke into state so a background re-render (poll tick,
+// notice clear, etc.) can repopulate `value="..."` without wiping what
+// the user was typing. Reads happen at button-click time against state,
+// which is why we don't need to also query the DOM in the handler.
+for (const input of document.querySelectorAll("[data-hazbase-input]")) {
+  const name = input.dataset.hazbaseInput || "";
+  input.addEventListener("input", () => {
+    if (name === "otp-email") state.hazbaseOtpEmail = input.value;
+    else if (name === "otp-code") state.hazbaseOtpCode = input.value;
+  });
+  // Enter key submits the step. In the email field it triggers "send"
+  // (or "verify" once a code was already issued — the email field stays
+  // editable post-send to support typo recovery via resend). In the OTP
+  // field it always submits verify.
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    event.preventDefault();
+    const target = name === "otp-code"
+      ? "verify-otp"
+      : state.hazbaseOtpRequested ? "verify-otp" : "request-otp";
+    const btn = document.querySelector(`[data-hazbase-action="${target}"]`);
+    btn?.click();
+  });
+}
+
+// Tap-to-copy the wallet payout address. We swap the clipboard icon to a
+// check mark for ~1.5s via CSS (toggling `.is-copied`) rather than a full
+// re-render, so focus stays on the button and the rest of the settings
+// page doesn't flicker. The address sits inside a banner that doesn't
+// otherwise re-render on every tick, so an ephemeral class flip is the
+// cleanest way to acknowledge the copy.
+for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
+  button.addEventListener("click", async () => {
+    const text = button.dataset.walletAddressCopy || "";
+    if (!text) return;
+    try {
+      await copyTextToClipboard(text);
+      button.classList.add("is-copied");
+      if (button._copyResetTimer) clearTimeout(button._copyResetTimer);
+      button._copyResetTimer = setTimeout(() => {
+        button.classList.remove("is-copied");
+        button._copyResetTimer = null;
+      }, 1500);
+    } catch {
+      // Copy failed (permissions denied, execCommand unsupported, etc).
+      // We intentionally stay silent — the address is still visible and
+      // `user-select: all` on the text span lets the user long-press to
+      // select manually on iOS.
+    }
   });
 }
 
@@ -7442,6 +7812,21 @@ function bindSharedUi(renderFn) {
         }
       }
       state.logoutConfirmOpen = false;
+      await renderFn();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-close-hazbase-logout-confirm]")) {
+    // Mirror the session-logout modal: the backdrop swallows outside-clicks
+    // to dismiss, but inside-card clicks bubble up through here too — skip
+    // those so the Confirm button's own handler can run alone.
+    button.addEventListener("click", async (event) => {
+      if (button.classList.contains("modal-backdrop")) {
+        if (event.target.closest(".modal-card")) {
+          return;
+        }
+      }
+      state.hazbaseLogoutConfirmOpen = false;
       await renderFn();
     });
   }
@@ -8088,6 +8473,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M8 12h8"/><path d="M10.5 17h3"/></svg>`;
     case "check":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6.8 12.5 3.2 3.2 7.2-7.4"/></svg>`;
+    case "copy":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3.5" width="11" height="14" rx="2"/><path d="M6.5 7.5H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-.5"/></svg>`;
     case "lock":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>`;
     case "coin":
@@ -8310,6 +8697,7 @@ function localizeApiError(value) {
     "choice-input-already-handled": "error.choiceInputAlreadyHandled",
     "mkcert-root-ca-not-found": "error.mkcertRootCaNotFound",
     "hazbase-auth-required": "error.hazbaseAuthRequired",
+    "hazbase-passkey-local-host-required": "error.hazbasePasskeyLocalHostRequired",
     "hazbase-wallet-account-missing": "error.hazbaseWalletAccountMissing",
     "unsupported-chain": "error.unsupportedChain",
   };

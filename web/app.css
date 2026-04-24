@@ -1136,6 +1136,89 @@ code {
   margin: 0;
 }
 
+/* The agent-payout address is the single most actionable fact in the ready
+   banner — rendered larger than copy, in a mono font, with a subtle
+   highlight so it's unmistakable as "the wallet agents will use". Rendered
+   as a <button> so a single tap copies it; the clipboard icon swaps to a
+   check mark for ~1.5s via the `.is-copied` class (applied from JS). No
+   hover / focus-ring styling on the button itself — on iOS the sticky
+   hover state + focus-visible kept flashing the border each tap, so we
+   leave the box static and let only the icon transition give feedback. */
+.wallet-flow-banner__address {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  margin: 0.25rem 0 0;
+  padding: 0.55rem 0.7rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.88rem;
+  letter-spacing: 0.03em;
+  line-height: 1.35;
+  color: #e9f7ff;
+  background: rgba(121, 196, 255, 0.08);
+  border: 1px solid rgba(121, 196, 255, 0.18);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  outline: none;
+  /* Tap copies via the clipboard API — we don't need the browser to also
+     range-select the text on tap (previously `user-select: all` on the
+     inner span, which caused an ugly blue highlight to flash every tap
+     on iOS). Copy works without any selection. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.wallet-flow-banner__address:focus {
+  outline: none;
+}
+
+.wallet-flow-banner__address-text {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+/* Stack both icons in the same slot (one is absolutely-positioned on top)
+   and cross-fade via the `.is-copied` toggle so the button layout doesn't
+   jump when the mark flips. */
+.wallet-flow-banner__address-icon-slot {
+  position: relative;
+  width: 1.1rem;
+  height: 1.1rem;
+  flex-shrink: 0;
+}
+
+.wallet-flow-banner__address-icon {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(233, 247, 255, 0.78);
+  transition: opacity 0.18s ease;
+}
+
+.wallet-flow-banner__address-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.wallet-flow-banner__address-icon--check {
+  opacity: 0;
+  color: #7fe0a8;
+  pointer-events: none;
+}
+
+.wallet-flow-banner__address.is-copied .wallet-flow-banner__address-icon--copy {
+  opacity: 0;
+}
+
+.wallet-flow-banner__address.is-copied .wallet-flow-banner__address-icon--check {
+  opacity: 1;
+}
+
 .wallet-flow-message {
   border-color: rgba(156, 181, 197, 0.14);
 }
@@ -1147,6 +1230,42 @@ code {
 .wallet-flow-message--error {
   border-color: rgba(255, 140, 140, 0.18);
   background: rgba(53, 26, 29, 0.96);
+}
+
+/* Brand attribution at the very bottom of the wallet settings page.
+   Sits below the advanced-actions panel as plain small text so it reads
+   as a credit, not another card. The link inherits the muted color and
+   only brightens on hover/focus so it doesn't compete with the Sign out
+   button for attention. */
+.wallet-powered-by {
+  margin: 0.75rem 0 0;
+  text-align: center;
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+  color: rgba(233, 247, 255, 0.45);
+}
+
+.wallet-powered-by a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(233, 247, 255, 0.22);
+  text-underline-offset: 2px;
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
+}
+
+.wallet-powered-by a:hover,
+.wallet-powered-by a:focus-visible {
+  color: rgba(233, 247, 255, 0.85);
+  text-decoration-color: rgba(233, 247, 255, 0.6);
+  outline: none;
+}
+
+/* Wraps the banner + notice + step list on the wallet settings page.
+   Pulled out of `renderSettingsGroup`'s `.settings-list` so each child card
+   renders on the page background instead of nested inside another frame. */
+.wallet-setup-stack {
+  display: grid;
+  gap: 0.85rem;
 }
 
 .wallet-step-list {
@@ -1306,9 +1425,224 @@ code {
   font-size: 0.8rem;
 }
 
+/* Inline input form placed above the action button (e.g. email + OTP code
+   during wallet sign-in). Progressive disclosure: the OTP field is only
+   rendered once the send step succeeds, so the grid just grows. */
+.wallet-step-card__form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.wallet-step-card__field {
+  display: grid;
+  gap: 0.3rem;
+}
+
+/* Row variant: label on the left, inline action link (e.g. "Change email")
+   on the right. Used when the field is locked but still editable via an
+   explicit escape hatch. */
+.wallet-step-card__field-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.wallet-step-card__field-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.wallet-step-card__field-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  color: rgba(147, 220, 182, 0.92);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: rgba(147, 220, 182, 0.45);
+  transition: color 0.12s ease, text-decoration-color 0.12s ease;
+}
+
+.wallet-step-card__field-link:hover,
+.wallet-step-card__field-link:focus-visible {
+  color: #ddfbea;
+  text-decoration-color: rgba(221, 251, 234, 0.85);
+  outline: none;
+}
+
+.wallet-step-card__field-input {
+  width: 100%;
+  padding: 0.58rem 0.75rem;
+  border-radius: 0.55rem;
+  border: 1px solid var(--line-strong);
+  background: rgba(7, 12, 16, 0.72);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.4;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+
+.wallet-step-card__field-input::placeholder {
+  color: rgba(205, 220, 231, 0.38);
+}
+
+.wallet-step-card__field-input:focus {
+  outline: none;
+  border-color: rgba(112, 202, 157, 0.55);
+  background: rgba(7, 12, 16, 0.92);
+  box-shadow: 0 0 0 3px rgba(47, 143, 103, 0.22);
+}
+
+.wallet-step-card__field-input--mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  letter-spacing: 0.14em;
+  font-size: 0.95rem;
+}
+
+/* Locked variant: the email field becomes read-only after the OTP has been
+   sent. We dim it (not fully grayed out, so the address stays readable),
+   flatten the interactive affordances, and let the sibling "Change email"
+   link carry the edit affordance instead. Using `disabled` on the input
+   also short-circuits the `shouldDeferRenderForActiveInteraction` guard
+   since the field can't accept focus while locked. */
+.wallet-step-card__field-input--locked,
+.wallet-step-card__field-input[disabled] {
+  background: rgba(7, 12, 16, 0.38);
+  border-color: var(--line);
+  color: rgba(205, 220, 231, 0.72);
+  cursor: not-allowed;
+}
+
+.wallet-step-card__field-input[disabled]:focus {
+  border-color: var(--line);
+  box-shadow: none;
+}
+
 .wallet-step-card__actions {
   display: grid;
   gap: 0.65rem;
+}
+
+/* Compact variant: used for finished steps so the current step dominates the
+   page. One row tall, icon + title + detail visible, no copy/actions. */
+.wallet-step-card--compact {
+  display: flex;
+  gap: 0.7rem;
+  align-items: center;
+  padding: 0.68rem 0.85rem;
+  border-color: rgba(112, 202, 157, 0.14);
+  background: rgba(22, 28, 35, 0.72);
+  box-shadow: none;
+}
+
+.wallet-step-card__compact-icon {
+  width: 1.4rem;
+  height: 1.4rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(112, 202, 157, 0.16);
+  color: #ddfbea;
+  flex: 0 0 auto;
+}
+
+.wallet-step-card__compact-icon svg {
+  width: 0.78rem;
+  height: 0.78rem;
+}
+
+.wallet-step-card__compact-body {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: grid;
+  gap: 0.1rem;
+}
+
+.wallet-step-card__compact-title {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.wallet-step-card__compact-detail {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: rgba(205, 220, 231, 0.62);
+  overflow-wrap: anywhere;
+}
+
+.wallet-step-card__compact-detail--mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.75rem;
+}
+
+.wallet-step-card__compact-status {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: rgba(112, 202, 157, 0.92);
+  flex: 0 0 auto;
+}
+
+/* Mainnet opt-in link: behaves like a row-shaped button so it sits naturally
+   among the step cards but reads as a disclosure, not a primary action. */
+.wallet-mainnet-optin {
+  display: flex;
+  gap: 0.7rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.75rem 0.9rem;
+  border-radius: 16px;
+  border: 1px dashed rgba(240, 180, 40, 0.28);
+  background: rgba(240, 180, 40, 0.04);
+  color: rgba(255, 220, 140, 0.96);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.wallet-mainnet-optin:hover,
+.wallet-mainnet-optin:focus-visible {
+  background: rgba(240, 180, 40, 0.09);
+  border-color: rgba(240, 180, 40, 0.44);
+  outline: none;
+}
+
+.wallet-mainnet-optin__body {
+  flex: 1 1 auto;
+  display: grid;
+  gap: 0.14rem;
+}
+
+.wallet-mainnet-optin__label {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.wallet-mainnet-optin__hint {
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.wallet-mainnet-optin__chevron {
+  flex: 0 0 auto;
+  font-size: 1rem;
+  opacity: 0.7;
 }
 
 @media (max-width: 640px) {
@@ -1318,6 +1652,12 @@ code {
 
   .wallet-step-card__status {
     align-self: flex-start;
+  }
+
+  .wallet-step-card--compact {
+    /* Stay single-line even on narrow phones — dropping to column here
+       would negate the point of the compact variant. */
+    flex-direction: row;
   }
 }
 
