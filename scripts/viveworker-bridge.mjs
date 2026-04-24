@@ -14015,9 +14015,19 @@ if (url.pathname === "/api/hazbase/passkey/register/challenge" && req.method ===
   const hazbase = normalizeHazbaseState(state.hazbase);
   if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
   const body = await parseJsonBody(req);
+  let partnerOrigin;
+  try {
+    partnerOrigin = deriveHazbasePartnerPasskeyOrigin(req, config);
+  } catch (error) {
+    return writeJson(res, 400, {
+      error: error?.code || "hazbase-passkey-local-host-required",
+      message: error?.message || "Open viveworker on its .local hostname to use hazBase passkeys.",
+    });
+  }
   const result = await requestPasskeyRegistrationChallenge({
     emailSession: hazbase.accessToken,
     deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
+    partnerOrigin,
   });
   return writeJson(res, 200, result);
 }
@@ -14049,10 +14059,20 @@ if (url.pathname === "/api/hazbase/passkey/assert/challenge" && req.method === "
   const hazbase = normalizeHazbaseState(state.hazbase);
   if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
   const body = await parseJsonBody(req);
+  let partnerOrigin;
+  try {
+    partnerOrigin = deriveHazbasePartnerPasskeyOrigin(req, config);
+  } catch (error) {
+    return writeJson(res, 400, {
+      error: error?.code || "hazbase-passkey-local-host-required",
+      message: error?.message || "Open viveworker on its .local hostname to use hazBase passkeys.",
+    });
+  }
   const result = await requestPasskeyAssertionChallenge({
     emailSession: hazbase.accessToken,
     purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
     deviceBindingId: hazbase.deviceBindingId || undefined,
+    partnerOrigin,
   });
   return writeJson(res, 200, result);
 }
@@ -17430,7 +17450,8 @@ function buildConfig(cli) {
     a2aShareUrl: stripTrailingSlash(
       process.env.VIVEWORKER_SHARE_URL || "https://share.viveworker.com"
     ),
-    hazbaseApiUrl: stripTrailingSlash(process.env.HAZBASE_API_URL || "https://passkey.hazbase.com"),
+    hazbaseApiUrl: stripTrailingSlash(process.env.HAZBASE_API_URL || "https://api.hazbase.com"),
+    hazbaseClientKey: cleanText(process.env.HAZBASE_CLIENT_KEY || "viveworker-internal"),
     hazbaseDeviceLabel: cleanText(process.env.HAZBASE_DEVICE_LABEL || "viveworker"),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
@@ -17535,10 +17556,43 @@ function normalizeHazbaseState(raw) {
   };
 }
 
+function hazbasePasskeyLocalHostError() {
+  const error = new Error("Open viveworker on its .local hostname to use hazBase passkeys.");
+  error.code = "hazbase-passkey-local-host-required";
+  return error;
+}
+
+function deriveHazbasePartnerPasskeyOrigin(req, config) {
+  const rawOrigin = cleanText(req.headers.origin || "");
+  const rawHost = cleanText(req.headers.host || "");
+  const candidateOrigin = rawOrigin || (rawHost ? `https://${rawHost}` : "");
+  if (!candidateOrigin) {
+    throw hazbasePasskeyLocalHostError();
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(candidateOrigin);
+  } catch {
+    throw hazbasePasskeyLocalHostError();
+  }
+
+  const hostname = cleanText(parsed.hostname || "").toLowerCase();
+  if (parsed.protocol !== "https:" || !hostname || net.isIP(hostname) || !hostname.endsWith(".local")) {
+    throw hazbasePasskeyLocalHostError();
+  }
+
+  return {
+    origin: `${parsed.protocol}//${parsed.host}`.toLowerCase(),
+    rpId: hostname,
+    clientKey: config.hazbaseClientKey || "viveworker-internal",
+  };
+}
+
 function configureHazbaseClient(config) {
   try {
-    setHazbaseClientKey(process.env.HAZBASE_CLIENT_KEY || "viveworker-internal");
-    setHazbaseApiEndpoint(config.hazbaseApiUrl || "https://passkey.hazbase.com");
+    setHazbaseClientKey(config.hazbaseClientKey || "viveworker-internal");
+    setHazbaseApiEndpoint(config.hazbaseApiUrl || "https://api.hazbase.com");
   } catch (error) {
     console.error(`[hazbase-config] ${error.message}`);
   }

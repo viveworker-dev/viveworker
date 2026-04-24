@@ -112,7 +112,7 @@ const LEGACY_KIND = "html";
 // the format branch in handleView.
 
 const X402_VERSION = 1;
-const DEFAULT_HAZBASE_API_ENDPOINT = "https://passkey.hazbase.com";
+const DEFAULT_HAZBASE_API_ENDPOINT = "https://api.hazbase.com";
 // Keyed by chainId. `usdc` is the canonical USDC contract address for that
 // chain; `eip712Name` + `eip712Version` are the EIP-712 domain fields the
 // facilitator uses to verify transferWithAuthorization signatures.

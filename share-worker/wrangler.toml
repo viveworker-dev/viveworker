@@ -42,7 +42,7 @@ preview_bucket_name = "viveworker-share-files-preview"
 # network for new paid shares; `HAZBASE_API_ENDPOINT` points at the backend.
 [vars]
 X402_NETWORK = "base-sepolia"
-HAZBASE_API_ENDPOINT = "https://passkey.hazbase.com"
+HAZBASE_API_ENDPOINT = "https://api.hazbase.com"
 
 # Closed-beta allowlist for paid shares. A CSV of userIds permitted to attach
 # `--price` / `--pay-to` on upload. Everyone else gets 403 paid-shares-closed-beta
