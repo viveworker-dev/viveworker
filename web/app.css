@@ -1108,6 +1108,225 @@ code {
   margin-top: 0.95rem;
 }
 
+.wallet-flow-banner {
+  gap: 0.35rem;
+}
+
+.wallet-flow-banner--ready {
+  border-color: rgba(121, 196, 255, 0.2);
+  background: linear-gradient(180deg, rgba(28, 40, 49, 0.98), rgba(20, 27, 34, 0.96));
+}
+
+.wallet-flow-banner__eyebrow {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(121, 196, 255, 0.82);
+}
+
+.wallet-flow-banner__title {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.wallet-flow-banner__copy {
+  margin: 0;
+}
+
+.wallet-flow-message {
+  border-color: rgba(156, 181, 197, 0.14);
+}
+
+.wallet-flow-message--notice {
+  background: rgba(31, 41, 50, 0.96);
+}
+
+.wallet-flow-message--error {
+  border-color: rgba(255, 140, 140, 0.18);
+  background: rgba(53, 26, 29, 0.96);
+}
+
+.wallet-step-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.wallet-step-card {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.95rem;
+  border: 1px solid rgba(156, 181, 197, 0.08);
+  border-radius: 18px;
+  background: rgba(22, 28, 35, 0.96);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.1);
+}
+
+.wallet-step-card--current {
+  border-color: rgba(121, 196, 255, 0.28);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.16);
+}
+
+.wallet-step-card--complete {
+  border-color: rgba(112, 202, 157, 0.16);
+}
+
+.wallet-step-card--locked {
+  opacity: 0.78;
+}
+
+.wallet-step-card__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+
+.wallet-step-card__headline {
+  min-width: 0;
+  display: flex;
+  gap: 0.62rem;
+  align-items: flex-start;
+}
+
+.wallet-step-card__icon {
+  width: 2rem;
+  height: 2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: rgba(121, 196, 255, 0.11);
+  color: #e9f7ff;
+  flex: 0 0 auto;
+}
+
+.wallet-step-card__icon svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.wallet-step-card__title-wrap {
+  min-width: 0;
+  display: grid;
+  gap: 0.18rem;
+}
+
+.wallet-step-card__eyebrow {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(205, 220, 231, 0.5);
+}
+
+.wallet-step-card__title {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.wallet-step-card__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.36rem;
+  min-height: 1.75rem;
+  padding: 0.22rem 0.68rem;
+  border-radius: 999px;
+  border: 1px solid rgba(156, 181, 197, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(231, 243, 250, 0.82);
+  font-size: 0.76rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.wallet-step-card__status--current {
+  border-color: rgba(121, 196, 255, 0.24);
+  background: rgba(121, 196, 255, 0.12);
+  color: #dcf1ff;
+}
+
+.wallet-step-card__status--complete {
+  border-color: rgba(112, 202, 157, 0.24);
+  background: rgba(112, 202, 157, 0.12);
+  color: #ddfbea;
+}
+
+.wallet-step-card__status--locked {
+  color: rgba(205, 220, 231, 0.6);
+}
+
+.wallet-step-card__status--optional {
+  border-color: rgba(240, 180, 40, 0.22);
+  background: rgba(240, 180, 40, 0.12);
+  color: rgba(255, 220, 140, 0.96);
+}
+
+.wallet-step-card__status-icon {
+  width: 0.82rem;
+  height: 0.82rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wallet-step-card__status-icon svg {
+  width: 0.82rem;
+  height: 0.82rem;
+}
+
+.wallet-step-card__copy,
+.wallet-step-card__detail {
+  margin: 0;
+}
+
+.wallet-step-card__copy {
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.wallet-step-card__detail {
+  padding: 0.78rem 0.85rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(156, 181, 197, 0.08);
+  color: rgba(231, 243, 250, 0.82);
+  font-size: 0.83rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.wallet-step-card__detail--mono {
+  font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.8rem;
+}
+
+.wallet-step-card__actions {
+  display: grid;
+  gap: 0.65rem;
+}
+
+@media (max-width: 640px) {
+  .wallet-step-card__header {
+    flex-direction: column;
+  }
+
+  .wallet-step-card__status {
+    align-self: flex-start;
+  }
+}
+
+@media (min-width: 720px) {
+  .wallet-step-card__actions {
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  }
+}
+
 .screen-header {
   display: flex;
   justify-content: space-between;

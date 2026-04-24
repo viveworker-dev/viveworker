@@ -327,6 +327,19 @@ node scripts/viveworker.mjs share upload report.pdf \
   --pay-to 0x0000000000000000000000000000000000000000
 # → https://share.viveworker.com/v/<slug>
 
+# Resolve a hazbase smart wallet address first when you want the payout
+# recipient to be the seller's hazbase wallet rather than a raw EOA.
+# Requires the local viveworker session secret (same value as SESSION_SECRET).
+curl -sS http://127.0.0.1:8787/api/hazbase/payout-address?chainId=84532 \
+  -H "x-viveworker-hook-secret: $SESSION_SECRET"
+# -> { "payoutAddress": "0x...", "payoutMethod": "hazbase_wallet", ... }
+
+# Then pass that resolved address to --pay-to. Keep payoutMethod metadata
+# in mind if you build your own worker request body directly.
+node scripts/viveworker.mjs share upload report.pdf \
+  --price 0.10 \
+  --pay-to 0x...
+
 # Rotate the price (invalidates outstanding paid sessions)
 node scripts/viveworker.mjs share update <slug> --price 0.20
 
@@ -336,6 +349,38 @@ node scripts/viveworker.mjs share update <slug> --pay-to 0x…
 # Remove the payment gate entirely (share becomes public)
 node scripts/viveworker.mjs share update <slug> --no-price
 ```
+
+**Wallet setup split (recommended):**
+- **Human path:** use `Settings -> Integrations -> Wallet` inside viveworker for OTP, passkey registration/assertion, and Base / Base Sepolia wallet issuance.
+- **Agent path:** treat hazbase wallet resolution as **read-only orchestration**. Agents should read local status / payout-address and then call `share upload` / `share update` with the resolved `--pay-to` value.
+- **Do not let agents drive OTP / passkey by default.** If the wallet is missing or the seller is signed out, the agent should instruct the human to complete those steps in the Wallet UI, then continue automatically afterwards.
+
+**Local agent runbook (hazbase wallet as seller payout):**
+1. Check whether viveworker already has a signed-in hazbase session and an issued wallet on the target chain.
+2. If status shows `signedIn=false`, `hazbase-auth-required`, or no wallet address for the target chain, stop and tell the human to finish the Wallet UI flow.
+3. Resolve the payout address locally.
+4. Pass that address to `share upload` / `share update` as `--pay-to`.
+5. If you build raw worker requests instead of using the CLI, keep `payoutMethod=hazbase_wallet` metadata so the backend audit trail preserves the wallet origin.
+
+```bash
+# 1) Inspect local hazbase status (read-only; safe for agents).
+curl -sS http://127.0.0.1:8787/api/hazbase/status \
+  -H "x-viveworker-hook-secret: $SESSION_SECRET"
+
+# 2) Resolve the seller payout address for Base Sepolia.
+PAYTO="$(curl -sS 'http://127.0.0.1:8787/api/hazbase/payout-address?chainId=84532' \
+  -H "x-viveworker-hook-secret: $SESSION_SECRET" | jq -r '.payoutAddress')"
+
+# 3) Use the resolved address in the existing share CLI.
+node scripts/viveworker.mjs share upload report.pdf \
+  --price 0.10 \
+  --pay-to "$PAYTO"
+```
+
+**Expected agent-side failures:**
+- `hazbase-auth-required`: no local hazbase session is active. Ask the human to sign in via `Wallet`.
+- `hazbase-wallet-account-missing`: the seller is signed in, but has not issued a wallet on that chain yet. Ask the human to issue it in `Wallet`.
+- `unsupported-chain`: the requested chain is not wired for wallet payout resolution on this viveworker instance.
 
 **A2A flow:**
 1. Paste the `/v/<slug>` URL into the message body for the buying agent (via `viveworker a2a`, Moltbook comment, thread-share, or whatever transport applies).

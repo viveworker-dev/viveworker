@@ -112,6 +112,7 @@ const LEGACY_KIND = "html";
 // the format branch in handleView.
 
 const X402_VERSION = 1;
+const DEFAULT_HAZBASE_API_ENDPOINT = "https://passkey.hazbase.com";
 // Keyed by chainId. `usdc` is the canonical USDC contract address for that
 // chain; `eip712Name` + `eip712Version` are the EIP-712 domain fields the
 // facilitator uses to verify transferWithAuthorization signatures.
@@ -430,13 +431,22 @@ async function handleUpload(request, env) {
   // surface small.
   const priceRaw = form.get("price");
   const payToRaw = form.get("payTo");
+  const payoutAddressRaw = form.get("payoutAddress");
+  const paymentNetworkRaw = form.get("paymentNetwork");
+  const payoutMethodRaw = form.get("payoutMethod");
   let priceAtomic = null;
   let payTo = null;
   let chainId = null;
+  let paymentNetwork = null;
+  let payoutMethod = null;
+  let payoutAddress = null;
   let paymentSalt = null;
   const anyPricePresent = typeof priceRaw === "string" && priceRaw.length > 0;
-  const anyPayToPresent = typeof payToRaw === "string" && payToRaw.length > 0;
-  if (anyPricePresent || anyPayToPresent) {
+  const requestedPayout = parseRequestedPayoutAddress(payToRaw, payoutAddressRaw);
+  if (requestedPayout.error) {
+    return jsonResponse({ error: requestedPayout.error }, 400);
+  }
+  if (anyPricePresent || requestedPayout.sawValue) {
     // Closed-beta gate: while x402 is pinned to testnet, only allowlisted
     // userIds can attach a price. Check first so a non-allowlisted user who
     // fat-fingered `--price` + `--pay-to` gets a clear "not in beta" error
@@ -451,7 +461,7 @@ async function handleUpload(request, env) {
         403,
       );
     }
-    if (!anyPricePresent || !anyPayToPresent) {
+    if (!anyPricePresent || !requestedPayout.address) {
       return jsonResponse({ error: "price-payTo-both-required" }, 400);
     }
     if (passwordHash) {
@@ -471,16 +481,17 @@ async function handleUpload(request, env) {
         400,
       );
     }
-    if (!isValidEthAddress(payToRaw)) {
-      return jsonResponse({ error: "invalid-payTo" }, 400);
-    }
-    const resolvedChainId = resolveChainId(env);
+    const requestedNetwork = typeof paymentNetworkRaw === "string" ? paymentNetworkRaw : "";
+    const resolvedChainId = resolveChainId(env, requestedNetwork);
     if (!resolvedChainId) {
       return jsonResponse({ error: "payment-network-not-configured" }, 500);
     }
     priceAtomic = parsed.toString();
-    payTo = normalizeEthAddress(payToRaw);
+    payTo = requestedPayout.address;
     chainId = resolvedChainId;
+    paymentNetwork = X402_NETWORKS[resolvedChainId]?.name || null;
+    payoutMethod = normalizeRequestedPayoutMethod(payoutMethodRaw);
+    payoutAddress = payTo;
     const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
     paymentSalt = bytesToBase64(saltBuf);
   }
@@ -556,6 +567,9 @@ async function handleUpload(request, env) {
     price: priceAtomic,
     payTo,
     chainId,
+    paymentNetwork,
+    payoutMethod,
+    payoutAddress,
     paymentSalt,
   };
 
@@ -603,6 +617,9 @@ async function handleUpload(request, env) {
     price: priceAtomic,
     payTo,
     chainId,
+    paymentNetwork: paymentNetwork || (chainId ? X402_NETWORKS[chainId]?.name || null : null),
+    payoutMethod: payoutMethod || null,
+    payoutAddress: payoutAddress || payTo,
     network: chainId ? X402_NETWORKS[chainId]?.name || null : null,
     size: file.size,
     originalName,
@@ -656,6 +673,9 @@ async function handleList(request, env) {
       price: meta.price || null,
       payTo: meta.payTo || null,
       chainId: meta.chainId || null,
+      paymentNetwork: meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
+      payoutMethod: meta.payoutMethod || null,
+      payoutAddress: meta.payoutAddress || meta.payTo || null,
       network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
     });
   }
@@ -838,6 +858,9 @@ async function handlePatch(request, env, slug) {
         meta.price = null;
         meta.payTo = null;
         meta.chainId = null;
+        meta.paymentNetwork = null;
+        meta.payoutMethod = null;
+        meta.payoutAddress = null;
         meta.paymentSalt = null;
         changed = true;
       }
@@ -870,43 +893,57 @@ async function handlePatch(request, env, slug) {
           400,
         );
       }
-      // payTo: take from body if present, else keep existing. If neither,
+      // Recipient: take from body if present, else keep existing. If neither,
       // reject — a price without a recipient is unusable.
+      const requestedPayout = parseRequestedPayoutAddress(
+        Object.prototype.hasOwnProperty.call(body, "payTo") ? body.payTo : undefined,
+        Object.prototype.hasOwnProperty.call(body, "payoutAddress") ? body.payoutAddress : undefined,
+      );
+      if (requestedPayout.error) {
+        return jsonResponse({ error: requestedPayout.error }, 400);
+      }
       let effectivePayTo;
-      if ("payTo" in body) {
-        if (typeof body.payTo !== "string" || !isValidEthAddress(body.payTo)) {
-          return jsonResponse({ error: "invalid-payTo" }, 400);
+      if (requestedPayout.sawValue) {
+        if (!requestedPayout.address) {
+          return jsonResponse({ error: "price-payTo-both-required" }, 400);
         }
-        effectivePayTo = normalizeEthAddress(body.payTo);
-      } else if (meta.payTo) {
-        effectivePayTo = meta.payTo;
+        effectivePayTo = requestedPayout.address;
+      } else if (meta.payoutAddress || meta.payTo) {
+        effectivePayTo = meta.payoutAddress || meta.payTo;
       } else {
         return jsonResponse({ error: "price-payTo-both-required" }, 400);
       }
-      const resolvedChainId = meta.chainId || resolveChainId(env);
+      const requestedNetwork = typeof body.paymentNetwork === "string" ? body.paymentNetwork : (meta.paymentNetwork || "");
+      const resolvedChainId = meta.chainId || resolveChainId(env, requestedNetwork);
       if (!resolvedChainId) {
         return jsonResponse({ error: "payment-network-not-configured" }, 500);
       }
       meta.price = parsed.toString();
       meta.payTo = effectivePayTo;
       meta.chainId = resolvedChainId;
+      meta.paymentNetwork = X402_NETWORKS[resolvedChainId]?.name || null;
+      meta.payoutMethod = normalizeRequestedPayoutMethod(body.payoutMethod || meta.payoutMethod);
+      meta.payoutAddress = effectivePayTo;
       const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
       meta.paymentSalt = bytesToBase64(saltBuf);
       changed = true;
     } else {
       return jsonResponse({ error: "invalid-price" }, 400);
     }
-  } else if ("payTo" in body) {
-    // payTo-only branch: only legal when the share already has a price.
-    const tv = body.payTo;
-    if (tv === null || tv === "") {
+  } else if ("payTo" in body || "payoutAddress" in body) {
+    // Recipient-only branch: only legal when the share already has a price.
+    const requestedPayout = parseRequestedPayoutAddress(
+      Object.prototype.hasOwnProperty.call(body, "payTo") ? body.payTo : undefined,
+      Object.prototype.hasOwnProperty.call(body, "payoutAddress") ? body.payoutAddress : undefined,
+    );
+    if (requestedPayout.error) {
+      return jsonResponse({ error: requestedPayout.error }, 400);
+    }
+    if (requestedPayout.sawValue && !requestedPayout.address) {
       return jsonResponse(
         { error: "payTo-cannot-be-cleared-alone", hint: "pass price:null to remove the payment gate" },
         400,
       );
-    }
-    if (typeof tv !== "string" || !isValidEthAddress(tv)) {
-      return jsonResponse({ error: "invalid-payTo" }, 400);
     }
     if (!meta.price) {
       return jsonResponse({ error: "payTo-without-price" }, 400);
@@ -925,9 +962,18 @@ async function handlePatch(request, env, slug) {
         403,
       );
     }
-    const normalized = normalizeEthAddress(tv);
+    const normalized = requestedPayout.address;
     if (normalized !== meta.payTo) {
       meta.payTo = normalized;
+      meta.payoutAddress = normalized;
+      changed = true;
+    }
+  }
+
+  if ("payoutMethod" in body && meta.price) {
+    const normalizedPayoutMethod = normalizeRequestedPayoutMethod(body.payoutMethod);
+    if (normalizedPayoutMethod !== (meta.payoutMethod || "external_eoa")) {
+      meta.payoutMethod = normalizedPayoutMethod;
       changed = true;
     }
   }
@@ -1010,6 +1056,9 @@ async function handlePatch(request, env, slug) {
     price: meta.price || null,
     payTo: meta.payTo || null,
     chainId: meta.chainId || null,
+    paymentNetwork: meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
+    payoutMethod: meta.payoutMethod || null,
+    payoutAddress: meta.payoutAddress || meta.payTo || null,
     network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
     size: meta.size,
     originalName: meta.originalName,
@@ -1065,118 +1114,104 @@ async function handleView(request, env, ctx, slug, headOnly = false) {
   // (broadcasting the transfer tx on-chain) is fired via ctx.waitUntil after
   // verify — the facilitator has already confirmed the signature + nonce, so
   // settle is essentially a formality.
-  const paymentExtraHeaders = {};
-  if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
-    const cookies = parseCookies(request.headers.get("cookie") || "");
-    const paidToken = cookies[PAID_COOKIE_NAME] || "";
-    const hasPaidSession = paidToken
-      ? await verifyUnlockToken(paidToken, slug, env, meta.paymentSalt)
-      : false;
 
-    if (!hasPaidSession) {
-      const xPaymentHeader = request.headers.get("x-payment") || "";
-      if (!xPaymentHeader) {
-        // First visit — advertise payment requirements. HEAD is intentionally
-        // terse (no body); content-type matches what GET would negotiate so
-        // DevTools HEAD probes reflect the real response. Link + X-Payment-
-        // Required hints are included so HEAD-preflight clients and tools
-        // that drop non-2xx bodies can still extract the price / payTo /
-        // chain without a second call.
-        writeShareEvent(env, headOnly ? "402_served_head" : "402_served", slug, {
-          userId: meta.userId || "",
-          network: X402_NETWORKS[meta.chainId]?.name || "",
-        });
-        if (headOnly) {
-          const requirements = buildPaymentRequirements(meta, slug, request.url);
-          const hintHeaders = buildPaymentHintHeaders(requirements);
-          return new Response(null, {
-            status: 402,
-            headers: {
-              "content-type": prefersHtml(request)
-                ? "text/html; charset=utf-8"
-                : "application/json; charset=utf-8",
-              "cache-control": "private, no-store",
-              ...hintHeaders,
-              ...SECURITY_HEADERS,
-            },
-          });
-        }
-        return build402Response(meta, request, slug);
-      }
+const paymentExtraHeaders = {};
+if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
+  const cookies = parseCookies(request.headers.get("cookie") || "");
+  const paidToken = cookies[PAID_COOKIE_NAME] || "";
+  const hasPaidSession = paidToken
+    ? await verifyUnlockToken(paidToken, slug, env, meta.paymentSalt)
+    : false;
 
-      const verifyResult = await facilitatorVerify(env, meta, xPaymentHeader, request.url, slug);
-      if (!verifyResult || !verifyResult.isValid) {
-        const reason = (verifyResult && verifyResult.invalidReason) || "payment-verification-failed";
-        // Distinguish facilitator-reachability issues from protocol-level
-        // rejections: facilitatorVerify returns `facilitator-unavailable` when
-        // the upstream is down, everything else is the facilitator's own
-        // invalidReason (bad signature, expired nonce, wrong amount, etc.).
-        writeShareEvent(env, reason === "facilitator-unavailable" ? "facilitator_unavailable" : "verify_failed", slug, {
-          userId: meta.userId || "",
-          network: X402_NETWORKS[meta.chainId]?.name || "",
-          reason,
-        });
-        return jsonResponse(
-          {
-            x402Version: X402_VERSION,
-            error: reason,
-          },
-          402,
-        );
-      }
-
-      writeShareEvent(env, "paid_view", slug, {
-        userId: meta.userId || "",
-        network: X402_NETWORKS[meta.chainId]?.name || "",
-      });
-
-      // Settle async; don't block the view. Any failure is logged but does
-      // not fail the read — the facilitator already validated the signature.
-      if (ctx && typeof ctx.waitUntil === "function") {
-        ctx.waitUntil(
-          facilitatorSettle(env, meta, xPaymentHeader, request.url, slug).catch((err) => {
-            console.error("[share-worker] facilitator settle failed", err?.stack || err);
-            writeShareEvent(env, "settle_failed", slug, {
-              userId: meta.userId || "",
-              network: X402_NETWORKS[meta.chainId]?.name || "",
-              reason: String(err?.message || err || "").slice(0, 200),
-            });
-          }),
-        );
-      }
-
-      // Mint a paid session so reloads within PAID_COOKIE_MAX_AGE_SEC skip 402.
-      const expMs = Date.now() + PAID_COOKIE_MAX_AGE_SEC * 1000;
-      const newPaidToken = await signUnlockToken(slug, env, meta.paymentSalt, expMs);
-      paymentExtraHeaders["set-cookie"] = [
-        `${PAID_COOKIE_NAME}=${newPaidToken}`,
-        `Path=/v/${slug}`,
-        `Max-Age=${PAID_COOKIE_MAX_AGE_SEC}`,
-        "HttpOnly",
-        "Secure",
-        "SameSite=Lax",
-      ].join("; ");
-      // X-PAYMENT-RESPONSE: base64-encoded JSON preview. Settlement is async
-      // so we don't have a tx hash yet; the client can poll the facilitator
-      // directly if it needs one, or trust the verify step.
-      const preview = {
-        success: true,
-        network: X402_NETWORKS[meta.chainId]?.name || null,
-        payer: verifyResult.payer || null,
-      };
-      paymentExtraHeaders["x-payment-response"] = bytesToBase64(
-        new TextEncoder().encode(JSON.stringify(preview)),
+  if (!hasPaidSession) {
+    const requirementResult = await requestHazbasePaymentRequirements(env, meta, slug, request.url);
+    if (!requirementResult.ok) {
+      return jsonResponse(
+        { x402Version: X402_VERSION, error: requirementResult.errorCode || "payment-service-unavailable" },
+        503,
       );
-    } else {
-      // Returning buyer with a valid `share_paid` cookie — no 402, no
-      // facilitator round-trip. Logged separately so we can distinguish new
-      // pays (billable attention) from session reuse (free reloads).
-      writeShareEvent(env, "paid_cookie_hit", slug, {
-        userId: meta.userId || "",
-        network: X402_NETWORKS[meta.chainId]?.name || "",
-      });
     }
+    const requirements = requirementResult.requirements;
+    const x402Body = requirementResult.x402;
+    const xPaymentHeader = request.headers.get("x-payment") || "";
+    if (!xPaymentHeader) {
+      writeShareEvent(env, headOnly ? "402_served_head" : "402_served", slug, {
+        userId: meta.userId || "",
+        network: requirements.network || "",
+      });
+      if (headOnly) {
+        const hintHeaders = buildPaymentHintHeaders(requirements);
+        return new Response(null, {
+          status: 402,
+          headers: {
+            "content-type": prefersHtml(request)
+              ? "text/html; charset=utf-8"
+              : "application/json; charset=utf-8",
+            "cache-control": "private, no-store",
+            ...hintHeaders,
+            ...SECURITY_HEADERS,
+          },
+        });
+      }
+      return build402Response(request, slug, x402Body);
+    }
+
+    const verifyResult = await verifyHazbasePayment(env, requirementResult.paymentRequestId, xPaymentHeader);
+    if (!verifyResult || !verifyResult.verified) {
+      const reason = (verifyResult && (verifyResult.invalidReason || verifyResult.errorCode)) || "payment-verification-failed";
+      writeShareEvent(env, reason === "facilitator_unavailable" ? "facilitator_unavailable" : "verify_failed", slug, {
+        userId: meta.userId || "",
+        network: requirements.network || "",
+        reason,
+      });
+      return jsonResponse(
+        {
+          x402Version: X402_VERSION,
+          error: reason,
+        },
+        402,
+      );
+    }
+
+    writeShareEvent(env, "paid_view", slug, {
+      userId: meta.userId || "",
+      network: requirements.network || "",
+    });
+
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(
+        settleHazbasePayment(env, requirementResult.paymentRequestId, xPaymentHeader).catch((err) => {
+          console.error("[share-worker] hazbase settle failed", err?.stack || err);
+          writeShareEvent(env, "settle_failed", slug, {
+            userId: meta.userId || "",
+            network: requirements.network || "",
+            reason: String(err?.message || err || "").slice(0, 200),
+          });
+        }),
+      );
+    }
+
+    const expMs = Date.now() + PAID_COOKIE_MAX_AGE_SEC * 1000;
+    const newPaidToken = await signUnlockToken(slug, env, meta.paymentSalt, expMs);
+    paymentExtraHeaders["set-cookie"] = [
+      `${PAID_COOKIE_NAME}=${newPaidToken}`,
+      `Path=/v/${slug}`,
+      `Max-Age=${PAID_COOKIE_MAX_AGE_SEC}`,
+      "HttpOnly",
+      "Secure",
+      "SameSite=Lax",
+    ].join("; ");
+    const previewHeader = verifyResult?.responsePreview?.headers?.["x-payment-response"];
+    if (previewHeader) {
+      paymentExtraHeaders["x-payment-response"] = previewHeader;
+    }
+  } else {
+    writeShareEvent(env, "paid_cookie_hit", slug, {
+      userId: meta.userId || "",
+      network: meta.paymentNetwork || X402_NETWORKS[meta.chainId]?.name || "",
+    });
   }
+}
 
   const url = new URL(request.url);
   const kind = meta.kind || LEGACY_KIND;
@@ -1626,8 +1661,34 @@ function normalizeEthAddress(addr) {
   return String(addr || "").toLowerCase();
 }
 
-function resolveChainId(env) {
-  const net = String(env?.X402_NETWORK || "").toLowerCase().trim();
+function normalizeRequestedPayoutMethod(raw) {
+  return typeof raw === "string" && raw.trim() === "hazbase_wallet"
+    ? "hazbase_wallet"
+    : "external_eoa";
+}
+
+function parseRequestedPayoutAddress(...values) {
+  let normalized = null;
+  let sawValue = false;
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    sawValue = true;
+    if (!trimmed) continue;
+    if (!isValidEthAddress(trimmed)) {
+      return { error: "invalid-payTo", sawValue };
+    }
+    const next = normalizeEthAddress(trimmed);
+    if (normalized && normalized !== next) {
+      return { error: "conflicting-payout-address", sawValue };
+    }
+    normalized = next;
+  }
+  return { address: normalized, sawValue };
+}
+
+function resolveChainId(env, explicitNetwork = "") {
+  const net = String(explicitNetwork || env?.X402_NETWORK || "").toLowerCase().trim();
   if (net === "base") return 8453;
   if (net === "base-sepolia" || net === "basesepolia" || net === "sepolia") return 84532;
   return null;
@@ -1661,21 +1722,93 @@ function canonicalizeResourceUrl(requestUrl) {
   }
 }
 
-function buildPaymentRequirements(meta, slug, requestUrl) {
-  const net = X402_NETWORKS[meta.chainId];
-  if (!net) return null;
+
+function hazbaseApiBase(env) {
+  return String(env?.HAZBASE_API_ENDPOINT || DEFAULT_HAZBASE_API_ENDPOINT).replace(/\/$/u, "");
+}
+
+function effectivePaymentNetwork(meta) {
+  return meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null);
+}
+
+function buildHazbasePaymentPayload(meta, slug, requestUrl) {
+  const network = effectivePaymentNetwork(meta);
+  const payoutAddress = meta.payoutAddress || meta.payTo;
+  if (!network || !payoutAddress) return null;
   return {
-    scheme: "exact",
-    network: net.name,
-    maxAmountRequired: meta.price,
-    resource: canonicalizeResourceUrl(requestUrl),
+    resourceId: `share:${slug}`,
+    resourceUrl: canonicalizeResourceUrl(requestUrl),
     description: `Unlock viveworker share ${slug}`,
     mimeType: meta.contentType || LEGACY_CONTENT_TYPE,
-    payTo: meta.payTo,
-    maxTimeoutSeconds: 60,
-    asset: net.usdc,
-    extra: { name: net.eip712Name, version: net.eip712Version },
+    network,
+    asset: "usdc",
+    priceAtomic: meta.price,
+    payoutMethod: {
+      kind: "external_eoa",
+      address: payoutAddress,
+    },
+    metadata: {
+      slug,
+      ownerUserId: meta.userId || "",
+      paymentSalt: meta.paymentSalt || "",
+      payoutOriginKind: meta.payoutMethod || "external_eoa",
+    },
   };
+}
+
+async function requestHazbasePaymentRequirements(env, meta, slug, requestUrl) {
+  const payload = buildHazbasePaymentPayload(meta, slug, requestUrl);
+  if (!payload) return { ok: false, errorCode: "payment-network-not-configured" };
+  try {
+    const res = await fetch(`${hazbaseApiBase(env)}/api/payments/x402/requirements`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-request-id": `share_req_${crypto.randomUUID()}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json().catch(() => null);
+    const data = json?.data || json;
+    if (!res.ok || !data?.paymentRequestId || !data?.x402?.accepts?.[0]) {
+      return { ok: false, errorCode: data?.errorCode || data?.error || "payment-service-unavailable" };
+    }
+    return {
+      ok: true,
+      paymentRequestId: data.paymentRequestId,
+      x402: data.x402,
+      requirements: data.x402.accepts[0],
+    };
+  } catch (err) {
+    console.error("[share-worker] hazbase requirements error", err?.stack || err);
+    return { ok: false, errorCode: "payment-service-unavailable" };
+  }
+}
+
+async function verifyHazbasePayment(env, paymentRequestId, xPaymentHeader) {
+  const res = await fetch(`${hazbaseApiBase(env)}/api/payments/x402/verify`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-request-id": `share_verify_${crypto.randomUUID()}`,
+    },
+    body: JSON.stringify({ paymentRequestId, xPayment: xPaymentHeader }),
+  });
+  const json = await res.json().catch(() => null);
+  return json?.data || json;
+}
+
+async function settleHazbasePayment(env, paymentRequestId, xPaymentHeader) {
+  const res = await fetch(`${hazbaseApiBase(env)}/api/payments/x402/settle`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-request-id": `share_settle_${crypto.randomUUID()}`,
+    },
+    body: JSON.stringify({ paymentRequestId, xPayment: xPaymentHeader }),
+  });
+  const json = await res.json().catch(() => null);
+  return json?.data || json;
 }
 
 // Header-only advertisement of the payment gate. Used on both GET and HEAD so
@@ -1726,19 +1859,14 @@ function prefersHtml(request) {
   return true;
 }
 
-function build402Response(meta, request, slug) {
-  const requirements = buildPaymentRequirements(meta, slug, request.url);
+function build402Response(request, slug, jsonBody) {
+  const requirements = jsonBody?.accepts?.[0];
   if (!requirements) {
     return jsonResponse(
       { x402Version: X402_VERSION, error: "payment-network-not-configured" },
       500,
     );
   }
-  const jsonBody = {
-    x402Version: X402_VERSION,
-    accepts: [requirements],
-    error: "payment-required",
-  };
   // `Link: rel="payment"` (RFC 8288) + `X-Payment-Required` header-only hint.
   // HEAD shares the same helper so preflight responses are symmetric with GET.
   const hintHeaders = buildPaymentHintHeaders(requirements);

@@ -36,19 +36,13 @@ preview_bucket_name = "viveworker-share-files-preview"
 #   wrangler secret put SHARE_SECRET
 # (paste a random 32+ byte string, e.g. `openssl rand -hex 32`)
 
-# x402 payment gate config. Shares with a price attached return HTTP 402 on
-# first view, and a facilitator verifies + settles the USDC payment. During
-# testnet dogfooding use `base-sepolia` + the free public facilitator; for
-# production flip to `base` and set X402_FACILITATOR_URL to the CDP-authed
-# endpoint + supply X402_FACILITATOR_AUTH.
+# x402 payment gate config. The worker now delegates requirements / verify
+# / settle to hazbase-backend-api and keeps only the share-specific 402 page
+# + paid-cookie logic locally. `X402_NETWORK` still pins the default upload
+# network for new paid shares; `HAZBASE_API_ENDPOINT` points at the backend.
 [vars]
 X402_NETWORK = "base-sepolia"
-X402_FACILITATOR_URL = "https://x402.org/facilitator"
-
-# X402_FACILITATOR_AUTH (Bearer token for the facilitator, empty on testnet).
-# Set it with:
-#   wrangler secret put X402_FACILITATOR_AUTH
-# (paste empty string for testnet; CDP API key for mainnet.)
+HAZBASE_API_ENDPOINT = "https://passkey.hazbase.com"
 
 # Closed-beta allowlist for paid shares. A CSV of userIds permitted to attach
 # `--price` / `--pay-to` on upload. Everyone else gets 403 paid-shares-closed-beta

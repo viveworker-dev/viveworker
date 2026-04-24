@@ -89,6 +89,7 @@ function printHelp() {
   console.log("");
   console.log("Paid shares (x402 / USDC on Base — CLOSED BETA, testnet only): --price 0.10 --pay-to 0x…");
   console.log("  Buyers use any x402-compatible client (e.g. `x402-fetch` on npm).");
+  console.log("  To use a hazbase wallet as payTo, resolve it first via the local /api/hazbase/payout-address endpoint.");
   console.log("  --price and --password are mutually exclusive on a single share.");
   console.log("  `share list --metrics` prints 24h / 7d payment-flow stats for your shares.");
   console.log("");

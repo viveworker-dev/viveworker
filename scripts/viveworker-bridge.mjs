@@ -14,6 +14,7 @@ import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import webPush from "web-push";
+import * as hazbaseAuth from "@hazbase/auth";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
@@ -25,6 +26,21 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const workspaceRoot = path.resolve(__dirname, "..");
 const webRoot = path.join(workspaceRoot, "web");
+const {
+  bootstrapPasskeyAccount,
+  completePasskeyAssertion,
+  completePasskeyRegistration,
+  listSupportedChains,
+  requestEmailOtp: requestHazbaseEmailOtp,
+  requestPasskeyAssertionChallenge,
+  requestPasskeyRegistrationChallenge,
+  setApiEndpoint: setHazbaseApiEndpoint,
+  setClientKey: setHazbaseClientKey,
+  verifyEmailOtp: verifyHazbaseEmailOtp,
+} = hazbaseAuth;
+const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "function"
+  ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
+  : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
@@ -194,6 +210,7 @@ await maybeRotateStartupPairingEnv(envFile);
 
 const config = buildConfig(cli);
 validateConfig(config);
+configureHazbaseClient(config);
 
 const runtime = {
   fileStates: new Map(),
@@ -13307,6 +13324,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         url.pathname === "/app.js" ||
         url.pathname === "/app.css" ||
         url.pathname === "/i18n.js" ||
+        url.pathname === "/hazbase-passkey.js" ||
         url.pathname === "/sw.js" ||
         url.pathname.startsWith("/icons/")
       ) {
@@ -13877,6 +13895,231 @@ function createNativeApprovalServer({ config, runtime, state }) {
           fetchedAtMs: nowMs,
         });
       }
+
+
+if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
+  const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  if (!hookAuth) {
+    const session = requireApiSession(req, res, config, state);
+    if (!session) return;
+  }
+  if (!config.hazbaseApiUrl) {
+    return writeJson(res, 200, { enabled: false });
+  }
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  let payments = null;
+  let chains = null;
+  let error = "";
+  try {
+    payments = await listSupportedPayments();
+  } catch (err) {
+    error = err?.message || String(err);
+  }
+  try {
+    chains = await listSupportedChains();
+  } catch (err) {
+    error = error || err?.message || String(err);
+  }
+  const supportedChains = Array.isArray(chains?.chains)
+    ? chains.chains.filter((entry) => Number(entry.chainId) === 8453 || Number(entry.chainId) === 84532)
+    : [];
+  const payoutAddresses = {
+    8453: resolveHazbaseAccountForChain(hazbase.accounts, 8453)?.smartAccountAddress || "",
+    84532: resolveHazbaseAccountForChain(hazbase.accounts, 84532)?.smartAccountAddress || "",
+  };
+  return writeJson(res, 200, {
+    enabled: true,
+    apiUrl: config.hazbaseApiUrl,
+    signedIn: Boolean(hazbase.accessToken),
+    email: hazbase.email,
+    userId: hazbase.userId,
+    sessionId: hazbase.sessionId,
+    deviceBindingId: hazbase.deviceBindingId,
+    credentialId: hazbase.credentialId,
+    highTrustExpiresAt: hazbase.highTrustExpiresAt,
+    accounts: hazbase.accounts,
+    supportedPayments: payments?.networks || [],
+    supportedChains,
+    defaultPaymentNetwork: payments?.defaultNetwork || "base-sepolia",
+    payoutAddresses,
+    error,
+  });
+}
+
+if (url.pathname === "/api/hazbase/payout-address" && req.method === "GET") {
+  const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  if (!hookAuth) {
+    const session = requireApiSession(req, res, config, state);
+    if (!session) return;
+  }
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const chainId = Number(url.searchParams.get("chainId") || 0);
+  if (chainId !== 8453 && chainId !== 84532) {
+    return writeJson(res, 400, { error: "unsupported-chain" });
+  }
+  const account = resolveHazbaseAccountForChain(hazbase.accounts, chainId);
+  if (!account?.smartAccountAddress) {
+    return writeJson(res, 409, { error: "hazbase-wallet-account-missing" });
+  }
+  return writeJson(res, 200, {
+    chainId,
+    payoutMethod: "hazbase_wallet",
+    payoutAddress: account.smartAccountAddress,
+    smartAccountAddress: account.smartAccountAddress,
+    accountVariant: account.accountVariant || "",
+    relayMode: account.relayMode || "",
+  });
+}
+
+if (url.pathname === "/api/hazbase/request-otp" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const body = await parseJsonBody(req);
+  const email = cleanText(body?.email || "");
+  if (!email) return writeJson(res, 400, { error: "email-required" });
+  const result = await requestHazbaseEmailOtp({ email });
+  state.hazbase = { ...normalizeHazbaseState(state.hazbase), email };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/verify-otp" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const body = await parseJsonBody(req);
+  const email = cleanText(body?.email || state.hazbase?.email || "");
+  const code = cleanText(body?.code || "");
+  if (!email || !code) return writeJson(res, 400, { error: "otp-required" });
+  const result = await verifyHazbaseEmailOtp({ email, code });
+  state.hazbase = {
+    ...normalizeHazbaseState(state.hazbase),
+    email: result.email || email,
+    accessToken: cleanText(result.accessToken || ""),
+    sessionId: cleanText(result.sessionId || ""),
+    userId: cleanText(result.userId || ""),
+    accounts: Array.isArray(result.accounts) ? result.accounts : [],
+    highTrustToken: "",
+    highTrustExpiresAt: "",
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/passkey/register/challenge" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const body = await parseJsonBody(req);
+  const result = await requestPasskeyRegistrationChallenge({
+    emailSession: hazbase.accessToken,
+    deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
+  });
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/passkey/register/complete" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const body = await parseJsonBody(req);
+  const result = await completePasskeyRegistration({
+    emailSession: hazbase.accessToken,
+    challengeId: cleanText(body?.challengeId || ""),
+    credential: body?.credential,
+    deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
+  });
+  state.hazbase = {
+    ...hazbase,
+    deviceBindingId: cleanText(result.deviceBindingId || hazbase.deviceBindingId || ""),
+    credentialId: cleanText(result.credentialId || hazbase.credentialId || ""),
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/passkey/assert/challenge" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const body = await parseJsonBody(req);
+  const result = await requestPasskeyAssertionChallenge({
+    emailSession: hazbase.accessToken,
+    purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
+    deviceBindingId: hazbase.deviceBindingId || undefined,
+  });
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/passkey/assert/complete" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const body = await parseJsonBody(req);
+  const result = await completePasskeyAssertion({
+    emailSession: hazbase.accessToken,
+    challengeId: cleanText(body?.challengeId || ""),
+    credential: body?.credential,
+    purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
+    deviceBindingId: hazbase.deviceBindingId || undefined,
+  });
+  state.hazbase = {
+    ...hazbase,
+    deviceBindingId: cleanText(result.deviceBindingId || hazbase.deviceBindingId || ""),
+    credentialId: cleanText(result.credentialId || hazbase.credentialId || ""),
+    highTrustToken: cleanText(result.highTrustToken || ""),
+    highTrustExpiresAt: cleanText(result.highTrustExpiresAt || ""),
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/account/bootstrap" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken || !hazbase.deviceBindingId || !hazbase.highTrustToken) {
+    return writeJson(res, 409, { error: "hazbase-bootstrap-prerequisites-missing" });
+  }
+  const body = await parseJsonBody(req);
+  const chainId = Number(body?.chainId || 0);
+  if (chainId !== 8453 && chainId !== 84532) {
+    return writeJson(res, 400, { error: "unsupported-chain" });
+  }
+  const result = await bootstrapPasskeyAccount({
+    emailSession: hazbase.accessToken,
+    deviceBindingId: hazbase.deviceBindingId,
+    highTrustToken: hazbase.highTrustToken,
+    chainId,
+  });
+  const nextAccounts = mergeHazbaseAccountSummaries(hazbase.accounts, [{
+    smartAccountAddress: result.smartAccountAddress,
+    chainId: result.chainId,
+    accountVariant: result.accountVariant,
+    relayMode: result.relayMode,
+    primaryDeviceBindingId: result.deviceBindingId,
+  }]);
+  state.hazbase = {
+    ...hazbase,
+    accounts: nextAccounts,
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  state.hazbase = normalizeHazbaseState(null);
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, { ok: true });
+}
 
       // Toggle acceptPublicTasks on the A2A relay.
       if (url.pathname === "/api/a2a/public-tasks" && req.method === "POST") {
@@ -17186,6 +17429,8 @@ function buildConfig(cli) {
     a2aShareUrl: stripTrailingSlash(
       process.env.VIVEWORKER_SHARE_URL || "https://share.viveworker.com"
     ),
+    hazbaseApiUrl: stripTrailingSlash(process.env.HAZBASE_API_URL || "https://passkey.hazbase.com"),
+    hazbaseDeviceLabel: cleanText(process.env.HAZBASE_DEVICE_LABEL || "viveworker"),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
     webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
@@ -17271,6 +17516,48 @@ function buildConfig(cli) {
     sessionSecret: process.env.SESSION_SECRET || "",
     claudeProjectsDir: resolvePath(process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), ".claude", "projects")),
   };
+}
+
+
+function normalizeHazbaseState(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  return {
+    email: cleanText(value.email ?? ""),
+    accessToken: cleanText(value.accessToken ?? ""),
+    sessionId: cleanText(value.sessionId ?? ""),
+    userId: cleanText(value.userId ?? ""),
+    deviceBindingId: cleanText(value.deviceBindingId ?? ""),
+    credentialId: cleanText(value.credentialId ?? ""),
+    highTrustToken: cleanText(value.highTrustToken ?? ""),
+    highTrustExpiresAt: cleanText(value.highTrustExpiresAt ?? ""),
+    accounts: Array.isArray(value.accounts) ? value.accounts : [],
+  };
+}
+
+function configureHazbaseClient(config) {
+  try {
+    setHazbaseClientKey(process.env.HAZBASE_CLIENT_KEY || "viveworker-internal");
+    setHazbaseApiEndpoint(config.hazbaseApiUrl || "https://passkey.hazbase.com");
+  } catch (error) {
+    console.error(`[hazbase-config] ${error.message}`);
+  }
+}
+
+function mergeHazbaseAccountSummaries(existing, incoming) {
+  const merged = new Map();
+  for (const entry of [...(Array.isArray(existing) ? existing : []), ...(Array.isArray(incoming) ? incoming : [])]) {
+    if (!entry || !entry.smartAccountAddress) continue;
+    const key = `${Number(entry.chainId) || 0}:${String(entry.smartAccountAddress).toLowerCase()}`;
+    merged.set(key, entry);
+  }
+  return [...merged.values()];
+}
+
+function resolveHazbaseAccountForChain(accounts, chainId) {
+  const normalizedChainId = Number(chainId || 0);
+  if (!normalizedChainId) return null;
+  const list = Array.isArray(accounts) ? accounts : [];
+  return list.find((entry) => Number(entry?.chainId) === normalizedChainId && cleanText(entry?.smartAccountAddress || "")) || null;
 }
 
 function validateConfig(config) {
@@ -17477,6 +17764,7 @@ async function loadState(stateFile) {
       autoPilotWriteLaneUiTests,
       autoPilotWriteLaneSource,
       a2aAcceptPublicTasks: parsed.a2aAcceptPublicTasks === true,
+      hazbase: normalizeHazbaseState(parsed.hazbase),
     };
   } catch {
     return {
@@ -17510,6 +17798,7 @@ async function loadState(stateFile) {
       autoPilotWriteLaneContent: false,
       autoPilotWriteLaneUiTests: false,
       autoPilotWriteLaneSource: false,
+      hazbase: normalizeHazbaseState(null),
     };
   }
 }

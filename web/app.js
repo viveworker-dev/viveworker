@@ -60,6 +60,9 @@ const state = {
   a2aRelayStatus: null,
   a2aShareStatus: null,
   a2aShareRecentExpanded: 0,
+  hazbaseStatus: null,
+  hazbaseNotice: "",
+  hazbaseError: "",
   a2aTaskExecutorPick: "codex",
   pushNotice: "",
   pushError: "",
@@ -81,6 +84,14 @@ const state = {
 };
 
 let detailLoadSequence = 0;
+let hazbasePasskeyModulePromise = null;
+
+async function loadHazbasePasskeyModule() {
+  if (!hazbasePasskeyModulePromise) {
+    hazbasePasskeyModulePromise = import("./hazbase-passkey.js");
+  }
+  return hazbasePasskeyModulePromise;
+}
 
 const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
@@ -296,6 +307,9 @@ async function refreshAuthenticatedState() {
   await fetchMoltbookScoutStatus();
   await fetchA2aRelayStatus();
   await fetchA2aShareStatus();
+  if (state.currentTab === "settings") {
+    await fetchHazbaseStatus();
+  }
   ensureCurrentSelection();
 }
 
@@ -442,6 +456,8 @@ function L(key, vars = {}) {
   return t(state.locale || DEFAULT_LOCALE, key, vars);
 }
 
+
+
 function detectBrowserLocale() {
   if (Array.isArray(navigator.languages) && navigator.languages.length > 0) {
     for (const value of navigator.languages) {
@@ -522,6 +538,15 @@ async function fetchA2aShareStatus() {
     state.a2aShareStatus = await apiGet("/api/share/status");
   } catch {
     state.a2aShareStatus = null;
+  }
+}
+
+
+async function fetchHazbaseStatus() {
+  try {
+    state.hazbaseStatus = await apiGet("/api/hazbase/status");
+  } catch {
+    state.hazbaseStatus = null;
   }
 }
 
@@ -657,9 +682,9 @@ function allInboxEntries() {
     return [];
   }
   return [
-    ...state.inbox.pending.map((item) => ({ item, status: "pending" })),
+    ...(Array.isArray(state.inbox.pending) ? state.inbox.pending.map((item) => ({ item, status: "pending" })) : []),
     ...(Array.isArray(state.inbox.diff) ? state.inbox.diff.map((item) => ({ item, status: "diff" })) : []),
-    ...state.inbox.completed.map((item) => ({ item, status: "completed" })),
+    ...(Array.isArray(state.inbox.completed) ? state.inbox.completed.map((item) => ({ item, status: "completed" })) : []),
   ];
 }
 
@@ -756,7 +781,7 @@ function listInboxEntries() {
   if (state.inboxSubtab === "completed") {
     return filteredCompletedEntries().map((item) => ({ item, status: "completed" }));
   }
-  return state.inbox.pending
+  return (Array.isArray(state.inbox.pending) ? state.inbox.pending : [])
     .filter((item) => entryMatchesProviderFilter(item))
     .map((item) => ({ item, status: "pending" }));
 }
@@ -3127,6 +3152,7 @@ function buildSettingsContext() {
     moltbookScout: state.moltbookScoutStatus,
     a2aRelay: state.a2aRelayStatus,
     a2aShare: state.a2aShareStatus,
+    hazbase: state.hazbaseStatus,
   };
 }
 
@@ -3301,6 +3327,13 @@ function settingsPageMeta(page) {
         description: L("settings.a2aShare.copy"),
         icon: "link",
       };
+    case "wallet":
+      return {
+        id: "wallet",
+        title: L("settings.wallet.title"),
+        description: L("settings.wallet.copy"),
+        icon: "coin",
+      };
     case "a2aExecutor":
       // Executor settings integrated into a2aRelay page — redirect.
       return settingsPageMeta("a2aRelay");
@@ -3382,7 +3415,7 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
-      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled) ? renderSettingsGroup(L("settings.group.integrations"), [
+      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled || context.hazbase?.enabled) ? renderSettingsGroup(L("settings.group.integrations"), [
         state.session?.moltbookEnabled ? renderSettingsNavRow({
           page: "moltbook",
           icon: "item",
@@ -3403,6 +3436,13 @@ function renderSettingsRoot(context, { mobile }) {
           title: L("settings.a2aShare.title"),
           subtitle: L("settings.a2aShare.subtitle"),
           value: context.a2aShare?.enabled ? L("settings.status.enabled") : L("settings.status.disabled"),
+        }) : "",
+        context.hazbase?.enabled ? renderSettingsNavRow({
+          page: "wallet",
+          icon: "coin",
+          title: L("settings.wallet.title"),
+          subtitle: L("settings.wallet.subtitle"),
+          value: context.hazbase?.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
         }) : "",
       ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
@@ -3460,6 +3500,9 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "a2aShare":
       content = renderSettingsA2aSharePage(context);
+      break;
+    case "wallet":
+      content = renderSettingsWalletPage(context);
       break;
     default:
       content = "";
@@ -4397,6 +4440,197 @@ function renderSettingsA2aSharePage(context) {
   `;
 }
 
+function renderSettingsWalletPage(context) {
+  const hazbase = context.hazbase || { enabled: false };
+  if (!hazbase?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.wallet.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const flow = deriveHazbaseWalletFlow(hazbase);
+  const statusLabel = hazbase.signedIn
+    ? L("settings.hazbase.status.signedIn")
+    : L("settings.hazbase.status.signedOut");
+  const summaryRows = [
+    renderSettingsInfoRow(L("settings.row.hazbaseStatus"), statusLabel),
+    renderSettingsInfoRow(L("settings.row.hazbaseEmail"), hazbase.email || "—"),
+    renderSettingsInfoRow(
+      L("settings.row.hazbasePasskey"),
+      flow.hasPasskey ? L("settings.hazbase.passkey.ready") : L("settings.hazbase.passkey.missing"),
+    ),
+    renderSettingsInfoRow(
+      L("settings.row.hazbaseBaseSepolia"),
+      flow.baseSepolia?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
+      { stacked: true, mono: Boolean(flow.baseSepolia?.smartAccountAddress) },
+    ),
+    renderSettingsInfoRow(
+      L("settings.row.hazbaseBase"),
+      flow.baseMainnet?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
+      { stacked: true, mono: Boolean(flow.baseMainnet?.smartAccountAddress) },
+    ),
+  ];
+  const guideRows = [
+    renderHazbaseWalletBanner(flow),
+    state.hazbaseNotice
+      ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--notice"><p>${escapeHtml(state.hazbaseNotice)}</p></div>`
+      : "",
+    state.hazbaseError
+      ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--error"><p>${escapeHtml(state.hazbaseError)}</p></div>`
+      : "",
+    `<div class="wallet-step-list">${flow.steps.map((step) => renderHazbaseWalletStepCard(step)).join("")}</div>`,
+  ].filter(Boolean);
+  const advancedActions = hazbase.signedIn
+    ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout">${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
+    : "";
+  return `
+    <div class="settings-page">
+      ${renderSettingsGroup(L("settings.wallet.summary.title"), summaryRows)}
+      ${renderSettingsGroup(L("settings.wallet.flow.title"), guideRows)}
+      ${advancedActions ? renderSettingsActionPanel(advancedActions, L("settings.wallet.advanced.title")) : ""}
+    </div>
+  `;
+}
+
+function deriveHazbaseWalletFlow(hazbase) {
+  const accounts = Array.isArray(hazbase.accounts) ? hazbase.accounts : [];
+  const baseSepolia = accounts.find((entry) => Number(entry.chainId) === 84532) || null;
+  const baseMainnet = accounts.find((entry) => Number(entry.chainId) === 8453) || null;
+  const signedIn = Boolean(hazbase.signedIn);
+  const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
+  const hasBaseSepolia = Boolean(baseSepolia?.smartAccountAddress);
+  const hasBaseMainnet = Boolean(baseMainnet?.smartAccountAddress);
+  const coreReady = signedIn && hasPasskey && hasBaseSepolia;
+
+  const actionButton = (labelKey, action, { primary = false, disabled = false } = {}) => `
+    <button
+      class="${primary ? "primary" : "secondary"} ${primary ? "primary--wide" : "secondary--wide"}"
+      type="button"
+      data-hazbase-action="${action}"
+      ${disabled ? "disabled" : ""}
+    >${escapeHtml(L(labelKey))}</button>
+  `;
+
+  return {
+    hasPasskey,
+    baseSepolia,
+    baseMainnet,
+    coreReady,
+    steps: [
+      {
+        number: 1,
+        icon: "approval",
+        title: L("settings.wallet.step.signIn.title"),
+        copy: L("settings.wallet.step.signIn.copy"),
+        detail: signedIn ? hazbase.email || L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
+        status: signedIn ? "complete" : "current",
+        actions: signedIn
+          ? []
+          : [
+              actionButton("settings.hazbase.action.requestOtp", "request-otp", { primary: true }),
+              actionButton("settings.hazbase.action.verifyOtp", "verify-otp"),
+            ],
+      },
+      {
+        number: 2,
+        icon: "lock",
+        title: L("settings.wallet.step.passkey.title"),
+        copy: L("settings.wallet.step.passkey.copy"),
+        detail: hasPasskey ? L("settings.hazbase.passkey.ready") : L("settings.hazbase.passkey.missing"),
+        status: hasPasskey ? "complete" : signedIn ? "current" : "locked",
+        actions: hasPasskey
+          ? []
+          : [
+              actionButton("settings.hazbase.action.registerPasskey", "register-passkey", {
+                primary: signedIn,
+                disabled: !signedIn,
+              }),
+            ],
+      },
+      {
+        number: 3,
+        icon: "coin",
+        title: L("settings.wallet.step.baseSepolia.title"),
+        copy: L("settings.wallet.step.baseSepolia.copy"),
+        detail: baseSepolia?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
+        monoDetail: Boolean(baseSepolia?.smartAccountAddress),
+        status: hasBaseSepolia ? "complete" : signedIn && hasPasskey ? "current" : "locked",
+        actions: hasBaseSepolia
+          ? []
+          : [
+              actionButton("settings.hazbase.action.bootstrapBaseSepolia", "bootstrap-base-sepolia", {
+                primary: signedIn && hasPasskey,
+                disabled: !signedIn || !hasPasskey,
+              }),
+            ],
+      },
+      {
+        number: 4,
+        icon: "coin",
+        title: L("settings.wallet.step.base.title"),
+        copy: L("settings.wallet.step.base.copy"),
+        detail: baseMainnet?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
+        monoDetail: Boolean(baseMainnet?.smartAccountAddress),
+        status: hasBaseMainnet ? "complete" : coreReady ? "optional" : "locked",
+        actions: hasBaseMainnet
+          ? []
+          : [
+              actionButton("settings.hazbase.action.bootstrapBase", "bootstrap-base", {
+                disabled: !coreReady,
+              }),
+            ],
+      },
+    ],
+  };
+}
+
+function renderHazbaseWalletBanner(flow) {
+  const title = flow.coreReady ? L("settings.wallet.ready.title") : L("settings.wallet.flow.banner.title");
+  const copy = flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy");
+  const className = flow.coreReady
+    ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--ready"
+    : "settings-copy-block settings-copy-block--stacked wallet-flow-banner";
+  return `
+    <div class="${className}">
+      <p class="wallet-flow-banner__eyebrow">${escapeHtml(L("settings.hazbase.title"))}</p>
+      <p class="wallet-flow-banner__title">${escapeHtml(title)}</p>
+      <p class="wallet-flow-banner__copy muted">${escapeHtml(copy)}</p>
+    </div>
+  `;
+}
+
+function renderHazbaseWalletStepCard(step) {
+  const statusMeta = {
+    complete: { label: L("settings.wallet.status.complete"), icon: "completed" },
+    current: { label: L("settings.wallet.status.current"), icon: "pending" },
+    locked: { label: L("settings.wallet.status.locked"), icon: "lock" },
+    optional: { label: L("settings.wallet.status.optional"), icon: "coin" },
+    pending: { label: L("settings.wallet.status.pending"), icon: "pending" },
+  }[step.status] || { label: L("settings.wallet.status.pending"), icon: "pending" };
+
+  return `
+    <article class="wallet-step-card wallet-step-card--${escapeHtml(step.status)}">
+      <div class="wallet-step-card__header">
+        <div class="wallet-step-card__headline">
+          <span class="wallet-step-card__icon" aria-hidden="true">${renderIcon(step.icon)}</span>
+          <div class="wallet-step-card__title-wrap">
+            <p class="wallet-step-card__eyebrow">${escapeHtml(L("settings.wallet.stepNumber", { count: step.number }))}</p>
+            <h3 class="wallet-step-card__title">${escapeHtml(step.title)}</h3>
+          </div>
+        </div>
+        <span class="wallet-step-card__status wallet-step-card__status--${escapeHtml(step.status)}">
+          <span class="wallet-step-card__status-icon" aria-hidden="true">${renderIcon(statusMeta.icon)}</span>
+          <span>${escapeHtml(statusMeta.label)}</span>
+        </span>
+      </div>
+      <p class="wallet-step-card__copy">${escapeHtml(step.copy)}</p>
+      <p class="wallet-step-card__detail ${step.monoDetail ? "wallet-step-card__detail--mono" : ""}">${escapeHtml(step.detail)}</p>
+      ${step.actions.length ? `<div class="wallet-step-card__actions">${step.actions.join("")}</div>` : ""}
+    </article>
+  `;
+}
+
 function formatRelativeAge(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "";
   // Intl.RelativeTimeFormat with numeric:"auto" gives us locale-aware phrasing
@@ -4457,8 +4691,16 @@ function formatUsdcAtomic(atomic) {
 }
 
 function renderSettingsInfoRow(label, value, options = {}) {
-  const rowClassName = ["settings-info-row", options.rowClassName || ""].filter(Boolean).join(" ");
-  const valueClassName = ["settings-info-row__value", options.valueClassName || ""].filter(Boolean).join(" ");
+  const rowClassName = [
+    "settings-info-row",
+    options.stacked ? "settings-info-row--stacked" : "",
+    options.rowClassName || "",
+  ].filter(Boolean).join(" ");
+  const valueClassName = [
+    "settings-info-row__value",
+    options.mono ? "settings-info-row__value--mono" : "",
+    options.valueClassName || "",
+  ].filter(Boolean).join(" ");
   const displayValue = options.rawValue ? value : escapeHtml(value);
   return `
     <div class="${rowClassName}">
@@ -6007,6 +6249,8 @@ function bindShellInteractions() {
     });
   }
 
+
+
   for (const select of document.querySelectorAll("[data-timeline-thread-select]")) {
     const handleInteractionStart = () => {
       markThreadFilterInteraction();
@@ -6040,6 +6284,7 @@ function bindShellInteractions() {
       state.timelineKindFilter = "all";
       state.timelineKindFilterOpen = false;
       state.completedThreadFilter = "all";
+      state.diffThreadFilter = "all";
       alignCurrentItemToVisibleEntries();
       await renderShell();
     });
@@ -6060,6 +6305,25 @@ function bindShellInteractions() {
       clearThreadFilterInteraction();
       state.timelineKindFilter = button.dataset.timelineKindFilterOption || "all";
       state.timelineKindFilterOpen = false;
+      alignCurrentItemToVisibleEntries();
+      await renderShell();
+    });
+  }
+
+  for (const select of document.querySelectorAll("[data-diff-thread-select]")) {
+    const handleInteractionStart = () => {
+      markThreadFilterInteraction();
+    };
+    const handleInteractionEnd = () => {
+      clearThreadFilterInteraction();
+    };
+    select.addEventListener("pointerdown", handleInteractionStart);
+    select.addEventListener("click", handleInteractionStart);
+    select.addEventListener("focus", handleInteractionStart);
+    select.addEventListener("blur", handleInteractionEnd);
+    select.addEventListener("change", async () => {
+      clearThreadFilterInteraction();
+      state.diffThreadFilter = select.value || "all";
       alignCurrentItemToVisibleEntries();
       await renderShell();
     });
@@ -6600,6 +6864,62 @@ function bindShellInteractions() {
       await renderShell();
     });
   }
+
+
+for (const button of document.querySelectorAll("[data-hazbase-action]")) {
+  button.addEventListener("click", async () => {
+    state.hazbaseNotice = "";
+    state.hazbaseError = "";
+    const action = button.dataset.hazbaseAction || "";
+    try {
+      if (action === "request-otp") {
+        const fallbackEmail = state.hazbaseStatus?.email || "";
+        const email = window.prompt(L("settings.hazbase.prompt.email"), fallbackEmail) || "";
+        if (!email.trim()) return;
+        const result = await apiPost("/api/hazbase/request-otp", { email: email.trim() });
+        state.hazbaseNotice = result?.debugCode
+          ? `${L("settings.hazbase.notice.otpRequested")} (${result.debugCode})`
+          : L("settings.hazbase.notice.otpRequested");
+      } else if (action === "verify-otp") {
+        const fallbackEmail = state.hazbaseStatus?.email || "";
+        const email = window.prompt(L("settings.hazbase.prompt.email"), fallbackEmail) || "";
+        if (!email.trim()) return;
+        const code = window.prompt(L("settings.hazbase.prompt.otp"), "") || "";
+        if (!code.trim()) return;
+        await apiPost("/api/hazbase/verify-otp", { email: email.trim(), code: code.trim() });
+        state.hazbaseNotice = L("settings.hazbase.notice.otpVerified");
+      } else if (action === "register-passkey") {
+        const { createPasskeyRegistrationCredential } = await loadHazbasePasskeyModule();
+        const challenge = await apiPost("/api/hazbase/passkey/register/challenge", {});
+        const credential = await createPasskeyRegistrationCredential(challenge);
+        await apiPost("/api/hazbase/passkey/register/complete", {
+          challengeId: challenge.challengeId,
+          credential,
+        });
+        state.hazbaseNotice = L("settings.hazbase.notice.passkeyRegistered");
+      } else if (action === "bootstrap-base-sepolia" || action === "bootstrap-base") {
+        const { createPasskeyAssertionCredential } = await loadHazbasePasskeyModule();
+        const chainId = action === "bootstrap-base" ? 8453 : 84532;
+        const challenge = await apiPost("/api/hazbase/passkey/assert/challenge", { purpose: "bootstrap" });
+        const credential = await createPasskeyAssertionCredential(challenge);
+        await apiPost("/api/hazbase/passkey/assert/complete", {
+          challengeId: challenge.challengeId,
+          credential,
+          purpose: "bootstrap",
+        });
+        await apiPost("/api/hazbase/account/bootstrap", { chainId });
+        state.hazbaseNotice = L("settings.hazbase.notice.walletBootstrapped", { chainId });
+      } else if (action === "logout") {
+        await apiPost("/api/hazbase/logout", {});
+        state.hazbaseNotice = L("settings.hazbase.notice.signedOut");
+      }
+      await fetchHazbaseStatus();
+    } catch (error) {
+      state.hazbaseError = error.message || String(error);
+    }
+    await renderShell();
+  });
+}
 
   for (const button of document.querySelectorAll("[data-locale-option]")) {
     button.addEventListener("click", async () => {
@@ -7980,6 +8300,9 @@ function localizeApiError(value) {
     "choice-input-read-only": "error.choiceInputReadOnly",
     "choice-input-already-handled": "error.choiceInputAlreadyHandled",
     "mkcert-root-ca-not-found": "error.mkcertRootCaNotFound",
+    "hazbase-auth-required": "error.hazbaseAuthRequired",
+    "hazbase-wallet-account-missing": "error.hazbaseWalletAccountMissing",
+    "unsupported-chain": "error.unsupportedChain",
   };
   const key = map[raw];
   return key ? L(key) : raw;

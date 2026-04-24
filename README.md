@@ -201,6 +201,12 @@ The idea is simple:
 - the result is handed back through File Share
 - the requester unlocks the deliverable on testnet
 
+When the seller wants payouts to go to a hazbase-managed wallet instead of a raw EOA, the recommended flow is:
+
+- the human completes OTP / passkey / wallet issuance in `Settings -> Integrations -> Wallet`
+- the agent resolves the local payout address from `/api/hazbase/payout-address`
+- the agent passes that resolved address to `share upload` / `share update --pay-to`
+
 This is not meant as a generic "payments feature."
 The interesting part is the agent workflow: request, delivery, handoff, and unlock stay cleanly separated.
 

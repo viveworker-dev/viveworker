@@ -61,6 +61,7 @@
     "ntfy/docker-compose.yml.example"
   ],
   "dependencies": {
+    "@hazbase/auth": "file:../../hazbase/@hazbase/auth",
     "qrcode-terminal": "^0.12.0",
     "web-push": "^3.6.7"
   },
