@@ -11,26 +11,50 @@
  *   viveworker share list [--json]
  *   viveworker share update <slug> [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--json]
  *   viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]
+ *   viveworker share pay <url> [--output <file>] [--dry-run] [--wallet eoa|hazbase] [--no-approval] [--json]
  *   viveworker share delete <slug>
  *
  * Paid shares: `--price 0.10 --pay-to 0x…` attaches an x402 payment gate.
  * Buyers hit HTTP 402 on first view, pay USDC on Base (testnet or mainnet
  * depending on worker config), and the worker serves the content. Any
- * x402-compatible client (e.g. `x402-fetch` on npm) can pay; viveworker
- * itself does not currently ship a buyer wallet.
+ * x402-compatible clients can pay. This CLI ships a minimal buyer flow for
+ * Base/Base Sepolia using VIVEWORKER_BUYER_PRIVATE_KEY or BUYER_PK. Before
+ * signing, non-dry-run EOA payments are sent to the paired viveworker device for
+ * human approval; --wallet hazbase asks the paired device to reauth with passkey
+ * and pay from the configured hazBase Smart Wallet.
  *
  * Environment overrides:
  *   VIVEWORKER_SHARE_URL — share worker base URL (default: https://share.viveworker.com)
  */
 
 import { promises as fs } from "node:fs";
+import crypto from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { Blob, File } from "node:buffer";
 
 const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
+const CONFIG_ENV_FILE = path.join(os.homedir(), ".viveworker", "config.env");
 const DEFAULT_SHARE_URL = "https://share.viveworker.com";
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // mirror worker
+const X402_VERSION = 1;
+const PAYMENT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
+const SUPPORTED_BUYER_NETWORKS = {
+  base: {
+    chainId: 8453,
+    label: "Base",
+    usdcName: "USD Coin",
+    usdcVersion: "2",
+  },
+  "base-sepolia": {
+    chainId: 84532,
+    label: "Base Sepolia",
+    usdcName: "USDC",
+    usdcVersion: "2",
+  },
+};
 
 // Mirror share-worker/worker.js SHARE_TYPES. Keep in sync by inspection —
 // scripts/ and share-worker/ don't share a module. Adding a new type here
@@ -64,6 +88,8 @@ export async function runShareCli(args) {
       return handleUpdate(args.slice(1));
     case "link":
       return handleLink(args.slice(1));
+    case "pay":
+      return handlePay(args.slice(1));
     case "delete":
     case "rm":
       return handleDelete(args.slice(1));
@@ -81,6 +107,7 @@ function printHelp() {
   console.log("  viveworker share list [--metrics] [--json]");
   console.log("  viveworker share update <slug> [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--json]");
   console.log("  viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
+  console.log("  viveworker share pay <url> [--output <file>] [--dry-run] [--no-approval] [--json]");
   console.log("  viveworker share delete <slug>");
   console.log("");
   console.log(`Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}`);
@@ -88,7 +115,9 @@ function printHelp() {
   console.log("HTML uploads are optimized by default when possible (use --no-optimize to disable).");
   console.log("");
   console.log("Paid shares (x402 / USDC on Base — CLOSED BETA, testnet only): --price 0.10 --pay-to 0x…");
-  console.log("  Buyers use any x402-compatible client (e.g. `x402-fetch` on npm).");
+  console.log("  Buyers can use: VIVEWORKER_BUYER_PRIVATE_KEY=0x… viveworker share pay <url>");
+  console.log("  Non-dry-run payments require paired-device approval before signing.");
+  console.log("  Use --no-approval / --yes only for trusted test automation.");
   console.log("  To use a hazbase wallet as payTo, resolve it first via the local /api/hazbase/payout-address endpoint.");
   console.log("  --price and --password are mutually exclusive on a single share.");
   console.log("  `share list --metrics` prints 24h / 7d payment-flow stats for your shares.");
@@ -700,6 +729,126 @@ async function handleLink(args) {
 }
 
 // ---------------------------------------------------------------------------
+// pay
+// ---------------------------------------------------------------------------
+
+async function handlePay(args) {
+  const flags = parseFlags(args);
+  const targetUrl = flags._[0];
+  if (!targetUrl) {
+    throw new Error("Usage: viveworker share pay <url> [--output <file>] [--dry-run] [--json]");
+  }
+
+  let url;
+  try {
+    url = new URL(targetUrl).toString();
+  } catch {
+    throw new Error("share pay requires an absolute http(s) URL");
+  }
+
+  const initial = await fetchWithTimeout(url, {
+    headers: {
+      accept: "application/json, application/x-x402+json;q=0.9, */*;q=0.1",
+    },
+  }, 30_000);
+  const initialBytes = Buffer.from(await initial.arrayBuffer());
+  const initialText = initialBytes.toString("utf8");
+
+  if (initial.status !== 402) {
+    if (flags.json) {
+      console.log(JSON.stringify({
+        paid: false,
+        status: initial.status,
+        contentType: initial.headers.get("content-type") || "",
+        note: initial.ok ? "resource did not require payment" : "resource did not return x402 payment requirements",
+      }, null, 2));
+      return;
+    }
+    if (initial.ok) {
+      console.log(`No payment required (${initial.status}).`);
+      await writeOrPreviewPaidBody(flags, initial, initialBytes);
+      return;
+    }
+    throw new Error(`Expected HTTP 402 payment requirements, got ${initial.status}`);
+  }
+
+  const x402 = parseX402Body(initialText);
+  const requirement = selectPaymentRequirement(x402);
+  const paymentSummary = summarizeRequirement(requirement);
+  if (flags["dry-run"] || flags.dryRun) {
+    const dryRun = {
+      paid: false,
+      dryRun: true,
+      url,
+      ...paymentSummary,
+    };
+    if (flags.json) {
+      console.log(JSON.stringify(dryRun, null, 2));
+    } else {
+      printPaymentSummary(dryRun);
+      console.log("Dry run only; no payment was signed.");
+    }
+    return;
+  }
+
+  const walletMode = resolveBuyerWalletMode(flags);
+  const payment = walletMode === "hazbase"
+    ? await requestHazbaseWalletPayment({ url, x402, requirement, paymentSummary, flags })
+    : await requestEoaPayment({ url, requirement, paymentSummary, flags });
+  const paid = await fetchWithTimeout(url, {
+    headers: {
+      accept: "*/*",
+      "x-payment": payment.header,
+    },
+  }, 60_000);
+  const paidBytes = Buffer.from(await paid.arrayBuffer());
+  const responsePreview = decodePaymentResponseHeader(paid.headers.get("x-payment-response"));
+
+  if (!paid.ok) {
+    let body = {};
+    try {
+      body = JSON.parse(paidBytes.toString("utf8"));
+    } catch {
+      body = { error: paidBytes.toString("utf8").slice(0, 200) };
+    }
+    throw new Error(formatApiError("Payment", paid.status, body));
+  }
+
+  const result = {
+    paid: true,
+    status: paid.status,
+    url,
+    payer: payment.payer,
+    ...paymentSummary,
+    xPaymentResponse: responsePreview,
+    contentType: paid.headers.get("content-type") || "",
+    bytes: paidBytes.length,
+  };
+
+  if (flags.output) {
+    const outputPath = path.resolve(String(flags.output));
+    await fs.writeFile(outputPath, paidBytes);
+    result.output = outputPath;
+  }
+
+  if (flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  printPaymentSummary(result);
+  if (result.xPaymentResponse) {
+    const tx = result.xPaymentResponse.transactionHash || result.xPaymentResponse.txHash || "";
+    if (tx) console.log(`   tx: ${tx}`);
+  }
+  if (result.output) {
+    console.log(`   saved: ${result.output}`);
+  } else {
+    previewPaidBody(result.contentType, paidBytes);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // delete
 // ---------------------------------------------------------------------------
 
@@ -734,6 +883,407 @@ async function handleDelete(args) {
   }
 
   console.log(`✅ Deleted ${slug}`);
+}
+
+function parseX402Body(text) {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {}
+
+  const match = String(text || "").match(
+    /<script[^>]+type=["']application\/x-x402\+json["'][^>]*>([\s\S]*?)<\/script>/iu
+  );
+  if (match) {
+    try {
+      return JSON.parse(match[1]);
+    } catch {}
+  }
+  throw new Error("HTTP 402 response did not contain a valid x402 JSON body");
+}
+
+function selectPaymentRequirement(x402) {
+  const accepts = Array.isArray(x402?.accepts) ? x402.accepts : [];
+  const requirement = accepts.find((item) =>
+    item &&
+    item.scheme === "exact" &&
+    Object.prototype.hasOwnProperty.call(SUPPORTED_BUYER_NETWORKS, String(item.network || ""))
+  );
+  if (!requirement) {
+    const networks = accepts.map((item) => item?.network).filter(Boolean).join(", ") || "none";
+    throw new Error(`No supported x402 exact payment option found (offered: ${networks})`);
+  }
+  if (!ETH_ADDR_REGEX.test(String(requirement.payTo || ""))) {
+    throw new Error("x402 payment requirement has an invalid payTo address");
+  }
+  if (!ETH_ADDR_REGEX.test(String(requirement.asset || ""))) {
+    throw new Error("x402 payment requirement has an invalid asset address");
+  }
+  if (!/^\d+$/u.test(String(requirement.maxAmountRequired || ""))) {
+    throw new Error("x402 payment requirement has an invalid amount");
+  }
+  return requirement;
+}
+
+function summarizeRequirement(requirement) {
+  const network = SUPPORTED_BUYER_NETWORKS[String(requirement.network)];
+  return {
+    network: String(requirement.network),
+    chainId: network.chainId,
+    amountAtomic: String(requirement.maxAmountRequired),
+    amountUsdc: formatUsdc(requirement.maxAmountRequired),
+    payTo: String(requirement.payTo),
+    asset: String(requirement.asset),
+    resource: String(requirement.resource || ""),
+    description: String(requirement.description || ""),
+  };
+}
+
+function printPaymentSummary(summary) {
+  const network = SUPPORTED_BUYER_NETWORKS[summary.network];
+  console.log("");
+  console.log(`${summary.paid ? "Paid" : "Payment required"} — ${summary.amountUsdc} USDC on ${network?.label || summary.network}`);
+  console.log(`   to: ${summary.payTo}`);
+  if (summary.payer) console.log(`   from: ${summary.payer}`);
+  if (summary.resource) console.log(`   resource: ${summary.resource}`);
+  console.log("");
+}
+
+
+function resolveBuyerWalletMode(flags) {
+  const raw = String(flags.wallet || flags["buyer-wallet"] || flags.buyerWallet || flags["payment-wallet"] || "eoa").trim().toLowerCase();
+  if (!raw || raw === "eoa" || raw === "private-key" || raw === "private_key") return "eoa";
+  if (raw === "hazbase" || raw === "hazbase-wallet" || raw === "smart-wallet" || raw === "smart_wallet") return "hazbase";
+  throw new Error("--wallet must be either eoa or hazbase");
+}
+
+async function requestEoaPayment({ url, requirement, paymentSummary, flags }) {
+  await requirePaymentApproval({ url, paymentSummary, flags });
+  const privateKey = resolveBuyerPrivateKey();
+  const payment = await buildXPaymentHeader(requirement, privateKey);
+  return {
+    header: payment.header,
+    payer: payment.payer,
+    payload: payment.payload,
+    walletMode: "eoa",
+  };
+}
+
+async function requestHazbaseWalletPayment({ url, x402, requirement, paymentSummary, flags }) {
+  const paymentRequestId = cleanPaymentRequestId(
+    x402?.paymentRequestId || x402?.hazbase?.paymentRequestId || requirement?.extra?.paymentRequestId || ""
+  );
+  if (!paymentRequestId) {
+    throw new Error("This 402 response does not expose a hazBase paymentRequestId; --wallet hazbase requires a hazBase-backed share.");
+  }
+  const config = await resolveApprovalBridgeConfig();
+  if (!config.baseUrl || !config.sessionSecret) {
+    throw new Error(
+      "Hazbase Smart Wallet payment requires the local viveworker bridge. " +
+      `Start viveworker or check ${CONFIG_ENV_FILE}.`
+    );
+  }
+  const timeoutMs = resolveApprovalTimeoutMs(flags, config.envText);
+  if (!flags.json) {
+    console.log(`Waiting for paired-device hazBase wallet payment (${Math.round(timeoutMs / 1000)}s timeout)...`);
+  }
+  const response = await postBridgeJson(config, "/api/payments/x402/hazbase-wallet", {
+    paymentRequestId,
+    url,
+    payment: paymentSummary,
+    createdAtMs: Date.now(),
+    timeoutMs,
+  }, timeoutMs + 5_000);
+  if (!response.ok || response.body?.paid !== true || !response.body?.xPayment) {
+    const code = response.body?.error || response.body?.decision || `http-${response.status}`;
+    throw new Error(`Hazbase Smart Wallet payment was not completed on the paired device (${code}).`);
+  }
+  const paid = response.body.payment || response.body;
+  return {
+    header: String(response.body.xPayment),
+    payer: String(paid.payer || response.body.payer || ""),
+    payload: response.body.paymentProof || null,
+    walletMode: "hazbase",
+    submittedUserOpHash: response.body.submittedUserOpHash || "",
+    transactionHash: response.body.transactionHash || "",
+  };
+}
+
+function cleanPaymentRequestId(value) {
+  const text = String(value || "").trim();
+  return /^[a-zA-Z0-9:_-]{8,160}$/u.test(text) ? text : "";
+}
+
+async function requirePaymentApproval({ url, paymentSummary, flags }) {
+  const config = await resolveApprovalBridgeConfig();
+  if (shouldSkipPaymentApproval(flags, config.envText)) {
+    if (!flags.json) {
+      console.warn("Skipping paired-device payment approval (--no-approval / --yes).");
+    }
+    return;
+  }
+
+  if (!config.baseUrl || !config.sessionSecret) {
+    throw new Error(
+      "Payment approval is required before signing, but the local viveworker bridge is not configured. " +
+      `Start viveworker or check ${CONFIG_ENV_FILE}. Use --no-approval only for trusted test automation.`
+    );
+  }
+
+  const timeoutMs = resolveApprovalTimeoutMs(flags, config.envText);
+  if (!flags.json) {
+    console.log(`Waiting for paired-device approval (${Math.round(timeoutMs / 1000)}s timeout)...`);
+  }
+
+  const body = {
+    paymentRequestId: `x402:${crypto.randomUUID()}`,
+    url,
+    payment: paymentSummary,
+    createdAtMs: Date.now(),
+    timeoutMs,
+  };
+  const response = await postApprovalRequest(config, body, timeoutMs + 5_000);
+  if (!response.ok || response.body?.approved !== true) {
+    const code = response.body?.error || response.body?.decision || `http-${response.status}`;
+    throw new Error(`Payment was not approved on the paired device (${code}).`);
+  }
+
+  const approved = response.body?.approvedPayment || {};
+  assertApprovedPaymentMatches(paymentSummary, approved);
+  if (!flags.json) {
+    console.log("Payment approved on paired device.");
+  }
+}
+
+function shouldSkipPaymentApproval(flags, envText = "") {
+  if (flags["no-approval"] || flags.noApproval || flags.yes || flags.y) {
+    return true;
+  }
+  const raw = String(process.env.VIVEWORKER_PAYMENT_APPROVALS || envValue(envText, "VIVEWORKER_PAYMENT_APPROVALS") || "").trim().toLowerCase();
+  return raw === "0" || raw === "false" || raw === "off" || raw === "skip";
+}
+
+function resolveApprovalTimeoutMs(flags, envText = "") {
+  const raw =
+    flags["approval-timeout"] ||
+    flags.approvalTimeout ||
+    process.env.VIVEWORKER_PAYMENT_APPROVAL_TIMEOUT_SEC ||
+    envValue(envText, "VIVEWORKER_PAYMENT_APPROVAL_TIMEOUT_SEC") ||
+    "";
+  if (!raw) return PAYMENT_APPROVAL_TIMEOUT_MS;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 10 || seconds > 900) {
+    throw new Error("--approval-timeout must be between 10 and 900 seconds");
+  }
+  return Math.round(seconds * 1000);
+}
+
+async function resolveApprovalBridgeConfig() {
+  const env = await readOptionalEnvFile(CONFIG_ENV_FILE);
+  const publicBaseUrl = (
+    process.env.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL ||
+    envValue(env, "NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL") ||
+    process.env.APPROVAL_SERVER_PUBLIC_BASE_URL ||
+    envValue(env, "APPROVAL_SERVER_PUBLIC_BASE_URL") ||
+    ""
+  ).replace(/\/$/u, "");
+  const localPort = process.env.NATIVE_APPROVAL_SERVER_PORT || envValue(env, "NATIVE_APPROVAL_SERVER_PORT") || "";
+  const localProtocol = publicBaseUrl.startsWith("https:") ? "https" : "http";
+  const baseUrl = (
+    process.env.VIVEWORKER_APPROVAL_BRIDGE_URL ||
+    (localPort ? `${localProtocol}://127.0.0.1:${localPort}` : publicBaseUrl)
+  ).replace(/\/$/u, "");
+  const sessionSecret = (
+    process.env.SESSION_SECRET ||
+    envValue(env, "SESSION_SECRET") ||
+    ""
+  ).trim();
+  return { baseUrl, sessionSecret, envText: env };
+}
+
+async function readOptionalEnvFile(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function postApprovalRequest(config, body, timeoutMs) {
+  return postBridgeJson(config, "/api/payments/x402/approval", body, timeoutMs);
+}
+
+function postBridgeJson(config, pathname, body, timeoutMs) {
+  const endpoint = `${config.baseUrl}${pathname}`;
+  const payload = JSON.stringify(body);
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = (value) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => done({ ok: false, status: 0, body: { error: "approval-request-timeout" } }), timeoutMs);
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(endpoint);
+    } catch {
+      clearTimeout(timer);
+      done({ ok: false, status: 0, body: { error: "invalid-approval-server-url" } });
+      return;
+    }
+
+    const isHttps = parsedUrl.protocol === "https:";
+    const port = parsedUrl.port ? Number(parsedUrl.port) : isHttps ? 443 : 80;
+    const options = {
+      hostname: parsedUrl.hostname,
+      port,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+        "x-viveworker-hook-secret": config.sessionSecret,
+      },
+      // LAN approval servers often use mkcert/self-signed certificates.
+      rejectUnauthorized: false,
+    };
+
+    const req = (isHttps ? https : http).request(options, (res) => {
+      let text = "";
+      res.on("data", (chunk) => { text += chunk; });
+      res.on("end", () => {
+        clearTimeout(timer);
+        let parsed = {};
+        try {
+          parsed = text ? JSON.parse(text) : {};
+        } catch {
+          parsed = { error: text.slice(0, 200) };
+        }
+        done({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode || 0, body: parsed });
+      });
+    });
+    req.on("error", (error) => {
+      clearTimeout(timer);
+      done({ ok: false, status: 0, body: { error: error.message || "approval-request-failed" } });
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function assertApprovedPaymentMatches(expected, approved) {
+  const keys = ["network", "chainId", "amountAtomic", "payTo", "asset", "resource"];
+  for (const key of keys) {
+    const left = normalizeComparablePaymentValue(expected?.[key]);
+    const right = normalizeComparablePaymentValue(approved?.[key]);
+    if (left && right && left !== right) {
+      throw new Error(`Approved payment mismatch for ${key}; refusing to sign.`);
+    }
+  }
+}
+
+function normalizeComparablePaymentValue(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function resolveBuyerPrivateKey() {
+  const raw = String(
+    process.env.VIVEWORKER_BUYER_PRIVATE_KEY ||
+    process.env.BUYER_PK ||
+    ""
+  ).trim();
+  if (!raw) {
+    throw new Error(
+      "Missing buyer wallet private key. Set VIVEWORKER_BUYER_PRIVATE_KEY=0x... " +
+      "or BUYER_PK=0x... for Base/Base Sepolia x402 payments."
+    );
+  }
+  return raw.startsWith("0x") ? raw : `0x${raw}`;
+}
+
+async function buildXPaymentHeader(requirement, privateKey) {
+  const ethers = await import("ethers");
+  const network = SUPPORTED_BUYER_NETWORKS[String(requirement.network)];
+  if (!network) throw new Error(`Unsupported buyer network: ${requirement.network}`);
+
+  const wallet = new ethers.Wallet(privateKey);
+  const now = Math.floor(Date.now() / 1000);
+  const maxTimeout = Number(requirement.maxTimeoutSeconds || 60);
+  const validAfter = String(Math.max(0, now - 30));
+  const validBefore = String(now + Math.max(30, Math.min(300, Number.isFinite(maxTimeout) ? maxTimeout : 60)));
+  const authorization = {
+    from: wallet.address,
+    to: ethers.getAddress(String(requirement.payTo)),
+    value: String(requirement.maxAmountRequired),
+    validAfter,
+    validBefore,
+    nonce: `0x${crypto.randomBytes(32).toString("hex")}`,
+  };
+  const domain = {
+    name: String(requirement.extra?.name || network.usdcName),
+    version: String(requirement.extra?.version || network.usdcVersion),
+    chainId: network.chainId,
+    verifyingContract: ethers.getAddress(String(requirement.asset)),
+  };
+  const types = {
+    TransferWithAuthorization: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "validAfter", type: "uint256" },
+      { name: "validBefore", type: "uint256" },
+      { name: "nonce", type: "bytes32" },
+    ],
+  };
+  const signature = await wallet.signTypedData(domain, types, authorization);
+  const payload = {
+    x402Version: X402_VERSION,
+    scheme: String(requirement.scheme || "exact"),
+    network: String(requirement.network),
+    payload: {
+      signature,
+      authorization,
+    },
+  };
+  return {
+    header: Buffer.from(JSON.stringify(payload)).toString("base64"),
+    payer: wallet.address,
+    payload,
+  };
+}
+
+function decodePaymentResponseHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  try {
+    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+    return JSON.parse(Buffer.from(normalized + padding, "base64").toString("utf8"));
+  } catch {
+    return { raw };
+  }
+}
+
+async function writeOrPreviewPaidBody(flags, res, bytes) {
+  const contentType = res.headers.get("content-type") || "";
+  if (flags.output) {
+    const outputPath = path.resolve(String(flags.output));
+    await fs.writeFile(outputPath, bytes);
+    console.log(`   saved: ${outputPath}`);
+    return;
+  }
+  previewPaidBody(contentType, bytes);
+}
+
+function previewPaidBody(contentType, bytes) {
+  if (/^text\/|json|xml|csv|html/u.test(String(contentType).toLowerCase())) {
+    const text = bytes.toString("utf8");
+    console.log(text.length > 1200 ? `${text.slice(0, 1200)}\n...` : text);
+    return;
+  }
+  console.log(`   received ${formatSize(bytes.length)} (${contentType || "unknown content type"}). Pass --output <file> to save bytes.`);
 }
 
 function formatApiError(op, status, body) {

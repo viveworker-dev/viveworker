@@ -1773,11 +1773,19 @@ async function requestHazbasePaymentRequirements(env, meta, slug, requestUrl) {
     if (!res.ok || !data?.paymentRequestId || !data?.x402?.accepts?.[0]) {
       return { ok: false, errorCode: data?.errorCode || data?.error || "payment-service-unavailable" };
     }
+    const x402 = {
+      ...data.x402,
+      // Non-standard but additive: viveworker's hazBase Smart Wallet buyer
+      // can use this stable id to ask hazBase to execute the payment, while
+      // normal x402 clients keep reading accepts[0] unchanged.
+      paymentRequestId: data.paymentRequestId,
+      hazbase: { paymentRequestId: data.paymentRequestId },
+    };
     return {
       ok: true,
       paymentRequestId: data.paymentRequestId,
-      x402: data.x402,
-      requirements: data.x402.accepts[0],
+      x402,
+      requirements: x402.accepts[0],
     };
   } catch (err) {
     console.error("[share-worker] hazbase requirements error", err?.stack || err);

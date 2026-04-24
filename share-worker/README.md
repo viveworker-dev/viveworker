@@ -314,9 +314,33 @@ Payment events flow through Cloudflare Analytics Engine (binding `ANALYTICS`, da
 
 Sellers read their own metrics via `share list --metrics` (hits `GET /api/metrics` → `queryShareAnalytics` → CF REST SQL). 24h + 7d windows, plus a per-slug breakdown ranked by activity.
 
+### Buyer reference (CLI)
+
+The viveworker CLI ships a minimal buyer flow for Base / Base Sepolia. It reads
+`VIVEWORKER_BUYER_PRIVATE_KEY` or `BUYER_PK`, signs an EIP-3009 authorization,
+retries with `X-PAYMENT`, and optionally writes the unlocked bytes. It can also use the local hazBase Smart Wallet flow with `--wallet hazbase`; that path asks the paired device for Passkey reauth and returns a hazBase-issued `X-PAYMENT` proof after the Smart Wallet payment settles.
+
+By default, the CLI is human-in-the-loop: after it parses the 402 requirements
+and before it signs, it sends the amount, recipient, network, and resource URL
+to the paired viveworker device and waits for approval. Use `--dry-run` for a
+read-only inspection and `--no-approval` / `--yes` only for trusted smoke tests
+or CI.
+
+```bash
+node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> --dry-run
+
+VIVEWORKER_BUYER_PRIVATE_KEY=0x... \
+  node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> \
+  --output ./paid-report.pdf
+
+node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> \
+  --wallet hazbase \
+  --output ./paid-report.pdf
+```
+
 ### Buyer reference (Node.js)
 
-The worker ships no buyer-side code. For a minimal example:
+For library-style clients, the same flow works with `x402-fetch`:
 
 ```js
 import { wrapFetchWithPayment } from "x402-fetch";

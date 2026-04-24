@@ -106,6 +106,8 @@ const state = {
   defaultLocale: DEFAULT_LOCALE,
   supportedLocales: [...SUPPORTED_LOCALES],
   appVersion: "",
+  versionStatus: null,
+  versionStatusError: "",
 };
 
 let detailLoadSequence = 0;
@@ -225,6 +227,7 @@ async function boot() {
   ensureCurrentSelection();
   maybeAutoFocusClaudePending();
   await renderShell();
+  refreshVersionStatusForTechnicalPage();
 
   // Diff fetch runs as a background phase because `/api/inbox/diff`
   // spawns `git` subprocesses per tracked repo and can stall for several
@@ -586,6 +589,29 @@ async function fetchHazbaseStatus() {
   }
 }
 
+async function fetchVersionStatus() {
+  try {
+    state.versionStatus = await apiGet("/api/version/status");
+    state.versionStatusError = "";
+  } catch (error) {
+    state.versionStatus = null;
+    state.versionStatusError = error.message || String(error);
+  }
+}
+
+function refreshVersionStatusForTechnicalPage() {
+  if (state.currentTab !== "settings" || state.settingsSubpage !== "advanced") {
+    return;
+  }
+  fetchVersionStatus()
+    .then(async () => {
+      if (state.currentTab === "settings" && state.settingsSubpage === "advanced" && !shouldDeferRenderForActiveInteraction()) {
+        await renderShell();
+      }
+    })
+    .catch(() => {});
+}
+
 async function getClientPushState() {
   const registration = state.serviceWorkerRegistration || (await navigator.serviceWorker?.ready.catch(() => null));
   if (registration) {
@@ -827,6 +853,7 @@ function normalizeProviderClient(value) {
   if (normalized === "claude") return "claude";
   if (normalized === "moltbook") return "moltbook";
   if (normalized === "a2a") return "a2a";
+  if (normalized === "viveworker") return "viveworker";
   return "codex";
 }
 
@@ -835,6 +862,7 @@ function providerDisplayName(provider) {
   if (p === "claude") return L("common.claude");
   if (p === "moltbook") return "Moltbook";
   if (p === "a2a") return "A2A";
+  if (p === "viveworker") return L("common.appName");
   return L("common.codex");
 }
 
@@ -1234,6 +1262,7 @@ async function renderShell() {
     <div class="${shellClassName}">
       ${desktop ? renderDesktopHeader(detail) : renderMobileTopBar(detail)}
       ${renderTopBanner()}
+      ${renderGlobalErrorBanner()}
       <main class="app-main">
         ${desktop ? renderDesktopWorkspace(detail) : renderMobileWorkspace(detail)}
       </main>
@@ -3490,7 +3519,9 @@ function renderSettingsRoot(context, { mobile }) {
           icon: "coin",
           title: L("settings.wallet.title"),
           subtitle: L("settings.wallet.subtitle"),
-          value: context.hazbase?.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
+          value: context.hazbase?.sessionInvalid
+            ? L("settings.hazbase.status.sessionExpired")
+            : context.hazbase?.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
         }) : "",
       ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
@@ -3673,6 +3704,7 @@ function renderSettingsDevicePage(context) {
 }
 
 function renderSettingsAdvancedPage(context) {
+  const versionNotice = renderVersionUpdateNotice();
   return `
     <div class="settings-page">
       ${context.diagnostics.map((message) => `<p class="inline-alert">${escapeHtml(message)}</p>`).join("")}
@@ -3691,7 +3723,25 @@ function renderSettingsAdvancedPage(context) {
           : "",
         renderSettingsInfoRow(L("settings.row.version"), state.appVersion || L("common.unavailable")),
       ].filter(Boolean), { listClassName: "settings-list settings-list--compact" })}
+      ${versionNotice}
     </div>
+  `;
+}
+
+function renderVersionUpdateNotice() {
+  const status = state.versionStatus;
+  if (!status?.updateAvailable || !status.latestVersion) {
+    return "";
+  }
+  return `
+    <section class="settings-copy-block settings-copy-block--compact settings-update-notice">
+      <p class="settings-update-notice__title">${escapeHtml(L("settings.updateAvailable.title"))}</p>
+      <p class="muted">${escapeHtml(L("settings.updateAvailable.copy", {
+        current: status.currentVersion || state.appVersion || "",
+        latest: status.latestVersion,
+      }))}</p>
+      <code class="settings-update-notice__command">npx viveworker update</code>
+    </section>
   `;
 }
 
@@ -4523,8 +4573,16 @@ function renderSettingsWalletPage(context) {
       : "",
     renderHazbaseWalletStepList(flow),
   ].filter(Boolean);
-  const advancedActions = hazbase.signedIn
-    ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout">${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
+  const canRefreshSession = Boolean(hazbase.sessionInvalid);
+  const advancedActions = canRefreshSession || hazbase.signedIn
+    ? [
+        canRefreshSession
+          ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="refresh-session">${escapeHtml(L("settings.hazbase.action.refreshSession"))}</button>`
+          : "",
+        hazbase.signedIn
+          ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout">${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
+          : "",
+      ].filter(Boolean).join("")
     : "";
   // Render the wallet flow without `renderSettingsGroup`'s `.settings-list`
   // wrapper. The banner (`.settings-copy-block`), notice/error blocks, and
@@ -4599,7 +4657,8 @@ function deriveHazbaseWalletFlow(hazbase) {
   const accounts = Array.isArray(hazbase.accounts) ? hazbase.accounts : [];
   const baseSepolia = accounts.find((entry) => Number(entry.chainId) === 84532) || null;
   const baseMainnet = accounts.find((entry) => Number(entry.chainId) === 8453) || null;
-  const signedIn = Boolean(hazbase.signedIn);
+  const sessionInvalid = Boolean(hazbase.sessionInvalid);
+  const signedIn = Boolean(hazbase.signedIn) && !sessionInvalid;
   const passkeyHost = hazbasePasskeyHostSupport();
   const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
   const hasBaseSepolia = Boolean(baseSepolia?.smartAccountAddress);
@@ -4619,17 +4678,20 @@ function deriveHazbaseWalletFlow(hazbase) {
     hasPasskey,
     baseSepolia,
     baseMainnet,
+    sessionInvalid,
     coreReady,
     steps: [
       {
         number: 1,
         icon: "approval",
-        title: L("settings.wallet.step.signIn.title"),
-        copy: L("settings.wallet.step.signIn.copy"),
+        title: sessionInvalid ? L("settings.wallet.step.refreshSession.title") : L("settings.wallet.step.signIn.title"),
+        copy: sessionInvalid ? L("settings.wallet.step.refreshSession.copy") : L("settings.wallet.step.signIn.copy"),
         detail: signedIn
           ? hazbase.email || L("settings.hazbase.status.signedIn")
           : state.hazbaseOtpRequested
             ? L("settings.hazbase.status.otpAwaitingVerify")
+            : sessionInvalid
+            ? L("settings.hazbase.status.sessionExpired")
             : L("settings.hazbase.status.signedOut"),
         status: signedIn ? "complete" : "current",
         // Inline form: email input (always visible pre-sign-in) and the
@@ -4657,7 +4719,7 @@ function deriveHazbaseWalletFlow(hazbase) {
                 actionButton("settings.hazbase.action.resendOtp", "request-otp"),
               ]
             : [
-                actionButton("settings.hazbase.action.requestOtp", "request-otp", { primary: true }),
+                actionButton(sessionInvalid ? "settings.hazbase.action.refreshSession" : "settings.hazbase.action.requestOtp", "request-otp", { primary: true }),
               ],
       },
       {
@@ -4718,9 +4780,13 @@ function deriveHazbaseWalletFlow(hazbase) {
 }
 
 function renderHazbaseWalletBanner(flow) {
-  const title = flow.coreReady ? L("settings.wallet.ready.title") : L("settings.wallet.flow.banner.title");
+  const title = flow.sessionInvalid
+    ? L("settings.wallet.sessionExpired.title")
+    : flow.coreReady ? L("settings.wallet.ready.title") : L("settings.wallet.flow.banner.title");
   const className = flow.coreReady
     ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--ready"
+    : flow.sessionInvalid
+      ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--session-expired"
     : "settings-copy-block settings-copy-block--stacked wallet-flow-banner";
   // Ready state: surface the smart-account address prominently so the user
   // can see at a glance which wallet agents will use as `--pay-to` when
@@ -4746,7 +4812,9 @@ function renderHazbaseWalletBanner(flow) {
       </button>
     `
     : `<p class="wallet-flow-banner__copy muted">${escapeHtml(
-        flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy"),
+        flow.sessionInvalid
+          ? L("settings.wallet.sessionExpired.copy")
+          : flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy"),
       )}</p>`;
   return `
     <div class="${className}">
@@ -6305,6 +6373,20 @@ function renderTopBanner() {
   return "";
 }
 
+function renderGlobalErrorBanner() {
+  if (!state.pushError) {
+    return "";
+  }
+  return `
+    <section class="install-banner install-banner--push">
+      <div class="install-banner__copy">
+        <strong>${escapeHtml(state.locale === "ja" ? "エラー" : "Error")}</strong>
+        <p class="muted">${escapeHtml(state.pushError)}</p>
+      </div>
+    </section>
+  `;
+}
+
 function renderPushBanner() {
   if (!shouldShowPushBanner()) {
     return "";
@@ -6488,6 +6570,7 @@ function bindShellInteractions() {
         openSettingsSubpage(nextPage);
       }
       await renderShell();
+      refreshVersionStatusForTechnicalPage();
     });
   }
 
@@ -6500,6 +6583,7 @@ function bindShellInteractions() {
       syncCurrentItemUrl(null);
       openSettingsSubpage("advanced");
       await renderShell();
+      refreshVersionStatusForTechnicalPage();
     });
   }
 
@@ -6507,6 +6591,7 @@ function bindShellInteractions() {
     button.addEventListener("click", async () => {
       openSettingsSubpage(button.dataset.settingsSubpage || "");
       await renderShell();
+      refreshVersionStatusForTechnicalPage();
     });
   }
 
@@ -6749,7 +6834,23 @@ function bindShellInteractions() {
       button.innerHTML = `<span class="action-spinner" aria-hidden="true"></span><span>${escapeHtml(L("reply.sendSending"))}</span>`;
 
       try {
-        await apiPost(actionUrl, body);
+        let postBody = body;
+        if (body?.hazbaseReauth === true) {
+          if (!hazbasePasskeyHostSupport().eligible) {
+            throw new Error(L("error.hazbasePasskeyLocalHostRequired"));
+          }
+          const { createPasskeyAssertionCredential } = await loadHazbasePasskeyModule();
+          const challenge = await apiPost("/api/hazbase/passkey/assert/challenge", { purpose: "reauth" });
+          const credential = await createPasskeyAssertionCredential(challenge);
+          await apiPost("/api/hazbase/passkey/assert/complete", {
+            challengeId: challenge.challengeId,
+            credential,
+            purpose: "reauth",
+          });
+          postBody = { ...body };
+          delete postBody.hazbaseReauth;
+        }
+        await apiPost(actionUrl, postBody);
         if (keepDetailOpen && activeItem?.kind === "approval") {
           pinActionOutcomeDetail(
             activeItem,
@@ -6769,6 +6870,9 @@ function bindShellInteractions() {
         state.pendingActionUrls.delete(actionUrl);
       } catch (error) {
         state.pendingActionUrls.delete(actionUrl);
+        if (error?.errorKey === "hazbase-session-expired") {
+          await fetchHazbaseStatus();
+        }
         // Restore buttons on failure so the user can retry
         for (const sibling of siblingButtons) {
           if (originalLabels.has(sibling)) {
@@ -6778,7 +6882,8 @@ function bindShellInteractions() {
           sibling.removeAttribute("aria-busy");
         }
         button.classList.remove("is-loading");
-        throw error;
+        state.pushError = error.message || String(error);
+        await renderShell();
       }
     });
   }
@@ -7209,6 +7314,11 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         state.hazbaseLogoutConfirmOpen = false;
         await apiPost("/api/hazbase/logout", {});
         state.hazbaseNotice = L("settings.hazbase.notice.signedOut");
+      } else if (action === "refresh-session") {
+        await apiPost("/api/hazbase/session/refresh", {});
+        state.hazbaseOtpRequested = false;
+        state.hazbaseOtpCode = "";
+        state.hazbaseNotice = L("settings.hazbase.notice.sessionRefreshStarted");
       } else if (action === "change-email") {
         // Flip the form back to pre-send mode. We keep the email so typo
         // recovery ("hoshin" → "hoshino") stays one edit away, but drop
@@ -7233,6 +7343,11 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
       }
       await fetchHazbaseStatus();
     } catch (error) {
+      if (error?.errorKey === "hazbase-session-expired") {
+        state.hazbaseOtpRequested = false;
+        state.hazbaseOtpCode = "";
+        await fetchHazbaseStatus();
+      }
       state.hazbaseError = error.message || String(error);
     }
     await renderShell();
@@ -8697,6 +8812,7 @@ function localizeApiError(value) {
     "choice-input-already-handled": "error.choiceInputAlreadyHandled",
     "mkcert-root-ca-not-found": "error.mkcertRootCaNotFound",
     "hazbase-auth-required": "error.hazbaseAuthRequired",
+    "hazbase-session-expired": "error.hazbaseSessionExpired",
     "hazbase-passkey-local-host-required": "error.hazbasePasskeyLocalHostRequired",
     "hazbase-wallet-account-missing": "error.hazbaseWalletAccountMissing",
     "unsupported-chain": "error.unsupportedChain",

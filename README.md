@@ -187,6 +187,15 @@ Typical commands:
 - `npx viveworker share update <slug> --password "hunter2"`
 - `npx viveworker share update <slug> --expires-days 7`
 - `npx viveworker share link <slug>`
+- `VIVEWORKER_BUYER_PRIVATE_KEY=0x... npx viveworker share pay https://share.viveworker.com/v/<slug> --output ./deliverable.pdf`
+- `npx viveworker share pay https://share.viveworker.com/v/<slug> --wallet hazbase --output ./deliverable.pdf`
+
+`share pay` is human-in-the-loop by default. EOA mode reads the x402 payment
+requirements and asks the paired device to approve before signing. `--wallet
+hazbase` instead sends the payment request to the paired device, asks for
+Passkey reauth, and pays from the configured hazBase Smart Wallet. Use
+`--dry-run` to inspect without signing, or `--no-approval` / `--yes` only for
+trusted EOA smoke tests and CI.
 
 The current public File Share surface is focused on private static artefact delivery from your Mac and your agents.
 
@@ -206,6 +215,7 @@ When the seller wants payouts to go to a hazbase-managed wallet instead of a raw
 - the human completes OTP / passkey / wallet issuance in `Settings -> Integrations -> Wallet`
 - the agent resolves the local payout address from `/api/hazbase/payout-address`
 - the agent passes that resolved address to `share upload` / `share update --pay-to`
+- the buyer agent can inspect with `share pay <url> --dry-run`, then request phone approval and unlock with `VIVEWORKER_BUYER_PRIVATE_KEY` / `BUYER_PK`
 
 This is not meant as a generic "payments feature."
 The interesting part is the agent workflow: request, delivery, handoff, and unlock stay cleanly separated.

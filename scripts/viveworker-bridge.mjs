@@ -56,6 +56,8 @@ const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const HAZBASE_METADATA_TIMEOUT_MS = 1500;
+const NPM_VERSION_CHECK_TIMEOUT_MS = 2500;
+const NPM_VERSION_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 // Shared memo for buildDiffThreadGroups. Each call spawns 3 git subprocesses
 // per tracked repo (`git diff --name-status`, `git status --porcelain`,
@@ -265,6 +267,11 @@ const runtime = {
   // deliberately NOT persisted via `state` since the cache is worthless after
   // a restart and would just bloat the state file.
   a2aShareStatusCache: null,
+  // Latest npm version cache. Checked only from the technical settings page
+  // and cached here so a weak network or repeated settings renders never
+  // hammer registry.npmjs.org.
+  npmVersionStatusCache: null,
+  npmVersionStatusPending: null,
 };
 const state = await loadState(config.stateFile);
 runtime.threadRegistry = await loadThreadRegistry(config.threadRegistryFile);
@@ -2809,6 +2816,7 @@ function providerDisplayName(locale, provider) {
   if (p === "claude") return t(locale, "common.claude");
   if (p === "moltbook") return "Moltbook";
   if (p === "a2a") return "A2A";
+  if (p === "viveworker") return t(locale, "common.appName");
   return t(locale, "common.codex");
 }
 
@@ -2848,7 +2856,7 @@ function normalizeHistoryItem(raw) {
   if (!isPlainObject(raw)) {
     return null;
   }
-  if (shouldHideClaudeInternalItem(raw)) {
+  if (shouldHideInternalTimelineItem(raw)) {
     return null;
   }
 
@@ -2903,7 +2911,7 @@ function normalizeHistoryItem(raw) {
     ...(raw.instruction != null ? { instruction: cleanText(raw.instruction) } : {}),
     ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
   };
-  return shouldHideClaudeInternalItem(normalized) ? null : normalized;
+  return shouldHideInternalTimelineItem(normalized) ? null : normalized;
 }
 
 function historyToken(stableId) {
@@ -3043,7 +3051,7 @@ function normalizeTimelineEntry(raw) {
   if (!isPlainObject(raw)) {
     return null;
   }
-  if (shouldHideClaudeInternalItem(raw)) {
+  if (shouldHideInternalTimelineItem(raw)) {
     return null;
   }
 
@@ -3137,7 +3145,7 @@ function normalizeTimelineEntry(raw) {
     ...(raw.taskStatus != null ? { taskStatus: cleanText(raw.taskStatus) } : {}),
     ...(suggestions.length > 0 ? { suggestions } : {}),
   };
-  return shouldHideClaudeInternalItem(normalized) ? null : normalized;
+  return shouldHideInternalTimelineItem(normalized) ? null : normalized;
 }
 
 function recordTimelineEntry({ config, runtime, state, entry }) {
@@ -5669,6 +5677,12 @@ async function processScannedEvent({ config, runtime, state, event }) {
     return false;
   }
 
+  if (shouldSuppressInternalScannedEvent(event)) {
+    state.seenEvents[event.id] = event.timestampMs || Date.now();
+    trimSeenEvents(state.seenEvents, config.maxSeenEvents);
+    return true;
+  }
+
   let dirty = false;
 
   if (event.kind === "task_complete") {
@@ -6526,6 +6540,150 @@ async function createNativeApproval({ config, runtime, conversationId, request, 
     resolving: false,
     provider: "codex",
   };
+}
+
+function createX402PaymentApproval({ config, body, now = Date.now() }) {
+  const payment = normalizeX402PaymentApprovalBody(body);
+  if (!payment) {
+    return null;
+  }
+  const token = crypto.randomBytes(18).toString("hex");
+  const requestId = cleanText(body.paymentRequestId || body.requestId || crypto.randomUUID());
+  const requestKey = `payment:${requestId}`;
+  const title = payment.amountUsdc
+    ? `Payment approval — ${payment.amountUsdc} USDC`
+    : "Payment approval";
+  return {
+    token,
+    requestKey,
+    conversationId: "payments",
+    requestId,
+    ownerClientId: null,
+    kind: "payment",
+    threadLabel: "x402 payment",
+    title,
+    messageText: formatX402PaymentApprovalMessage(payment),
+    reviewUrl: `${config.nativeApprovalPublicBaseUrl}/native-approvals/${token}`,
+    rawParams: payment,
+    cwd: "",
+    workspaceRoot: "",
+    fileRefs: [],
+    diffText: "",
+    diffAvailable: false,
+    diffSource: "",
+    diffAddedLines: 0,
+    diffRemovedLines: 0,
+    createdAtMs: now,
+    resolved: false,
+    resolving: false,
+    resolveClaudeWaiter: null,
+    provider: "viveworker",
+  };
+}
+
+
+function createHazbaseWalletPaymentApproval({ config, body, now = Date.now() }) {
+  const payment = normalizeX402PaymentApprovalBody(body);
+  if (!payment) return null;
+  const paymentRequestId = cleanText(body.paymentRequestId || body.requestId || "");
+  if (!/^[a-zA-Z0-9:_-]{8,160}$/u.test(paymentRequestId)) return null;
+  const token = crypto.randomBytes(18).toString("hex");
+  const requestKey = `hazbase_wallet_payment:${paymentRequestId}`;
+  const title = payment.amountUsdc
+    ? `Hazbase wallet payment — ${payment.amountUsdc} USDC`
+    : "Hazbase wallet payment";
+  return {
+    token,
+    requestKey,
+    conversationId: "payments",
+    requestId: paymentRequestId,
+    paymentRequestId,
+    ownerClientId: null,
+    kind: "hazbase_wallet_payment",
+    threadLabel: "x402 payment",
+    title,
+    messageText: formatHazbaseWalletPaymentApprovalMessage(payment),
+    reviewUrl: `${config.nativeApprovalPublicBaseUrl}/native-approvals/${token}`,
+    rawParams: payment,
+    cwd: "",
+    workspaceRoot: "",
+    fileRefs: [],
+    diffText: "",
+    diffAvailable: false,
+    diffSource: "",
+    diffAddedLines: 0,
+    diffRemovedLines: 0,
+    createdAtMs: now,
+    resolved: false,
+    resolving: false,
+    resolveClaudeWaiter: null,
+    provider: "viveworker",
+  };
+}
+
+function formatHazbaseWalletPaymentApprovalMessage(payment) {
+  const lines = [
+    "Hazbase Smart Wallet payment requested.",
+    "",
+    `Amount: ${payment.amountUsdc || payment.amountAtomic} USDC`,
+    `Network: ${payment.network} (chainId ${payment.chainId})`,
+    `Pay to: ${payment.payTo}`,
+    `Asset: ${payment.asset}`,
+    `Resource: ${payment.resource}`,
+    "",
+    "Approving will ask for your passkey, then hazBase will submit a gasless Smart Wallet payment.",
+  ];
+  if (payment.description) lines.splice(7, 0, `Description: ${payment.description}`);
+  if (payment.url && payment.url !== payment.resource) lines.splice(-1, 0, `URL: ${payment.url}`);
+  return lines.join("\n");
+}
+
+function normalizeX402PaymentApprovalBody(body) {
+  if (!isPlainObject(body)) return null;
+  const payment = isPlainObject(body.payment) ? body.payment : {};
+  const network = cleanText(payment.network || "");
+  const chainId = Number(payment.chainId) || 0;
+  const amountAtomic = cleanText(payment.amountAtomic || "");
+  const amountUsdc = cleanText(payment.amountUsdc || "");
+  const payTo = cleanText(payment.payTo || "");
+  const asset = cleanText(payment.asset || "");
+  const resource = cleanText(payment.resource || body.url || "");
+  const description = cleanText(payment.description || "");
+  const url = cleanText(body.url || resource);
+  if (!network || !chainId || !amountAtomic || !payTo || !asset || !resource) {
+    return null;
+  }
+  return {
+    url,
+    network,
+    chainId,
+    amountAtomic,
+    amountUsdc,
+    payTo,
+    asset,
+    resource,
+    description,
+  };
+}
+
+function formatX402PaymentApprovalMessage(payment) {
+  const lines = [
+    "x402 payment approval requested.",
+    "",
+    `Amount: ${payment.amountUsdc || payment.amountAtomic} USDC`,
+    `Network: ${payment.network} (chainId ${payment.chainId})`,
+    `Pay to: ${payment.payTo}`,
+    `Asset: ${payment.asset}`,
+    `Resource: ${payment.resource}`,
+  ];
+  if (payment.description) {
+    lines.push(`Description: ${payment.description}`);
+  }
+  if (payment.url && payment.url !== payment.resource) {
+    lines.push(`URL: ${payment.url}`);
+  }
+  lines.push("", "Approve only if the amount, recipient, network, and resource match what you expect.");
+  return lines.join("\n");
 }
 
 async function buildNativeApprovalPayload({ config, runtime, conversationId, request, token }) {
@@ -8767,6 +8925,18 @@ function isHiddenClaudeInternalScoringText(text) {
   return /^You are scoring Moltbook posts? for an AI agent\b/iu.test(single);
 }
 
+function isHiddenCodexApprovalAssessmentText(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single) {
+    return false;
+  }
+  return /\bThe following is the Codex agent history(?: added since your last approval assessment)?\b/iu.test(single);
+}
+
+function shouldHideInternalTimelineItem(item) {
+  return shouldHideClaudeInternalItem(item) || shouldHideCodexInternalApprovalItem(item);
+}
+
 function shouldHideClaudeInternalItem(item) {
   if (!isPlainObject(item)) {
     return false;
@@ -8783,6 +8953,48 @@ function shouldHideClaudeInternalItem(item) {
     isHiddenClaudeInternalScoringText(item.summary) ||
     isHiddenClaudeInternalScoringText(item.detailText) ||
     isHiddenClaudeInternalScoringText(item.message)
+  );
+}
+
+function shouldSuppressInternalScannedEvent(event) {
+  if (!isPlainObject(event)) {
+    return false;
+  }
+  const provider = normalizeProvider(event.provider || "codex");
+  if (provider !== "codex") {
+    return false;
+  }
+
+  return shouldHideCodexInternalApprovalItem({
+    provider,
+    kind: cleanText(event.kind || ""),
+    title: event.title,
+    threadLabel: event.threadLabel,
+    summary: event.summary ?? event.message,
+    messageText: event.messageText ?? event.detailText ?? event.message,
+    detailText: event.detailText,
+    message: event.message,
+  });
+}
+
+function shouldHideCodexInternalApprovalItem(item) {
+  if (!isPlainObject(item)) {
+    return false;
+  }
+  if (normalizeProvider(item.provider) !== "codex") {
+    return false;
+  }
+
+  const title = cleanText(item.title ?? "");
+  const threadLabel = cleanText(item.threadLabel ?? "");
+  if (isHiddenCodexApprovalAssessmentText(title) || isHiddenCodexApprovalAssessmentText(threadLabel)) {
+    return true;
+  }
+  return (
+    isHiddenCodexApprovalAssessmentText(item.messageText) ||
+    isHiddenCodexApprovalAssessmentText(item.summary) ||
+    isHiddenCodexApprovalAssessmentText(item.detailText) ||
+    isHiddenCodexApprovalAssessmentText(item.message)
   );
 }
 
@@ -10499,7 +10711,9 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       token: approval.token,
       threadId: cleanText(approval.conversationId || ""),
       threadLabel: approval.threadLabel || "",
-      title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+      title: cleanText(approval.kind || "") === "payment"
+        ? cleanText(approval.title || "") || formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel)
+        : formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
       summary: formatNotificationBody(approval.messageText, 100) || approval.messageText,
       primaryLabel: t(locale, "server.action.review"),
       createdAtMs: Number(approval.createdAtMs) || now,
@@ -10851,7 +11065,9 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         kind: "approval",
         threadId: cleanText(approval.conversationId || ""),
         threadLabel: approval.threadLabel,
-        title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+        title: cleanText(approval.kind || "") === "payment"
+          ? cleanText(approval.title || "") || formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel)
+          : formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
         summary: formatNotificationBody(approval.messageText, 180) || approval.messageText,
         messageText: approval.messageText,
         outcome: "pending",
@@ -11058,7 +11274,9 @@ function buildPendingApprovalDetail(runtime, state, approval, locale) {
     approvalKind,
     provider: normalizeProvider(approval.provider),
     token: approval.token,
-    title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+    title: approvalKind === "payment"
+      ? cleanText(approval.title || "") || formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel)
+      : formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
     threadLabel: approval.threadLabel || "",
     createdAtMs: Number(approval.createdAtMs) || 0,
     messageHtml: renderMessageHtml(approval.messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`),
@@ -11073,10 +11291,14 @@ function buildPendingApprovalDetail(runtime, state, approval, locale) {
     readOnly: approval.readOnly === true,
     actions: approval.readOnly === true
       ? []
-      : [
-          { label: t(locale, "server.action.approve"), tone: "primary", url: `/api/items/approval/${encodeURIComponent(approval.token)}/accept`, body: {} },
-          { label: t(locale, "server.action.reject"), tone: "danger", url: `/api/items/approval/${encodeURIComponent(approval.token)}/decline`, body: {} },
-        ],
+      : approvalKind === "hazbase_wallet_payment"
+        ? [
+            { label: t(locale, "server.action.payWithWallet"), tone: "primary", url: `/api/payments/x402/hazbase-wallet/${encodeURIComponent(approval.token)}/pay`, body: { hazbaseReauth: true } },
+          ]
+        : [
+            { label: t(locale, "server.action.approve"), tone: "primary", url: `/api/items/approval/${encodeURIComponent(approval.token)}/accept`, body: {} },
+            { label: t(locale, "server.action.reject"), tone: "danger", url: `/api/items/approval/${encodeURIComponent(approval.token)}/decline`, body: {} },
+          ],
   };
   if (approvalKind === "plan") {
     const planText = String(approval.planText || "");
@@ -13472,6 +13694,12 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, buildSessionPayload({ config, state, session }));
       }
 
+      if (url.pathname === "/api/version/status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        return writeJson(res, 200, await getNpmVersionStatus(runtime, config));
+      }
+
       // Collapses the PWA's boot-time fan-out (session + inbox + timeline
       // + devices) into a single HTTPS round-trip. iOS Safari tears down
       // connections aggressively, so each parallel fetch pays its own
@@ -13929,10 +14157,15 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     8453: resolveHazbaseAccountForChain(hazbase.accounts, 8453)?.smartAccountAddress || "",
     84532: resolveHazbaseAccountForChain(hazbase.accounts, 84532)?.smartAccountAddress || "",
   };
+  const signedIn = Boolean(hazbase.accessToken) && !hazbase.sessionInvalid;
   return writeJson(res, 200, {
     enabled: true,
     apiUrl: config.hazbaseApiUrl,
-    signedIn: Boolean(hazbase.accessToken),
+    signedIn,
+    sessionStatus: hazbase.sessionInvalid ? "expired" : signedIn ? "signed_in" : "signed_out",
+    sessionInvalid: hazbase.sessionInvalid,
+    sessionInvalidReason: hazbase.sessionInvalidReason,
+    sessionInvalidAt: hazbase.sessionInvalidAt,
     email: hazbase.email,
     userId: hazbase.userId,
     sessionId: hazbase.sessionId,
@@ -13995,15 +14228,19 @@ if (url.pathname === "/api/hazbase/verify-otp" && req.method === "POST") {
   const code = cleanText(body?.code || "");
   if (!email || !code) return writeJson(res, 400, { error: "otp-required" });
   const result = await verifyHazbaseEmailOtp({ email, code });
+  const previousHazbase = normalizeHazbaseState(state.hazbase);
   state.hazbase = {
-    ...normalizeHazbaseState(state.hazbase),
+    ...previousHazbase,
     email: result.email || email,
     accessToken: cleanText(result.accessToken || ""),
     sessionId: cleanText(result.sessionId || ""),
     userId: cleanText(result.userId || ""),
-    accounts: Array.isArray(result.accounts) ? result.accounts : [],
+    accounts: mergeHazbaseAccountSummaries(previousHazbase.accounts, Array.isArray(result.accounts) ? result.accounts : []),
     highTrustToken: "",
     highTrustExpiresAt: "",
+    sessionInvalid: false,
+    sessionInvalidReason: "",
+    sessionInvalidAt: "",
   };
   await saveState(config.stateFile, state);
   return writeJson(res, 200, result);
@@ -14024,11 +14261,17 @@ if (url.pathname === "/api/hazbase/passkey/register/challenge" && req.method ===
       message: error?.message || "Open viveworker on its .local hostname to use hazBase passkeys.",
     });
   }
-  const result = await requestPasskeyRegistrationChallenge({
-    emailSession: hazbase.accessToken,
-    deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
-    partnerOrigin,
-  });
+  let result;
+  try {
+    result = await requestPasskeyRegistrationChallenge({
+      emailSession: hazbase.accessToken,
+      deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
+      partnerOrigin,
+    });
+  } catch (error) {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res })) return;
+    throw error;
+  }
   return writeJson(res, 200, result);
 }
 
@@ -14038,16 +14281,25 @@ if (url.pathname === "/api/hazbase/passkey/register/complete" && req.method === 
   const hazbase = normalizeHazbaseState(state.hazbase);
   if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
   const body = await parseJsonBody(req);
-  const result = await completePasskeyRegistration({
-    emailSession: hazbase.accessToken,
-    challengeId: cleanText(body?.challengeId || ""),
-    credential: body?.credential,
-    deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
-  });
+  let result;
+  try {
+    result = await completePasskeyRegistration({
+      emailSession: hazbase.accessToken,
+      challengeId: cleanText(body?.challengeId || ""),
+      credential: body?.credential,
+      deviceLabel: cleanText(body?.deviceLabel || config.hazbaseDeviceLabel || "") || undefined,
+    });
+  } catch (error) {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res })) return;
+    throw error;
+  }
   state.hazbase = {
     ...hazbase,
     deviceBindingId: cleanText(result.deviceBindingId || hazbase.deviceBindingId || ""),
     credentialId: cleanText(result.credentialId || hazbase.credentialId || ""),
+    sessionInvalid: false,
+    sessionInvalidReason: "",
+    sessionInvalidAt: "",
   };
   await saveState(config.stateFile, state);
   return writeJson(res, 200, result);
@@ -14068,12 +14320,18 @@ if (url.pathname === "/api/hazbase/passkey/assert/challenge" && req.method === "
       message: error?.message || "Open viveworker on its .local hostname to use hazBase passkeys.",
     });
   }
-  const result = await requestPasskeyAssertionChallenge({
-    emailSession: hazbase.accessToken,
-    purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
-    deviceBindingId: hazbase.deviceBindingId || undefined,
-    partnerOrigin,
-  });
+  let result;
+  try {
+    result = await requestPasskeyAssertionChallenge({
+      emailSession: hazbase.accessToken,
+      purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
+      deviceBindingId: hazbase.deviceBindingId || undefined,
+      partnerOrigin,
+    });
+  } catch (error) {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res })) return;
+    throw error;
+  }
   return writeJson(res, 200, result);
 }
 
@@ -14083,19 +14341,28 @@ if (url.pathname === "/api/hazbase/passkey/assert/complete" && req.method === "P
   const hazbase = normalizeHazbaseState(state.hazbase);
   if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
   const body = await parseJsonBody(req);
-  const result = await completePasskeyAssertion({
-    emailSession: hazbase.accessToken,
-    challengeId: cleanText(body?.challengeId || ""),
-    credential: body?.credential,
-    purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
-    deviceBindingId: hazbase.deviceBindingId || undefined,
-  });
+  let result;
+  try {
+    result = await completePasskeyAssertion({
+      emailSession: hazbase.accessToken,
+      challengeId: cleanText(body?.challengeId || ""),
+      credential: body?.credential,
+      purpose: cleanText(body?.purpose || "bootstrap") || "bootstrap",
+      deviceBindingId: hazbase.deviceBindingId || undefined,
+    });
+  } catch (error) {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res })) return;
+    throw error;
+  }
   state.hazbase = {
     ...hazbase,
     deviceBindingId: cleanText(result.deviceBindingId || hazbase.deviceBindingId || ""),
     credentialId: cleanText(result.credentialId || hazbase.credentialId || ""),
     highTrustToken: cleanText(result.highTrustToken || ""),
     highTrustExpiresAt: cleanText(result.highTrustExpiresAt || ""),
+    sessionInvalid: false,
+    sessionInvalidReason: "",
+    sessionInvalidAt: "",
   };
   await saveState(config.stateFile, state);
   return writeJson(res, 200, result);
@@ -14113,12 +14380,18 @@ if (url.pathname === "/api/hazbase/account/bootstrap" && req.method === "POST") 
   if (chainId !== 8453 && chainId !== 84532) {
     return writeJson(res, 400, { error: "unsupported-chain" });
   }
-  const result = await bootstrapPasskeyAccount({
-    emailSession: hazbase.accessToken,
-    deviceBindingId: hazbase.deviceBindingId,
-    highTrustToken: hazbase.highTrustToken,
-    chainId,
-  });
+  let result;
+  try {
+    result = await bootstrapPasskeyAccount({
+      emailSession: hazbase.accessToken,
+      deviceBindingId: hazbase.deviceBindingId,
+      highTrustToken: hazbase.highTrustToken,
+      chainId,
+    });
+  } catch (error) {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res })) return;
+    throw error;
+  }
   const nextAccounts = mergeHazbaseAccountSummaries(hazbase.accounts, [{
     smartAccountAddress: result.smartAccountAddress,
     chainId: result.chainId,
@@ -14129,9 +14402,27 @@ if (url.pathname === "/api/hazbase/account/bootstrap" && req.method === "POST") 
   state.hazbase = {
     ...hazbase,
     accounts: nextAccounts,
+    sessionInvalid: false,
+    sessionInvalidReason: "",
+    sessionInvalidAt: "",
   };
   await saveState(config.stateFile, state);
   return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/session/refresh" && req.method === "POST") {
+  const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  if (!hookAuth) {
+    const session = requireMutatingApiSession(req, res, config, state);
+    if (!session) return;
+  }
+  markHazbaseSessionInvalid(state, "manual_refresh_requested");
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, {
+    ok: true,
+    status: "session_refresh_required",
+  });
 }
 
 if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
@@ -14654,6 +14945,164 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           deviceId,
           currentDeviceRevoked,
         });
+      }
+
+
+      if (url.pathname === "/api/payments/x402/hazbase-wallet" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+
+        const approval = createHazbaseWalletPaymentApproval({ config, body });
+        if (!approval) {
+          return writeJson(res, 400, { error: "invalid-hazbase-wallet-payment-request" });
+        }
+        if (runtime.nativeApprovalsByRequestKey.has(approval.requestKey)) {
+          return writeJson(res, 409, { error: "hazbase-wallet-payment-already-pending" });
+        }
+
+        runtime.nativeApprovalsByToken.set(approval.token, approval);
+        runtime.nativeApprovalsByRequestKey.set(approval.requestKey, approval);
+
+        deliverWebPushItem({
+          config,
+          state,
+          kind: "approval",
+          tab: "inbox",
+          subtab: "pending",
+          token: approval.token,
+          stableId: pendingApprovalStableId(approval),
+          title: approval.title,
+          body: approval.messageText,
+          buildLocalizedContent: () => ({ title: approval.title, body: approval.messageText }),
+        }).catch((error) => {
+          console.error(`[hazbase-wallet-payment-push] ${approval.requestKey} | ${error.message}`);
+        });
+
+        const waitMs = Math.max(10_000, Math.min(900_000, Number(body.timeoutMs) || 600_000));
+        const decisionPromise = new Promise((resolve) => {
+          approval.resolveClaudeWaiter = resolve;
+        });
+        const timeoutPromise = new Promise((resolve) => {
+          setTimeout(() => resolve({ paid: false, decision: "timeout", error: "hazbase-wallet-payment-timeout" }), waitMs);
+        });
+        const decision = await Promise.race([decisionPromise, timeoutPromise]);
+
+        if (!approval.resolved) {
+          approval.resolved = true;
+          approval.resolving = false;
+          runtime.nativeApprovalsByToken.delete(approval.token);
+          runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+        }
+
+        if (decision && typeof decision === "object" && decision.paid === true) {
+          return writeJson(res, 200, decision);
+        }
+        const error = decision?.error || decision?.decision || "hazbase-wallet-payment-declined";
+        const statusCode = error === "hazbase-wallet-payment-timeout" ? 408 : 403;
+        return writeJson(res, statusCode, { paid: false, error, decision: decision?.decision || "decline" });
+      }
+
+      const hazbaseWalletPayMatch = url.pathname.match(/^\/api\/payments\/x402\/hazbase-wallet\/([a-f0-9]+)\/pay$/u);
+      if (hazbaseWalletPayMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        const token = hazbaseWalletPayMatch[1];
+        const approval = runtime.nativeApprovalsByToken.get(token);
+        if (!approval || approval.kind !== "hazbase_wallet_payment") {
+          return writeJson(res, 404, { error: "approval-not-found" });
+        }
+        if (approval.resolved || approval.resolving) {
+          return writeJson(res, 409, { error: "approval-already-handled" });
+        }
+        approval.resolving = true;
+        try {
+          const result = await completeHazbaseWalletPaymentApproval({ config, runtime, state, approval });
+          return writeJson(res, 200, result);
+        } catch (error) {
+          approval.resolving = false;
+          console.error(`[hazbase-wallet-payment-error] ${approval.requestKey} | ${error?.stack || error?.message || error}`);
+          return writeJson(res, Number(error?.statusCode) || 500, { error: error?.code || error?.message || "hazbase-wallet-payment-failed" });
+        }
+      }
+
+      if (url.pathname === "/api/payments/x402/approval" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+
+        const approval = createX402PaymentApproval({ config, body });
+        if (!approval) {
+          return writeJson(res, 400, { error: "invalid-payment-approval-request" });
+        }
+        if (runtime.nativeApprovalsByRequestKey.has(approval.requestKey)) {
+          return writeJson(res, 409, { error: "payment-approval-already-pending" });
+        }
+
+        runtime.nativeApprovalsByToken.set(approval.token, approval);
+        runtime.nativeApprovalsByRequestKey.set(approval.requestKey, approval);
+
+        deliverWebPushItem({
+          config,
+          state,
+          kind: "approval",
+          tab: "inbox",
+          subtab: "pending",
+          token: approval.token,
+          stableId: pendingApprovalStableId(approval),
+          title: approval.title,
+          body: approval.messageText,
+          buildLocalizedContent: () => ({
+            title: approval.title,
+            body: approval.messageText,
+          }),
+        }).catch((error) => {
+          console.error(`[payment-approval-push] ${approval.requestKey} | ${error.message}`);
+        });
+
+        const waitMs = Math.max(10_000, Math.min(900_000, Number(body.timeoutMs) || 600_000));
+        const decisionPromise = new Promise((resolve) => {
+          approval.resolveClaudeWaiter = resolve;
+        });
+        const timeoutPromise = new Promise((resolve) => {
+          setTimeout(() => resolve("timeout"), waitMs);
+        });
+        const decision = await Promise.race([decisionPromise, timeoutPromise]);
+
+        if (!approval.resolved) {
+          approval.resolved = true;
+          approval.resolving = false;
+          runtime.nativeApprovalsByToken.delete(approval.token);
+          runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+        }
+
+        if (decision === "accept") {
+          return writeJson(res, 200, {
+            approved: true,
+            decision,
+            approvedPayment: approval.rawParams,
+          });
+        }
+        if (decision === "timeout") {
+          return writeJson(res, 408, { approved: false, decision, error: "payment-approval-timeout" });
+        }
+        return writeJson(res, 403, { approved: false, decision: "decline", error: "payment-approval-declined" });
       }
 
       if (url.pathname === "/api/providers/claude/events" && req.method === "POST") {
@@ -15473,6 +15922,10 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         if (approval.resolved || approval.resolving) {
           return writeJson(res, 409, { error: "approval-already-handled" });
         }
+        if (approval.kind === "hazbase_wallet_payment") {
+          console.warn(`[hazbase-wallet-payment-generic-decision-blocked] ${approval.requestKey} | ${decision}`);
+          return writeJson(res, 409, { error: "hazbase-wallet-payment-requires-wallet-pay-route" });
+        }
 
         approval.resolving = true;
         try {
@@ -16066,6 +16519,21 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (approval.resolved || approval.resolving) {
         return writeApprovalHandled(res, req, approval.title, 409, config.defaultLocale);
+      }
+      if (approval.kind === "hazbase_wallet_payment") {
+        console.warn(`[hazbase-wallet-payment-native-decision-blocked] ${approval.requestKey} | ${decision}`);
+        if (requestWantsHtml(req)) {
+          return writeHtml(
+            res,
+            409,
+            renderStatusPage({
+              title: approval.title,
+              body: "This approval must be completed from the viveworker app with the wallet payment button.",
+              tone: "warn",
+            })
+          );
+        }
+        return writeJson(res, 409, { error: "hazbase-wallet-payment-requires-wallet-pay-route" });
       }
 
       approval.resolving = true;
@@ -17453,6 +17921,9 @@ function buildConfig(cli) {
     hazbaseApiUrl: stripTrailingSlash(process.env.HAZBASE_API_URL || "https://api.hazbase.com"),
     hazbaseClientKey: cleanText(process.env.HAZBASE_CLIENT_KEY || "viveworker-internal"),
     hazbaseDeviceLabel: cleanText(process.env.HAZBASE_DEVICE_LABEL || "viveworker"),
+    npmPackageName: cleanText(process.env.VIVEWORKER_NPM_PACKAGE || "viveworker"),
+    npmDistTag: cleanText(process.env.VIVEWORKER_NPM_DIST_TAG || "latest"),
+    npmRegistryUrl: stripTrailingSlash(process.env.NPM_REGISTRY_URL || "https://registry.npmjs.org"),
     webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
     authRequired: boolEnv("AUTH_REQUIRED", true),
     webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
@@ -17553,7 +18024,54 @@ function normalizeHazbaseState(raw) {
     highTrustToken: cleanText(value.highTrustToken ?? ""),
     highTrustExpiresAt: cleanText(value.highTrustExpiresAt ?? ""),
     accounts: Array.isArray(value.accounts) ? value.accounts : [],
+    sessionInvalid: value.sessionInvalid === true,
+    sessionInvalidReason: cleanText(value.sessionInvalidReason ?? ""),
+    sessionInvalidAt: cleanText(value.sessionInvalidAt ?? ""),
   };
+}
+
+function isHazbaseInvalidAppSessionError(error) {
+  const details = error?.details && typeof error.details === "object" ? error.details : {};
+  const statusCode = Number(error?.statusCode || error?.status || details.statusCode || 0);
+  const text = [
+    error?.code,
+    error?.message,
+    details.errorCode,
+    details.code,
+    details.error,
+    details.message,
+  ]
+    .map((entry) => cleanText(entry || "").toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+  return statusCode === 401 && text.includes("invalid app session");
+}
+
+function markHazbaseSessionInvalid(state, reason = "invalid_app_session") {
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  state.hazbase = {
+    ...hazbase,
+    accessToken: "",
+    sessionId: "",
+    highTrustToken: "",
+    highTrustExpiresAt: "",
+    sessionInvalid: true,
+    sessionInvalidReason: cleanText(reason || "invalid_app_session"),
+    sessionInvalidAt: new Date().toISOString(),
+  };
+  return state.hazbase;
+}
+
+async function maybeWriteHazbaseSessionExpiredResponse({ error, config, state, res }) {
+  if (!isHazbaseInvalidAppSessionError(error)) {
+    return false;
+  }
+  markHazbaseSessionInvalid(state);
+  await saveState(config.stateFile, state);
+  return writeJson(res, 401, {
+    error: "hazbase-session-expired",
+    message: "Hazbase wallet session expired. Sign in again from Wallet settings.",
+  });
 }
 
 function hazbasePasskeyLocalHostError() {
@@ -17627,6 +18145,117 @@ async function fetchHazbaseMetadata(config, endpoint, timeoutMs = HAZBASE_METADA
   }
 }
 
+async function getNpmVersionStatus(runtime, config) {
+  const now = Date.now();
+  const cached = runtime.npmVersionStatusCache;
+  if (cached && now - Number(cached.checkedAtMs || 0) < NPM_VERSION_CHECK_CACHE_TTL_MS) {
+    return cached;
+  }
+  if (runtime.npmVersionStatusPending) {
+    return runtime.npmVersionStatusPending;
+  }
+  runtime.npmVersionStatusPending = fetchNpmVersionStatus(config)
+    .then((status) => {
+      runtime.npmVersionStatusCache = status;
+      return status;
+    })
+    .catch((error) => {
+      const fallback = {
+        packageName: config.npmPackageName || "viveworker",
+        distTag: config.npmDistTag || "latest",
+        currentVersion: appPackageVersion,
+        latestVersion: "",
+        updateAvailable: false,
+        checkedAtMs: Date.now(),
+        error: cleanText(error?.message || "npm version check failed"),
+      };
+      runtime.npmVersionStatusCache = fallback;
+      return fallback;
+    })
+    .finally(() => {
+      runtime.npmVersionStatusPending = null;
+    });
+  return runtime.npmVersionStatusPending;
+}
+
+async function fetchNpmVersionStatus(config) {
+  const packageName = cleanText(config.npmPackageName || "viveworker") || "viveworker";
+  const distTag = cleanText(config.npmDistTag || "latest") || "latest";
+  const registryBaseUrl = stripTrailingSlash(config.npmRegistryUrl || "https://registry.npmjs.org");
+  const endpoint = `${registryBaseUrl}/${encodeURIComponent(packageName).replace(/^%40/u, "@")}/${encodeURIComponent(distTag)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NPM_VERSION_CHECK_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`npm registry returned ${response.status}`);
+    }
+    const payload = await response.json().catch(() => null);
+    const latestVersion = cleanText(payload?.version || "");
+    if (!latestVersion) {
+      throw new Error("npm registry response did not include a version");
+    }
+    return {
+      packageName,
+      distTag,
+      currentVersion: appPackageVersion,
+      latestVersion,
+      updateAvailable: comparePackageVersions(latestVersion, appPackageVersion) > 0,
+      checkedAtMs: Date.now(),
+      error: "",
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("npm version check timed out");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function comparePackageVersions(left, right) {
+  const a = parsePackageVersion(left);
+  const b = parsePackageVersion(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a.parts[index] !== b.parts[index]) return a.parts[index] > b.parts[index] ? 1 : -1;
+  }
+  if (!a.prerelease.length && b.prerelease.length) return 1;
+  if (a.prerelease.length && !b.prerelease.length) return -1;
+  const length = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const av = a.prerelease[index];
+    const bv = b.prerelease[index];
+    if (av == null && bv == null) return 0;
+    if (av == null) return -1;
+    if (bv == null) return 1;
+    const an = /^\d+$/u.test(av) ? Number(av) : null;
+    const bn = /^\d+$/u.test(bv) ? Number(bv) : null;
+    if (an != null && bn != null && an !== bn) return an > bn ? 1 : -1;
+    if (an != null && bn == null) return -1;
+    if (an == null && bn != null) return 1;
+    const cmp = av.localeCompare(bv);
+    if (cmp !== 0) return cmp > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+function parsePackageVersion(value) {
+  const normalized = cleanText(value || "").replace(/^v/iu, "").split("+")[0];
+  const [core, prerelease = ""] = normalized.split("-", 2);
+  const parts = core.split(".").map((part) => Number(part)).map((part) => (Number.isFinite(part) && part >= 0 ? part : 0));
+  while (parts.length < 3) parts.push(0);
+  return {
+    parts: parts.slice(0, 3),
+    prerelease: prerelease ? prerelease.split(".").map((part) => cleanText(part)).filter(Boolean) : [],
+  };
+}
+
 function mergeHazbaseAccountSummaries(existing, incoming) {
   const merged = new Map();
   for (const entry of [...(Array.isArray(existing) ? existing : []), ...(Array.isArray(incoming) ? incoming : [])]) {
@@ -17642,6 +18271,124 @@ function resolveHazbaseAccountForChain(accounts, chainId) {
   if (!normalizedChainId) return null;
   const list = Array.isArray(accounts) ? accounts : [];
   return list.find((entry) => Number(entry?.chainId) === normalizedChainId && cleanText(entry?.smartAccountAddress || "")) || null;
+}
+
+
+async function completeHazbaseWalletPaymentApproval({ config, runtime, state, approval }) {
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) throw codedError("hazbase-auth-required", 401);
+  if (!hazbase.deviceBindingId) throw codedError("hazbase-passkey-required", 409);
+  if (!hazbase.highTrustToken) throw codedError("hazbase-reauth-required", 409);
+  const chainId = Number(approval.rawParams?.chainId || 0);
+  const account = resolveHazbaseAccountForChain(hazbase.accounts, chainId);
+  if (!account?.smartAccountAddress) throw codedError("hazbase-wallet-account-missing", 409);
+
+  let result;
+  try {
+    result = await postHazbaseJson(config, "/api/payments/x402/hazbase-wallet/pay", {
+      paymentRequestId: approval.paymentRequestId,
+      deviceBindingId: hazbase.deviceBindingId,
+      highTrustToken: hazbase.highTrustToken,
+      smartAccountAddress: account.smartAccountAddress,
+      waitForReceipt: true,
+    }, hazbase.accessToken, 130_000);
+  } catch (error) {
+    if (isHazbaseInvalidAppSessionError(error)) {
+      markHazbaseSessionInvalid(state);
+      await saveState(config.stateFile, state);
+      throw codedError("hazbase-session-expired", 401, {
+        message: "Hazbase wallet session expired. Sign in again from Wallet settings.",
+      });
+    }
+    throw error;
+  }
+
+  if (!result?.xPayment) {
+    throw codedError(result?.errorCode || result?.error || "hazbase-wallet-payment-failed", 502);
+  }
+
+  const payload = {
+    paid: true,
+    decision: "accept",
+    paymentRequestId: approval.paymentRequestId,
+    xPayment: cleanText(result.xPayment || ""),
+    payer: cleanText(result.payer || account.smartAccountAddress || ""),
+    chainId: Number(result.chainId || chainId),
+    network: cleanText(result.network || approval.rawParams?.network || ""),
+    relayMode: cleanText(result.relayMode || ""),
+    submittedUserOpHash: cleanText(result.submittedUserOpHash || ""),
+    transactionHash: cleanText(result.transactionHash || ""),
+    payment: result,
+  };
+
+  approval.resolved = true;
+  approval.resolving = false;
+  runtime.nativeApprovalsByToken.delete(approval.token);
+  runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+  approval.resolveClaudeWaiter?.(payload);
+  const stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "approval",
+    stableId: `approval:${approval.requestKey}:${Date.now()}`,
+    token: approval.token,
+    title: approval.title,
+    threadLabel: approval.threadLabel || "",
+    messageText: `${approvalDecisionMessage("accept", config.defaultLocale, approval.provider)}\n\n${approval.messageText}\n\nTransaction: ${payload.transactionHash || payload.submittedUserOpHash}`,
+    summary: formatNotificationBody(approval.messageText, 160) || approvalDecisionMessage("accept", config.defaultLocale, approval.provider),
+    fileRefs: [],
+    diffText: "",
+    diffSource: "",
+    diffAvailable: false,
+    diffAddedLines: 0,
+    diffRemovedLines: 0,
+    outcome: "approved",
+    provider: approval.provider || "viveworker",
+  });
+  if (stateChanged) await saveState(config.stateFile, state);
+  console.log(`[hazbase-wallet-payment] ${approval.requestKey} | ${payload.transactionHash || payload.submittedUserOpHash}`);
+  return { ok: true, ...payload };
+}
+
+async function postHazbaseJson(config, endpoint, body, bearerToken, timeoutMs = 30_000) {
+  const baseUrl = stripTrailingSlash(config?.hazbaseApiUrl || "");
+  if (!baseUrl) throw codedError("hazbase-api-not-configured", 503);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(`${baseUrl}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${bearerToken}`,
+        "x-request-id": `viveworker_${crypto.randomUUID()}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => null);
+    const data = payload?.data || payload || {};
+    if (!response.ok) {
+      throw codedError(data?.errorCode || data?.code || data?.error || `hazbase-api-${response.status}`, response.status, data);
+    }
+    return data;
+  } catch (error) {
+    if (error?.name === "AbortError") throw codedError("hazbase-api-timeout", 504);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function codedError(code, statusCode = 500, details = null) {
+  const error = new Error(code);
+  error.code = code;
+  error.statusCode = statusCode;
+  error.details = details;
+  return error;
 }
 
 function validateConfig(config) {

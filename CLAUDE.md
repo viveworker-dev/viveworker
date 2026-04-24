@@ -375,7 +375,28 @@ PAYTO="$(curl -sS 'http://127.0.0.1:8787/api/hazbase/payout-address?chainId=8453
 node scripts/viveworker.mjs share upload report.pdf \
   --price 0.10 \
   --pay-to "$PAYTO"
+
+# 4) Buyer: inspect a paid share without signing.
+node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> --dry-run
+
+# 5) Buyer: pay with a Base Sepolia EOA that holds test-USDC and unlock.
+VIVEWORKER_BUYER_PRIVATE_KEY=0x... \
+  node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> \
+  --output ./paid-report.pdf
+
+# Or ask the paired device to reauth and pay from the configured hazBase Smart Wallet.
+node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> \
+  --wallet hazbase \
+  --output ./paid-report.pdf
 ```
+
+`share pay` is human-in-the-loop by default. EOA mode fetches the 402 requirements,
+pushes the amount, network, recipient, and resource URL to the paired phone,
+and waits for approval before signing the EIP-3009 authorization. `--wallet
+hazbase` sends the request to the paired phone, performs Passkey reauth there,
+and pays via the configured hazBase Smart Wallet. Agents should not add
+`--no-approval` unless the human explicitly asks for a trusted EOA smoke test /
+CI run.
 
 **Expected agent-side failures:**
 - `hazbase-auth-required`: no local hazbase session is active. Ask the human to sign in via `Wallet`.
@@ -385,7 +406,7 @@ node scripts/viveworker.mjs share upload report.pdf \
 **A2A flow:**
 1. Paste the `/v/<slug>` URL into the message body for the buying agent (via `viveworker a2a`, Moltbook comment, thread-share, or whatever transport applies).
 2. The buyer's `WebFetch`-equivalent tool gets a `402 Payment Required` response with the x402 requirements body.
-3. The buyer uses any x402-compatible client — the `x402-fetch` npm library, Cursor's built-in browser, or Coinbase AgentKit — to sign an EIP-3009 `transferWithAuthorization` and retry with an `X-PAYMENT` header. viveworker's current CLI does **not** include a buyer-side wallet; the external agent must bring its own signer.
+3. The buyer can run `viveworker share pay <url>` with `VIVEWORKER_BUYER_PRIVATE_KEY` / `BUYER_PK`, or use another x402-compatible client such as `x402-fetch`, Cursor's built-in browser, or Coinbase AgentKit. The CLI asks the paired phone to approve, then signs an EIP-3009 `transferWithAuthorization` and retries with an `X-PAYMENT` header.
 4. The worker serves the content, sets a 15-minute `share_paid` cookie, and emits `X-PAYMENT-RESPONSE` with a settlement preview. Reloads within the 15 minutes skip the 402.
 
 **Semantics:**
