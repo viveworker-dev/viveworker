@@ -13518,9 +13518,90 @@ function buildWebAppHtml({ pairToken }) {
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/viveworker-icon-192.png">
     <link rel="stylesheet" href="/app.css">
+    <style>
+      .boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: grid;
+        place-items: center;
+        padding: max(1.2rem, env(safe-area-inset-top)) 1rem max(1.2rem, env(safe-area-inset-bottom));
+        color: #f5fbff;
+        background:
+          radial-gradient(circle at 50% 18%, rgba(47, 143, 103, 0.22), transparent 30%),
+          radial-gradient(circle at 78% 78%, rgba(79, 131, 216, 0.14), transparent 28%),
+          linear-gradient(180deg, #081015 0%, #091015 100%);
+        transition: opacity 220ms ease, visibility 220ms ease;
+      }
+      .boot-splash__card {
+        width: min(20rem, 82vw);
+        display: grid;
+        justify-items: center;
+        gap: 0.9rem;
+        text-align: center;
+      }
+      .boot-splash__logo {
+        width: clamp(5.4rem, 28vw, 7rem);
+        height: clamp(5.4rem, 28vw, 7rem);
+        border-radius: 28%;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
+      }
+      .boot-splash__title {
+        margin: 0.25rem 0 0;
+        font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
+        font-size: clamp(1.65rem, 8vw, 2.4rem);
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+      .boot-splash__status {
+        margin: 0;
+        color: rgba(205, 220, 231, 0.72);
+        font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
+        font-size: 0.9rem;
+        letter-spacing: 0.02em;
+      }
+      .boot-splash__dots {
+        display: inline-grid;
+        grid-auto-flow: column;
+        gap: 0.34rem;
+        margin-top: 0.15rem;
+      }
+      .boot-splash__dots span {
+        width: 0.42rem;
+        height: 0.42rem;
+        border-radius: 999px;
+        background: rgba(142, 215, 255, 0.88);
+        animation: viveworker-boot-dot 980ms ease-in-out infinite;
+      }
+      .boot-splash__dots span:nth-child(2) { animation-delay: 140ms; }
+      .boot-splash__dots span:nth-child(3) { animation-delay: 280ms; }
+      .viveworker-ready .boot-splash {
+        opacity: 0;
+        visibility: hidden;
+      }
+      @keyframes viveworker-boot-dot {
+        0%, 80%, 100% { transform: translateY(0); opacity: 0.42; }
+        40% { transform: translateY(-0.28rem); opacity: 1; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-splash,
+        .boot-splash__dots span {
+          transition: none;
+          animation: none;
+        }
+      }
+    </style>
     <title>viveworker</title>
   </head>
   <body>
+    <div id="boot-splash" class="boot-splash" role="status" aria-live="polite" aria-label="viveworker is starting">
+      <div class="boot-splash__card">
+        <img class="boot-splash__logo" src="/icons/viveworker-v-pulse.svg" alt="" width="112" height="112" decoding="async">
+        <h1 class="boot-splash__title">viveworker</h1>
+        <p class="boot-splash__status">Starting</p>
+        <span class="boot-splash__dots" aria-hidden="true"><span></span><span></span><span></span></span>
+      </div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/app.js"></script>
   </body>

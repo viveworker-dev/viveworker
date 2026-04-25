@@ -132,6 +132,23 @@ function hazbasePasskeyHostSupport() {
 }
 
 const app = document.querySelector("#app");
+let bootSplashDismissed = false;
+
+function dismissBootSplash() {
+  if (bootSplashDismissed || typeof document === "undefined") {
+    return;
+  }
+  bootSplashDismissed = true;
+  const splash = document.querySelector("#boot-splash");
+  document.body?.classList.add("viveworker-ready");
+  if (!splash) {
+    return;
+  }
+  splash.setAttribute("aria-hidden", "true");
+  window.setTimeout(() => {
+    splash.remove();
+  }, 280);
+}
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
 const initialTargetTab = params.get("tab") || "";
@@ -146,6 +163,7 @@ boot().catch((error) => {
   const hint = /Load failed|Failed to fetch|NetworkError|fetch/i.test(message)
     ? `<p class="muted">${escapeHtml(L("error.networkHint"))}</p>`
     : "";
+  dismissBootSplash();
   app.innerHTML = `
     <main class="onboarding-shell">
       <section class="onboarding-card">
@@ -1171,6 +1189,7 @@ function renderPair() {
   });
 
   bindSharedUi(renderPair);
+  requestAnimationFrame(dismissBootSplash);
 }
 
 async function pair(payload) {
@@ -1279,6 +1298,7 @@ async function renderShell() {
   applyPendingListScrollRestore();
   applyPendingSettingsSubpageScrollReset();
   applyPendingSettingsScrollRestore();
+  requestAnimationFrame(dismissBootSplash);
 }
 
 function applyPendingDetailScrollReset() {
