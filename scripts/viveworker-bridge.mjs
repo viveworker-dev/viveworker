@@ -13544,6 +13544,9 @@ function buildWebAppHtml({ pairToken }) {
         width: clamp(5.4rem, 28vw, 7rem);
         height: clamp(5.4rem, 28vw, 7rem);
         border-radius: 28%;
+        background:
+          radial-gradient(circle at 76% 24%, rgba(125, 211, 252, 0.22), transparent 30%),
+          linear-gradient(180deg, rgba(23, 52, 72, 0.96), rgba(9, 17, 23, 0.96));
         box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
       }
       .boot-splash__title {
@@ -18152,18 +18155,31 @@ function buildConfig(cli) {
 }
 
 
+function inferHazbaseDeviceBindingIdFromAccounts(accounts) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  for (const entry of list) {
+    const deviceBindingId = cleanText(
+      entry?.primaryDeviceBindingId || entry?.deviceBindingId || entry?.ownerDeviceBindingId || ""
+    );
+    if (deviceBindingId) return deviceBindingId;
+  }
+  return "";
+}
+
 function normalizeHazbaseState(raw) {
   const value = raw && typeof raw === "object" ? raw : {};
+  const accounts = Array.isArray(value.accounts) ? value.accounts : [];
+  const deviceBindingId = cleanText(value.deviceBindingId ?? "") || inferHazbaseDeviceBindingIdFromAccounts(accounts);
   return {
     email: cleanText(value.email ?? ""),
     accessToken: cleanText(value.accessToken ?? ""),
     sessionId: cleanText(value.sessionId ?? ""),
     userId: cleanText(value.userId ?? ""),
-    deviceBindingId: cleanText(value.deviceBindingId ?? ""),
+    deviceBindingId,
     credentialId: cleanText(value.credentialId ?? ""),
     highTrustToken: cleanText(value.highTrustToken ?? ""),
     highTrustExpiresAt: cleanText(value.highTrustExpiresAt ?? ""),
-    accounts: Array.isArray(value.accounts) ? value.accounts : [],
+    accounts,
     sessionInvalid: value.sessionInvalid === true,
     sessionInvalidReason: cleanText(value.sessionInvalidReason ?? ""),
     sessionInvalidAt: cleanText(value.sessionInvalidAt ?? ""),

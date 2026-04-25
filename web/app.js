@@ -3544,6 +3544,7 @@ function renderSettingsRoot(context, { mobile }) {
           page: "wallet",
           icon: "coin",
           title: L("settings.wallet.title"),
+          badge: "beta",
           subtitle: L("settings.wallet.subtitle"),
           value: context.hazbase?.sessionInvalid
             ? L("settings.hazbase.status.sessionExpired")
@@ -3806,12 +3807,15 @@ function renderSettingsGroup(title, rows, options = {}) {
   `;
 }
 
-function renderSettingsNavRow({ page, icon, title, subtitle, value }) {
+function renderSettingsNavRow({ page, icon, title, badge, subtitle, value }) {
   return `
     <button class="settings-nav-row" type="button" data-settings-subpage="${escapeHtml(page)}">
       <span class="settings-row__icon" aria-hidden="true">${renderIcon(icon)}</span>
       <span class="settings-row__body">
-        <span class="settings-row__title">${escapeHtml(title)}</span>
+        <span class="settings-row__title-line">
+          <span class="settings-row__title">${escapeHtml(title)}</span>
+          ${badge ? `<span class="settings-row__badge">${escapeHtml(badge)}</span>` : ""}
+        </span>
         ${subtitle ? `<span class="settings-row__subtitle">${escapeHtml(subtitle)}</span>` : ""}
       </span>
       <span class="settings-row__value">${escapeHtml(value || "")}</span>
@@ -4591,6 +4595,7 @@ function renderSettingsWalletPage(context) {
   // longer duplicated.
   const guideRows = [
     renderHazbaseWalletBanner(flow),
+    renderHazbaseWalletBetaNotice(),
     state.hazbaseNotice
       ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--notice"><p>${escapeHtml(state.hazbaseNotice)}</p></div>`
       : "",
@@ -4642,15 +4647,10 @@ function renderSettingsWalletPage(context) {
 function renderHazbaseWalletStepList(flow) {
   const rendered = [];
   for (const step of flow.steps) {
-    // Step 4 (Base mainnet) is hidden while hazbase's closed beta keeps
-    // chainId 8453 out of `WALLET_GATEWAY_CHAINS_JSON` — calling bootstrap
-    // against mainnet currently returns `unsupported_chain`, so there's no
-    // path for the user to complete the step. Step 3 (Base Sepolia) is the
-    // true completion boundary; the ready banner already keys off
-    // `coreReady = signedIn && hasPasskey && hasBaseSepolia`. Drop this
-    // guard (and restore the opt-in reveal) once mainnet is enabled
-    // server-side.
-    if (step.number === 4) {
+    // Keep the Base mainnet roadmap visible only after the usable Base Sepolia
+    // wallet is ready. Showing Step 4 during email/passkey setup makes the
+    // sequential flow feel like there is another action competing for focus.
+    if (step.number === 4 && step.status === "comingSoon" && !flow.coreReady) {
       continue;
     }
 
@@ -4790,16 +4790,10 @@ function deriveHazbaseWalletFlow(hazbase) {
         icon: "coin",
         title: L("settings.wallet.step.base.title"),
         copy: L("settings.wallet.step.base.copy"),
-        detail: baseMainnet?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
+        detail: baseMainnet?.smartAccountAddress || L("settings.wallet.step.base.comingSoonDetail"),
         monoDetail: Boolean(baseMainnet?.smartAccountAddress),
-        status: hasBaseMainnet ? "complete" : coreReady ? "optional" : "locked",
-        actions: hasBaseMainnet
-          ? []
-          : [
-              actionButton("settings.hazbase.action.bootstrapBase", "bootstrap-base", {
-                disabled: !coreReady,
-              }),
-            ],
+        status: hasBaseMainnet ? "complete" : "comingSoon",
+        actions: [],
       },
     ],
   };
@@ -4851,14 +4845,29 @@ function renderHazbaseWalletBanner(flow) {
   `;
 }
 
+function renderHazbaseWalletBetaNotice() {
+  return `
+    <div class="settings-copy-block settings-copy-block--compact wallet-beta-notice">
+      <p>${escapeHtml(L("settings.wallet.betaNotice"))}</p>
+    </div>
+  `;
+}
+
 function renderHazbaseWalletStepCard(step, { mode = "full" } = {}) {
   const statusMeta = {
     complete: { label: L("settings.wallet.status.complete"), icon: "completed" },
     current: { label: L("settings.wallet.status.current"), icon: "pending" },
     locked: { label: L("settings.wallet.status.locked"), icon: "lock" },
     optional: { label: L("settings.wallet.status.optional"), icon: "coin" },
+    comingSoon: { label: L("settings.wallet.status.comingSoon"), icon: "coin" },
     pending: { label: L("settings.wallet.status.pending"), icon: "pending" },
   }[step.status] || { label: L("settings.wallet.status.pending"), icon: "pending" };
+  const statusChipHtml = step.status === "current"
+    ? ""
+    : `<span class="wallet-step-card__status wallet-step-card__status--${escapeHtml(step.status)}">
+          <span class="wallet-step-card__status-icon" aria-hidden="true">${renderIcon(statusMeta.icon)}</span>
+          <span>${escapeHtml(statusMeta.label)}</span>
+        </span>`;
 
   if (mode === "compact") {
     // Compact row for finished steps. Keeps the check icon + title + one-line
@@ -4889,10 +4898,7 @@ function renderHazbaseWalletStepCard(step, { mode = "full" } = {}) {
             <h3 class="wallet-step-card__title">${escapeHtml(step.title)}</h3>
           </div>
         </div>
-        <span class="wallet-step-card__status wallet-step-card__status--${escapeHtml(step.status)}">
-          <span class="wallet-step-card__status-icon" aria-hidden="true">${renderIcon(statusMeta.icon)}</span>
-          <span>${escapeHtml(statusMeta.label)}</span>
-        </span>
+        ${statusChipHtml}
       </div>
       <p class="wallet-step-card__copy">${escapeHtml(step.copy)}</p>
       <p class="wallet-step-card__detail ${step.monoDetail ? "wallet-step-card__detail--mono" : ""}">${escapeHtml(step.detail)}</p>

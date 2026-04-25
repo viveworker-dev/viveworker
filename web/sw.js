@@ -1,7 +1,7 @@
-const CACHE_NAME = "viveworker-v61";
+const CACHE_NAME = "viveworker-v66";
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
-const APP_ASSETS = ["/app.css", "/app.js", "/i18n.js"];
+const APP_ASSETS = ["/app.css", "/app.js", "/i18n.js", "/icons/viveworker-v-pulse.svg"];
 const APP_ROUTES = new Set(["/", "/app", "/app/"]);
 const CACHED_PATHS = new Set(APP_ASSETS);
 
