@@ -1899,7 +1899,11 @@ function buildActionOutcomeDetail({ kind, title, message }) {
 
 function approvalOutcomeMessage(actionUrl, provider) {
   const vars = { provider: providerDisplayName(provider) };
-  return /\/accept$/u.test(String(actionUrl || ""))
+  const normalizedUrl = String(actionUrl || "");
+  if (/\/api\/payments\/x402\/hazbase-wallet\/[^/]+\/pay$/u.test(normalizedUrl)) {
+    return L("server.message.paymentSubmitted");
+  }
+  return /\/accept$/u.test(normalizedUrl)
     ? L("server.message.approvalAccepted", vars)
     : L("server.message.approvalRejected", vars);
 }
@@ -2617,6 +2621,8 @@ function timelineEntryStatusLabel(item, isMessageLike) {
       return L("timeline.status.approved");
     case "rejected":
       return L("timeline.status.rejected");
+    case "failed":
+      return L("timeline.status.failed");
     case "implemented":
       return L("timeline.status.implemented");
     case "dismissed":
@@ -6496,20 +6502,7 @@ function renderLogoutConfirmModal() {
           <strong id="logout-confirm-title">${escapeHtml(L("logout.confirm.title"))}</strong>
           <p class="muted">${escapeHtml(L("logout.confirm.copy"))}</p>
         </div>
-        <div class="logout-option">
-          <div class="logout-option__copy">
-            <strong>${escapeHtml(L("logout.confirm.keepTrustedTitle"))}</strong>
-            <p class="muted">${escapeHtml(L("logout.confirm.keepTrustedCopy"))}</p>
-          </div>
-          <button class="primary primary--wide" type="button" data-logout-mode="session">${escapeHtml(L("logout.action.keepTrusted"))}</button>
-        </div>
-        <div class="logout-option logout-option--danger">
-          <div class="logout-option__copy">
-            <strong>${escapeHtml(L("logout.confirm.removeTitle"))}</strong>
-            <p class="muted">${escapeHtml(L("logout.confirm.removeCopy"))}</p>
-          </div>
-          <button class="secondary secondary--wide" type="button" data-logout-mode="revoke">${escapeHtml(L("logout.action.removeDevice"))}</button>
-        </div>
+        <button class="secondary secondary--wide" type="button" data-logout-mode="session">${escapeHtml(L("logout.action.keepTrusted"))}</button>
         <button class="ghost ghost--wide" type="button" data-close-logout-confirm>${escapeHtml(L("common.cancel"))}</button>
       </section>
     </div>
@@ -6870,18 +6863,33 @@ function bindShellInteractions() {
         state.pendingActionUrls.delete(actionUrl);
       } catch (error) {
         state.pendingActionUrls.delete(actionUrl);
+        const approvalFinalized = Boolean(error?.payload?.approvalFinalized);
         if (error?.errorKey === "hazbase-session-expired") {
           await fetchHazbaseStatus();
         }
-        // Restore buttons on failure so the user can retry
-        for (const sibling of siblingButtons) {
-          if (originalLabels.has(sibling)) {
-            sibling.innerHTML = originalLabels.get(sibling);
+        if (approvalFinalized) {
+          await refreshAuthenticatedState();
+          if (keepDetailOpen && activeItem?.kind === "approval") {
+            pinActionOutcomeDetail(
+              activeItem,
+              buildActionOutcomeDetail({
+                kind: "approval",
+                title: state.currentDetail?.title,
+                message: L("server.message.paymentFailed", { reason: error.message || String(error) }),
+              })
+            );
           }
-          sibling.disabled = false;
-          sibling.removeAttribute("aria-busy");
+        } else {
+          // Restore buttons on recoverable failure so the user can retry the same action.
+          for (const sibling of siblingButtons) {
+            if (originalLabels.has(sibling)) {
+              sibling.innerHTML = originalLabels.get(sibling);
+            }
+            sibling.disabled = false;
+            sibling.removeAttribute("aria-busy");
+          }
+          button.classList.remove("is-loading");
         }
-        button.classList.remove("is-loading");
         state.pushError = error.message || String(error);
         await renderShell();
       }
