@@ -1,4 +1,11 @@
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "./i18n.js";
+import { ensureIdentityKeypair, bytesToHex } from "./remote-pairing/keys.js";
+import {
+  loadPairingState as loadRemotePairingState,
+  savePairingState as saveRemotePairingState,
+  clearPairingState as clearRemotePairingState,
+} from "./remote-pairing/pairing-state.js";
+import { routedFetch } from "./remote-pairing/api-router.js";
 
 const DESKTOP_BREAKPOINT = 980;
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
@@ -60,6 +67,20 @@ const state = {
   a2aRelayStatus: null,
   a2aShareStatus: null,
   a2aShareRecentExpanded: 0,
+  // Remote-pairing relay snapshot — { enabled, relayUrl, configuredRelayUrl,
+  // identityFingerprint, sessions: [...], pairings: [...] } | null.
+  // Populated by fetchRemotePairingStatus() on settings page open and after
+  // toggle/revoke actions. Null until first fetch completes.
+  remotePairingStatus: null,
+  // Notice / error flashes for the remote-pairing settings page (consumed
+  // and cleared after a single render, mirroring `pushNotice` / `pushError`
+  // from the push UI).
+  remotePairingNotice: "",
+  remotePairingError: "",
+  // Pending action key for in-flight toggle / revoke / relay-url save —
+  // used to disable buttons while the round-trip is in progress so a fast
+  // double-click doesn't fire two POSTs.
+  remotePairingPending: "",
   hazbaseStatus: null,
   hazbaseNotice: "",
   hazbaseError: "",
@@ -194,10 +215,17 @@ async function boot() {
 
   if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
     try {
-      await pair({
+      const pairResult = await pair({
         token: initialPairToken,
         temporary: shouldUseTemporaryBootstrapPairing(),
       });
+      // Mirror the manual #pair-form path: register with the bridge so
+      // off-LAN reconnect via the relay works without a second pair step.
+      // Skipped when the bridge graced this tab a temporary session
+      // (Safari non-PWA bootstrap), since those don't survive the tab.
+      if (pairResult?.temporaryPairing !== true) {
+        await enrollRemotePairing();
+      }
     } catch (error) {
       state.pairError = error.message || String(error);
     }
@@ -306,6 +334,7 @@ async function boot() {
       refreshInboxDiff(),
       fetchMoltbookScoutStatus(),
       fetchA2aShareStatus(),
+      fetchRemotePairingStatus(),
     ])
       .then(async () => {
         if (!shouldDeferRenderForActiveInteraction()) {
@@ -364,6 +393,7 @@ async function refreshAuthenticatedState() {
   await fetchMoltbookScoutStatus();
   await fetchA2aRelayStatus();
   await fetchA2aShareStatus();
+  await fetchRemotePairingStatus();
   if (state.currentTab === "settings") {
     await fetchHazbaseStatus();
   }
@@ -386,6 +416,7 @@ async function refreshAuthenticatedStateRemote() {
     fetchMoltbookScoutStatus(),
     fetchA2aRelayStatus(),
     fetchA2aShareStatus(),
+    fetchRemotePairingStatus(),
   ]);
 }
 
@@ -583,6 +614,18 @@ async function fetchA2aRelayStatus() {
     state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
   } catch {
     state.a2aRelayStatus = null;
+  }
+}
+
+async function fetchRemotePairingStatus() {
+  if (!state.session?.remotePairingAvailable) {
+    state.remotePairingStatus = null;
+    return;
+  }
+  try {
+    state.remotePairingStatus = await apiGet("/api/remote-pairing/status");
+  } catch {
+    state.remotePairingStatus = null;
   }
 }
 
@@ -1176,9 +1219,16 @@ function renderPair() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      await pair({ code: String(form.get("code") || "") });
+      const pairResult = await pair({ code: String(form.get("code") || "") });
       state.pairError = "";
       state.pairNotice = "";
+      // Best-effort: register this phone's X25519 pubkey with the bridge
+      // so it can reach us via the relay later. Doesn't block the shell
+      // render; failures (older bridge, IndexedDB blocked, …) are swallowed
+      // inside the helper.
+      if (pairResult?.temporaryPairing !== true) {
+        await enrollRemotePairing();
+      }
       await refreshSession();
       await refreshAuthenticatedState();
       await renderShell();
@@ -1198,6 +1248,76 @@ async function pair(payload) {
     syncPairingTokenState("");
   }
   return result;
+}
+
+/**
+ * Best-effort post-pair enrollment: hand the bridge our X25519 static
+ * pubkey + a friendly label, persist the bridge's response in localStorage,
+ * and return the saved record (or null on any failure).
+ *
+ * Always called after a successful LAN pair (regardless of whether the
+ * remote relay is currently ON). Reasoning:
+ *
+ *   - Enrollment is idempotent on phonePub server-side; re-pairing the same
+ *     phone keeps its existing pairingId and bridge identity.
+ *   - Doing it eagerly means flipping the relay toggle later "just works"
+ *     without forcing the user to repair-on-LAN to register their key.
+ *   - LAN-only basic auth keeps working even if this fails (e.g. older
+ *     bridge predating the lan-enroll endpoint, IndexedDB blocked, etc.) —
+ *     we explicitly swallow errors and let the caller continue rendering
+ *     the authenticated shell.
+ *
+ * Skipped when the surrounding `pair()` returned `temporaryPairing: true`
+ * — temporary sessions are an opt-in shape that doesn't outlive the tab,
+ * so persisting a pairing record would be misleading.
+ *
+ * @param {string} [label]  user-visible device label; defaults to a
+ *                          "LAN paired YYYY-MM-DD" stamp.
+ * @returns {Promise<import("./remote-pairing/pairing-state.js").RemotePairingState | null>}
+ */
+async function enrollRemotePairing(label) {
+  try {
+    const keypair = await ensureIdentityKeypair();
+    const phonePubHex = bytesToHex(keypair.pub);
+    const effectiveLabel = (label && String(label).trim()) || buildDefaultEnrollLabel();
+    const response = await apiPost("/api/remote-pairing/lan-enroll", {
+      phonePubHex,
+      label: effectiveLabel,
+    });
+    if (!response || response.ok !== true) {
+      return null;
+    }
+    const saved = saveRemotePairingState({
+      pairingId: response.pairingId,
+      phonePub: response.phonePub,
+      phoneFingerprint: response.phoneFingerprint,
+      bridgePubHex: response.bridgePubHex,
+      bridgeFingerprint: response.bridgeFingerprint,
+      relayUrl: response.relayUrl,
+      label: response.label || "",
+      addedAtMs: Number.isFinite(response.addedAtMs) ? response.addedAtMs : Date.now(),
+    });
+    if (!saved) {
+      // Storage is full / disabled; the bridge still has the pairing,
+      // so future toggle-on works — just no localStorage cache for the
+      // PWA's own routing decisions.
+      return null;
+    }
+    return loadRemotePairingState();
+  } catch (error) {
+    console.warn("[remote-pairing] lan-enroll skipped:", error?.message || error);
+    return null;
+  }
+}
+
+function buildDefaultEnrollLabel() {
+  // YYYY-MM-DD so re-enrolls produce stable, sortable labels in the
+  // settings list. (The user can rename in the settings page later.)
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `LAN paired ${y}-${m}-${d}`;
 }
 
 async function logout({ revokeCurrentDeviceTrust = false } = {}) {
@@ -3256,6 +3376,7 @@ function buildSettingsContext() {
     a2aRelay: state.a2aRelayStatus,
     a2aShare: state.a2aShareStatus,
     hazbase: state.hazbaseStatus,
+    remotePairing: state.remotePairingStatus,
   };
 }
 
@@ -3437,6 +3558,13 @@ function settingsPageMeta(page) {
         description: L("settings.wallet.copy"),
         icon: "coin",
       };
+    case "remotePairing":
+      return {
+        id: "remotePairing",
+        title: L("settings.remotePairing.title"),
+        description: L("settings.remotePairing.copy"),
+        icon: "link",
+      };
     case "a2aExecutor":
       // Executor settings integrated into a2aRelay page — redirect.
       return settingsPageMeta("a2aRelay");
@@ -3518,7 +3646,7 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
-      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled || context.hazbase?.enabled) ? renderSettingsGroup(L("settings.group.integrations"), [
+      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled || context.hazbase?.enabled || state.session?.remotePairingAvailable) ? renderSettingsGroup(L("settings.group.integrations"), [
         state.session?.moltbookEnabled ? renderSettingsNavRow({
           page: "moltbook",
           icon: "item",
@@ -3549,6 +3677,15 @@ function renderSettingsRoot(context, { mobile }) {
           value: context.hazbase?.sessionInvalid
             ? L("settings.hazbase.status.sessionExpired")
             : context.hazbase?.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
+        }) : "",
+        state.session?.remotePairingAvailable ? renderSettingsNavRow({
+          page: "remotePairing",
+          icon: "link",
+          title: L("settings.remotePairing.title"),
+          subtitle: L("settings.remotePairing.subtitle"),
+          value: context.remotePairing?.enabled
+            ? L("settings.status.enabled")
+            : L("settings.status.disabled"),
         }) : "",
       ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
@@ -3609,6 +3746,9 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "wallet":
       content = renderSettingsWalletPage(context);
+      break;
+    case "remotePairing":
+      content = renderSettingsRemotePairingPage(context);
       break;
     default:
       content = "";
@@ -4564,6 +4704,202 @@ function renderSettingsA2aSharePage(context) {
             `<p class="settings-group__description muted">${escapeHtml(L("settings.a2aShare.files.empty"))}</p>`,
           ])}
       ${share.error ? `<p class="settings-page-copy muted">${escapeHtml(L("settings.a2aShare.error", { reason: share.error }))}</p>` : ""}
+    </div>
+  `;
+}
+
+function renderSettingsRemotePairingPage(context) {
+  // Always render — remote pairing is a feature toggle, not a credential-
+  // gated integration. If the bridge hasn't responded with a status payload
+  // yet, fall back to a default-disabled view so the toggle still works.
+  const status = context.remotePairing || {
+    enabled: false,
+    relayUrl: "",
+    configuredRelayUrl: "",
+    identityFingerprint: null,
+    sessions: [],
+    pairings: [],
+  };
+
+  const enabled = status.enabled === true;
+  const sessions = Array.isArray(status.sessions) ? status.sessions : [];
+  const pairings = Array.isArray(status.pairings) ? status.pairings : [];
+  const sessionsByPub = new Map(
+    sessions.map((s) => [String(s.phonePub || "").toLowerCase(), s]),
+  );
+  const togglePending = state.remotePairingPending === "toggle";
+  const relayPending = state.remotePairingPending === "relayUrl";
+
+  // "This device" — the locally-stored enrollment record (if any). Read
+  // synchronously from localStorage on each render so the badge shows up
+  // immediately after a successful lan-enroll without waiting for state
+  // refresh. Returns null in storage-disabled contexts (Safari private
+  // mode etc.) — the page just renders without the indicator.
+  const localPairing = (() => {
+    try {
+      return loadRemotePairingState();
+    } catch {
+      return null;
+    }
+  })();
+  const localPhonePub = (localPairing?.phonePub || "").toLowerCase();
+
+  // Status row: enabled? show first session state if any. Otherwise the
+  // toggle is the only signal — there's no "connected but no pairings"
+  // state worth surfacing to a non-technical user.
+  const statusValue = (() => {
+    if (!enabled) return L("settings.remotePairing.status.disabled");
+    if (sessions.length === 0) return L("settings.remotePairing.status.connected");
+    const liveCount = sessions.filter((s) => s.state === "open" || s.state === "running").length;
+    if (liveCount > 0) return L("settings.remotePairing.status.connected");
+    return L("settings.remotePairing.status.connecting");
+  })();
+
+  // Identity fingerprint row — shows the bridge's stable public key short-
+  // form so the human can verify what the phone is pairing against.
+  const fpRow = renderSettingsInfoRow(
+    L("settings.remotePairing.identity.fingerprint"),
+    status.identityFingerprint || L("settings.remotePairing.identity.empty"),
+  );
+
+  // The toggle row mirrors the A2A "accept public tasks" switch shape so we
+  // share styles and event hooks (data-attributes are unique).
+  const toggleRow = `
+    <section class="settings-group">
+      <p class="settings-group__title">${escapeHtml(L("settings.remotePairing.toggle.title"))}</p>
+      <label class="reply-mode-switch reply-mode-switch--settings" data-remote-pairing-toggle>
+        <input type="checkbox" class="reply-mode-switch__input"
+          ${enabled ? "checked" : ""}
+          ${togglePending ? "disabled" : ""}
+          data-remote-pairing-toggle-checkbox />
+        <span class="reply-mode-switch--settings__toggle">
+          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+          <span class="reply-mode-switch__state">${escapeHtml(enabled ? L("settings.claudeAway.on") : L("settings.claudeAway.off"))}</span>
+        </span>
+        <span class="reply-mode-switch__hint">${escapeHtml(L("settings.remotePairing.toggle.description"))}</span>
+      </label>
+    </section>
+  `;
+
+  // Relay URL editor. When empty, the bridge falls back to the compiled-in
+  // default — surfacing that here would require leaking it to the client,
+  // so we just show "" and lean on the placeholder.
+  const relayUrlValue = String(status.configuredRelayUrl || "");
+  const relayUrlSection = `
+    <section class="settings-group">
+      <p class="settings-group__title">${escapeHtml(L("settings.remotePairing.relayUrl.title"))}</p>
+      <div class="settings-input-row">
+        <input type="text"
+          class="settings-input"
+          data-remote-pairing-relay-url-input
+          value="${escapeHtml(relayUrlValue)}"
+          placeholder="${escapeHtml(L("settings.remotePairing.relayUrl.placeholder"))}"
+          ${relayPending ? "disabled" : ""}
+          autocomplete="off"
+          spellcheck="false" />
+        <button type="button"
+          class="secondary"
+          data-remote-pairing-relay-url-save
+          ${relayPending ? "disabled" : ""}>
+          ${escapeHtml(L("settings.remotePairing.relayUrl.save"))}
+        </button>
+      </div>
+      <p class="settings-group__description">${escapeHtml(L("settings.remotePairing.relayUrl.help"))}</p>
+    </section>
+  `;
+
+  // Pairings list — one card per phonePub on disk. "Live" badge if there's
+  // an open session; otherwise show the last-seen timestamp. The phone
+  // currently rendering this page gets an extra "This device" badge so the
+  // user can identify themselves in the list (especially useful when more
+  // than one phone is paired to the same Mac).
+  const pairingsRows = pairings.length === 0
+    ? `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.pairings.empty"))}</p>`
+    : pairings.map((p) => {
+        const session = sessionsByPub.get(String(p.phonePub || "").toLowerCase());
+        const live = session?.state === "open" || session?.state === "running";
+        const lastSeen = p.lastSeenAtMs
+          ? new Date(p.lastSeenAtMs).toLocaleString(state.locale)
+          : L("settings.remotePairing.pairings.never");
+        const added = p.addedAtMs
+          ? new Date(p.addedAtMs).toLocaleString(state.locale)
+          : L("settings.remotePairing.pairings.never");
+        const pendingThis = state.remotePairingPending === `revoke:${p.phonePub}`;
+        const isThisDevice = localPhonePub.length > 0
+          && String(p.phonePub || "").toLowerCase() === localPhonePub;
+        return `
+          <article class="settings-card${isThisDevice ? " settings-card--self" : ""}" data-remote-pairing-row="${escapeHtml(p.phonePub)}">
+            <header class="settings-card__header">
+              <div>
+                <p class="settings-card__title">${escapeHtml(p.label || p.phoneFingerprint || p.pairingId)}</p>
+                <p class="settings-card__subtitle">${escapeHtml(p.phoneFingerprint || p.phonePub.slice(0, 16))}</p>
+              </div>
+              <div class="settings-card__badges">
+                ${isThisDevice ? `<span class="settings-card__badge settings-card__badge--self">${escapeHtml(L("settings.remotePairing.pairings.thisDevice"))}</span>` : ""}
+                <span class="settings-card__badge ${live ? "settings-card__badge--live" : "settings-card__badge--offline"}">
+                  ${escapeHtml(live ? L("settings.remotePairing.pairings.live") : L("settings.remotePairing.pairings.offline"))}
+                </span>
+              </div>
+            </header>
+            <dl class="settings-card__rows">
+              <div><dt>${escapeHtml(L("settings.remotePairing.pairings.added"))}</dt><dd>${escapeHtml(added)}</dd></div>
+              <div><dt>${escapeHtml(L("settings.remotePairing.pairings.lastSeen"))}</dt><dd>${escapeHtml(lastSeen)}</dd></div>
+            </dl>
+            <div class="settings-card__actions">
+              <button type="button"
+                class="danger"
+                data-remote-pairing-revoke="${escapeHtml(p.phonePub)}"
+                ${pendingThis ? "disabled" : ""}>
+                ${escapeHtml(L("settings.remotePairing.pairings.revoke"))}
+              </button>
+            </div>
+          </article>
+        `;
+      }).join("");
+
+  // "This device" group — sits above the pairings list and tells the user
+  // explicitly whether *this phone* (the one rendering the page) is the
+  // enrolled one. Two states:
+  //   1. Enrolled: show the phone fingerprint + a confirmation copy.
+  //   2. Not enrolled: surface a hint that re-pairing on LAN registers
+  //      the device. (The hint applies even when other phones are paired
+  //      — they're not relevant to this device's relay status.)
+  const thisDeviceSection = (() => {
+    if (localPairing) {
+      const fingerprint = localPairing.phoneFingerprint
+        || localPairing.phonePub.slice(0, 16);
+      return renderSettingsGroup(L("settings.remotePairing.thisDevice.title"), [
+        `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.thisDevice.copy"))}</p>`,
+        renderSettingsInfoRow(
+          L("settings.remotePairing.thisDevice.fingerprint"),
+          fingerprint,
+        ),
+      ]);
+    }
+    return renderSettingsGroup(L("settings.remotePairing.thisDevice.title"), [
+      `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.thisDevice.notEnrolled"))}</p>`,
+    ]);
+  })();
+
+  const noticeBlock = state.remotePairingNotice
+    ? `<p class="settings-page-copy">${escapeHtml(state.remotePairingNotice)}</p>`
+    : "";
+  const errorBlock = state.remotePairingError
+    ? `<p class="settings-page-copy danger">${escapeHtml(state.remotePairingError)}</p>`
+    : "";
+
+  return `
+    <div class="settings-page">
+      ${noticeBlock}
+      ${errorBlock}
+      ${renderSettingsGroup(L("settings.remotePairing.status.title"), [
+        renderSettingsInfoRow(L("settings.remotePairing.status.title"), statusValue),
+        fpRow,
+      ])}
+      ${toggleRow}
+      ${relayUrlSection}
+      ${thisDeviceSection}
+      ${renderSettingsGroup(L("settings.remotePairing.pairings.title"), [pairingsRows])}
     </div>
   `;
 }
@@ -7272,6 +7608,120 @@ function bindShellInteractions() {
     });
   }
 
+  // ─── Remote pairing (Phase 5c) ─────────────────────────────────────
+  // Optimistic flips with bridge-side reconciliation. The bridge endpoints
+  // hot-restart the orchestrator, so the post-POST `fetchRemotePairingStatus`
+  // call can briefly observe a transient state — that's fine, the next
+  // render will land on the steady state.
+  for (const checkbox of document.querySelectorAll("[data-remote-pairing-toggle-checkbox]")) {
+    checkbox.addEventListener("change", async () => {
+      const next = checkbox.checked === true;
+      const previous = state.remotePairingStatus?.enabled === true;
+      state.remotePairingNotice = "";
+      state.remotePairingError = "";
+      state.remotePairingPending = "toggle";
+      // Optimistic flip — render once with the new value disabled-during-pending,
+      // then reconcile with the bridge.
+      if (state.remotePairingStatus) {
+        state.remotePairingStatus = { ...state.remotePairingStatus, enabled: next };
+      } else {
+        state.remotePairingStatus = {
+          enabled: next,
+          relayUrl: "",
+          configuredRelayUrl: "",
+          identityFingerprint: null,
+          sessions: [],
+          pairings: [],
+        };
+      }
+      await renderShell();
+      try {
+        await apiPost("/api/remote-pairing/toggle", { enabled: next });
+        state.remotePairingNotice = next
+          ? L("settings.remotePairing.notice.toggleOn")
+          : L("settings.remotePairing.notice.toggleOff");
+        await fetchRemotePairingStatus();
+      } catch (error) {
+        // Roll back to the previous value so the checkbox visually reverts.
+        if (state.remotePairingStatus) {
+          state.remotePairingStatus = { ...state.remotePairingStatus, enabled: previous };
+        }
+        state.remotePairingError = L("settings.remotePairing.error.toggleFailed");
+      } finally {
+        state.remotePairingPending = "";
+        await renderShell();
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-remote-pairing-relay-url-save]")) {
+    button.addEventListener("click", async () => {
+      // The input lives on the same page; querySelector grabs the (single)
+      // visible field. If we ever add multiple URL editors we'd need to
+      // scope this to a container — but right now there's exactly one.
+      const input = document.querySelector("[data-remote-pairing-relay-url-input]");
+      const trimmed = (input?.value || "").trim();
+      state.remotePairingNotice = "";
+      state.remotePairingError = "";
+      state.remotePairingPending = "relayUrl";
+      await renderShell();
+      try {
+        await apiPost("/api/remote-pairing/relay-url", { relayUrl: trimmed });
+        state.remotePairingNotice = L("settings.remotePairing.notice.relayUrlSaved");
+        await fetchRemotePairingStatus();
+      } catch (error) {
+        // Distinguish the validation error from a generic save failure so
+        // the user knows whether to fix the URL or retry.
+        state.remotePairingError = error?.errorKey === "invalid-relay-url"
+          ? L("settings.remotePairing.error.invalidRelayUrl")
+          : L("settings.remotePairing.error.relayUrlFailed");
+      } finally {
+        state.remotePairingPending = "";
+        await renderShell();
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-remote-pairing-revoke]")) {
+    button.addEventListener("click", async () => {
+      const phonePub = button.dataset.remotePairingRevoke || "";
+      if (!phonePub) return;
+      if (!window.confirm(L("settings.remotePairing.pairings.revokeConfirm"))) return;
+      state.remotePairingNotice = "";
+      state.remotePairingError = "";
+      // Per-pub pending key so the renderer only disables this card's
+      // button, not every revoke button on the page.
+      state.remotePairingPending = `revoke:${phonePub}`;
+      await renderShell();
+      try {
+        await apiPost("/api/remote-pairing/revoke", { phonePub });
+        // If the revoked phone is THIS device, drop the local enrollment
+        // record too — otherwise the "this device" indicator would keep
+        // claiming the (now-revoked) record is live, and a future fetch
+        // routing layer would try to reuse the stale pairingId. Best
+        // effort: storage failures don't change the revoke outcome.
+        try {
+          const local = loadRemotePairingState();
+          if (
+            local
+            && local.phonePub.toLowerCase() === phonePub.toLowerCase()
+          ) {
+            clearRemotePairingState();
+          }
+        } catch {
+          // ignore — same fall-through as savePairingState
+        }
+        state.remotePairingNotice = L("settings.remotePairing.notice.revoked");
+        await fetchRemotePairingStatus();
+      } catch (error) {
+        state.remotePairingError = L("settings.remotePairing.error.revokeFailed");
+      } finally {
+        state.remotePairingPending = "";
+        await renderShell();
+      }
+    });
+  }
+
 
 for (const button of document.querySelectorAll("[data-hazbase-action]")) {
   button.addEventListener("click", async () => {
@@ -7548,24 +7998,13 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
       try {
         const decisionBody = { action: submittedAction, editedText };
         if (editedTitle) decisionBody.editedTitle = editedTitle;
-        const res = await fetch(`/api/items/moltbook-draft/${encodeURIComponent(token)}/decision`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          credentials: "same-origin",
-          body: JSON.stringify(decisionBody),
-        });
-        if (!res.ok) {
-          const errBody = await res.json().catch(() => ({}));
-          alert(`Moltbook draft ${submittedAction} failed: ${errBody.error || res.status}`);
-          buttons.forEach((btn) => {
-            btn.disabled = false;
-            btn.classList.remove("is-loading", "is-dimmed");
-            btn.innerHTML = labelCache.get(btn);
-          });
-          if (textarea) textarea.readOnly = false;
-          moltbookDraftForm.dataset.submitting = "";
-          return;
-        }
+        // apiPost routes through LAN-first / relay-fallback and throws on
+        // !ok — the existing catch below handles both transport and HTTP
+        // failures uniformly.
+        await apiPost(
+          `/api/items/moltbook-draft/${encodeURIComponent(token)}/decision`,
+          decisionBody,
+        );
         // Mark local detail as resolved so re-render shows "already resolved" immediately.
         if (state.currentDetail?.kind === "moltbook_draft") {
           state.currentDetail.moltbookDraftEnabled = false;
@@ -7574,7 +8013,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         await refreshAuthenticatedState();
         await renderShell();
       } catch (error) {
-        alert(`Moltbook draft error: ${error.message}`);
+        alert(`Moltbook draft ${submittedAction} failed: ${error.message}`);
         buttons.forEach((btn) => {
           btn.disabled = false;
           btn.classList.remove("is-loading", "is-dimmed");
@@ -7625,24 +8064,10 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
       try {
         const decisionBody = { action: submittedAction, instruction };
         if (executor) decisionBody.executor = executor;
-        const res = await fetch(`/api/items/a2a-task/${encodeURIComponent(token)}/decision`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          credentials: "same-origin",
-          body: JSON.stringify(decisionBody),
-        });
-        if (!res.ok) {
-          const errBody = await res.json().catch(() => ({}));
-          alert(`A2A task ${submittedAction} failed: ${errBody.error || res.status}`);
-          buttons.forEach((btn) => {
-            btn.disabled = false;
-            btn.classList.remove("is-loading", "is-dimmed");
-            btn.innerHTML = labelCache.get(btn);
-          });
-          if (textarea) textarea.readOnly = false;
-          a2aTaskForm.dataset.submitting = "";
-          return;
-        }
+        await apiPost(
+          `/api/items/a2a-task/${encodeURIComponent(token)}/decision`,
+          decisionBody,
+        );
         if (state.currentDetail?.kind === "a2a_task") {
           state.currentDetail.a2aTaskEnabled = false;
           state.currentDetail.readOnly = true;
@@ -7650,7 +8075,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         await refreshAuthenticatedState();
         await renderShell();
       } catch (error) {
-        alert(`A2A task error: ${error.message}`);
+        alert(`A2A task ${submittedAction} failed: ${error.message}`);
         buttons.forEach((btn) => {
           btn.disabled = false;
           btn.classList.remove("is-loading", "is-dimmed");
@@ -7691,24 +8116,10 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
       if (textarea) textarea.readOnly = true;
       const editedContent = normalizeClientText(new FormData(threadShareForm).get("shareContent"));
       try {
-        const res = await fetch(`/api/threads/share/${encodeURIComponent(token)}/decision`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          credentials: "same-origin",
-          body: JSON.stringify({ decision: submittedAction, editedContent }),
-        });
-        if (!res.ok) {
-          const errBody = await res.json().catch(() => ({}));
-          alert(`Thread share ${submittedAction} failed: ${errBody.error || res.status}`);
-          buttons.forEach((btn) => {
-            btn.disabled = false;
-            btn.classList.remove("is-loading", "is-dimmed");
-            btn.innerHTML = labelCache.get(btn);
-          });
-          if (textarea) textarea.readOnly = false;
-          threadShareForm.dataset.submitting = "";
-          return;
-        }
+        await apiPost(
+          `/api/threads/share/${encodeURIComponent(token)}/decision`,
+          { decision: submittedAction, editedContent },
+        );
         if (state.currentDetail?.kind === "thread_share") {
           state.currentDetail.threadShareEnabled = false;
           state.currentDetail.readOnly = true;
@@ -7716,7 +8127,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         await refreshAuthenticatedState();
         await renderShell();
       } catch (error) {
-        alert(`Thread share error: ${error.message}`);
+        alert(`Thread share ${submittedAction} failed: ${error.message}`);
         buttons.forEach((btn) => {
           btn.disabled = false;
           btn.classList.remove("is-loading", "is-dimmed");
@@ -8759,7 +9170,10 @@ function handleDocumentVisibilityChange() {
 }
 
 async function apiGet(url) {
-  const response = await fetch(url, {
+  // routedFetch tries LAN first, then falls back to the relay tunnel when
+  // the phone is off-LAN. Returns a fetch-Response-compatible object so the
+  // rest of this function is identical to a plain `fetch()` call.
+  const response = await routedFetch(url, {
     credentials: "same-origin",
     headers: {
       Accept: "application/json",
@@ -8778,7 +9192,10 @@ async function apiGet(url) {
 
 async function apiPost(url, body) {
   const isFormDataBody = typeof FormData !== "undefined" && body instanceof FormData;
-  const response = await fetch(url, {
+  // FormData uploads cannot ride the relay (no multipart in the RPC layer).
+  // routedFetch surfaces that as a `formdata-over-relay-unsupported` error
+  // when LAN is also dead; the caller's existing error UI handles it.
+  const response = await routedFetch(url, {
     method: "POST",
     credentials: "same-origin",
     headers: isFormDataBody

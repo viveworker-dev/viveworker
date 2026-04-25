@@ -1,0 +1,23 @@
+name = "viveworker-pairing-relay"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+# Custom domain — uncomment once the DNS record + zone are in place.
+# routes = [
+#   { pattern = "pairing.viveworker.com", zone_name = "viveworker.com", custom_domain = true },
+# ]
+
+# PairingChannel — one Durable Object instance per pairingId. Holds the two
+# WebSockets (phone + bridge) and an in-memory replay buffer. Hibernatable:
+# CF unloads the DO between messages so we don't pay for idle pairings.
+[[durable_objects.bindings]]
+name = "PAIRING_CHANNEL"
+class_name = "PairingChannel"
+
+# SQLite-backed DO is the recommended default for new projects. We don't
+# persist anything to it in Phase 1 (in-memory replay buffer only) but the
+# binding is future-proofed.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PairingChannel"]

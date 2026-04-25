@@ -4926,3 +4926,171 @@ button[aria-busy="true"]:not(.is-loading) {
   font-size: 0.85rem;
   color: #ff8a8a;
 }
+
+/* ─── Remote pairing settings (Phase 5c) ───────────────────────────────
+ * Two new shapes:
+ *   1. Inline input + button (relay URL editor). The pattern reuses the
+ *      `wallet-step-card__field-input` look (dark sunken input on a dark
+ *      page) without the wallet-card wrapper, since this page is plainer.
+ *   2. Per-pairing summary card with header (label + live/offline badge),
+ *      a two-column dl of meta rows, and a danger-button action footer.
+ */
+.settings-input-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.settings-input {
+  flex: 1 1 0;
+  min-width: 0;
+  width: 100%;
+  padding: 0.58rem 0.75rem;
+  border-radius: 0.55rem;
+  border: 1px solid var(--line-strong);
+  background: rgba(7, 12, 16, 0.72);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.4;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+
+.settings-input::placeholder {
+  color: rgba(205, 220, 231, 0.38);
+}
+
+.settings-input:focus {
+  outline: none;
+  border-color: rgba(112, 202, 157, 0.55);
+  background: rgba(7, 12, 16, 0.92);
+  box-shadow: 0 0 0 3px rgba(47, 143, 103, 0.22);
+}
+
+.settings-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.settings-card {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.85rem 1rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(156, 181, 197, 0.16);
+}
+
+.settings-card + .settings-card {
+  margin-top: 0.55rem;
+}
+
+.settings-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.settings-card__title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.settings-card__subtitle {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.settings-card__badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.settings-card__badge--live {
+  background: rgba(112, 202, 157, 0.18);
+  color: #b5e6cc;
+}
+
+.settings-card__badge--offline {
+  background: rgba(156, 181, 197, 0.14);
+  color: var(--muted);
+}
+
+/* "This device" badge — accent border + indigo tint to draw the eye to the
+   row representing the phone the user is currently looking at. Placed
+   alongside the live/offline badge inside .settings-card__badges. */
+.settings-card__badge--self {
+  background: rgba(120, 144, 240, 0.18);
+  color: #c2cdfa;
+  border: 1px solid rgba(120, 144, 240, 0.45);
+}
+
+/* Container for stacked badges — vertical stack on mobile keeps each badge
+   on its own line so labels stay legible regardless of width. */
+.settings-card__badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+/* Subtle frame upgrade for the "this device" pairing card so the user can
+   spot themselves in the list at a glance. */
+.settings-card--self {
+  border-color: rgba(120, 144, 240, 0.45);
+  background: rgba(120, 144, 240, 0.07);
+}
+
+.settings-card__rows {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 0.85rem;
+  row-gap: 0.25rem;
+  margin: 0;
+}
+
+.settings-card__rows > div {
+  display: contents;
+}
+
+.settings-card__rows dt {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  text-transform: uppercase;
+  align-self: center;
+}
+
+.settings-card__rows dd {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text);
+  align-self: center;
+}
+
+.settings-card__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.15rem;
+}
+
+.settings-page-copy.danger {
+  color: #ff8a8a;
+}

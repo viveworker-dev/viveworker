@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>viveworker · remote-pairing test</title>
+  <style>
+    /* Minimal styling. The intent is to be readable in any browser without
+       depending on the main app shell. */
+    :root { color-scheme: light dark; }
+    body {
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      margin: 0;
+      padding: 1rem;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+    h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+    fieldset { border: 1px solid #888; border-radius: 6px; padding: 0.75rem; margin-bottom: 0.75rem; }
+    fieldset legend { padding: 0 0.4rem; font-weight: 600; }
+    label { display: inline-flex; flex-direction: column; gap: 0.15rem; margin-right: 1rem; }
+    input[type="text"], input[type="url"] {
+      font: inherit;
+      padding: 0.3rem 0.5rem;
+      border: 1px solid #888;
+      border-radius: 4px;
+      min-width: 220px;
+    }
+    button {
+      font: inherit;
+      padding: 0.3rem 0.8rem;
+      border: 1px solid #888;
+      border-radius: 4px;
+      cursor: pointer;
+      background: transparent;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.75rem;
+    }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+
+    .peer {
+      border: 1px solid #888;
+      border-radius: 6px;
+      padding: 0.75rem;
+    }
+    .peer .row { display: flex; gap: 0.5rem; align-items: center; margin: 0.4rem 0; }
+    .peer ul { padding-left: 1.2rem; max-height: 200px; overflow-y: auto; margin: 0.4rem 0 0; }
+    .state-disconnected { color: #888; }
+    .state-opening, .state-handshaking, .state-resuming { color: #c80; }
+    .state-connected { color: #080; font-weight: 600; }
+    .state-failed { color: #c00; font-weight: 600; }
+
+    code, pre { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+    pre#log {
+      background: #f5f5f5;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 0.5rem;
+      max-height: 360px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+    @media (prefers-color-scheme: dark) {
+      pre#log { background: #1c1c1c; border-color: #333; }
+    }
+  </style>
+</head>
+<body>
+  <h1>viveworker remote-pairing — Phase 2 browser smoke test</h1>
+
+  <details style="margin-bottom: 0.75rem;">
+    <summary>How to run</summary>
+    <ol>
+      <li>Start the relay in one terminal:
+        <pre><code>cd worker-pairing && npx wrangler dev --local --port 8801</code></pre>
+      </li>
+      <li>Serve the <code>web/</code> directory in another terminal:
+        <pre><code>cd web && npx http-server -p 8000 -c-1</code></pre>
+        (any static server works; <code>-c-1</code> disables caching so edits show up immediately)
+      </li>
+      <li>Open <code>http://127.0.0.1:8000/remote-pairing-test.html</code> in your browser.</li>
+      <li>Click <strong>Start</strong>. Both peers should reach <code>connected</code> with matching channel bindings.</li>
+      <li>Type messages into either peer's input and click Send — the other peer's "Received" list updates.</li>
+      <li>Click <strong>Force-disconnect</strong> on a peer to simulate a network blip; you should see it transition through <code>disconnected → opening → resuming → connected</code> and the encrypted channel survives.</li>
+    </ol>
+    <p>
+      This page intentionally lives outside the main PWA shell — it loads only the
+      remote-pairing modules, so any failure isolates to the new code.
+    </p>
+  </details>
+
+  <fieldset>
+    <legend>Configuration</legend>
+    <label>Relay URL <input id="relay" type="url" value="ws://127.0.0.1:8801"></label>
+    <label>Pairing ID <input id="pairing" type="text"></label>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="reset">Reset</button>
+  </fieldset>
+
+  <div class="grid">
+    <section class="peer" data-peer="phone">
+      <h2>Phone (initiator)</h2>
+      <div class="row">State: <span class="state state-disconnected" id="phone-state">disconnected</span></div>
+      <div class="row">Identity fingerprint: <code id="phone-fp">—</code></div>
+      <div class="row">Channel binding: <code id="phone-binding">—</code></div>
+      <div class="row">Outbound seq: <code id="phone-seq">0</code></div>
+      <div class="row">
+        <input id="phone-input" type="text" placeholder="message to send" disabled>
+        <button id="phone-send" disabled>Send</button>
+        <button id="phone-disconnect" disabled>Force-disconnect</button>
+      </div>
+      <h3 style="font-size: 0.85rem; margin: 0.4rem 0 0;">Received</h3>
+      <ul id="phone-recv"></ul>
+    </section>
+
+    <section class="peer" data-peer="bridge">
+      <h2>Bridge (responder)</h2>
+      <div class="row">State: <span class="state state-disconnected" id="bridge-state">disconnected</span></div>
+      <div class="row">Identity fingerprint: <code id="bridge-fp">—</code></div>
+      <div class="row">Channel binding: <code id="bridge-binding">—</code></div>
+      <div class="row">Outbound seq: <code id="bridge-seq">0</code></div>
+      <div class="row">
+        <input id="bridge-input" type="text" placeholder="message to send" disabled>
+        <button id="bridge-send" disabled>Send</button>
+        <button id="bridge-disconnect" disabled>Force-disconnect</button>
+      </div>
+      <h3 style="font-size: 0.85rem; margin: 0.4rem 0 0;">Received</h3>
+      <ul id="bridge-recv"></ul>
+    </section>
+  </div>
+
+  <h2 style="margin-top: 1rem;">Logs</h2>
+  <pre id="log"></pre>
+
+  <!-- Run as ES module — no build step. The bundle is checked into git;
+       transport.js / wake.js / keys.js are vanilla ESM. -->
+  <script type="module">
+    import {
+      generateIdentityKeypair,
+      fingerprintIdentity,
+      bytesToHex,
+    } from "/remote-pairing.bundle.js";
+    import { RemotePairingTransport, STATE } from "/remote-pairing/transport.js";
+    import { bindWakeEvents } from "/remote-pairing/wake.js";
+
+    // -------------------------------------------------------------------------
+    // DOM helpers
+    // -------------------------------------------------------------------------
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+
+    function log(line) {
+      const stamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+      logEl.textContent += `[${stamp}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setState(name, state) {
+      const el = $(`${name}-state`);
+      el.textContent = state;
+      el.className = `state state-${state}`;
+    }
+
+    function setBinding(name, bytes) {
+      $(`${name}-binding`).textContent = bytes
+        ? bytesToHex(bytes).slice(0, 32) + "…"
+        : "—";
+    }
+
+    function setFingerprint(name, pub) {
+      $(`${name}-fp`).textContent = fingerprintIdentity(pub);
+    }
+
+    function appendRecv(name, text) {
+      const li = document.createElement("li");
+      const stamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+      li.textContent = `[${stamp}] ${text}`;
+      $(`${name}-recv`).appendChild(li);
+    }
+
+    // -------------------------------------------------------------------------
+    // Default pairing ID picks something distinct per page-load so reload
+    // doesn't get mixed up with a previous session's outbox.
+    // -------------------------------------------------------------------------
+
+    $("pairing").value = `browser-test-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
+
+    // -------------------------------------------------------------------------
+    // Per-peer wiring
+    // -------------------------------------------------------------------------
+
+    /**
+     * @param {"phone" | "bridge"} role
+     * @param {object} opts  full RemotePairingTransport options minus callbacks
+     * @returns {{ transport: RemotePairingTransport, unbindWake: () => void }}
+     */
+    function buildPeer(role, opts) {
+      const transport = new RemotePairingTransport({
+        ...opts,
+        onMessage: (pt) => {
+          const text = new TextDecoder().decode(pt);
+          appendRecv(role, text);
+          log(`${role} ← "${text}"`);
+        },
+        onStateChange: (next, prev, info) => {
+          setState(role, next);
+          log(`${role} ${prev} → ${next}${info?.resumed ? " (resumed)" : ""}`);
+          // Refresh seq display on every state change (cheap, no extra hooks).
+          $(`${role}-seq`).textContent = String(transport._outboundSeq);
+          // Enable / disable controls based on state.
+          const connected = next === STATE.CONNECTED;
+          $(`${role}-input`).disabled = !connected;
+          $(`${role}-send`).disabled = !connected;
+          $(`${role}-disconnect`).disabled = !connected;
+        },
+        onError: (err) => {
+          log(`${role} ERROR: ${err?.message ?? err}`);
+        },
+        onHandshakeComplete: ({ channelBinding }) => {
+          setBinding(role, channelBinding);
+        },
+      });
+
+      $(`${role}-send`).onclick = () => {
+        const input = $(`${role}-input`);
+        const text = input.value;
+        if (!text) return;
+        try {
+          transport.send(new TextEncoder().encode(text));
+          log(`${role} → "${text}"`);
+          input.value = "";
+        } catch (err) {
+          log(`${role} send error: ${err.message}`);
+        }
+      };
+
+      $(`${role}-disconnect`).onclick = () => {
+        // Reach into the WS to simulate a network drop without telling the
+        // transport. This is the path we want to exercise: relay closes our
+        // WS, we reconnect with RESUME_REQ, get RESUME_OK, channel survives.
+        try {
+          transport._ws?.close(1006, "test-disconnect");
+          log(`${role} forced WS close — expect resume cycle`);
+        } catch (err) {
+          log(`${role} forced disconnect failed: ${err.message}`);
+        }
+      };
+
+      // Phase 2d: wire up wake events too, just so they're exercised in this
+      // page even though there's no SW push or visibility change firing
+      // during a one-tab demo. The unbind goes into our reset path.
+      const unbindWake = bindWakeEvents(transport, {
+        onWake: (reason) => log(`${role} wake reason=${reason}`),
+      });
+
+      return { transport, unbindWake };
+    }
+
+    // -------------------------------------------------------------------------
+    // Top-level controls
+    // -------------------------------------------------------------------------
+
+    /** @type {{transport: RemotePairingTransport, unbindWake: () => void} | null} */
+    let phone = null;
+    /** @type {{transport: RemotePairingTransport, unbindWake: () => void} | null} */
+    let bridge = null;
+
+    $("start").onclick = async () => {
+      $("start").disabled = true;
+      try {
+        const relayUrl = $("relay").value.trim();
+        const pairingId = $("pairing").value.trim();
+        if (!relayUrl) throw new Error("relay URL required");
+        if (!pairingId) throw new Error("pairing id required");
+
+        // For the smoke test we generate fresh keypairs in the same tab. In
+        // production the phone has the bridge's pubkey from LAN bootstrap.
+        const phoneKeys = generateIdentityKeypair();
+        const bridgeKeys = generateIdentityKeypair();
+        setFingerprint("phone", phoneKeys.pub);
+        setFingerprint("bridge", bridgeKeys.pub);
+
+        phone = buildPeer("phone", {
+          relayUrl,
+          pairingId,
+          role: "phone",
+          identityKeypair: phoneKeys,
+          remoteStatic: bridgeKeys.pub,
+        });
+        bridge = buildPeer("bridge", {
+          relayUrl,
+          pairingId,
+          role: "bridge",
+          identityKeypair: bridgeKeys,
+        });
+
+        $("stop").disabled = false;
+
+        log("connecting both peers…");
+        await Promise.all([phone.transport.connect(), bridge.transport.connect()]);
+        log("both peers connected");
+      } catch (err) {
+        log(`start failed: ${err?.message ?? err}`);
+        $("start").disabled = false;
+      }
+    };
+
+    $("stop").onclick = () => {
+      try { phone?.unbindWake(); } catch {}
+      try { bridge?.unbindWake(); } catch {}
+      try { phone?.transport.close(); } catch {}
+      try { bridge?.transport.close(); } catch {}
+      phone = null;
+      bridge = null;
+      $("stop").disabled = true;
+      $("start").disabled = false;
+      log("stopped");
+    };
+
+    $("reset").onclick = () => {
+      $("stop").click();
+      logEl.textContent = "";
+      for (const role of ["phone", "bridge"]) {
+        setBinding(role, null);
+        $(`${role}-fp`).textContent = "—";
+        $(`${role}-seq`).textContent = "0";
+        $(`${role}-recv`).textContent = "";
+      }
+      // Roll a new pairing ID so a stale outbox can't influence the next run.
+      $("pairing").value = `browser-test-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
+      log("reset");
+    };
+
+    // Surface uncaught errors so a silent crash doesn't leave you wondering.
+    window.addEventListener("error", (ev) => {
+      log(`uncaught: ${ev?.error?.message ?? ev?.message ?? ev}`);
+    });
+    window.addEventListener("unhandledrejection", (ev) => {
+      log(`unhandled rejection: ${ev?.reason?.message ?? ev?.reason ?? "?"}`);
+    });
+
+    log("page loaded — configure relay URL + pairing ID, then click Start");
+  </script>
+</body>
+</html>

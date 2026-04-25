@@ -21,6 +21,11 @@ import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
 import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems } from "./moltbook-api.mjs";
+import { startRemotePairingRelay, DEFAULT_RELAY_URL } from "./lib/remote-pairing/orchestrator.mjs";
+import { restartRemotePairingRelay, persistRemotePairingEnv, getRemotePairingStatus } from "./lib/remote-pairing/control.mjs";
+import { loadPairings, removePairingPersisted, addPairingPersisted, buildPairing, REMOTE_PAIRINGS_FILE } from "./lib/remote-pairing/pairings.mjs";
+import { ensureIdentityKeypair } from "./lib/remote-pairing/keys.mjs";
+import { fingerprintIdentity, bytesToHex } from "./lib/remote-pairing/keys-core.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -209,6 +214,7 @@ const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
 loadEnvFile(envFile);
 loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
+loadEnvFile(path.join(os.homedir(), ".viveworker", "remote-pairing.env"));
 await maybeRotateStartupPairingEnv(envFile);
 
 const config = buildConfig(cli);
@@ -261,6 +267,7 @@ const runtime = {
   recentCodeEvents: [],
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
+  remotePairingHandle: null,
   stopping: false,
   // In-memory cache for the `/api/share/status` endpoint. A 30s TTL avoids
   // hammering the share worker on every settings-page render. Purely runtime —
@@ -475,6 +482,11 @@ function buildSessionLocalePayload(config, state, deviceId) {
     a2aShareEnabled: Boolean(config.a2aRelayUserId && config.a2aApiKey),
     a2aExecutors: runtime.a2aAvailableExecutors || { codex: false, claude: false },
     a2aExecutorPreference: state.a2aExecutorPreference || "ask",
+    // Remote pairing is always "available" — the row appears in Settings →
+    // Integrations regardless of whether the relay is currently enabled, so
+    // users can find the toggle. The actual enabled/connected state is read
+    // from /api/remote-pairing/status.
+    remotePairingAvailable: true,
   };
 }
 
@@ -10180,6 +10192,36 @@ function readSession(req, config, state) {
     };
   }
 
+  // Relay-dispatched requests authenticate via the Noise channel
+  // binding + pairing identity, set on the synthetic IncomingMessage by
+  // scripts/lib/remote-pairing/http-dispatch.mjs. They have no cookies
+  // (HttpOnly session cookie can't be forwarded by the PWA's JS layer,
+  // and the RPC frame doesn't carry browser cookies), so the cookie
+  // path below would always 401 them.
+  //
+  // Trust model: only this process's relay orchestrator can attach this
+  // marker — it's set on a synthetic req object that never leaves the
+  // bridge. An attacker would need code-exec inside the bridge to forge
+  // it, which is past the threat model anyway. The orchestrator only
+  // dispatches requests for pairings whose Noise IK handshake succeeded
+  // against the bridge's static key, so reaching this branch implies
+  // the phone proved possession of `pairing.phonePub`.
+  const relay = req.viveworker;
+  if (relay?.fromRelay && relay.pairing?.pairingId) {
+    return {
+      authenticated: true,
+      sessionId: `relay:${relay.pairing.pairingId}`,
+      pairedAtMs: Number(relay.pairing.addedAtMs) || Date.now(),
+      // Relay sessions live only as long as the underlying Noise channel
+      // — there's no cookie expiry to track. 0 = "no fixed expiry, the
+      // transport layer manages liveness".
+      expiresAtMs: 0,
+      deviceId: relay.pairing.phoneFingerprint || deviceId,
+      fromRelay: true,
+      pairingId: relay.pairing.pairingId,
+    };
+  }
+
   const token = parseCookies(req)[sessionCookieName];
   const payload = token ? verifySessionToken(token, config.sessionSecret) : null;
   if (!payload) {
@@ -10638,6 +10680,16 @@ function requestOrigin(req) {
 }
 
 function requireTrustedMutationOrigin(req, res, config) {
+  // Relay-dispatched requests have no Origin / Referer (the PWA's RPC
+  // frame doesn't synthesize one) and a non-loopback synthetic
+  // remoteAddress, so they would always 403 here. They're authenticated
+  // by the Noise channel binding instead — no browser-side CSRF surface
+  // exists because an attacker can't establish a Noise channel without
+  // the pairing's static key. See readSession() for the trust-model
+  // notes.
+  if (req.viveworker?.fromRelay) {
+    return true;
+  }
   const origin = requestOrigin(req);
   if (!origin) {
     if (isLoopbackRequest(req)) {
@@ -13671,7 +13723,16 @@ function createNativeApprovalServer({ config, runtime, state }) {
         url.pathname === "/i18n.js" ||
         url.pathname === "/hazbase-passkey.js" ||
         url.pathname === "/sw.js" ||
-        url.pathname.startsWith("/icons/")
+        url.pathname.startsWith("/icons/") ||
+        // Remote-pairing PWA modules + their generated crypto bundle.
+        // The bundle is auto-built by scripts/build-remote-pairing-bundle.mjs
+        // and the per-module wrappers under web/remote-pairing/ import from it.
+        // resolveWebAsset() still enforces the webRoot containment check, so
+        // a wide-prefix allowlist here is safe against path traversal.
+        url.pathname.startsWith("/remote-pairing/") ||
+        url.pathname === "/remote-pairing.bundle.js" ||
+        url.pathname === "/remote-pairing.bundle.js.map" ||
+        url.pathname === "/remote-pairing.bundle.js.LEGAL.txt"
       ) {
         const served = await serveWebAsset(res, url.pathname, req);
         if (served) {
@@ -14574,6 +14635,331 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           }
         }
         return writeJson(res, 200, { ok: true, acceptPublicTasks: accept });
+      }
+
+      // ─── Remote pairing (off-LAN PWA relay) ──────────────────────────
+
+      // GET /api/remote-pairing/status — settings UI bootstrap.
+      //
+      // Returns the current orchestrator state plus the (read-only) list of
+      // pairings on disk. Sessions only exist when `enabled: true`; when the
+      // relay is off we still surface the pairings so the user can revoke
+      // before re-enabling.
+      if (url.pathname === "/api/remote-pairing/status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        const status = getRemotePairingStatus(runtime);
+        let pairings = [];
+        try {
+          const list = await loadPairings();
+          pairings = list.map((p) => ({
+            pairingId: p.pairingId,
+            label: p.label || "",
+            phonePub: p.phonePub,
+            phoneFingerprint: p.phoneFingerprint,
+            addedAtMs: p.addedAtMs ?? null,
+            lastSeenAtMs: p.lastSeenAtMs ?? null,
+          }));
+        } catch (err) {
+          console.warn(`[remote-pairing] status: failed to load pairings: ${err?.message}`);
+        }
+        return writeJson(res, 200, {
+          enabled: status.enabled,
+          relayUrl: status.relayUrl,
+          configuredRelayUrl: config.remotePairingRelayUrl || "",
+          identityFingerprint: status.identityFingerprint,
+          identityPubHex: status.identityPubHex,
+          sessions: status.sessions,
+          pairings,
+          pairingsFile: REMOTE_PAIRINGS_FILE,
+        });
+      }
+
+      // POST /api/remote-pairing/toggle — flip on/off without restart.
+      //
+      // Body: { enabled: boolean }
+      // Persists to ~/.viveworker/remote-pairing.env (so the next bridge
+      // launch starts in the new state) and hot-restarts the orchestrator.
+      // The same approval server's request handler is reused, so cookies /
+      // session auth behave identically over LAN HTTP and the relay.
+      if (url.pathname === "/api/remote-pairing/toggle" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        if (typeof body?.enabled !== "boolean") {
+          return writeJson(res, 400, { error: "enabled-required", message: "body.enabled must be a boolean" });
+        }
+        if (typeof requestHandler !== "function") {
+          return writeJson(res, 503, { error: "request-handler-unavailable" });
+        }
+        const next = body.enabled;
+        config.remotePairingEnabled = next;
+        try {
+          await persistRemotePairingEnv({ enabled: next });
+        } catch (err) {
+          // Persistence failure shouldn't roll back the in-memory config —
+          // the user can retry from the UI and the runtime is still in the
+          // intended state. Surface the error clearly.
+          console.error(`[remote-pairing] env persist failed: ${err?.message}`);
+        }
+        try {
+          await restartRemotePairingRelay({
+            runtime,
+            config,
+            requestListener: requestHandler,
+            logger: console,
+          });
+        } catch (err) {
+          console.error(`[remote-pairing] hot-restart failed: ${err?.message}`);
+          return writeJson(res, 500, { error: "restart-failed", message: err.message });
+        }
+        const status = getRemotePairingStatus(runtime);
+        return writeJson(res, 200, {
+          ok: true,
+          enabled: status.enabled,
+          relayUrl: status.relayUrl,
+          identityFingerprint: status.identityFingerprint,
+          sessions: status.sessions,
+        });
+      }
+
+      // POST /api/remote-pairing/relay-url — change the relay endpoint.
+      //
+      // Body: { relayUrl: string | null }
+      //   - empty string / null  → falls back to DEFAULT_RELAY_URL
+      //   - non-empty string     → must be ws:// or wss://
+      // Persists + hot-restarts (only restarts if currently enabled, since
+      // a dormant handle has nothing to reconnect).
+      if (url.pathname === "/api/remote-pairing/relay-url" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        const raw = body?.relayUrl;
+        let normalized = "";
+        if (raw == null || raw === "") {
+          normalized = "";
+        } else if (typeof raw === "string") {
+          const trimmed = raw.trim();
+          if (!/^wss?:\/\//u.test(trimmed)) {
+            return writeJson(res, 400, {
+              error: "invalid-relay-url",
+              message: "relayUrl must be ws:// or wss:// (or empty for default)",
+            });
+          }
+          normalized = trimmed;
+        } else {
+          return writeJson(res, 400, { error: "invalid-relay-url" });
+        }
+        config.remotePairingRelayUrl = normalized;
+        try {
+          await persistRemotePairingEnv({ relayUrl: normalized || null });
+        } catch (err) {
+          console.error(`[remote-pairing] env persist failed: ${err?.message}`);
+        }
+        if (config.remotePairingEnabled && typeof requestHandler === "function") {
+          try {
+            await restartRemotePairingRelay({
+              runtime,
+              config,
+              requestListener: requestHandler,
+              logger: console,
+            });
+          } catch (err) {
+            console.error(`[remote-pairing] hot-restart failed: ${err?.message}`);
+            return writeJson(res, 500, { error: "restart-failed", message: err.message });
+          }
+        }
+        const status = getRemotePairingStatus(runtime);
+        return writeJson(res, 200, {
+          ok: true,
+          enabled: status.enabled,
+          relayUrl: status.relayUrl,
+          configuredRelayUrl: config.remotePairingRelayUrl || "",
+        });
+      }
+
+      // POST /api/remote-pairing/revoke — drop a pairing by phonePub.
+      //
+      // Body: { phonePub: string }  (64-char hex, the phone's static X25519 pub)
+      // Removes the entry from `~/.viveworker/remote-pairings.json` and
+      // calls reloadNow() so the orchestrator tears the live session down.
+      // No-op if the pub isn't on file (idempotent).
+      if (url.pathname === "/api/remote-pairing/revoke" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        const phonePub = typeof body?.phonePub === "string" ? body.phonePub.trim().toLowerCase() : "";
+        if (!/^[0-9a-f]{64}$/u.test(phonePub)) {
+          return writeJson(res, 400, {
+            error: "invalid-phone-pub",
+            message: "phonePub must be a 64-char hex string",
+          });
+        }
+        let beforeLen = 0;
+        let afterLen = 0;
+        try {
+          const before = await loadPairings();
+          beforeLen = before.length;
+          const after = await removePairingPersisted(phonePub);
+          afterLen = after.length;
+        } catch (err) {
+          return writeJson(res, 500, { error: "revoke-failed", message: err.message });
+        }
+        const removed = beforeLen !== afterLen;
+        if (removed && runtime.remotePairingHandle) {
+          try {
+            await runtime.remotePairingHandle.reloadNow();
+          } catch (err) {
+            console.warn(`[remote-pairing] reloadNow after revoke failed: ${err?.message}`);
+          }
+        }
+        return writeJson(res, 200, { ok: true, removed, remaining: afterLen });
+      }
+
+      // POST /api/remote-pairing/lan-enroll — finalize a LAN pairing by
+      // exchanging X25519 static pubkeys so the same phone can later reach
+      // the bridge via the relay (when off-LAN).
+      //
+      // Body: { phonePubHex: string (64-hex), label?: string (≤200 chars) }
+      // Returns: { ok, pairingId, phonePub, phoneFingerprint, bridgePubHex,
+      //            bridgeFingerprint, relayUrl, label, addedAtMs }
+      //
+      // Side effects:
+      //   - Adds (or refreshes) the phone in ~/.viveworker/remote-pairings.json.
+      //     Idempotent on phonePub: re-pairing the same device keeps the
+      //     existing pairingId so the relay slot doesn't churn (any in-flight
+      //     remote session for that phone stays valid).
+      //   - Triggers runtime.remotePairingHandle.reloadNow() so the
+      //     orchestrator spawns a session for the new phone immediately
+      //     when the relay is currently on. Safe no-op when the relay is off
+      //     — the next toggle-on will pick up the new entry from disk.
+      //   - Calls ensureIdentityKeypair(), which generates the bridge's
+      //     static keypair on first run. After this endpoint succeeds the
+      //     bridge always has a stable identity.
+      //
+      // Auth: requires an authenticated session. The natural caller is the
+      // LAN-paired phone right after /api/session/pair succeeds — the
+      // session cookie set by that endpoint is what gates this one.
+      if (url.pathname === "/api/remote-pairing/lan-enroll" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        const phonePubHex = typeof body?.phonePubHex === "string"
+          ? body.phonePubHex.trim().toLowerCase()
+          : "";
+        if (!/^[0-9a-f]{64}$/u.test(phonePubHex)) {
+          return writeJson(res, 400, {
+            error: "invalid-phone-pub",
+            message: "phonePubHex must be a 64-char hex string",
+          });
+        }
+        // Cap label at 200 chars — the persisted JSON has no hard limit but
+        // long strings make the settings UI ugly and there's no legitimate
+        // reason for a device label to exceed this.
+        const label = typeof body?.label === "string"
+          ? body.label.trim().slice(0, 200)
+          : "";
+
+        // Idempotent re-enroll: if the same phone re-pairs (e.g. user
+        // cleared site data on the phone, regenerated the keypair, then
+        // happened to land on the same hex — vanishingly unlikely; far more
+        // commonly: same keypair, fresh label), keep the original pairingId.
+        let existingPairings = [];
+        try {
+          existingPairings = await loadPairings();
+        } catch (err) {
+          return writeJson(res, 500, {
+            error: "load-pairings-failed",
+            message: err.message,
+          });
+        }
+        const existing = existingPairings.find((p) => p.phonePub === phonePubHex);
+        const pairingId = existing?.pairingId || crypto.randomUUID();
+
+        // Bridge identity — generates on first call. We can't lean on
+        // runtime.remotePairingHandle here because the relay may be OFF
+        // (in which case the handle is dormant and identityKeypair is
+        // null), but enrollment still has to expose a stable bridge pub
+        // so the phone can store it.
+        let bridgeKeypair;
+        try {
+          bridgeKeypair = await ensureIdentityKeypair();
+        } catch (err) {
+          return writeJson(res, 500, {
+            error: "bridge-keypair-failed",
+            message: err.message,
+          });
+        }
+
+        let entry;
+        try {
+          entry = buildPairing({ pairingId, phonePub: phonePubHex, label });
+        } catch (err) {
+          return writeJson(res, 400, {
+            error: "build-pairing-failed",
+            message: err.message,
+          });
+        }
+
+        try {
+          await addPairingPersisted(entry);
+        } catch (err) {
+          return writeJson(res, 500, {
+            error: "save-pairings-failed",
+            message: err.message,
+          });
+        }
+
+        // Kick the orchestrator if it's running so the new pairing's
+        // session spawns without waiting for the fs.watch debounce. When
+        // the relay is off this is a no-op (dormant handle's reloadNow is
+        // safe to call).
+        if (runtime.remotePairingHandle) {
+          try {
+            await runtime.remotePairingHandle.reloadNow();
+          } catch (err) {
+            console.warn(`[remote-pairing] reloadNow after lan-enroll failed: ${err?.message}`);
+          }
+        }
+
+        const bridgePubHex = bytesToHex(bridgeKeypair.pub);
+        const bridgeFingerprint = fingerprintIdentity(bridgeKeypair.pub);
+        // Relay URL: explicit config value > orchestrator default. We
+        // surface the resolved URL (not the configured one) so the phone
+        // doesn't have to know about the fallback chain.
+        const relayUrl = (config.remotePairingRelayUrl || "").trim() || DEFAULT_RELAY_URL;
+
+        return writeJson(res, 200, {
+          ok: true,
+          pairingId: entry.pairingId,
+          phonePub: entry.phonePub,
+          phoneFingerprint: entry.phoneFingerprint,
+          bridgePubHex,
+          bridgeFingerprint,
+          relayUrl,
+          label: entry.label,
+          addedAtMs: entry.addedAtMs,
+        });
       }
 
       // ─── Thread sharing ──────────────────────────────────────────────
@@ -16725,14 +17111,22 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
     }
   };
 
+  let server;
   if (config.webPushEnabled) {
-    return createHttpsServer({
+    server = createHttpsServer({
       cert: readFileSync(config.tlsCertFile, "utf8"),
       key: readFileSync(config.tlsKeyFile, "utf8"),
     }, requestHandler);
+  } else {
+    server = createHttpServer(requestHandler);
   }
-
-  return createHttpServer(requestHandler);
+  // Expose the handler on the server so the remote-pairing relay client can
+  // reuse it: RPC frames arriving over the encrypted relay channel get
+  // wrapped in synthetic req/res objects and dispatched through the SAME
+  // listener LAN HTTP requests use, so authn/authz/cookies/CSRF behave
+  // identically off-LAN.
+  server.requestHandler = requestHandler;
+  return server;
 }
 
 function requestWantsHtml(req) {
@@ -18050,6 +18444,12 @@ function buildConfig(cli) {
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
     a2aRelayRegisterSecret: cleanText(process.env.A2A_RELAY_REGISTER_SECRET || ""),
+    // Remote-pairing relay (PWA off-LAN). Off by default — bridges that
+    // never leave the trusted LAN don't need to open an outbound connection
+    // to the relay. Toggle with REMOTE_PAIRING_ENABLED=true in
+    // ~/.viveworker/remote-pairing.env (or any source loadEnvFile reads).
+    remotePairingEnabled: boolEnv("REMOTE_PAIRING_ENABLED", false),
+    remotePairingRelayUrl: cleanText(process.env.REMOTE_PAIRING_RELAY_URL || ""),
     // share.viveworker.com — HTML hosting backed by the same A2A credentials.
     // Override for staging / self-hosted deployments via VIVEWORKER_SHARE_URL.
     a2aShareUrl: stripTrailingSlash(
@@ -20068,6 +20468,37 @@ async function main() {
       }
     }
 
+    // --- Remote-pairing relay (PWA off-LAN) ---
+    // Optional. When enabled, the bridge keeps an outbound WebSocket open per
+    // paired phone (`~/.viveworker/remote-pairings.json`) to the remote-pairing
+    // relay (Cloudflare Worker + Durable Object). RPC frames arriving over
+    // those channels are dispatched through the same `requestHandler` LAN HTTP
+    // uses, so cookies / auth / CSRF behave identically off-LAN.
+    //
+    // If disabled (default), the orchestrator returns a dormant handle and
+    // does no I/O. Pairings file changes are auto-reloaded via fs.watch — no
+    // outer loop needed here.
+    if (approvalServer && approvalServer.requestHandler) {
+      try {
+        runtime.remotePairingHandle = await startRemotePairingRelay({
+          enabled: config.remotePairingEnabled,
+          relayUrl: config.remotePairingRelayUrl || undefined,
+          requestListener: approvalServer.requestHandler,
+          logger: console,
+        });
+        const status = runtime.remotePairingHandle.getStatus();
+        if (status.enabled) {
+          console.log(
+            `[remote-pairing] connected relay=${status.relayUrl} ` +
+            `identity=${status.identityFingerprint} ` +
+            `paired=${status.sessions.length}`
+          );
+        }
+      } catch (err) {
+        console.error(`[remote-pairing] startup failed: ${err?.message}`);
+      }
+    }
+
     let lastA2aEnvCheckAt = 0;
     const A2A_ENV_CHECK_INTERVAL_MS = 30_000; // check every 30 seconds
 
@@ -20153,6 +20584,13 @@ async function main() {
     runtime.stopping = true;
 
     stopRelayPolling();
+
+    if (runtime.remotePairingHandle) {
+      try {
+        runtime.remotePairingHandle.close();
+      } catch {}
+      runtime.remotePairingHandle = null;
+    }
 
     if (runtime.ipcClient) {
       runtime.ipcClient.stop();
