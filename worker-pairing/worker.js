@@ -23,10 +23,7 @@ const RELAY_TOKEN_RE = /^v1\.[A-Za-z0-9_-]{32}\.[a-z0-9]{1,13}$/u;
 const RELAY_TOKEN_POW_BITS = 16;
 const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
 const RELAY_CHANNEL_DOMAIN = "viveworker-remote-pairing-relay-channel";
-const INVALID_TOKEN_WINDOW_MS = 60_000;
-const INVALID_TOKEN_MAX_PER_WINDOW = 30;
 const VALID_ROLES = new Set(["phone", "bridge"]);
-const invalidTokenBuckets = new Map();
 
 const BANNER_HTML = `<!doctype html>
 <html lang="en">
@@ -56,7 +53,11 @@ inside a Durable Object that buffers frames for short reconnects.</p>
 export default {
   /**
    * @param {Request} request
-   * @param {{ PAIRING_CHANNEL: DurableObjectNamespace }} env
+   * @param {{
+   *   PAIRING_CHANNEL: DurableObjectNamespace,
+   *   INVALID_TOKEN_RL?: { limit: (opts: { key: string }) => Promise<{ success: boolean }> },
+   *   WS_UPGRADE_RL?:    { limit: (opts: { key: string }) => Promise<{ success: boolean }> },
+   * }} env
    * @param {ExecutionContext} ctx
    */
   async fetch(request, env, ctx) {
@@ -91,14 +92,31 @@ export default {
         return new Response("invalid role (must be phone|bridge)", { status: 400 });
       }
       const relayToken = url.searchParams.get("token") || "";
+      const cfIp = request.headers.get("cf-connecting-ip") || "unknown";
       if (!await verifyRelayToken(pairingId, relayToken)) {
-        if (recordInvalidTokenAttempt(request)) {
+        // CF-native rate limit aggregates across every isolate, so a
+        // distributed scanner can't fan out to fresh isolates to refresh
+        // its bucket the way the old in-memory Map allowed.
+        const rl = await safeRateLimit(env.INVALID_TOKEN_RL, cfIp);
+        if (rl && !rl.success) {
           return new Response("too many invalid relay tokens", {
             status: 429,
             headers: { "retry-after": "60" },
           });
         }
         return new Response("invalid relay token", { status: 401 });
+      }
+
+      // Token is valid — but a stolen-token attacker could still try to
+      // keep the bridge in a forced-restart loop by hammering valid WS
+      // upgrades. Cap per (pairingId, IP) so a single source can't burn
+      // through DO instances.
+      const upgradeRl = await safeRateLimit(env.WS_UPGRADE_RL, `${pairingId}:${cfIp}`);
+      if (upgradeRl && !upgradeRl.success) {
+        return new Response("too many ws upgrade attempts", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
       }
 
       // Forward to the DO instance keyed by pairingId + token. A leaked
@@ -120,24 +138,26 @@ async function verifyRelayToken(pairingId, relayToken) {
   return countLeadingZeroBits(digest) >= RELAY_TOKEN_POW_BITS;
 }
 
-function recordInvalidTokenAttempt(request) {
-  const key = request.headers.get("cf-connecting-ip") || "unknown";
-  const now = Date.now();
-  let bucket = invalidTokenBuckets.get(key);
-  if (!bucket || now - bucket.startedAtMs >= INVALID_TOKEN_WINDOW_MS) {
-    bucket = { startedAtMs: now, count: 0 };
-    invalidTokenBuckets.set(key, bucket);
+/**
+ * Wrapper around a Rate Limit binding that gracefully handles missing
+ * bindings (e.g. older deploys, `wrangler dev --local` sessions) and any
+ * runtime errors from the limit() call. We never want a rate-limit hiccup
+ * to take the relay down — fail-open and let the next request retry.
+ *
+ * Returns:
+ *   { success: true }  — binding missing OR limiter said "allowed"
+ *   { success: false } — limiter exceeded
+ *   null               — limiter threw; caller should treat as allowed
+ */
+async function safeRateLimit(binding, key) {
+  if (!binding || typeof binding.limit !== "function") {
+    return { success: true };
   }
-  bucket.count += 1;
-  if (invalidTokenBuckets.size > 1024) pruneBuckets(now);
-  return bucket.count > INVALID_TOKEN_MAX_PER_WINDOW;
-}
-
-function pruneBuckets(now) {
-  for (const [key, bucket] of invalidTokenBuckets) {
-    if (now - bucket.startedAtMs >= INVALID_TOKEN_WINDOW_MS) {
-      invalidTokenBuckets.delete(key);
-    }
+  try {
+    return await binding.limit({ key });
+  } catch {
+    // Limiter is best-effort; an outage here must not break the relay.
+    return null;
   }
 }
 

@@ -27,3 +27,40 @@ class_name = "PairingChannel"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PairingChannel"]
+
+# Cloudflare-native Rate Limit bindings. These replace the per-isolate
+# in-memory token-bucket Map that lived in module scope; that Map gave each
+# isolate its own counter, so an attacker hitting a few isolates in parallel
+# could trivially bypass it. The CF Rate Limit binding aggregates across
+# every isolate in this Worker so the limit is real.
+#
+# Note: `wrangler dev --local` returns `success: true` unconditionally for
+# rate limit bindings (no local enforcement). Verify behaviour against a
+# remote / staging deploy before counting on these in production smoke tests.
+
+# INVALID_TOKEN_RL — caps how many bogus relay-token attempts a single client
+# IP can burn through per minute. Anything past this is almost certainly a
+# bot or PoW-token scanner; legitimate phones never see >1 invalid attempt
+# (the token is generated locally and persisted, so it's either correct or
+# the pairing is broken — neither case retries 30 times in a minute).
+[[ratelimits]]
+name = "INVALID_TOKEN_RL"
+namespace_id = "2001"
+
+  [ratelimits.simple]
+  limit = 30
+  period = 60
+
+# WS_UPGRADE_RL — caps how many *valid* WebSocket upgrades a single
+# (pairingId, IP) tuple can drive per minute. Defends against an attacker
+# who has both pairingId AND a valid relay token (e.g. one stolen from a
+# compromised device) trying to keep the bridge in a forced-restart loop.
+# 60/min is generous: a healthy phone reconnects on visibility / network
+# changes — typically 1-5 per minute under normal load.
+[[ratelimits]]
+name = "WS_UPGRADE_RL"
+namespace_id = "2002"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
