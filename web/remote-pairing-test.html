@@ -100,6 +100,7 @@
     <legend>Configuration</legend>
     <label>Relay URL <input id="relay" type="url" value="ws://127.0.0.1:8801"></label>
     <label>Pairing ID <input id="pairing" type="text"></label>
+    <label>Relay token <input id="relay-token" type="text" placeholder="auto-generated on Start"></label>
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
     <button id="reset">Reset</button>
@@ -279,8 +280,13 @@
       try {
         const relayUrl = $("relay").value.trim();
         const pairingId = $("pairing").value.trim();
+        let relayToken = $("relay-token").value.trim();
         if (!relayUrl) throw new Error("relay URL required");
         if (!pairingId) throw new Error("pairing id required");
+        if (!relayToken) {
+          relayToken = await generateRelayToken(pairingId);
+          $("relay-token").value = relayToken;
+        }
 
         // For the smoke test we generate fresh keypairs in the same tab. In
         // production the phone has the bridge's pubkey from LAN bootstrap.
@@ -292,6 +298,7 @@
         phone = buildPeer("phone", {
           relayUrl,
           pairingId,
+          relayToken,
           role: "phone",
           identityKeypair: phoneKeys,
           remoteStatic: bridgeKeys.pub,
@@ -299,6 +306,7 @@
         bridge = buildPeer("bridge", {
           relayUrl,
           pairingId,
+          relayToken,
           role: "bridge",
           identityKeypair: bridgeKeys,
         });
@@ -337,8 +345,46 @@
       }
       // Roll a new pairing ID so a stale outbox can't influence the next run.
       $("pairing").value = `browser-test-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
+      $("relay-token").value = "";
       log("reset");
     };
+
+    async function generateRelayToken(pairingId) {
+      const bytes = new Uint8Array(24);
+      crypto.getRandomValues(bytes);
+      const nonce = base64url(bytes);
+      let counter = crypto.getRandomValues(new Uint32Array(1))[0];
+      for (;;) {
+        const token = `v1.${nonce}.${counter.toString(36)}`;
+        const digest = new Uint8Array(await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(`viveworker-remote-pairing-relay-token:${pairingId}:${token}`),
+        ));
+        if (countLeadingZeroBits(digest) >= 16) return token;
+        counter = (counter + 1) >>> 0;
+      }
+    }
+
+    function countLeadingZeroBits(bytes) {
+      let bits = 0;
+      for (const b of bytes) {
+        if (b === 0) {
+          bits += 8;
+          continue;
+        }
+        for (let i = 7; i >= 0; i--) {
+          if ((b & (1 << i)) !== 0) return bits;
+          bits += 1;
+        }
+      }
+      return bits;
+    }
+
+    function base64url(bytes) {
+      let bin = "";
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+    }
 
     // Surface uncaught errors so a silent crash doesn't leave you wondering.
     window.addEventListener("error", (ev) => {

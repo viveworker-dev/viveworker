@@ -34,6 +34,7 @@ import { dirname, resolve } from "node:path";
 import WebSocket from "ws";
 
 import { generateIdentityKeypair } from "../lib/remote-pairing/noise.mjs";
+import { generateRelayToken } from "../lib/remote-pairing/pairings.mjs";
 import {
   RemotePairingTransport,
   STATE,
@@ -45,6 +46,7 @@ import {
 
 const DEV_PORT = 8802; // distinct from relay-demo (8801) so they can co-exist
 const PAIRING_ID = `transport-demo-${Date.now()}`;
+const RELAY_TOKEN = generateRelayToken(PAIRING_ID);
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(HERE, "../../worker-pairing");
 const RELAY_URL = `ws://127.0.0.1:${DEV_PORT}`;
@@ -111,6 +113,7 @@ function makeTransport({ role, identityKeypair, remoteStatic, label }) {
   const transport = new RemotePairingTransport({
     relayUrl: RELAY_URL,
     pairingId: PAIRING_ID,
+    relayToken: RELAY_TOKEN,
     role,
     identityKeypair,
     remoteStatic,

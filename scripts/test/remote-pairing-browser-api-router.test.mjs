@@ -101,8 +101,9 @@ function makeLoadPairingState(record = makePairingRecord()) {
 
 function makePairingRecord(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     pairingId: "pair-aaaa-bbbb",
+    relayToken: "v1.testtesttesttesttesttesttesttest.abc",
     phonePub: "aa".repeat(32),
     phoneFingerprint: "PHONE-FP",
     bridgePubHex: "bb".repeat(32),
@@ -139,6 +140,7 @@ function makeFakeFetch(behaviors) {
   //   { mode: "ok", status, body }       — returns a Response-like
   //   { mode: "throw", err }              — throws err on call
   //   { mode: "abort" }                   — throws AbortError
+  //   { mode: "hang" }                    — waits until init.signal aborts
   let i = 0;
   const calls = [];
   async function fakeFetch(url, init) {
@@ -150,6 +152,22 @@ function makeFakeFetch(behaviors) {
       const err = new Error("aborted");
       err.name = "AbortError";
       throw err;
+    }
+    if (beh.mode === "hang") {
+      return await new Promise((resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+          return;
+        }
+        signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        }, { once: true });
+      });
     }
     const status = beh.status ?? 200;
     const body = beh.body ?? "{}";
@@ -259,6 +277,50 @@ test("LAN TypeError → falls back to relay successfully", async () => {
   assert.equal(rpcCalls.fetch.length, 1);
   // The relay fetch carried the path correctly.
   assert.equal(rpcCalls.fetch[0].path, "/api/foo");
+});
+
+test("LAN hang times out → falls back to relay successfully", async () => {
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "hang" }]),
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay-after-timeout"}' }),
+    }),
+  });
+  const res = await routedFetch("/api/bootstrap", {}, { ...opts, lanTimeoutMs: 10 });
+  assert.equal(res.ok, true);
+  assert.deepEqual(await res.json(), { via: "relay-after-timeout" });
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(rpcCalls.constructed, 1);
+  assert.equal(rpcCalls.fetch.length, 1);
+  assert.equal(rpcCalls.fetch[0].path, "/api/bootstrap");
+  assert.equal(__getTelemetry().lanFail, 1);
+});
+
+test("relay transport failure resets client and retries once", async () => {
+  let relayAttempts = 0;
+  const { opts, rpcCalls } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "throw", err: new TypeError("Failed to fetch") }]),
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => {
+        relayAttempts++;
+        if (relayAttempts === 1) {
+          const err = new Error("stale noise session");
+          err.name = "RpcTransportFailedError";
+          throw err;
+        }
+        return makeRpcResponse({ status: 200, body: '{"via":"fresh-relay"}' });
+      },
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, opts);
+  assert.equal(res.ok, true);
+  assert.deepEqual(await res.json(), { via: "fresh-relay" });
+  assert.equal(rpcCalls.constructed, 2);
+  assert.equal(rpcCalls.close, 1);
+  assert.equal(rpcCalls.fetch.length, 2);
+  assert.equal(__getTelemetry().clientResets, 1);
+  assert.equal(__getTelemetry().relayFail, 0);
 });
 
 test("both LAN and relay fail → throws the LAN error", async () => {
@@ -485,24 +547,43 @@ test("bindWakeEvents is called once at client construction time", async () => {
 // Body shape gate
 // ---------------------------------------------------------------------------
 
-test("FormData body returns a clear error on the relay path", async () => {
+test("FormData body is serialized as multipart on the relay path", async () => {
   // Force the relay path by failing LAN.
   const fetchPair = makeFakeFetch([{ mode: "throw", err: new TypeError("nope") }]);
+  let capturedReq = null;
   const { opts } = makeOpts({
     fetchPair,
     rpcPair: makeFakeRpcClientCtor({
-      fetchImpl: async () => makeRpcResponse({ status: 200, body: "{}" }),
+      fetchImpl: async (req) => {
+        capturedReq = req;
+        return makeRpcResponse({ status: 200, body: "{}" });
+      },
     }),
   });
   // FormData isn't built into Node before v18+, but globalThis.FormData
   // exists on modern Node. Skip this test if it isn't available.
-  if (typeof FormData === "undefined") return;
+  if (typeof FormData === "undefined" || typeof Blob === "undefined") return;
   const fd = new FormData();
-  fd.append("file", "data");
-  await assert.rejects(
-    routedFetch("/api/upload", { method: "POST", body: fd }, opts),
-    /formdata-over-relay-unsupported|Failed/,
-  );
+  fd.append("text", "hello");
+  fd.append("file", new Blob(["file-data"], { type: "text/plain" }), "note.txt");
+  const res = await routedFetch("/api/upload", { method: "POST", body: fd }, opts);
+  assert.equal(res.status, 200);
+  assert.ok(capturedReq, "relay request should be sent");
+  assert.equal(capturedReq.method, "POST");
+  assert.match(capturedReq.headers["content-type"], /^multipart\/form-data; boundary=/);
+  assert.ok(capturedReq.body instanceof Uint8Array);
+  assert.equal(capturedReq.headers["content-length"], String(capturedReq.body.byteLength));
+
+  const multipart = new TextDecoder().decode(capturedReq.body);
+  const boundary = capturedReq.headers["content-type"].match(/boundary=(.+)$/)?.[1];
+  assert.ok(boundary);
+  assert.match(multipart, new RegExp(`--${boundary}`));
+  assert.match(multipart, /Content-Disposition: form-data; name="text"/);
+  assert.match(multipart, /hello/);
+  assert.match(multipart, /Content-Disposition: form-data; name="file"; filename="note\.txt"/);
+  assert.match(multipart, /Content-Type: text\/plain/);
+  assert.match(multipart, /file-data/);
+  assert.ok(multipart.endsWith(`--${boundary}--\r\n`));
 });
 
 // ---------------------------------------------------------------------------

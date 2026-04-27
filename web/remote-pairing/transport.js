@@ -82,6 +82,7 @@ export const STATE = Object.freeze({
 const DEFAULT_PING_INTERVAL_MS = 30_000;          // CF idle timeout is ~100s
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
+const MAX_PRE_CONNECT_BACKOFF_MS = 4_000;
 const DEFAULT_PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 
 // CloseEvent codes we emit. 1000 is normal; 4xxx is application-defined.
@@ -97,6 +98,7 @@ const CLOSE_FATAL = 4002;
  * @typedef {Object} TransportOptions
  * @property {string} relayUrl                      e.g. "wss://pairing.viveworker.com"
  * @property {string} pairingId                     pairing slot identifier
+ * @property {string} relayToken                    relay capability token
  * @property {"phone" | "bridge"} role
  * @property {{priv: Uint8Array, pub: Uint8Array}} identityKeypair
  * @property {Uint8Array} [remoteStatic]            required for the initiator role
@@ -118,6 +120,7 @@ export class RemotePairingTransport {
   constructor(opts) {
     if (!opts?.relayUrl) throw new TypeError("relayUrl required");
     if (!opts.pairingId) throw new TypeError("pairingId required");
+    if (!opts.relayToken) throw new TypeError("relayToken required");
     if (opts.role !== "phone" && opts.role !== "bridge") {
       throw new TypeError(`role must be "phone" or "bridge", got ${JSON.stringify(opts.role)}`);
     }
@@ -128,6 +131,7 @@ export class RemotePairingTransport {
     // Normalize URL: strip trailing slash so we can `${relayUrl}/v1/...` cleanly.
     this._relayUrl = opts.relayUrl.replace(/\/+$/, "");
     this._pairingId = opts.pairingId;
+    this._relayToken = opts.relayToken;
     this._role = opts.role;
     this._identityKeypair = opts.identityKeypair;
     // Default: phone is the initiator (knows bridge's static pubkey from LAN
@@ -318,7 +322,8 @@ export class RemotePairingTransport {
 
     const url =
       `${this._relayUrl}/v1/pairing/${encodeURIComponent(this._pairingId)}` +
-      `/ws?role=${encodeURIComponent(this._role)}`;
+      `/ws?role=${encodeURIComponent(this._role)}` +
+      `&token=${encodeURIComponent(this._relayToken)}`;
 
     let ws;
     try {
@@ -477,9 +482,9 @@ export class RemotePairingTransport {
           staticKeypair: this._identityKeypair,
           prologue: this._prologue,
         });
-    this._startHandshakeTimer();
 
     if (this._initiator) {
+      this._startHandshakeTimer();
       // Send msg1 immediately. We don't piggy-back application data on the
       // handshake transcript — the encrypted channel carries that after
       // CONNECTED. Empty payload keeps the wire shape predictable.
@@ -491,6 +496,11 @@ export class RemotePairingTransport {
         return;
       }
       this._sendData(msg1);
+    } else {
+      // The bridge/responder can legitimately sit here waiting for a phone
+      // to arrive through the relay. Do not start the handshake timeout until
+      // msg1 is actually received; keep the relay socket alive instead.
+      this._startPing();
     }
     // Responder waits passively — _dispatchData picks up msg1 when it arrives.
   }
@@ -508,6 +518,7 @@ export class RemotePairingTransport {
         this._handshake.readMessage(frame.payload);
       } else {
         // Inbound msg1 from initiator → reply with msg2.
+        this._startHandshakeTimer();
         this._handshake.readMessage(frame.payload);
         const msg2 = this._handshake.writeMessage(new Uint8Array(0));
         this._sendData(msg2);
@@ -573,7 +584,11 @@ export class RemotePairingTransport {
   _scheduleReconnect() {
     if (this._closed) return;
     const idx = Math.min(this._reconnectAttempt, this._backoffMs.length - 1);
-    const delay = this._backoffMs[idx];
+    const waitingForFirstConnect = this._connectPromise != null && this._session == null;
+    const rawDelay = this._backoffMs[idx];
+    const delay = waitingForFirstConnect
+      ? Math.min(rawDelay, MAX_PRE_CONNECT_BACKOFF_MS)
+      : rawDelay;
     this._reconnectAttempt += 1;
     this._log.debug?.(`reconnect in ${delay}ms (attempt ${this._reconnectAttempt})`);
     this._reconnectTimer = setTimeout(() => {

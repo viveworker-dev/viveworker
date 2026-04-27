@@ -53,6 +53,7 @@ function makeStorage(initial = {}) {
 function makeRecord(overrides = {}) {
   return {
     pairingId: "00000000-0000-4000-8000-000000000000",
+    relayToken: "v1.testtesttesttesttesttesttesttest.abc",
     phonePub: "AA".repeat(32).toLowerCase(),
     phoneFingerprint: "AAAA-AAAA-AAAA",
     bridgePubHex: "BB".repeat(32).toLowerCase(),
@@ -80,6 +81,7 @@ test("save → load round-trips a full record", () => {
   assert.ok(loaded, "expected a record to be loaded");
   assert.equal(loaded.version, __SCHEMA_VERSION);
   assert.equal(loaded.pairingId, record.pairingId);
+  assert.equal(loaded.relayToken, record.relayToken);
   assert.equal(loaded.phonePub, record.phonePub);
   assert.equal(loaded.phoneFingerprint, record.phoneFingerprint);
   assert.equal(loaded.bridgePubHex, record.bridgePubHex);
@@ -145,6 +147,7 @@ test("loadPairingState returns null on missing required fields", () => {
   const storage = makeStorage();
   for (const drop of [
     "pairingId",
+    "relayToken",
     "phonePub",
     "phoneFingerprint",
     "bridgePubHex",
@@ -229,6 +232,7 @@ test("savePairingState rejects missing required fields", () => {
   const storage = makeStorage();
   for (const drop of [
     "pairingId",
+    "relayToken",
     "phonePub",
     "phoneFingerprint",
     "bridgePubHex",
@@ -252,6 +256,10 @@ test("savePairingState rejects empty-string required fields", () => {
   assert.throws(
     () => savePairingState(makeRecord({ pairingId: "" }), { storage }),
     /pairingId must be a non-empty string/,
+  );
+  assert.throws(
+    () => savePairingState(makeRecord({ relayToken: "" }), { storage }),
+    /relayToken must be a non-empty string/,
   );
 });
 

@@ -5,9 +5,10 @@ import {
   savePairingState as saveRemotePairingState,
   clearPairingState as clearRemotePairingState,
 } from "./remote-pairing/pairing-state.js";
-import { routedFetch } from "./remote-pairing/api-router.js";
+import { routedFetch } from "./remote-pairing/api-router.js?v=20260427-timeline-image-permission";
 
 const DESKTOP_BREAKPOINT = 980;
+const APP_BUILD_ID = "20260427-timeline-image-permission";
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
@@ -19,6 +20,8 @@ const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
+const MAX_TIMELINE_IMAGE_OBJECT_URLS = 80;
+const timelineImageObjectUrlCache = new Map();
 
 const state = {
   session: null,
@@ -58,6 +61,7 @@ const state = {
   detailDiffExpanded: {},
   choiceLocalDrafts: {},
   completionReplyDrafts: {},
+  completionReplySheetToken: "",
   pendingActionUrls: new Set(),
   pairError: "",
   pairNotice: "",
@@ -81,6 +85,7 @@ const state = {
   // used to disable buttons while the round-trip is in progress so a fast
   // double-click doesn't fire two POSTs.
   remotePairingPending: "",
+  remotePairingDetailsOpen: false,
   hazbaseStatus: null,
   hazbaseNotice: "",
   hazbaseError: "",
@@ -127,6 +132,9 @@ const state = {
   defaultLocale: DEFAULT_LOCALE,
   supportedLocales: [...SUPPORTED_LOCALES],
   appVersion: "",
+  appBuildId: APP_BUILD_ID,
+  serverAppBuildId: "",
+  clientUpdateRequired: false,
   versionStatus: null,
   versionStatusError: "",
 };
@@ -154,6 +162,34 @@ function hazbasePasskeyHostSupport() {
 
 const app = document.querySelector("#app");
 let bootSplashDismissed = false;
+
+if (typeof window !== "undefined") {
+  window.__viveworkerAppBuild = APP_BUILD_ID;
+}
+
+function syncVisualViewportMetrics() {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const root = document.documentElement;
+  const viewport = window.visualViewport;
+  const width = viewport?.width || window.innerWidth || root.clientWidth || 0;
+  const left = viewport?.offsetLeft || 0;
+  root.style.setProperty("--visual-viewport-width", `${Math.max(0, width)}px`);
+  root.style.setProperty("--visual-viewport-left", `${Math.max(0, left)}px`);
+}
+
+function resetHorizontalViewportScroll() {
+  syncVisualViewportMetrics();
+  const scrollingElement = document.scrollingElement || document.documentElement;
+  if (scrollingElement) {
+    scrollingElement.scrollLeft = 0;
+  }
+  document.documentElement.scrollLeft = 0;
+  document.body.scrollLeft = 0;
+  syncVisualViewportMetrics();
+  window.requestAnimationFrame?.(syncVisualViewportMetrics);
+}
 
 function dismissBootSplash() {
   if (bootSplashDismissed || typeof document === "undefined") {
@@ -199,11 +235,15 @@ boot().catch((error) => {
 
 async function boot() {
   updateManifestHref(initialPairToken);
+  syncVisualViewportMetrics();
   // SW register + update() can take hundreds of ms and does not need to gate
   // first paint. Fire and forget; the `controllerchange` reload handler wired
   // up inside `registerServiceWorker` still picks up new versions.
   registerServiceWorker().catch(() => {});
   navigator.serviceWorker?.addEventListener("message", handleServiceWorkerMessage);
+  window.addEventListener("resize", syncVisualViewportMetrics, { passive: true });
+  window.visualViewport?.addEventListener("resize", syncVisualViewportMetrics, { passive: true });
+  window.visualViewport?.addEventListener("scroll", syncVisualViewportMetrics, { passive: true });
   window.addEventListener("resize", handleViewportChange, { passive: true });
   window.addEventListener("focus", handlePotentialExternalNavigation, { passive: true });
   window.addEventListener("pageshow", handlePotentialExternalNavigation, { passive: true });
@@ -364,6 +404,47 @@ async function registerServiceWorker() {
   }
 }
 
+async function forceAppRefreshFromLan() {
+  try {
+    const healthInit = {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    };
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      healthInit.signal = AbortSignal.timeout(2500);
+    }
+    await fetch("/health", healthInit);
+  } catch {
+    state.pushError = L("error.clientUpdateNeedsLan");
+    return;
+  }
+
+  try {
+    const registration = state.serviceWorkerRegistration || await navigator.serviceWorker?.getRegistration?.();
+    await registration?.update?.();
+  } catch {
+    // Reload below is still useful; the next boot can retry SW update.
+  }
+
+  try {
+    if (typeof caches !== "undefined") {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter((key) => /^viveworker-v/.test(key))
+          .map((key) => caches.delete(key))
+      );
+    }
+  } catch {
+    // Cache deletion is best-effort; network-first app routes still help.
+  }
+
+  const nextUrl = new URL(window.location.href);
+  nextUrl.searchParams.set("appRefresh", String(Date.now()));
+  window.location.replace(nextUrl.toString());
+}
+
 function handleViewportChange() {
   const nextViewportMode = isDesktopLayout();
   if (nextViewportMode === lastViewportMode) {
@@ -422,6 +503,7 @@ async function refreshAuthenticatedStateRemote() {
 
 async function refreshSession() {
   state.session = await apiGet("/api/session");
+  applyServerAppBuildId(state.session?.webAppBuildId);
   syncPairingTokenState(desiredBootstrapPairingToken());
   applyResolvedLocale();
 }
@@ -435,6 +517,7 @@ async function refreshSession() {
 async function refreshBootstrap() {
   const bootstrap = await apiGet("/api/bootstrap");
   state.session = bootstrap?.session || null;
+  applyServerAppBuildId(bootstrap?.appBuildId || state.session?.webAppBuildId);
   syncPairingTokenState(desiredBootstrapPairingToken());
   applyResolvedLocale();
 
@@ -455,13 +538,19 @@ async function refreshBootstrap() {
   syncCompletedThreadFilter();
   syncInboxSubtab();
 
-  state.timeline = bootstrap?.timeline || null;
+  state.timeline = await hydrateTimelinePayloadImages(bootstrap?.timeline || null);
   syncTimelineThreadFilter();
   syncTimelineKindFilter();
 
   const devicesPayload = bootstrap?.devices;
   state.devices = Array.isArray(devicesPayload?.devices) ? devicesPayload.devices : [];
   state.deviceError = "";
+}
+
+function applyServerAppBuildId(value) {
+  const buildId = normalizeClientText(value);
+  state.serverAppBuildId = buildId;
+  state.clientUpdateRequired = Boolean(buildId && buildId !== APP_BUILD_ID);
 }
 
 async function syncDetectedLocalePreference() {
@@ -560,9 +649,10 @@ function detectBrowserLocale() {
 
 async function refreshPushStatus() {
   const client = await getClientPushState();
+  const { clientSubscription, ...clientStatus } = client;
   if (!state.session?.authenticated) {
     state.pushStatus = {
-      ...client,
+      ...clientStatus,
       enabled: false,
       subscribed: false,
       serverSubscribed: false,
@@ -573,16 +663,34 @@ async function refreshPushStatus() {
   }
 
   try {
-    const server = await apiGet("/api/push/status");
+    let server = await apiGet("/api/push/status");
+    if (
+      server?.enabled === true &&
+      server?.subscribed !== true &&
+      clientSubscription &&
+      clientStatus.notificationPermission === "granted"
+    ) {
+      try {
+        await apiPost("/api/push/subscribe", {
+          subscription: clientSubscription,
+          userAgent: navigator.userAgent,
+          standalone: isStandaloneMode(),
+        });
+        server = await apiGet("/api/push/status");
+      } catch {
+        // Best effort: if the browser still has a local subscription, the
+        // status row can reflect that while the enable action repairs it.
+      }
+    }
     state.pushStatus = {
       ...server,
-      ...client,
+      ...clientStatus,
       serverSubscribed: Boolean(server.subscribed),
-      subscribed: Boolean(server.subscribed || client.clientSubscribed),
+      subscribed: Boolean(server.subscribed || clientStatus.clientSubscribed),
     };
   } catch (error) {
     state.pushStatus = {
-      ...client,
+      ...clientStatus,
       enabled: false,
       subscribed: false,
       serverSubscribed: false,
@@ -691,6 +799,7 @@ async function getClientPushState() {
       "PushManager" in window &&
       "Notification" in window,
     clientSubscribed: Boolean(subscription),
+    clientSubscription: subscription ? subscription.toJSON() : null,
   };
 }
 
@@ -731,7 +840,7 @@ async function refreshInboxDiff() {
 }
 
 async function refreshTimeline() {
-  state.timeline = await apiGet("/api/timeline");
+  state.timeline = await hydrateTimelinePayloadImages(await apiGet("/api/timeline"));
   syncTimelineThreadFilter();
   syncTimelineKindFilter();
 }
@@ -1289,6 +1398,7 @@ async function enrollRemotePairing(label) {
     }
     const saved = saveRemotePairingState({
       pairingId: response.pairingId,
+      relayToken: response.relayToken,
       phonePub: response.phonePub,
       phoneFingerprint: response.phoneFingerprint,
       bridgePubHex: response.bridgePubHex,
@@ -1347,6 +1457,7 @@ function resetAuthenticatedState() {
   state.choiceLocalDrafts = {};
   clearAllCompletionReplyDrafts();
   state.completionReplyDrafts = {};
+  state.completionReplySheetToken = "";
   state.settingsSubpage = "";
   state.settingsScrollState = null;
   state.listScrollState = null;
@@ -1358,6 +1469,7 @@ function resetAuthenticatedState() {
   state.deviceError = "";
   state.logoutConfirmOpen = false;
   state.pairError = "";
+  state.remotePairingDetailsOpen = false;
 }
 
 async function revokeTrustedDevice(deviceId) {
@@ -1379,6 +1491,7 @@ async function revokeTrustedDevice(deviceId) {
 }
 
 async function renderShell() {
+  syncVisualViewportMetrics();
   const desktop = isDesktopLayout();
   const shouldShowDetail = state.currentTab !== "settings" && state.currentItem && (desktop || state.detailOpen);
   let detail = null;
@@ -1411,9 +1524,13 @@ async function renderShell() {
       ${renderLogoutConfirmModal()}
       ${renderHazbaseLogoutConfirmModal()}
     </div>
+    ${!desktop && detail ? renderCompletionReplySheet(detail) : ""}
   `;
 
   bindShellInteractions();
+  if (state.completionReplySheetToken) {
+    resetHorizontalViewportScroll();
+  }
   applyPendingDetailScrollReset();
   applyPendingListScrollRestore();
   applyPendingSettingsSubpageScrollReset();
@@ -1481,6 +1598,9 @@ function clearThreadFilterInteraction() {
 
 function shouldDeferRenderForActiveInteraction() {
   const activeElement = document.activeElement;
+  if (state.completionReplySheetToken) {
+    return true;
+  }
   if (
     activeElement instanceof HTMLTextAreaElement &&
     activeElement.matches("[data-completion-reply-textarea]") &&
@@ -1903,7 +2023,9 @@ async function fetchCurrentDetailForItem(itemRef = state.currentItem) {
     return state.detailOverride.detail;
   }
   try {
-    const detail = await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`);
+    const detail = await hydrateDetailImages(
+      await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`)
+    );
     if (hasLaunchItemIntent(itemRef)) {
       state.launchItemIntent.status = "loaded";
     }
@@ -1917,7 +2039,9 @@ async function fetchCurrentDetailForItem(itemRef = state.currentItem) {
     }
     await refreshInbox();
     try {
-      const detail = await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`);
+      const detail = await hydrateDetailImages(
+        await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`)
+      );
       if (hasLaunchItemIntent(itemRef)) {
         state.launchItemIntent.status = "loaded";
       }
@@ -3350,7 +3474,7 @@ function buildSettingsContext() {
     standalone,
     supportsPushValue,
     permission,
-    subscribed: push.serverSubscribed === true,
+    subscribed: push.subscribed === true,
   });
 
   return {
@@ -3479,6 +3603,101 @@ function collectSettingsDiagnostics({ permission, secureContext, standalone, sup
   return Array.from(new Set(issues.filter(Boolean)));
 }
 
+function hasAutoPilotWriteLaneEnabled(session = state.session) {
+  return Boolean(
+    session?.autoPilotTrustedWrites === true ||
+    session?.autoPilotWriteLaneContent === true ||
+    session?.autoPilotWriteLaneUiTests === true ||
+    session?.autoPilotWriteLaneSource === true,
+  );
+}
+
+function hasAutoPilotEnabled(session = state.session) {
+  return Boolean(session?.autoPilotTrustedReads === true || hasAutoPilotWriteLaneEnabled(session));
+}
+
+function settingsEnabledValue(enabled) {
+  return enabled ? L("common.enabled") : L("common.disabled");
+}
+
+function settingsNeedsActionValue() {
+  return L("settings.status.actionNeeded");
+}
+
+function settingsDisconnectedValue() {
+  return L("settings.status.disconnected");
+}
+
+function settingsNotificationRootValue(context) {
+  if (context.push?.subscribed === true) {
+    return L("common.enabled");
+  }
+  if (context.permission === "denied") {
+    return settingsNeedsActionValue();
+  }
+  return L("common.disabled");
+}
+
+function settingsMoltbookRootValue(context) {
+  return context.moltbookScout?.enabled === true
+    ? L("common.enabled")
+    : settingsNeedsActionValue();
+}
+
+function settingsA2aRelayRootValue(context) {
+  const relay = context.a2aRelay;
+  if (relay?.enabled === true && relay?.connected === true) {
+    return L("common.enabled");
+  }
+  return settingsDisconnectedValue();
+}
+
+function settingsA2aShareRootValue(context) {
+  const share = context.a2aShare;
+  if (share?.enabled === true && !share?.error) {
+    return L("common.enabled");
+  }
+  return settingsNeedsActionValue();
+}
+
+function settingsWalletRootValue(context) {
+  if (context.hazbase?.enabled !== true) {
+    return L("common.disabled");
+  }
+  return deriveHazbaseWalletFlow(context.hazbase).coreReady
+    ? L("common.enabled")
+    : settingsNeedsActionValue();
+}
+
+function isRemotePairingSessionConnected(session) {
+  const value = normalizeClientText(session?.state).toLowerCase();
+  return value === "connected" || value === "open" || value === "running";
+}
+
+function isRemotePairingSessionReachable(session) {
+  const value = normalizeClientText(session?.state).toLowerCase();
+  return value === "connected" || value === "open" || value === "running" || value === "opening" || value === "handshaking" || value === "resuming";
+}
+
+function remotePairingStatusModel(status) {
+  const enabled = status?.enabled === true;
+  const sessions = Array.isArray(status?.sessions) ? status.sessions : [];
+  const pairings = Array.isArray(status?.pairings) ? status.pairings : [];
+  if (!enabled) {
+    return { key: "disabled", tone: "muted", label: L("settings.remotePairing.status.disabled") };
+  }
+  if (sessions.some(isRemotePairingSessionConnected)) {
+    return { key: "connected", tone: "success", label: L("settings.remotePairing.status.connected") };
+  }
+  if (sessions.some(isRemotePairingSessionReachable)) {
+    return { key: "available", tone: "success", label: L("settings.remotePairing.status.available") };
+  }
+  if (pairings.length > 0) {
+    return { key: "waiting", tone: "warning", label: L("settings.remotePairing.status.waiting") };
+  }
+  return { key: "waiting", tone: "muted", label: L("settings.remotePairing.status.waiting") };
+}
+
 function settingsPageMeta(page) {
   switch (page) {
     case "notifications":
@@ -3580,7 +3799,7 @@ function renderSettingsRoot(context, { mobile }) {
       page: "notifications",
       icon: "notifications",
       title: L("settings.notifications.title"),
-      value: L(context.setupState.notifications.labelKey),
+      value: settingsNotificationRootValue(context),
     }),
     renderSettingsNavRow({
       page: "language",
@@ -3593,23 +3812,20 @@ function renderSettingsRoot(context, { mobile }) {
           page: "install",
           icon: "homescreen",
           title: L("settings.install.title"),
-          value: L(context.setupState.install.labelKey),
+          value: settingsEnabledValue(context.standalone),
         })
       : "",
     renderSettingsNavRow({
       page: "awayMode",
       icon: "settings",
       title: L("settings.awayMode.title"),
-      value: state.session?.claudeAwayMode === true ? L("settings.claudeAway.on") : L("settings.claudeAway.off"),
+      value: settingsEnabledValue(state.session?.claudeAwayMode === true),
     }),
     renderSettingsNavRow({
       page: "autoPilot",
       icon: "approval",
       title: L("settings.autoPilot.title"),
-      value:
-        state.session?.autoPilotTrustedReads === true || state.session?.autoPilotTrustedWrites === true
-          ? L("common.enabled")
-          : L("common.disabled"),
+      value: settingsEnabledValue(hasAutoPilotEnabled()),
     }),
   ].filter(Boolean);
   const deviceRows = [
@@ -3621,6 +3837,13 @@ function renderSettingsRoot(context, { mobile }) {
         ? L("settings.device.count", { count: context.devices.length })
         : L("settings.pairing.connected"),
     }),
+    state.session?.remotePairingAvailable ? renderSettingsNavRow({
+      page: "remotePairing",
+      icon: "link",
+      title: L("settings.remotePairing.title"),
+      subtitle: L("settings.remotePairing.subtitle"),
+      value: settingsEnabledValue(context.remotePairing?.enabled === true),
+    }) : "",
   ];
   const advancedRows = [
     renderSettingsNavRow({
@@ -3646,46 +3869,31 @@ function renderSettingsRoot(context, { mobile }) {
           `
       }
       ${renderSettingsGroup(L("settings.group.general"), generalRows)}
-      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled || context.hazbase?.enabled || state.session?.remotePairingAvailable) ? renderSettingsGroup(L("settings.group.integrations"), [
+      ${(state.session?.moltbookEnabled || state.session?.a2aRelayEnabled || state.session?.a2aShareEnabled || context.hazbase?.enabled) ? renderSettingsGroup(L("settings.group.integrations"), [
         state.session?.moltbookEnabled ? renderSettingsNavRow({
           page: "moltbook",
           icon: "item",
           title: L("settings.moltbook.title"),
-          subtitle: L("settings.moltbook.subtitle"),
-          value: context.moltbookScout?.enabled ? L("settings.status.enabled") : L("settings.status.disabled"),
+          value: settingsMoltbookRootValue(context),
         }) : "",
         state.session?.a2aRelayEnabled ? renderSettingsNavRow({
           page: "a2aRelay",
           icon: "link",
           title: L("settings.a2aRelay.title"),
-          subtitle: L("settings.a2aRelay.subtitle"),
-          value: context.a2aRelay?.connected ? L("settings.status.connected") : L("settings.a2aRelay.status.disconnected"),
+          value: settingsA2aRelayRootValue(context),
         }) : "",
         state.session?.a2aShareEnabled ? renderSettingsNavRow({
           page: "a2aShare",
           icon: "link",
           title: L("settings.a2aShare.title"),
-          subtitle: L("settings.a2aShare.subtitle"),
-          value: context.a2aShare?.enabled ? L("settings.status.enabled") : L("settings.status.disabled"),
+          value: settingsA2aShareRootValue(context),
         }) : "",
         context.hazbase?.enabled ? renderSettingsNavRow({
           page: "wallet",
           icon: "coin",
           title: L("settings.wallet.title"),
           badge: "beta",
-          subtitle: L("settings.wallet.subtitle"),
-          value: context.hazbase?.sessionInvalid
-            ? L("settings.hazbase.status.sessionExpired")
-            : context.hazbase?.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"),
-        }) : "",
-        state.session?.remotePairingAvailable ? renderSettingsNavRow({
-          page: "remotePairing",
-          icon: "link",
-          title: L("settings.remotePairing.title"),
-          subtitle: L("settings.remotePairing.subtitle"),
-          value: context.remotePairing?.enabled
-            ? L("settings.status.enabled")
-            : L("settings.status.disabled"),
+          value: settingsWalletRootValue(context),
         }) : "",
       ].filter(Boolean)) : ""}
       ${renderSettingsGroup(L("settings.pairing.title"), deviceRows)}
@@ -3765,10 +3973,11 @@ function renderSettingsSubpage(context, { mobile }) {
 
 function renderSettingsNotificationsPage(context) {
   const { push, permission, secureContext, standalone, supportsPushValue, serverEnabled } = context;
+  const notificationEnabled = push.subscribed === true;
   const statusRows = [
-    renderSettingsInfoRow(L("settings.row.status"), L(context.setupState.notifications.labelKey)),
-    renderSettingsInfoRow(L("settings.row.notificationPermission"), L(`settings.permission.${permission}`) || permission),
-    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
+    renderSettingsInfoRow(L("settings.row.status"), notificationEnabled ? L("common.enabled") : L("common.disabled")),
+    renderSettingsInfoRow(L("settings.row.notificationPermission"), permission === "granted" ? L("common.enabled") : L("common.disabled")),
+    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), notificationEnabled ? L("common.enabled") : L("common.disabled")),
     push.lastSuccessfulDeliveryAtMs
       ? renderSettingsInfoRow(
           L("settings.row.lastSuccessfulDelivery"),
@@ -3781,9 +3990,9 @@ function renderSettingsNotificationsPage(context) {
       ${renderSettingsGroup("", statusRows)}
       ${renderSettingsGroup(L("settings.group.advanced"), [
         renderSettingsInfoRow(L("settings.row.serverWebPush"), serverEnabled ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.secureContext"), secureContext ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), standalone ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), supportsPushValue ? L("common.supported") : L("common.notSupported")),
+        renderSettingsInfoRow(L("settings.row.secureContext"), secureContext ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.homeScreenApp"), standalone ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.browserSupport"), supportsPushValue ? L("common.enabled") : L("common.disabled")),
       ])}
       ${state.pushNotice ? `<p class="inline-alert inline-alert--success">${escapeHtml(state.pushNotice)}</p>` : ""}
       ${state.pushError ? `<p class="inline-alert inline-alert--danger">${escapeHtml(state.pushError)}</p>` : ""}
@@ -3877,11 +4086,11 @@ function renderSettingsAdvancedPage(context) {
       ${context.diagnostics.map((message) => `<p class="inline-alert">${escapeHtml(message)}</p>`).join("")}
       ${renderSettingsGroup("", [
         renderSettingsInfoRow(L("settings.row.serverWebPush"), context.serverEnabled ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.notificationPermission"), L(`settings.permission.${context.permission}`) || context.permission),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.supported") : L("common.notSupported")),
-        renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.serverSubscribed ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.notificationPermission"), context.permission === "granted" ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.enabled") : L("common.disabled")),
+        renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.subscribed ? L("common.enabled") : L("common.disabled")),
         context.push.lastSuccessfulDeliveryAtMs
           ? renderSettingsInfoRow(
               L("settings.row.lastSuccessfulDelivery"),
@@ -3947,7 +4156,34 @@ function renderSettingsGroup(title, rows, options = {}) {
   `;
 }
 
-function renderSettingsNavRow({ page, icon, title, badge, subtitle, value }) {
+function settingsNavValueTone(value, explicitTone = "") {
+  if (explicitTone) {
+    return explicitTone;
+  }
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (text === L("common.enabled") || text === L("settings.status.enabled")) {
+    return "enabled";
+  }
+  if (text === L("common.disabled") || text === L("settings.status.disabled")) {
+    return "disabled";
+  }
+  if (text === L("settings.status.actionNeeded")) {
+    return "attention";
+  }
+  if (text === L("settings.status.disconnected")) {
+    return "disconnected";
+  }
+  return "";
+}
+
+function renderSettingsNavRow({ page, icon, title, badge, subtitle, value, valueTone }) {
+  const tone = settingsNavValueTone(value, valueTone);
+  const valueClass = tone
+    ? `settings-row__value settings-row__value--${escapeHtml(tone)}`
+    : "settings-row__value";
   return `
     <button class="settings-nav-row" type="button" data-settings-subpage="${escapeHtml(page)}">
       <span class="settings-row__icon" aria-hidden="true">${renderIcon(icon)}</span>
@@ -3958,7 +4194,7 @@ function renderSettingsNavRow({ page, icon, title, badge, subtitle, value }) {
         </span>
         ${subtitle ? `<span class="settings-row__subtitle">${escapeHtml(subtitle)}</span>` : ""}
       </span>
-      <span class="settings-row__value">${escapeHtml(value || "")}</span>
+      <span class="${valueClass}">${escapeHtml(value || "")}</span>
       <span class="settings-row__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>
     </button>
   `;
@@ -3970,15 +4206,17 @@ function renderSettingsAwayModePage() {
   return `
     <div class="settings-page">
       ${renderSettingsGroup("", [`
-        <label class="reply-mode-switch" data-claude-away-toggle>
+        <label class="reply-mode-switch reply-mode-switch--settings" data-claude-away-toggle>
           <input type="checkbox" class="reply-mode-switch__input" ${enabled ? "checked" : ""} data-claude-away-checkbox />
-          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
           <span class="reply-mode-switch__copy">
             <span class="reply-mode-switch__title">
               <span>${escapeHtml(L("settings.claudeAway.title"))}</span>
-              <span class="reply-mode-switch__state">${escapeHtml(stateLabel)}</span>
             </span>
             <span class="reply-mode-switch__hint">${escapeHtml(L("settings.claudeAway.description"))}</span>
+          </span>
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(stateLabel)}</span>
           </span>
         </label>
       `])}
@@ -3993,23 +4231,24 @@ function renderSettingsAutoPilotPage() {
   const writeLaneContentEnabled = state.session?.autoPilotWriteLaneContent === true;
   const writeLaneUiTestsEnabled = state.session?.autoPilotWriteLaneUiTests === true;
   const writeLaneSourceEnabled = state.session?.autoPilotWriteLaneSource === true;
-  const trustedWritesEnabled =
-    writeLaneContentEnabled || writeLaneUiTestsEnabled || writeLaneSourceEnabled || state.session?.autoPilotTrustedWrites === true;
+  const trustedWritesEnabled = hasAutoPilotWriteLaneEnabled();
   const trustedWritesStateLabel = trustedWritesEnabled ? L("common.enabled") : L("common.disabled");
   const recentEntries = recentAutoPilotEntries();
   const suggestions = recentAutoPilotSuggestions();
   return `
     <div class="settings-page">
       ${renderSettingsGroup("", [`
-        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-toggle>
+        <label class="reply-mode-switch reply-mode-switch--settings reply-mode-switch--grouped" data-auto-pilot-toggle>
           <input type="checkbox" class="reply-mode-switch__input" ${trustedReadsEnabled ? "checked" : ""} data-auto-pilot-checkbox />
-          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
           <span class="reply-mode-switch__copy">
             <span class="reply-mode-switch__title">
               <span>${escapeHtml(L("settings.autoPilot.trustedReadsTitle"))}</span>
-              <span class="reply-mode-switch__state">${escapeHtml(trustedReadsStateLabel)}</span>
             </span>
             <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.trustedReadsDescription"))}</span>
+          </span>
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(trustedReadsStateLabel)}</span>
           </span>
         </label>
       `, `
@@ -4020,39 +4259,45 @@ function renderSettingsAutoPilotPage() {
       `, `
         <div class="settings-toggle-subcopy muted">${escapeHtml(L("settings.autoPilot.trustedWritesDescription"))}</div>
       `, `
-        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="content">
+        <label class="reply-mode-switch reply-mode-switch--settings reply-mode-switch--grouped" data-auto-pilot-write-lane="content">
           <input type="checkbox" class="reply-mode-switch__input" ${writeLaneContentEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="content" />
-          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
           <span class="reply-mode-switch__copy">
             <span class="reply-mode-switch__title">
               <span>${escapeHtml(L("settings.autoPilot.writeLaneContentTitle"))}</span>
-              <span class="reply-mode-switch__state">${escapeHtml(writeLaneContentEnabled ? L("common.enabled") : L("common.disabled"))}</span>
             </span>
             <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneContentDescription"))}</span>
           </span>
-        </label>
-      `, `
-        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="ui-tests">
-          <input type="checkbox" class="reply-mode-switch__input" ${writeLaneUiTestsEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="ui-tests" />
-          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
-          <span class="reply-mode-switch__copy">
-            <span class="reply-mode-switch__title">
-              <span>${escapeHtml(L("settings.autoPilot.writeLaneUiTestsTitle"))}</span>
-              <span class="reply-mode-switch__state">${escapeHtml(writeLaneUiTestsEnabled ? L("common.enabled") : L("common.disabled"))}</span>
-            </span>
-            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneUiTestsDescription"))}</span>
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(writeLaneContentEnabled ? L("common.enabled") : L("common.disabled"))}</span>
           </span>
         </label>
       `, `
-        <label class="reply-mode-switch reply-mode-switch--grouped" data-auto-pilot-write-lane="source">
+        <label class="reply-mode-switch reply-mode-switch--settings reply-mode-switch--grouped" data-auto-pilot-write-lane="ui-tests">
+          <input type="checkbox" class="reply-mode-switch__input" ${writeLaneUiTestsEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="ui-tests" />
+          <span class="reply-mode-switch__copy">
+            <span class="reply-mode-switch__title">
+              <span>${escapeHtml(L("settings.autoPilot.writeLaneUiTestsTitle"))}</span>
+            </span>
+            <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneUiTestsDescription"))}</span>
+          </span>
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(writeLaneUiTestsEnabled ? L("common.enabled") : L("common.disabled"))}</span>
+          </span>
+        </label>
+      `, `
+        <label class="reply-mode-switch reply-mode-switch--settings reply-mode-switch--grouped" data-auto-pilot-write-lane="source">
           <input type="checkbox" class="reply-mode-switch__input" ${writeLaneSourceEnabled ? "checked" : ""} data-auto-pilot-write-lane-checkbox="source" />
-          <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
           <span class="reply-mode-switch__copy">
             <span class="reply-mode-switch__title">
               <span>${escapeHtml(L("settings.autoPilot.writeLaneSourceTitle"))}</span>
-              <span class="reply-mode-switch__state">${escapeHtml(writeLaneSourceEnabled ? L("common.enabled") : L("common.disabled"))}</span>
             </span>
             <span class="reply-mode-switch__hint">${escapeHtml(L("settings.autoPilot.writeLaneSourceDescription"))}</span>
+          </span>
+          <span class="reply-mode-switch--settings__toggle">
+            <span class="reply-mode-switch__track" aria-hidden="true"><span class="reply-mode-switch__thumb"></span></span>
+            <span class="reply-mode-switch__state">${escapeHtml(writeLaneSourceEnabled ? L("common.enabled") : L("common.disabled"))}</span>
           </span>
         </label>
       `], { listClassName: "settings-list settings-list--toggle-group" })}
@@ -4724,8 +4969,12 @@ function renderSettingsRemotePairingPage(context) {
   const enabled = status.enabled === true;
   const sessions = Array.isArray(status.sessions) ? status.sessions : [];
   const pairings = Array.isArray(status.pairings) ? status.pairings : [];
+  const statusModel = remotePairingStatusModel(status);
   const sessionsByPub = new Map(
     sessions.map((s) => [String(s.phonePub || "").toLowerCase(), s]),
+  );
+  const sessionsByPairingId = new Map(
+    sessions.map((s) => [String(s.pairingId || ""), s]),
   );
   const togglePending = state.remotePairingPending === "toggle";
   const relayPending = state.remotePairingPending === "relayUrl";
@@ -4743,17 +4992,7 @@ function renderSettingsRemotePairingPage(context) {
     }
   })();
   const localPhonePub = (localPairing?.phonePub || "").toLowerCase();
-
-  // Status row: enabled? show first session state if any. Otherwise the
-  // toggle is the only signal — there's no "connected but no pairings"
-  // state worth surfacing to a non-technical user.
-  const statusValue = (() => {
-    if (!enabled) return L("settings.remotePairing.status.disabled");
-    if (sessions.length === 0) return L("settings.remotePairing.status.connected");
-    const liveCount = sessions.filter((s) => s.state === "open" || s.state === "running").length;
-    if (liveCount > 0) return L("settings.remotePairing.status.connected");
-    return L("settings.remotePairing.status.connecting");
-  })();
+  const localRegistered = Boolean(localPairing);
 
   // Identity fingerprint row — shows the bridge's stable public key short-
   // form so the human can verify what the phone is pairing against.
@@ -4762,11 +5001,14 @@ function renderSettingsRemotePairingPage(context) {
     status.identityFingerprint || L("settings.remotePairing.identity.empty"),
   );
 
-  // The toggle row mirrors the A2A "accept public tasks" switch shape so we
-  // share styles and event hooks (data-attributes are unique).
-  const toggleRow = `
-    <section class="settings-group">
-      <p class="settings-group__title">${escapeHtml(L("settings.remotePairing.toggle.title"))}</p>
+  const connectionSection = `
+    <section class="settings-remote-connection">
+      <header class="settings-remote-connection__header">
+        <div class="settings-remote-connection__copy">
+          <p class="settings-remote-connection__title">${escapeHtml(L("settings.remotePairing.connection.title"))}</p>
+        </div>
+        <span class="settings-remote-status settings-remote-status--${escapeHtml(statusModel.tone)}">${escapeHtml(statusModel.label)}</span>
+      </header>
       <label class="reply-mode-switch reply-mode-switch--settings" data-remote-pairing-toggle>
         <input type="checkbox" class="reply-mode-switch__input"
           ${enabled ? "checked" : ""}
@@ -4778,6 +5020,7 @@ function renderSettingsRemotePairingPage(context) {
         </span>
         <span class="reply-mode-switch__hint">${escapeHtml(L("settings.remotePairing.toggle.description"))}</span>
       </label>
+      <p class="settings-remote-connection__trust">${escapeHtml(L("settings.remotePairing.security.copy"))}</p>
     </section>
   `;
 
@@ -4813,41 +5056,47 @@ function renderSettingsRemotePairingPage(context) {
   // currently rendering this page gets an extra "This device" badge so the
   // user can identify themselves in the list (especially useful when more
   // than one phone is paired to the same Mac).
-  const pairingsRows = pairings.length === 0
-    ? `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.pairings.empty"))}</p>`
-    : pairings.map((p) => {
-        const session = sessionsByPub.get(String(p.phonePub || "").toLowerCase());
-        const live = session?.state === "open" || session?.state === "running";
-        const lastSeen = p.lastSeenAtMs
-          ? new Date(p.lastSeenAtMs).toLocaleString(state.locale)
+  const otherPairings = localPhonePub
+    ? pairings.filter((p) => String(p.phonePub || "").toLowerCase() !== localPhonePub)
+    : pairings;
+  const pairingsRows = otherPairings.length === 0
+    ? `<div class="settings-copy-block"><p class="muted">${escapeHtml(L("settings.remotePairing.pairings.empty"))}</p></div>`
+    : `<div class="device-list">
+        ${otherPairings.map((p) => {
+        const session = sessionsByPub.get(String(p.phonePub || "").toLowerCase())
+          || sessionsByPairingId.get(String(p.pairingId || ""));
+        const live = isRemotePairingSessionConnected(session);
+        const lastSeenAtMs = Number(session?.lastSeenAtMs || p.lastSeenAtMs) || 0;
+        const lastSeen = lastSeenAtMs
+          ? new Date(lastSeenAtMs).toLocaleString(state.locale)
           : L("settings.remotePairing.pairings.never");
         const added = p.addedAtMs
           ? new Date(p.addedAtMs).toLocaleString(state.locale)
           : L("settings.remotePairing.pairings.never");
         const pendingThis = state.remotePairingPending === `revoke:${p.phonePub}`;
-        const isThisDevice = localPhonePub.length > 0
-          && String(p.phonePub || "").toLowerCase() === localPhonePub;
         return `
-          <article class="settings-card${isThisDevice ? " settings-card--self" : ""}" data-remote-pairing-row="${escapeHtml(p.phonePub)}">
-            <header class="settings-card__header">
-              <div>
-                <p class="settings-card__title">${escapeHtml(p.label || p.phoneFingerprint || p.pairingId)}</p>
-                <p class="settings-card__subtitle">${escapeHtml(p.phoneFingerprint || p.phonePub.slice(0, 16))}</p>
+          <article class="device-card" data-remote-pairing-row="${escapeHtml(p.phonePub)}">
+            <div class="device-card__header">
+              <div class="device-card__title-wrap">
+                <div class="device-card__headline">
+                  <span class="device-card__icon" aria-hidden="true">${renderIcon("iphone")}</span>
+                  <h3 class="device-card__title">${escapeHtml(p.label || p.phoneFingerprint || p.pairingId)}</h3>
+                </div>
+                <p class="device-card__subtitle">${escapeHtml(p.phoneFingerprint || p.phonePub.slice(0, 16))}</p>
               </div>
-              <div class="settings-card__badges">
-                ${isThisDevice ? `<span class="settings-card__badge settings-card__badge--self">${escapeHtml(L("settings.remotePairing.pairings.thisDevice"))}</span>` : ""}
-                <span class="settings-card__badge ${live ? "settings-card__badge--live" : "settings-card__badge--offline"}">
+              <div class="device-card__badges">
+                <span class="device-card__badge ${live ? "device-card__badge--live" : "device-card__badge--offline"}">
                   ${escapeHtml(live ? L("settings.remotePairing.pairings.live") : L("settings.remotePairing.pairings.offline"))}
                 </span>
               </div>
-            </header>
-            <dl class="settings-card__rows">
-              <div><dt>${escapeHtml(L("settings.remotePairing.pairings.added"))}</dt><dd>${escapeHtml(added)}</dd></div>
-              <div><dt>${escapeHtml(L("settings.remotePairing.pairings.lastSeen"))}</dt><dd>${escapeHtml(lastSeen)}</dd></div>
-            </dl>
-            <div class="settings-card__actions">
+            </div>
+            <div class="device-card__meta">
+              ${renderDeviceMetaRow(L("settings.remotePairing.pairings.added"), added)}
+              ${renderDeviceMetaRow(L("settings.remotePairing.pairings.lastSeen"), lastSeen)}
+            </div>
+            <div class="device-card__actions">
               <button type="button"
-                class="danger"
+                class="secondary secondary--wide"
                 data-remote-pairing-revoke="${escapeHtml(p.phonePub)}"
                 ${pendingThis ? "disabled" : ""}>
                 ${escapeHtml(L("settings.remotePairing.pairings.revoke"))}
@@ -4855,7 +5104,8 @@ function renderSettingsRemotePairingPage(context) {
             </div>
           </article>
         `;
-      }).join("");
+      }).join("")}
+      </div>`;
 
   // "This device" group — sits above the pairings list and tells the user
   // explicitly whether *this phone* (the one rendering the page) is the
@@ -4865,21 +5115,64 @@ function renderSettingsRemotePairingPage(context) {
   //      the device. (The hint applies even when other phones are paired
   //      — they're not relevant to this device's relay status.)
   const thisDeviceSection = (() => {
-    if (localPairing) {
+    if (localRegistered) {
       const fingerprint = localPairing.phoneFingerprint
         || localPairing.phonePub.slice(0, 16);
       return renderSettingsGroup(L("settings.remotePairing.thisDevice.title"), [
-        `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.thisDevice.copy"))}</p>`,
-        renderSettingsInfoRow(
-          L("settings.remotePairing.thisDevice.fingerprint"),
-          fingerprint,
-        ),
+        `
+          <div class="device-list">
+            <article class="device-card">
+              <div class="device-card__header">
+                <div class="device-card__title-wrap">
+                  <div class="device-card__headline">
+                    <span class="device-card__icon" aria-hidden="true">${renderIcon("iphone")}</span>
+                    <h3 class="device-card__title">${escapeHtml(L("settings.remotePairing.thisDevice.registeredTitle"))}</h3>
+                  </div>
+                  <p class="device-card__subtitle">${escapeHtml(fingerprint)}</p>
+                </div>
+                <span class="device-card__badge">${escapeHtml(L("settings.remotePairing.pairings.thisDevice"))}</span>
+              </div>
+              <div class="device-card__meta">
+                ${renderDeviceMetaRow(L("settings.remotePairing.status.title"), statusModel.label)}
+                ${renderDeviceMetaRow(L("settings.remotePairing.thisDevice.fingerprint"), fingerprint)}
+              </div>
+            </article>
+          </div>
+        `,
       ]);
     }
     return renderSettingsGroup(L("settings.remotePairing.thisDevice.title"), [
-      `<p class="settings-page-copy muted">${escapeHtml(L("settings.remotePairing.thisDevice.notEnrolled"))}</p>`,
+      `
+        <div class="device-list">
+          <article class="device-card">
+            <div class="device-card__header">
+              <div class="device-card__title-wrap">
+                <div class="device-card__headline">
+                  <span class="device-card__icon" aria-hidden="true">${renderIcon("iphone")}</span>
+                  <h3 class="device-card__title">${escapeHtml(L("settings.remotePairing.thisDevice.notEnrolledTitle"))}</h3>
+                </div>
+              </div>
+            </div>
+            <div class="device-card__meta">
+              ${renderDeviceMetaRow(L("settings.remotePairing.status.title"), L("settings.remotePairing.status.disabled"))}
+              ${renderDeviceMetaRow(L("settings.remotePairing.thisDevice.fingerprint"), L("common.unavailable"))}
+            </div>
+            <p class="settings-page-copy muted settings-remote-device-hint">${escapeHtml(L("settings.remotePairing.thisDevice.notEnrolled"))}</p>
+          </article>
+        </div>
+      `,
     ]);
   })();
+
+  const detailsSection = `
+    <details class="settings-disclosure settings-remote-details" data-remote-pairing-details ${state.remotePairingDetailsOpen ? "open" : ""}>
+      <summary>${escapeHtml(L("settings.remotePairing.details.title"))}</summary>
+      <div class="settings-disclosure__body">
+        ${relayUrlSection}
+        ${renderSettingsGroup(L("settings.remotePairing.identity.title"), [fpRow])}
+      </div>
+    </details>
+  `;
 
   const noticeBlock = state.remotePairingNotice
     ? `<p class="settings-page-copy">${escapeHtml(state.remotePairingNotice)}</p>`
@@ -4892,14 +5185,10 @@ function renderSettingsRemotePairingPage(context) {
     <div class="settings-page">
       ${noticeBlock}
       ${errorBlock}
-      ${renderSettingsGroup(L("settings.remotePairing.status.title"), [
-        renderSettingsInfoRow(L("settings.remotePairing.status.title"), statusValue),
-        fpRow,
-      ])}
-      ${toggleRow}
-      ${relayUrlSection}
+      ${connectionSection}
       ${thisDeviceSection}
-      ${renderSettingsGroup(L("settings.remotePairing.pairings.title"), [pairingsRows])}
+      ${renderSettingsGroup(L("settings.remotePairing.pairings.otherTitle"), [pairingsRows])}
+      ${detailsSection}
     </div>
   `;
 }
@@ -5366,6 +5655,7 @@ function formatUsdcAtomic(atomic) {
 }
 
 function renderSettingsInfoRow(label, value, options = {}) {
+  const tone = settingsNavValueTone(value, options.valueTone || "");
   const rowClassName = [
     "settings-info-row",
     options.stacked ? "settings-info-row--stacked" : "",
@@ -5373,6 +5663,7 @@ function renderSettingsInfoRow(label, value, options = {}) {
   ].filter(Boolean).join(" ");
   const valueClassName = [
     "settings-info-row__value",
+    tone ? `settings-info-row__value--${tone}` : "",
     options.mono ? "settings-info-row__value--mono" : "",
     options.valueClassName || "",
   ].filter(Boolean).join(" ");
@@ -5419,9 +5710,17 @@ function renderTrustedDeviceCard(device) {
   const badge = device.currentDevice
     ? `<span class="device-card__badge">${escapeHtml(L("settings.device.thisDevice"))}</span>`
     : "";
-  const actionLabel = device.currentDevice
-    ? L("settings.action.removeThisDevice")
-    : L("settings.action.revokeDevice");
+  const actions = device.currentDevice
+    ? ""
+    : `
+      <div class="device-card__actions">
+        <button
+          class="secondary secondary--wide"
+          type="button"
+          data-device-revoke="${escapeHtml(device.deviceId)}"
+        >${escapeHtml(L("settings.action.revokeDevice"))}</button>
+      </div>
+    `;
 
   return `
     <article class="device-card">
@@ -5442,14 +5741,7 @@ function renderTrustedDeviceCard(device) {
         ${renderDeviceMetaRow(L("settings.row.pushStatus"), pushLabel)}
         ${renderDeviceMetaRow(L("settings.row.currentLanguage"), localeLabel)}
       </div>
-      <div class="device-card__actions">
-        <button
-          class="secondary secondary--wide"
-          type="button"
-          data-device-revoke="${escapeHtml(device.deviceId)}"
-          data-device-current="${device.currentDevice ? "true" : "false"}"
-        >${escapeHtml(actionLabel)}</button>
-      </div>
+      ${actions}
     </article>
   `;
 }
@@ -5522,8 +5814,9 @@ function renderStandardDetailMobile(detail) {
   const kindInfo = kindMeta(detail.kind, detail);
   const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind);
   const plainIntro = renderDetailPlainIntro(detail, { mobile: true });
+  const hasCompletionReply = isCompletionReplyAvailable(detail);
   return `
-    <div class="mobile-detail-screen">
+    <div class="mobile-detail-screen ${hasCompletionReply ? "mobile-detail-screen--has-reply-dock" : ""}">
       <div class="detail-shell detail-shell--mobile">
         <div class="mobile-detail-scroll mobile-detail-scroll--detail">
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
@@ -5553,10 +5846,10 @@ function renderStandardDetailMobile(detail) {
           ${renderDetailDiffPanel(detail, { mobile: true })}
           ${renderDetailDiffThreadGroups(detail, { mobile: true })}
           ${renderDetailFileRefs(detail, { mobile: true })}
-          ${renderCompletionReplyComposer(detail, { mobile: true })}
         </div>
         ${detail.readOnly ? "" : renderActionButtons(detail.actions || [], { mobileSticky: true })}
       </div>
+      ${renderCompletionReplyDock(detail)}
     </div>
   `;
 }
@@ -6304,7 +6597,7 @@ function renderThreadShareDetail(detail, options = {}) {
 }
 
 function renderCompletionReplyComposer(detail, options = {}) {
-  if ((detail.kind !== "completion" && detail.kind !== "assistant_final") || detail.reply?.enabled !== true) {
+  if (!isCompletionReplyAvailable(detail)) {
     return "";
   }
 
@@ -6474,6 +6767,51 @@ function renderCompletionReplyComposer(detail, options = {}) {
             `
         }
       </div>
+    </section>
+  `;
+}
+
+function isCompletionReplyAvailable(detail) {
+  return Boolean(
+    detail &&
+    (detail.kind === "completion" || detail.kind === "assistant_final") &&
+    detail.reply?.enabled === true &&
+    detail.token
+  );
+}
+
+function renderCompletionReplyDock(detail) {
+  if (!isCompletionReplyAvailable(detail)) {
+    return "";
+  }
+  const providerVars = { provider: providerDisplayName(detail?.provider) };
+  return `
+    <div class="reply-dock" role="region" aria-label="${escapeHtml(L("reply.eyebrow"))}">
+      <button
+        class="reply-dock__button"
+        type="button"
+        data-open-completion-reply-sheet
+        data-token="${escapeHtml(detail.token)}"
+      >
+        <span class="reply-dock__label">${escapeHtml(L("reply.title", providerVars))}</span>
+      </button>
+    </div>
+  `;
+}
+
+function renderCompletionReplySheet(detail) {
+  if (!isCompletionReplyAvailable(detail) || state.completionReplySheetToken !== detail.token) {
+    return "";
+  }
+  const providerVars = { provider: providerDisplayName(detail?.provider) };
+  return `
+    <div class="reply-sheet-backdrop" data-close-completion-reply-sheet aria-hidden="true"></div>
+    <section class="reply-sheet" role="dialog" aria-modal="true" aria-label="${escapeHtml(L("reply.title", providerVars))}">
+      <div class="reply-sheet__handle" aria-hidden="true"></div>
+      <button class="reply-sheet__close" type="button" data-close-completion-reply-sheet aria-label="${escapeHtml(L("common.close"))}">
+        <span aria-hidden="true">&times;</span>
+      </button>
+      ${renderCompletionReplyComposer(detail, { mobile: true, sheet: true })}
     </section>
   `;
 }
@@ -6728,9 +7066,26 @@ function renderInstallBanner() {
   `;
 }
 
+function renderClientUpdateBanner() {
+  return `
+    <section class="install-banner install-banner--push">
+      <div class="install-banner__copy">
+        <strong>${escapeHtml(L("banner.clientUpdate.title"))}</strong>
+        <p class="muted">${escapeHtml(L("banner.clientUpdate.copy"))}</p>
+      </div>
+      <div class="actions install-banner__actions">
+        <button class="secondary" type="button" data-force-app-refresh>${escapeHtml(L("banner.clientUpdate.action"))}</button>
+      </div>
+    </section>
+  `;
+}
+
 function renderTopBanner() {
   if (!isDesktopLayout() && (state.detailOpen || isSettingsSubpageOpen())) {
     return "";
+  }
+  if (state.clientUpdateRequired) {
+    return renderClientUpdateBanner();
   }
   if (shouldShowInstallBanner()) {
     return renderInstallBanner();
@@ -7258,6 +7613,23 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-open-completion-reply-sheet][data-token]")) {
+    button.addEventListener("click", async () => {
+      state.completionReplySheetToken = button.dataset.token || "";
+      resetHorizontalViewportScroll();
+      await renderShell();
+      resetHorizontalViewportScroll();
+    });
+  }
+
+  for (const trigger of document.querySelectorAll("[data-close-completion-reply-sheet]")) {
+    trigger.addEventListener("click", async () => {
+      state.completionReplySheetToken = "";
+      resetHorizontalViewportScroll();
+      await renderShell();
+    });
+  }
+
   for (const input of document.querySelectorAll("[data-reply-mode-toggle][data-reply-token]")) {
     input.addEventListener("change", async () => {
       const token = input.dataset.replyToken || "";
@@ -7468,14 +7840,51 @@ function bindShellInteractions() {
     state.session.autoPilotWriteLaneSource = result?.writeLaneSourceEnabled === true;
   }
 
+  function snapshotAutoPilotSettings() {
+    return {
+      trustedReads: state.session?.autoPilotTrustedReads === true,
+      trustedWrites: state.session?.autoPilotTrustedWrites === true,
+      writeLaneContent: state.session?.autoPilotWriteLaneContent === true,
+      writeLaneUiTests: state.session?.autoPilotWriteLaneUiTests === true,
+      writeLaneSource: state.session?.autoPilotWriteLaneSource === true,
+    };
+  }
+
+  function restoreAutoPilotSettings(snapshot) {
+    if (!state.session || !snapshot) {
+      return;
+    }
+    state.session.autoPilotTrustedReads = snapshot.trustedReads === true;
+    state.session.autoPilotTrustedWrites = snapshot.trustedWrites === true;
+    state.session.autoPilotWriteLaneContent = snapshot.writeLaneContent === true;
+    state.session.autoPilotWriteLaneUiTests = snapshot.writeLaneUiTests === true;
+    state.session.autoPilotWriteLaneSource = snapshot.writeLaneSource === true;
+  }
+
+  function reconcileAutoPilotTrustedWrites() {
+    if (!state.session) {
+      return;
+    }
+    state.session.autoPilotTrustedWrites = Boolean(
+      state.session.autoPilotWriteLaneContent === true ||
+      state.session.autoPilotWriteLaneUiTests === true ||
+      state.session.autoPilotWriteLaneSource === true,
+    );
+  }
+
   for (const checkbox of document.querySelectorAll("[data-auto-pilot-checkbox]")) {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
+      const previous = snapshotAutoPilotSettings();
+      if (state.session) {
+        state.session.autoPilotTrustedReads = next;
+      }
+      await renderShell();
       try {
         const result = await apiPost("/api/settings/auto-pilot", { trustedReadsEnabled: next });
         applyAutoPilotSettingsResult(result);
-        await refreshAuthenticatedState();
       } catch (error) {
+        restoreAutoPilotSettings(previous);
         state.pushError = error.message || String(error);
       }
       await renderShell();
@@ -7486,17 +7895,29 @@ function bindShellInteractions() {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
       const lane = normalizeClientText(checkbox.getAttribute("data-auto-pilot-write-lane-checkbox") || "");
+      const previous = snapshotAutoPilotSettings();
       const payload =
         lane === "content"
           ? { writeLaneContentEnabled: next }
           : lane === "ui-tests"
             ? { writeLaneUiTestsEnabled: next }
             : { writeLaneSourceEnabled: next };
+      if (state.session) {
+        if (lane === "content") {
+          state.session.autoPilotWriteLaneContent = next;
+        } else if (lane === "ui-tests") {
+          state.session.autoPilotWriteLaneUiTests = next;
+        } else {
+          state.session.autoPilotWriteLaneSource = next;
+        }
+        reconcileAutoPilotTrustedWrites();
+      }
+      await renderShell();
       try {
         const result = await apiPost("/api/settings/auto-pilot", payload);
         applyAutoPilotSettingsResult(result);
-        await refreshAuthenticatedState();
       } catch (error) {
+        restoreAutoPilotSettings(previous);
         state.pushError = error.message || String(error);
       }
       await renderShell();
@@ -7517,11 +7938,23 @@ function bindShellInteractions() {
       if (!payload) {
         return;
       }
+      const previous = snapshotAutoPilotSettings();
+      if (state.session) {
+        if (lane === "content") {
+          state.session.autoPilotWriteLaneContent = true;
+        } else if (lane === "ui_tests") {
+          state.session.autoPilotWriteLaneUiTests = true;
+        } else {
+          state.session.autoPilotWriteLaneSource = true;
+        }
+        reconcileAutoPilotTrustedWrites();
+      }
+      await renderShell();
       try {
         const result = await apiPost("/api/settings/auto-pilot", payload);
         applyAutoPilotSettingsResult(result);
-        await refreshAuthenticatedState();
       } catch (error) {
+        restoreAutoPilotSettings(previous);
         state.pushError = error.message || String(error);
       }
       await renderShell();
@@ -7613,6 +8046,12 @@ function bindShellInteractions() {
   // hot-restart the orchestrator, so the post-POST `fetchRemotePairingStatus`
   // call can briefly observe a transient state — that's fine, the next
   // render will land on the steady state.
+  for (const details of document.querySelectorAll("[data-remote-pairing-details]")) {
+    details.addEventListener("toggle", () => {
+      state.remotePairingDetailsOpen = details.open === true;
+    });
+  }
+
   for (const checkbox of document.querySelectorAll("[data-remote-pairing-toggle-checkbox]")) {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
@@ -8186,14 +8625,22 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
       await renderShell();
 
       try {
-        const requestBody = new FormData();
-        requestBody.set("text", text);
-        requestBody.set("planMode", draft.mode === "plan" ? "true" : "false");
-        requestBody.set("force", draft.confirmOverride === true ? "true" : "false");
-        for (const attachment of draft.attachments || []) {
-          if (attachment?.file) {
-            requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
-          }
+        const attachments = (draft.attachments || []).filter((attachment) => attachment?.file);
+        let requestBody;
+        if (attachments.length > 0) {
+          requestBody = new FormData();
+          requestBody.set("text", text);
+          requestBody.set("planMode", draft.mode === "plan" ? "true" : "false");
+          requestBody.set("force", draft.confirmOverride === true ? "true" : "false");
+        } else {
+          requestBody = {
+            text,
+            planMode: draft.mode === "plan",
+            force: draft.confirmOverride === true,
+          };
+        }
+        for (const attachment of attachments) {
+          requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
         }
         const replyKind = replyForm.dataset.replyKind || "completion";
         await apiPost(`/api/items/${encodeURIComponent(replyKind)}/${encodeURIComponent(token)}/reply`, requestBody);
@@ -8348,6 +8795,13 @@ function bindSharedUi(renderFn) {
   for (const button of document.querySelectorAll("[data-install-guide-open]")) {
     button.addEventListener("click", async () => {
       state.installGuideOpen = true;
+      await renderFn();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-force-app-refresh]")) {
+    button.addEventListener("click", async () => {
+      await forceAppRefreshFromLan();
       await renderFn();
     });
   }
@@ -9169,6 +9623,128 @@ function handleDocumentVisibilityChange() {
   handlePotentialExternalNavigation();
 }
 
+async function hydrateTimelinePayloadImages(payload) {
+  if (!payload || !Array.isArray(payload.entries)) {
+    return payload;
+  }
+
+  const entries = await Promise.all(
+    payload.entries.map(async (entry) => hydrateItemImageUrls(entry))
+  );
+  return { ...payload, entries };
+}
+
+async function hydrateDetailImages(detail) {
+  if (!detail || !Array.isArray(detail.imageUrls)) {
+    return detail;
+  }
+  return hydrateItemImageUrls(detail);
+}
+
+async function hydrateItemImageUrls(item) {
+  const imageUrls = Array.isArray(item?.imageUrls) ? item.imageUrls.filter(Boolean) : [];
+  if (imageUrls.length === 0) {
+    return item;
+  }
+
+  const hydratedUrls = await Promise.all(imageUrls.map((url) => routedTimelineImageUrl(url)));
+  return {
+    ...item,
+    imageUrls: hydratedUrls.filter(Boolean),
+  };
+}
+
+async function routedTimelineImageUrl(imageUrl) {
+  const sourceUrl = normalizeClientText(imageUrl);
+  if (!sourceUrl || /^(?:blob:|data:)/iu.test(sourceUrl)) {
+    return sourceUrl;
+  }
+
+  const existing = timelineImageObjectUrlCache.get(sourceUrl);
+  if (existing?.objectUrl) {
+    existing.lastUsedMs = Date.now();
+    return existing.objectUrl;
+  }
+
+  try {
+    const response = await routedFetch(sourceUrl, {
+      credentials: "same-origin",
+      headers: {
+        Accept: "image/*",
+      },
+    });
+    if (!response.ok) {
+      return unavailableTimelineImageDataUrl();
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const contentType = responseHeader(response.headers, "content-type") || "application/octet-stream";
+    const objectUrl = URL.createObjectURL(new Blob([arrayBuffer], { type: contentType }));
+    timelineImageObjectUrlCache.set(sourceUrl, {
+      objectUrl,
+      lastUsedMs: Date.now(),
+    });
+    pruneTimelineImageObjectUrlCache();
+    return objectUrl;
+  } catch {
+    return unavailableTimelineImageDataUrl();
+  }
+}
+
+function unavailableTimelineImageDataUrl() {
+  const title = L("detail.imageUnavailable");
+  const subtitle = L("detail.imageUnavailableHint");
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#132026"/>
+          <stop offset="1" stop-color="#0a1116"/>
+        </linearGradient>
+      </defs>
+      <rect width="640" height="640" rx="34" fill="url(#bg)"/>
+      <rect x="24" y="24" width="592" height="592" rx="28" fill="none" stroke="#9cb5c5" stroke-opacity=".18" stroke-width="2"/>
+      <circle cx="320" cy="266" r="50" fill="#26343d"/>
+      <path d="M294 266h52M320 240v52" stroke="#d7e5ed" stroke-width="12" stroke-linecap="round" opacity=".78"/>
+      <text x="320" y="360" text-anchor="middle" fill="#d7e5ed" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="31" font-weight="700">${escapeSvgText(title)}</text>
+      <text x="320" y="410" text-anchor="middle" fill="#9cb5c5" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="22">${escapeSvgText(subtitle)}</text>
+    </svg>
+  `.trim();
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+
+function escapeSvgText(value) {
+  return normalizeClientText(value)
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;");
+}
+
+function responseHeader(headers, name) {
+  const key = String(name || "").toLowerCase();
+  if (!headers || !key) {
+    return "";
+  }
+  if (typeof headers.get === "function") {
+    return headers.get(key) || "";
+  }
+  return headers[key] || headers[name] || "";
+}
+
+function pruneTimelineImageObjectUrlCache() {
+  if (timelineImageObjectUrlCache.size <= MAX_TIMELINE_IMAGE_OBJECT_URLS) {
+    return;
+  }
+  const staleEntries = [...timelineImageObjectUrlCache.entries()]
+    .sort((left, right) => Number(left[1]?.lastUsedMs || 0) - Number(right[1]?.lastUsedMs || 0))
+    .slice(0, Math.max(0, timelineImageObjectUrlCache.size - MAX_TIMELINE_IMAGE_OBJECT_URLS));
+  for (const [sourceUrl, entry] of staleEntries) {
+    if (entry?.objectUrl && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+      URL.revokeObjectURL(entry.objectUrl);
+    }
+    timelineImageObjectUrlCache.delete(sourceUrl);
+  }
+}
+
 async function apiGet(url) {
   // routedFetch tries LAN first, then falls back to the relay tunnel when
   // the phone is off-LAN. Returns a fetch-Response-compatible object so the
@@ -9192,9 +9768,8 @@ async function apiGet(url) {
 
 async function apiPost(url, body) {
   const isFormDataBody = typeof FormData !== "undefined" && body instanceof FormData;
-  // FormData uploads cannot ride the relay (no multipart in the RPC layer).
-  // routedFetch surfaces that as a `formdata-over-relay-unsupported` error
-  // when LAN is also dead; the caller's existing error UI handles it.
+  // Keep native FormData for LAN; routedFetch serializes it to multipart
+  // bytes only when the request has to travel through the remote relay.
   const response = await routedFetch(url, {
     method: "POST",
     credentials: "same-origin",

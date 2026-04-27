@@ -55,6 +55,74 @@ import { Readable } from "node:stream";
  */
 
 // ---------------------------------------------------------------------------
+// Path gate — defense in depth
+// ---------------------------------------------------------------------------
+//
+// Noise IK + the phonePub allowlist already authenticate the peer, so in
+// principle the bridge can trust anything that arrives with `fromRelay:
+// true`. We still gate the path here as a belt-and-braces measure: if a
+// phone identity key ever leaks (extractable IndexedDB record on a stolen
+// device, supply-chain XSS in the PWA host, etc.), the blast radius is the
+// reachable HTTP surface, and there's no reason that surface should
+// include LAN-bootstrap or pairing-management endpoints that only make
+// sense over a local-only origin.
+//
+// The rules are intentionally minimal:
+//   1. Only `/api/...` paths can ride the relay. The bridge serves the PWA
+//      shell, the SW, static assets, and a few diagnostic pages on other
+//      paths — none of those need to be reachable through the relay (the
+//      PWA is hosted by the phone OS, not by the bridge over the relay).
+//   2. A short deny list inside `/api/` blocks endpoints whose threat
+//      model only makes sense over LAN: pairing enrollment / revoke /
+//      LAN session bootstrap. These would already 403 in practice (no
+//      session cookie, etc.), but locking them out at the dispatch layer
+//      keeps a future relaxation of cookie auth from accidentally opening
+//      them.
+//
+// Both checks return a synthetic 403 RPC response — they never invoke the
+// bridge's request listener.
+
+const RELAY_DENIED_PATHS = new Set([
+  "/api/remote-pairing/lan-enroll",
+  "/api/remote-pairing/revoke",
+  "/api/session/pair",
+]);
+
+const RELAY_DENIED_PREFIXES = [
+  "/admin/",
+  "/internal/",
+  "/__",
+  "/api/internal/",
+  "/api/admin/",
+];
+
+/**
+ * @param {string} rawPath
+ * @returns {{ allowed: boolean, reason?: string }}
+ */
+export function classifyRelayPath(rawPath) {
+  const path = String(rawPath || "");
+  let pathname;
+  try {
+    pathname = new URL(path, "http://relay.local/").pathname;
+  } catch {
+    return { allowed: false, reason: "invalid-path" };
+  }
+  if (!pathname.startsWith("/api/")) {
+    return { allowed: false, reason: "non-api-path" };
+  }
+  for (const prefix of RELAY_DENIED_PREFIXES) {
+    if (pathname.startsWith(prefix)) {
+      return { allowed: false, reason: "denied-prefix" };
+    }
+  }
+  if (RELAY_DENIED_PATHS.has(pathname)) {
+    return { allowed: false, reason: "denied-path" };
+  }
+  return { allowed: true };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -87,6 +155,20 @@ export function createHttpDispatch(opts) {
    * }} rpcReq
    */
   return async function httpDispatch(rpcReq) {
+    // Defense-in-depth path gate — see RELAY_DENIED_* above.
+    const gate = classifyRelayPath(rpcReq.path);
+    if (!gate.allowed) {
+      log.warn?.(
+        `[http-dispatch] denied relay request ` +
+        `(${gate.reason}) ${String(rpcReq.method || "").toUpperCase()} ${redactPathForLog(rpcReq.path)}`,
+      );
+      return {
+        status: 403,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ error: "path-not-allowed-via-relay" }),
+      };
+    }
+
     const bodyBuf = decodeBody(rpcReq.body, rpcReq.bodyEncoding);
     const remoteAddress = `${addrPrefix}${rpcReq.pairing.phoneFingerprint}`;
 
@@ -203,6 +285,17 @@ export function createHttpDispatch(opts) {
 
     return res._toRpcResponse();
   };
+}
+
+function redactPathForLog(rawPath) {
+  const value = String(rawPath || "");
+  try {
+    const parsed = new URL(value, "http://relay.local/");
+    const segments = parsed.pathname.split("/").filter(Boolean).slice(0, 3);
+    return `/${segments.join("/")}`;
+  } catch {
+    return value.split("?")[0].slice(0, 64);
+  }
 }
 
 // ---------------------------------------------------------------------------

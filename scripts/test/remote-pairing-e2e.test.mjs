@@ -26,7 +26,6 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -52,6 +51,10 @@ import { bytesToHex } from "../lib/remote-pairing/keys-core.mjs";
 import {
   RemotePairingRpcClient,
 } from "../../web/remote-pairing/rpc-client.js";
+import {
+  startWranglerDev,
+  stopWranglerDev,
+} from "./remote-pairing-wrangler-dev.mjs";
 
 // ===========================================================================
 // wrangler dev — shared across all tests in this file
@@ -62,39 +65,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(HERE, "../../worker-pairing");
 const RELAY_URL = `ws://127.0.0.1:${DEV_PORT}`;
 
-/** @type {ReturnType<typeof spawn> | null} */
-let wranglerProc = null;
+let wranglerHandle = null;
 
 test.before(async () => {
-  wranglerProc = spawn(
-    "npx",
-    ["--no-install", "wrangler", "dev", "--local", "--port", String(DEV_PORT)],
-    {
-      cwd: WORKER_DIR,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, WRANGLER_LOG: "warn" },
-    },
-  );
-  wranglerProc.stdout.on("data", () => {});
-  wranglerProc.stderr.on("data", () => {});
-
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${DEV_PORT}/healthz`);
-      if (res.ok) return;
-    } catch { /* not ready */ }
-    await sleep(500);
-  }
-  wranglerProc.kill();
-  throw new Error("wrangler dev failed to start within 60s");
+  wranglerHandle = await startWranglerDev({ workerDir: WORKER_DIR, port: DEV_PORT });
 });
 
 test.after(async () => {
-  if (wranglerProc && wranglerProc.exitCode == null) {
-    wranglerProc.kill("SIGTERM");
-    await sleep(250);
-  }
+  await stopWranglerDev(wranglerHandle);
 });
 
 // ===========================================================================
@@ -182,8 +160,9 @@ async function spawnPipeline(cfg) {
   // 2) Pre-write a single pairing for one phone.
   const phoneKeypair = generateIdentityKeypair();
   const pairingId = uniquePairingId(cfg.label);
+  const pairing = buildPairing({ pairingId, phonePub: phoneKeypair.pub, label: cfg.label });
   await savePairings(
-    [buildPairing({ pairingId, phonePub: phoneKeypair.pub, label: cfg.label })],
+    [pairing],
     tmp.pairingsFile,
   );
 
@@ -206,6 +185,7 @@ async function spawnPipeline(cfg) {
   const rpc = new RemotePairingRpcClient({
     relayUrl: RELAY_URL,
     pairingId,
+    relayToken: pairing.relayToken,
     identityKeypair: phoneKeypair,
     remoteStatic: bridgeKeypair.pub,
     role: "phone",
@@ -222,6 +202,7 @@ async function spawnPipeline(cfg) {
     handle,
     rpc,
     pairingId,
+    pairing,
     bridgeKeypair,
     phoneKeypair,
     events,
@@ -324,9 +305,25 @@ test("404 from listener surfaces as fetch().status === 404", async () => {
   try {
     await waitFor(() => env.rpc.isConnected, "phone never connected");
 
-    const res = await env.rpc.fetch({ method: "GET", path: "/no/such/path" });
+    // Path must live under /api/ to clear the relay path gate; the listener
+    // is what produces the 404 here.
+    const res = await env.rpc.fetch({ method: "GET", path: "/api/no/such/path" });
     assert.equal(res.status, 404);
     assert.equal(await res.text(), "not found");
+  } finally {
+    await env.teardown();
+  }
+});
+
+test("relay path gate denies non-/api paths with a 403", async () => {
+  const env = await spawnPipeline({ label: "deny-non-api" });
+  try {
+    await waitFor(() => env.rpc.isConnected, "phone never connected");
+
+    const res = await env.rpc.fetch({ method: "GET", path: "/no/such/path" });
+    assert.equal(res.status, 403);
+    const json = await res.json();
+    assert.equal(json.error, "path-not-allowed-via-relay");
   } finally {
     await env.teardown();
   }
@@ -361,6 +358,7 @@ test("getStatus() reflects identity + connected session", async () => {
     assert.equal(status.identityPubHex, bytesToHex(env.bridgeKeypair.pub));
     assert.equal(status.sessions.length, 1);
     assert.equal(status.sessions[0].pairingId, env.pairingId);
+    assert.equal(status.sessions[0].phonePub, bytesToHex(env.phoneKeypair.pub));
     assert.ok(status.sessions[0].channelBindingHex);
   } finally {
     await env.teardown();
@@ -381,15 +379,12 @@ test("reloadNow() picks up a newly-added pairing — second phone can RPC", asyn
     // tell the orchestrator to reload.
     const phone2Kp = generateIdentityKeypair();
     const id2 = uniquePairingId("reload-second");
+    const pairing2 = buildPairing({ pairingId: id2, phonePub: phone2Kp.pub, label: "second" });
     await savePairings(
       [
         // keep the first
-        buildPairing({
-          pairingId: env.pairingId,
-          phonePub: env.phoneKeypair.pub,
-          label: "reload",
-        }),
-        buildPairing({ pairingId: id2, phonePub: phone2Kp.pub, label: "second" }),
+        env.pairing,
+        pairing2,
       ],
       env.tmp.pairingsFile,
     );
@@ -404,6 +399,7 @@ test("reloadNow() picks up a newly-added pairing — second phone can RPC", asyn
     const rpc2 = new RemotePairingRpcClient({
       relayUrl: RELAY_URL,
       pairingId: id2,
+      relayToken: pairing2.relayToken,
       identityKeypair: phone2Kp,
       remoteStatic: env.bridgeKeypair.pub,
       role: "phone",

@@ -35,6 +35,7 @@ import { dirname, resolve } from "node:path";
 
 import WebSocket from "ws";
 
+import { generateRelayToken } from "../lib/remote-pairing/pairings.mjs";
 import {
   createInitiator,
   createResponder,
@@ -53,6 +54,7 @@ import {
 
 const DEV_PORT = 8801;
 const PAIRING_ID = `demo-${Date.now()}`;
+const RELAY_TOKEN = generateRelayToken(PAIRING_ID);
 const PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(HERE, "../../worker-pairing");
@@ -113,7 +115,9 @@ function stopWranglerDev(proc) {
 // ---------------------------------------------------------------------------
 
 function openWS(role) {
-  const url = `ws://127.0.0.1:${DEV_PORT}/v1/pairing/${PAIRING_ID}/ws?role=${role}`;
+  const url =
+    `ws://127.0.0.1:${DEV_PORT}/v1/pairing/${PAIRING_ID}/ws` +
+    `?role=${role}&token=${encodeURIComponent(RELAY_TOKEN)}`;
   const ws = new WebSocket(url);
   return new Promise((resolve, reject) => {
     ws.once("open", () => resolve(ws));

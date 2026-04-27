@@ -382,6 +382,7 @@ test("getStatus() shape — populated when enabled", async () => {
     assert.equal(st.sessions.length, 1);
     assert.equal(st.sessions[0].pairingId, pairing.pairingId);
     assert.equal(st.sessions[0].label, "status-phone");
+    assert.equal(st.sessions[0].phonePub, pairing.phonePub);
     assert.equal(typeof st.sessions[0].state, "string");
 
     handle.close();

@@ -13,7 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createHttpDispatch } from "../lib/remote-pairing/http-dispatch.mjs";
+import { createHttpDispatch, classifyRelayPath } from "../lib/remote-pairing/http-dispatch.mjs";
 import { buildPairing } from "../lib/remote-pairing/pairings.mjs";
 import { generateIdentityKeypair } from "../lib/remote-pairing/keys-core.mjs";
 
@@ -412,4 +412,88 @@ test("res.end with a Buffer works as well as with a string", async () => {
   });
   const result = await dispatch(fakeRpc());
   assert.equal(result.body, "buf-end");
+});
+
+// ---------------------------------------------------------------------------
+// classifyRelayPath — defense-in-depth path gate
+// ---------------------------------------------------------------------------
+
+test("classifyRelayPath allows ordinary /api/* paths", () => {
+  assert.deepEqual(classifyRelayPath("/api/threads/list"), { allowed: true });
+  assert.deepEqual(classifyRelayPath("/api/timeline?since=123"), { allowed: true });
+  assert.deepEqual(classifyRelayPath("/api/session"), { allowed: true });
+});
+
+test("classifyRelayPath rejects non-/api paths", () => {
+  for (const path of ["/", "/app", "/sw.js", "/static/foo.js", "/manifest.webmanifest"]) {
+    const result = classifyRelayPath(path);
+    assert.equal(result.allowed, false, `expected ${path} to be blocked`);
+    assert.equal(result.reason, "non-api-path");
+  }
+});
+
+test("classifyRelayPath rejects sensitive /api endpoints", () => {
+  for (const path of [
+    "/api/remote-pairing/lan-enroll",
+    "/api/remote-pairing/revoke",
+    "/api/session/pair",
+  ]) {
+    const result = classifyRelayPath(path);
+    assert.equal(result.allowed, false, `expected ${path} to be blocked`);
+    assert.equal(result.reason, "denied-path");
+  }
+});
+
+test("classifyRelayPath rejects forbidden prefixes inside /api/", () => {
+  // Top-level /admin/ etc. are caught earlier by the non-/api guard; what
+  // we want this test to lock down is that we don't accidentally let
+  // /api/admin/* or /api/internal/* through.
+  for (const path of ["/api/admin/x", "/api/internal/y"]) {
+    const result = classifyRelayPath(path);
+    assert.equal(result.allowed, false, `expected ${path} to be blocked`);
+    assert.equal(result.reason, "denied-prefix");
+  }
+});
+
+test("classifyRelayPath blocks top-level admin/internal/__ paths regardless of reason", () => {
+  for (const path of ["/admin/whatever", "/internal/foo", "/__viveworker/x"]) {
+    const result = classifyRelayPath(path);
+    assert.equal(result.allowed, false, `expected ${path} to be blocked`);
+  }
+});
+
+test("classifyRelayPath strips query strings before matching", () => {
+  // The deny entries are exact pathname matches, so query strings shouldn't
+  // matter — and shouldn't accidentally allow a denied path through.
+  assert.equal(
+    classifyRelayPath("/api/remote-pairing/lan-enroll?bypass=1").allowed,
+    false,
+  );
+});
+
+test("dispatch returns 403 for denied paths without invoking the listener", async () => {
+  let listenerCalled = false;
+  const dispatch = createHttpDispatch({
+    requestListener: () => { listenerCalled = true; },
+  });
+  const result = await dispatch(fakeRpc({
+    method: "POST",
+    path: "/api/remote-pairing/lan-enroll",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  assert.equal(listenerCalled, false);
+  assert.equal(result.status, 403);
+  const json = JSON.parse(result.body);
+  assert.equal(json.error, "path-not-allowed-via-relay");
+});
+
+test("dispatch returns 403 for non-/api paths", async () => {
+  const dispatch = createHttpDispatch({
+    requestListener: () => {
+      throw new Error("listener should not run");
+    },
+  });
+  const result = await dispatch(fakeRpc({ method: "GET", path: "/sw.js" }));
+  assert.equal(result.status, 403);
 });

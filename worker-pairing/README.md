@@ -6,9 +6,9 @@ only the outer WebSocket frame; payloads inside the envelope are
 end-to-end encrypted by `scripts/lib/remote-pairing/noise.mjs` and the
 relay never sees plaintext.
 
-Status: **Phase 1 — relay scaffold**. Routing, replay buffer, and resume
-flow verified by unit tests against a mocked CF runtime. Real-runtime
-integration (wrangler dev / a deployed Worker) and PWA wiring are next.
+Status: **Remote relay beta**. Routing, replay buffer, resume, relay
+capability tokens, and PWA/bridge wiring are in place; abuse hardening
+continues as the public relay sees real traffic.
 
 ## Why a separate Worker
 
@@ -44,13 +44,15 @@ inspects `payload`.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /v1/pairing/:pairingId/ws?role=phone\|bridge` | WS upgrade → DO |
+| `GET /v1/pairing/:pairingId/ws?role=phone\|bridge&token=...` | WS upgrade → DO |
 | `GET /healthz` | health probe |
 | `GET /` | human-readable banner |
 
-`pairingId` is `[A-Za-z0-9_-]{8,64}`. Any client-generated unguessable
-identifier works; we'll standardise on a 22-char base64url UUID once the
-Phase 0 LAN-bootstrap pairing flow is hooked up.
+`pairingId` is `[A-Za-z0-9_-]{8,64}`. The `token` is a per-pairing relay
+capability generated during LAN enrollment. The Worker verifies a small
+proof-of-work on the token before allocating a DO and derives the DO name
+from `pairingId + token`, so a leaked pairingId alone cannot reach the
+real rendezvous room.
 
 ## Frame routing summary
 
@@ -128,37 +130,34 @@ wrangler deploy
 # Start a local Worker + DO instance with WS support.
 wrangler dev --local
 
-# Connect a phone client (in another shell):
-#   ws://localhost:8787/v1/pairing/test-001/ws?role=phone
+# Connect a phone client (in another shell, using a generated relay token):
+#   ws://localhost:8787/v1/pairing/test-001/ws?role=phone&token=<relay-token>
 # Connect a bridge client similarly with role=bridge.
 ```
 
-The Phase 0 demo (`scripts/test/remote-pairing-demo.mjs`) currently uses
-stdio pipes for transport. The Phase 1 hand-off step is to add a
-WS-transport variant of the demo that connects through `wrangler dev`,
-proving the same Noise session survives a real CF Worker hop.
+The legacy Phase 0 demo (`scripts/test/remote-pairing-demo.mjs`) still uses
+stdio pipes for transport. The Worker-backed smoke demos live in
+`scripts/test/remote-pairing-relay-demo.mjs` and
+`scripts/test/remote-pairing-transport-demo.mjs`.
 
 ## Phase 1 → Phase 2 hand-off
 
 What this Worker guarantees today:
 
-- ✅ Two-peer rendezvous by `pairingId` (DO `idFromName`).
+- ✅ Two-peer rendezvous by `pairingId + relayToken` (DO `idFromName`).
+- ✅ Per-pairing relay capability token with edge proof-of-work check.
+- ✅ Soft per-isolate throttling for repeated invalid relay tokens.
 - ✅ DATA frame routing without payload inspection.
 - ✅ Replay buffer with ACK-driven GC and TTL safety net.
 - ✅ RESUME flow (OK + replay / FAIL on gap or hibernation).
 - ✅ PING/PONG keepalive support (relay-local).
-- ✅ Connection replacement on reconnect (old socket gets WS code 4003).
+- ✅ Active same-role sockets are not evicted by unauthenticated duplicate upgrades.
 - ✅ Hibernatable DO — no $$ for idle pairings.
 
 What still needs to land before the PWA can use this for real:
 
-- 🔜 **WS-transport adapter** in the PC bridge (replaces stdio pipes).
-- 🔜 **Browser WS client** in the PWA bundle.
-- 🔜 **Per-pairing bearer token** (Phase 1 leaves the WS open; Noise
-  layer is the real auth, but a dumb-bot rate-limit at the relay edge is
-  cheap and worth adding before public deploy).
-- 🔜 **Real-runtime smoke test** against `wrangler dev` (driving two
-  Noise peers through the live Worker).
+- 🔜 **Cloudflare-managed rate limits / abuse counters** for sustained public traffic.
+- 🔜 **Real-runtime smoke test stability** against `wrangler dev` in CI.
 - 🔜 **Hibernation timing measurement** — confirm CF actually unloads
   the DO under expected idle patterns; tune ping interval if not.
 

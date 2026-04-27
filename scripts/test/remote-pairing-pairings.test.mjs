@@ -24,6 +24,7 @@ import {
   findByPairingId,
   markSeen,
   buildPairing,
+  verifyRelayToken,
   addPairingPersisted,
   removePairingPersisted,
   MAX_PAIRINGS,
@@ -119,7 +120,6 @@ test("loadPairings rejects entries with bad phonePub hex", async () => {
       label: "",
       addedAtMs: 1,
       lastSeenAtMs: null,
-      lastSeenChannelBinding: null,
     }],
   }), "utf8");
   await assert.rejects(() => loadPairings(filePath), /phonePub/);
@@ -136,7 +136,6 @@ test("loadPairings rejects entries with wrong-sized phonePub", async () => {
       label: "",
       addedAtMs: 1,
       lastSeenAtMs: null,
-      lastSeenChannelBinding: null,
     }],
   }), "utf8");
   await assert.rejects(() => loadPairings(filePath), /must be 32 bytes/);
@@ -157,7 +156,6 @@ test("loadPairings re-derives fingerprint from phonePub", async () => {
       label: "",
       addedAtMs: 1,
       lastSeenAtMs: null,
-      lastSeenChannelBinding: null,
     }],
   }), "utf8");
   const loaded = await loadPairings(filePath);
@@ -187,8 +185,11 @@ test("addPairing is idempotent on phonePub (preserves addedAtMs)", () => {
 });
 
 test("addPairing throws past MAX_PAIRINGS", () => {
-  const list = [];
-  for (let i = 0; i < MAX_PAIRINGS; i++) list.push(fakePairing());
+  const existing = fakePairing();
+  const list = Array.from({ length: MAX_PAIRINGS }, (_, i) => ({
+    ...existing,
+    pairingId: `slot-${i}`,
+  }));
   assert.throws(() => addPairing(list, fakePairing()), /MAX_PAIRINGS/);
 });
 
@@ -219,15 +220,45 @@ test("findByPairingId returns the pairing or null", () => {
   assert.equal(findByPairingId([p], "no-such-slot"), null);
 });
 
-test("markSeen stamps lastSeenAtMs + channel binding (immutably)", () => {
+test("markSeen stamps lastSeenAtMs (immutably)", () => {
   const p = fakePairing();
-  const cb = new Uint8Array(32).fill(0xab);
-  const next = markSeen([p], p.phonePub, { atMs: 1234567, channelBinding: cb });
+  const next = markSeen([p], p.phonePub, { atMs: 1234567 });
   assert.equal(next.length, 1);
   assert.equal(next[0].lastSeenAtMs, 1234567);
-  assert.equal(next[0].lastSeenChannelBinding, "ab".repeat(32));
+  // Channel binding is no longer persisted (debug-only field removed).
+  assert.equal("lastSeenChannelBinding" in next[0], false);
   // Original list untouched.
   assert.equal(p.lastSeenAtMs, null);
+});
+
+test("markSeen ignores legacy channelBinding argument without throwing", () => {
+  const p = fakePairing();
+  const cb = new Uint8Array(32).fill(0xab);
+  // Older callers may still pass channelBinding; the parameter is accepted
+  // but discarded.
+  const next = markSeen([p], p.phonePub, { atMs: 999, channelBinding: cb });
+  assert.equal(next[0].lastSeenAtMs, 999);
+  assert.equal("lastSeenChannelBinding" in next[0], false);
+});
+
+test("loadPairings drops lastSeenChannelBinding from older schemas", async () => {
+  const filePath = await tmpFile();
+  const kp = generateIdentityKeypair();
+  await fs.writeFile(filePath, JSON.stringify({
+    version: 1,
+    pairings: [{
+      pairingId: "slot-legacy",
+      phonePub: bytesToHex(kp.pub),
+      phoneFingerprint: "AAAA-BBBB-CCCC",
+      label: "",
+      addedAtMs: 1,
+      lastSeenAtMs: null,
+      lastSeenChannelBinding: "ab".repeat(32),
+    }],
+  }), "utf8");
+  const loaded = await loadPairings(filePath);
+  assert.equal(loaded.length, 1);
+  assert.equal("lastSeenChannelBinding" in loaded[0], false);
 });
 
 test("markSeen on unknown pub is a no-op (returns equivalent list)", () => {
@@ -271,12 +302,33 @@ test("buildPairing computes fingerprint + addedAtMs", () => {
   const kp = generateIdentityKeypair();
   const p = buildPairing({ pairingId: "slot-x", phonePub: kp.pub, label: "test" });
   assert.equal(p.pairingId, "slot-x");
+  assert.equal(verifyRelayToken(p.pairingId, p.relayToken), true);
   assert.equal(p.phonePub, bytesToHex(kp.pub));
   assert.match(p.phoneFingerprint, /^[A-Z0-9]+(-[A-Z0-9]+)*$/);
   assert.equal(p.label, "test");
   assert.ok(p.addedAtMs > 0);
   assert.equal(p.lastSeenAtMs, null);
-  assert.equal(p.lastSeenChannelBinding, null);
+  // lastSeenChannelBinding removed from schema (debug-only, never read).
+  assert.equal("lastSeenChannelBinding" in p, false);
+});
+
+test("buildPairing preserves a supplied valid relayToken", () => {
+  const kp = generateIdentityKeypair();
+  const first = buildPairing({ pairingId: "slot-y", phonePub: kp.pub });
+  const second = buildPairing({
+    pairingId: "slot-y",
+    relayToken: first.relayToken,
+    phonePub: kp.pub,
+  });
+  assert.equal(second.relayToken, first.relayToken);
+});
+
+test("buildPairing rejects an invalid supplied relayToken", () => {
+  const kp = generateIdentityKeypair();
+  assert.throws(
+    () => buildPairing({ pairingId: "slot-z", relayToken: "v1.not-valid.nope", phonePub: kp.pub }),
+    /relayToken failed validation/,
+  );
 });
 
 test("buildPairing rejects wrong-sized phonePub", () => {

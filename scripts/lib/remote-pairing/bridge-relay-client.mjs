@@ -40,9 +40,10 @@
 
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
+import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
 
 import { RemotePairingTransport, STATE } from "../../../web/remote-pairing/transport.js";
-import { bytesToHex } from "./keys-core.mjs";
+import { bytesToHex, hexToBytes } from "./keys-core.mjs";
 import {
   loadPairings,
   REMOTE_PAIRINGS_FILE,
@@ -229,7 +230,7 @@ export class BridgeRelayClient {
 
   /**
    * Snapshot of the current sessions for introspection / a debug page.
-   * @returns {Array<{ pairingId: string, label: string, state: string,
+   * @returns {Array<{ pairingId: string, label: string, phonePub: string, state: string,
    *   lastSeenAtMs: number | null, channelBindingHex: string | null,
    *   phoneFingerprint: string }>}
    */
@@ -252,7 +253,7 @@ export class BridgeRelayClient {
   /** @param {Pairing} pairing */
   _spawnSession(pairing) {
     if (this._sessions.has(pairing.pairingId)) {
-      this._log.warn?.(`duplicate pairingId ${pairing.pairingId} — replacing`);
+      this._log.warn?.(`duplicate ${pairingLogLabel(pairing)} — replacing`);
       this._sessions.get(pairing.pairingId)?.close();
     }
     const session = new BridgePairingSession({
@@ -285,8 +286,8 @@ export class BridgeRelayClient {
     // to a different pairingId in the new list.
     for (const [pairingId, session] of this._sessions) {
       const next = byId.get(pairingId);
-      if (!next || next.phonePub !== session.pairing.phonePub) {
-        this._log.debug?.(`closing session ${pairingId} (removed or pubkey rotated)`);
+      if (!next || next.phonePub !== session.pairing.phonePub || next.relayToken !== session.pairing.relayToken) {
+        this._log.debug?.(`closing ${pairingLogLabel(session.pairing)} (removed or credentials rotated)`);
         session.close();
         this._sessions.delete(pairingId);
       }
@@ -335,10 +336,12 @@ class BridgePairingSession {
     /** @type {number | null} */
     this._lastSeenAtMs = null;
     this._closed = false;
-
-    this._transport = new RemotePairingTransport({
+    this._restartTimer = null;
+    this._restartAttempt = 0;
+    this._transportOpts = {
       relayUrl,
       pairingId: pairing.pairingId,
+      relayToken: pairing.relayToken,
       role: "bridge",
       initiator: false,
       identityKeypair,
@@ -346,7 +349,7 @@ class BridgePairingSession {
       // Noise IK reveals it during the handshake. We then validate against
       // the allowlist in `_handleHandshakeComplete`.
       onMessage: (pt) => this._handleMessage(pt),
-      onStateChange: (state, prev, info) => this._onStateChange(state, prev, info),
+      onStateChange: (state, prev, info) => this._handleTransportState(state, prev, info),
       onError: (err) => this._onError(err),
       onHandshakeComplete: (info) => this._handleHandshakeComplete(info),
       WebSocketImpl,
@@ -355,7 +358,8 @@ class BridgePairingSession {
       handshakeTimeoutMs,
       prologue,
       logger: logger,
-    });
+    };
+    this._transport = this._createTransport();
   }
 
   async start() {
@@ -366,7 +370,7 @@ class BridgePairingSession {
       // The first connect failed (likely couldn't open the WS at all). The
       // transport will keep retrying internally; the rejection here is just
       // the first-attempt promise. Log and keep going.
-      this._log.debug?.(`initial connect rejected for ${this.pairing.pairingId}: ${err.message}`);
+      this._log.debug?.(`initial connect rejected for ${this._logLabel()}: ${err.message}`);
     }
   }
 
@@ -387,7 +391,7 @@ class BridgePairingSession {
       this._transport.send(bytes);
       return true;
     } catch (err) {
-      this._log.warn?.(`send failed on ${this.pairing.pairingId}: ${err.message}`);
+      this._log.warn?.(`send failed on ${this._logLabel()}: ${err.message}`);
       return false;
     }
   }
@@ -395,6 +399,7 @@ class BridgePairingSession {
   close() {
     if (this._closed) return;
     this._closed = true;
+    this._clearRestartTimer();
     // Abort any in-flight request handlers so awaited dispatchers can return
     // promptly. We don't bother sending responses for these — the peer
     // already lost the connection.
@@ -407,6 +412,7 @@ class BridgePairingSession {
     return {
       pairingId: this.pairing.pairingId,
       label: this.pairing.label,
+      phonePub: this.pairing.phonePub,
       state: this._transport.state,
       lastSeenAtMs: this._lastSeenAtMs,
       channelBindingHex: this._channelBinding ? bytesToHex(this._channelBinding) : null,
@@ -418,22 +424,79 @@ class BridgePairingSession {
   // Handshake completion — verify allowlist
   // -------------------------------------------------------------------------
 
+  _createTransport() {
+    return new RemotePairingTransport(this._transportOpts);
+  }
+
+  _handleTransportState(state, prev, info) {
+    this._onStateChange(state, prev, info);
+    if (state === STATE.CONNECTED) {
+      this._restartAttempt = 0;
+      return;
+    }
+    if (state === STATE.FAILED && !this._closed) {
+      this._scheduleTransportRestart(info?.error);
+    }
+  }
+
+  _scheduleTransportRestart(error) {
+    if (this._restartTimer || this._closed) return;
+    for (const ctrl of this._inFlight.values()) ctrl.abort(new Error("transport restarting"));
+    this._inFlight.clear();
+    this._channelBinding = null;
+
+    const delays = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+    const delay = delays[Math.min(this._restartAttempt, delays.length - 1)];
+    this._restartAttempt += 1;
+    this._log.warn?.(
+      `transport failed for ${this._logLabel()}; rebuilding in ${delay}ms` +
+      `${error?.message ? ` (${error.message})` : ""}`,
+    );
+    this._restartTimer = setTimeout(() => {
+      this._restartTimer = null;
+      if (this._closed) return;
+      try {
+        this._transport.close();
+      } catch {
+        // Failed transports may already have closed their socket.
+      }
+      this._transport = this._createTransport();
+      this.start().catch((err) => {
+        this._onError(err);
+      });
+    }, delay);
+  }
+
+  _clearRestartTimer() {
+    if (this._restartTimer != null) {
+      clearTimeout(this._restartTimer);
+      this._restartTimer = null;
+    }
+  }
+
   _handleHandshakeComplete({ channelBinding, remoteStatic }) {
     if (this._closed) return;
     if (!remoteStatic) {
       this._fatal(new Error("handshake completed without revealing remoteStatic"));
       return;
     }
-    const peerPubHex = bytesToHex(remoteStatic);
-    if (peerPubHex !== this.pairing.phonePub) {
+    // Constant-time pubkey check. The previous `peerPubHex !== ...` form
+    // short-circuits on the first mismatching hex char, leaking how far
+    // an attacker's guess matched via WS handshake-completion latency. The
+    // attack window is narrow (relay jitter dominates) but the fix is
+    // mechanical, so the prudent default is timing-safe equality.
+    const expected = hexToBytes(this.pairing.phonePub);
+    if (
+      remoteStatic.length !== expected.length ||
+      !nodeTimingSafeEqual(remoteStatic, expected)
+    ) {
       // Possible causes:
       //   - The relay routed the wrong phone here (server bug).
       //   - The phone rotated keys without updating the LAN-side allowlist.
       //   - Someone with stolen credentials is impersonating the slot.
       // None are recoverable by waiting; close the session.
       this._fatal(new Error(
-        `peer pubkey ${peerPubHex} doesn't match pairing ${this.pairing.pairingId} ` +
-        `(expected ${this.pairing.phonePub})`,
+        `peer pubkey mismatch for ${this._logLabel()}`,
       ));
       return;
     }
@@ -472,7 +535,7 @@ class BridgePairingSession {
     } catch (err) {
       // A malformed RPC frame inside an authenticated channel is suspicious
       // but recoverable — log and drop, don't tear the session down.
-      this._log.warn?.(`rpc decode failed on ${this.pairing.pairingId}: ${err.message}`);
+      this._log.warn?.(`rpc decode failed on ${this._logLabel()}: ${err.message}`);
       return;
     }
     switch (frame.type) {
@@ -487,7 +550,7 @@ class BridgePairingSession {
         // Bridge is the responder of RPC requests and the producer of events.
         // Receiving these from the phone means the phone confused roles —
         // log and drop.
-        this._log.warn?.(`unexpected rpc type ${frame.type} from phone ${this.pairing.pairingId}`);
+        this._log.warn?.(`unexpected rpc type ${frame.type} from ${this._logLabel()}`);
         break;
       default:
         this._log.warn?.(`unhandled rpc type ${frame.type}`);
@@ -540,7 +603,7 @@ class BridgePairingSession {
           return;
         }
         this._log.warn?.(
-          `dispatch error on ${this.pairing.pairingId} ${req.method} ${req.path}: ${err?.message}`,
+          `dispatch error on ${this._logLabel()} ${requestLogLabel(req)}: ${err?.message}`,
         );
         this._sendResponse({
           id: req.id,
@@ -570,7 +633,7 @@ class BridgePairingSession {
       bytes = encodeResponse(res);
     } catch (err) {
       this._log.error?.(
-        `failed to encode response for ${this.pairing.pairingId} id=${res.id}: ${err.message}`,
+        `failed to encode response for ${this._logLabel()} id=${res.id}: ${err.message}`,
       );
       return;
     }
@@ -578,15 +641,19 @@ class BridgePairingSession {
       // Lost the channel between dispatch start and response. The phone-side
       // RPC client is expected to time out and retry; we drop silently.
       this._log.debug?.(
-        `dropped response id=${res.id} on ${this.pairing.pairingId} — transport not connected`,
+        `dropped response id=${res.id} on ${this._logLabel()} — transport not connected`,
       );
       return;
     }
     try {
       this._transport.send(bytes);
     } catch (err) {
-      this._log.warn?.(`response send failed on ${this.pairing.pairingId}: ${err.message}`);
+      this._log.warn?.(`response send failed on ${this._logLabel()}: ${err.message}`);
     }
+  }
+
+  _logLabel() {
+    return pairingLogLabel(this.pairing);
   }
 }
 
@@ -607,6 +674,29 @@ function normalizeLogger(logger) {
     warn: typeof logger.warn === "function" ? logger.warn.bind(logger) : undefined,
     error: typeof logger.error === "function" ? logger.error.bind(logger) : undefined,
   };
+}
+
+function pairingLogLabel(pairing) {
+  if (pairing?.phoneFingerprint) {
+    return `phone:${pairing.phoneFingerprint}`;
+  }
+  return redactPairingId(pairing?.pairingId);
+}
+
+function redactPairingId(pairingId) {
+  const value = String(pairingId || "");
+  return value ? `pairing:${value.slice(0, 6)}…` : "pairing:unknown";
+}
+
+function requestLogLabel(req) {
+  const method = String(req?.method || "REQUEST").toUpperCase();
+  try {
+    const pathname = new URL(String(req?.path || "/"), "http://viveworker.local").pathname;
+    const parts = pathname.split("/").filter(Boolean).slice(0, 2);
+    return `${method} /${parts.join("/")}`;
+  } catch {
+    return method;
+  }
 }
 
 function validateDispatchResult(result) {

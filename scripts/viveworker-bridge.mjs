@@ -47,6 +47,8 @@ const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "func
   ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
   : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
+const WEB_APP_BUILD_ID = "20260427-timeline-image-permission";
+const WEB_APP_SCRIPT_URL = `/app.js?v=${WEB_APP_BUILD_ID}`;
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
@@ -818,6 +820,21 @@ function normalizeTimelineFileRefs(rawFileRefs) {
     }
   }
   return deduped;
+}
+
+function filterTimelineFileRefsForImagePaths(fileRefs, imagePaths) {
+  const normalizedRefs = normalizeTimelineFileRefs(fileRefs);
+  const normalizedImages = normalizeTimelineImagePaths(imagePaths);
+  if (normalizedRefs.length === 0 || normalizedImages.length === 0) {
+    return normalizedRefs;
+  }
+
+  const imageRefKeys = new Set();
+  for (const imagePath of normalizedImages) {
+    imageRefKeys.add(imagePath);
+    imageRefKeys.add(path.basename(imagePath));
+  }
+  return normalizedRefs.filter((fileRef) => !imageRefKeys.has(fileRef) && !imageRefKeys.has(path.basename(fileRef)));
 }
 
 function cleanTimelineFileRef(value) {
@@ -2886,7 +2903,8 @@ function normalizeHistoryItem(raw) {
   const title =
     (!isFallbackTimelineTitle(rawTitle, kind, threadId) ? rawTitle : "") ||
     (threadLabel ? formatTitle(kindTitle(DEFAULT_LOCALE, kind), threadLabel) : kindTitle(DEFAULT_LOCALE, kind));
-  const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
+  const rawMessageText = raw.messageText ?? "";
+  const messageText = normalizeTimelineMessageText(rawMessageText);
   const summary = normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "";
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
   if (!stableId || !historyKinds.has(kind) || !title) {
@@ -2894,6 +2912,14 @@ function normalizeHistoryItem(raw) {
   }
 
   const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
+  const imagePaths = normalizeTimelineImagePaths([
+    ...(Array.isArray(raw.imagePaths ?? raw.localImagePaths) ? (raw.imagePaths ?? raw.localImagePaths) : []),
+    ...extractTimelineImagePaths(rawMessageText),
+  ]);
+  const fileRefs = filterTimelineFileRefsForImagePaths(
+    normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    imagePaths
+  );
 
   const normalized = {
     stableId,
@@ -2904,8 +2930,8 @@ function normalizeHistoryItem(raw) {
     threadLabel,
     summary,
     messageText,
-    imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
-    fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    imagePaths,
+    fileRefs,
     diffText: normalizeTimelineDiffText(raw.diffText ?? ""),
     diffSource: normalizeTimelineDiffSource(raw.diffSource ?? ""),
     diffAvailable: raw.diffAvailable === true || Boolean(raw.diffText),
@@ -3139,7 +3165,8 @@ function normalizeTimelineEntry(raw) {
   }
 
   const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
-  const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
+  const rawMessageText = raw.messageText ?? "";
+  const messageText = normalizeTimelineMessageText(rawMessageText);
   const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
   const diffText = normalizeTimelineDiffText(raw.diffText ?? "");
   const diffSource = normalizeTimelineDiffSource(raw.diffSource ?? "");
@@ -3174,6 +3201,14 @@ function normalizeTimelineEntry(raw) {
     threadLabel ||
     kindTitle(DEFAULT_LOCALE, kind);
   const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
+  const imagePaths = normalizeTimelineImagePaths([
+    ...(Array.isArray(raw.imagePaths ?? raw.localImagePaths) ? (raw.imagePaths ?? raw.localImagePaths) : []),
+    ...extractTimelineImagePaths(rawMessageText),
+  ]);
+  const fileRefs = filterTimelineFileRefsForImagePaths(
+    normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    imagePaths
+  );
 
   const normalized = {
     stableId,
@@ -3186,8 +3221,8 @@ function normalizeTimelineEntry(raw) {
     messageText,
     fileEventType,
     previousFileRefs: normalizeTimelineFileRefs(raw.previousFileRefs ?? []),
-    imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
-    fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    imagePaths,
+    fileRefs,
     diffText,
     diffSource,
     diffAvailable: raw.diffAvailable === true || Boolean(diffText),
@@ -5193,8 +5228,8 @@ async function readRecentRolloutUserMessagesWithImages({ filePath, maxBytes }) {
 async function querySqliteTimelineRows({ logsDbFile, cursorId, minTsSec = 0 }) {
   const conditions = [
     `id > ${Math.max(0, Number(cursorId) || 0)}`,
-    `target = 'codex_api::endpoint::responses_websocket'`,
-    `feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%'`,
+    `target IN ('codex_api::endpoint::responses_websocket', 'codex_api::sse::responses')`,
+    `(feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%' OR feedback_log_body LIKE '%SSE event: {"type":"response.output_item.done"%')`,
     `feedback_log_body LIKE '%"type":"message"%'`,
     `feedback_log_body LIKE '%"role":"assistant"%'`,
   ];
@@ -5204,28 +5239,50 @@ async function querySqliteTimelineRows({ logsDbFile, cursorId, minTsSec = 0 }) {
   }
 
   const sql = `
-    SELECT id, ts, thread_id, feedback_log_body
+    SELECT
+      logs.id,
+      logs.ts,
+      logs.thread_id,
+      logs.feedback_log_body,
+      (
+        SELECT ctx.feedback_log_body
+        FROM logs AS ctx
+        WHERE ctx.id < logs.id
+          AND ctx.id >= logs.id - 5
+          AND ctx.target = 'codex_otel.log_only'
+          AND ctx.feedback_log_body LIKE '%conversation.id=%'
+        ORDER BY ctx.id DESC
+        LIMIT 1
+      ) AS context_log_body
     FROM logs
     WHERE ${conditions.join("\n      AND ")}
-    ORDER BY id ASC
+    ORDER BY logs.id ASC
     LIMIT ${SQLITE_COMPLETION_BATCH_SIZE}
   `;
 
   return runSqliteJsonQuery(logsDbFile, sql);
 }
 
+function parseResponsesEventPayload(body) {
+  const raw = String(body || "");
+  for (const marker of ["websocket event: ", "SSE event: "]) {
+    const markerIndex = raw.indexOf(marker);
+    if (markerIndex === -1) {
+      continue;
+    }
+    try {
+      return JSON.parse(raw.slice(markerIndex + marker.length));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function buildSqliteTimelineEntry({ row, config, runtime }) {
   const body = String(row?.feedback_log_body ?? "");
-  const marker = "websocket event: ";
-  const markerIndex = body.indexOf(marker);
-  if (markerIndex === -1) {
-    return null;
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(body.slice(markerIndex + marker.length));
-  } catch {
+  const payload = parseResponsesEventPayload(body);
+  if (!payload) {
     return null;
   }
 
@@ -5249,7 +5306,12 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
     return null;
   }
 
-  const threadId = cleanText(row.thread_id || extractThreadIdFromLogBody(body));
+  const contextLogBody = String(row?.context_log_body ?? "");
+  const threadId = cleanText(
+    row.thread_id ||
+    extractThreadIdFromLogBody(body) ||
+    extractThreadIdFromLogBody(contextLogBody)
+  );
   if (!threadId) {
     return null;
   }
@@ -5377,6 +5439,25 @@ async function findReplyUploadFallback(config, sourcePath, usedPaths = new Set()
   return candidates[0]?.filePath || "";
 }
 
+function isFileAccessDeniedError(error) {
+  const code = cleanText(error?.code || "");
+  return code === "EACCES" || code === "EPERM";
+}
+
+async function copyFileWithSystemCp(sourcePath, destinationPath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("/bin/cp", ["-p", sourcePath, destinationPath], { stdio: "ignore" });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve(true);
+        return;
+      }
+      reject(new Error(`cp exited with ${signal || code}`));
+    });
+  });
+}
+
 async function copyTimelineAttachmentToPersistentDir(config, sourcePath) {
   const normalizedSourcePath = resolvePath(cleanText(sourcePath || ""));
   if (!normalizedSourcePath) {
@@ -5393,6 +5474,16 @@ async function copyTimelineAttachmentToPersistentDir(config, sourcePath) {
     await fs.copyFile(normalizedSourcePath, destinationPath);
     return destinationPath;
   } catch (error) {
+    if (isFileAccessDeniedError(error)) {
+      try {
+        await copyFileWithSystemCp(normalizedSourcePath, destinationPath);
+        return destinationPath;
+      } catch (fallbackError) {
+        await fs.rm(destinationPath, { force: true }).catch(() => {});
+        console.warn(`[timeline-image-copy-skipped] ${error?.message || error}; cp fallback failed: ${fallbackError?.message || fallbackError}`);
+        return "";
+      }
+    }
     console.warn(`[timeline-image-copy-skipped] ${error?.message || error}`);
     return "";
   }
@@ -5405,8 +5496,12 @@ async function normalizePersistedTimelineImagePaths({ config, state, imagePaths 
   }
 
   const aliases = isPlainObject(state.timelineImagePathAliases) ? state.timelineImagePathAliases : (state.timelineImagePathAliases = {});
+  const copyFailures = isPlainObject(state.timelineImagePathCopyFailures)
+    ? state.timelineImagePathCopyFailures
+    : (state.timelineImagePathCopyFailures = {});
   const usedFallbacks = new Set();
   const nextPaths = [];
+  const copyRetryMs = 10 * 60 * 1000;
 
   for (const rawPath of normalizedImagePaths) {
     const normalizedPath = cleanText(rawPath || "");
@@ -5416,24 +5511,38 @@ async function normalizePersistedTimelineImagePaths({ config, state, imagePaths 
 
     const aliasedPath = cleanText(aliases[normalizedPath] || "");
     if (aliasedPath) {
-      try {
-        await fs.access(aliasedPath);
-        nextPaths.push(aliasedPath);
-        continue;
-      } catch {
-        // Fall through and repair below.
+      if (aliasedPath.startsWith(`${config.timelineAttachmentsDir}${path.sep}`)) {
+        try {
+          await fs.access(aliasedPath);
+          nextPaths.push(aliasedPath);
+          continue;
+        } catch {
+          // Fall through and repair below.
+        }
       }
+    }
+
+    const lastCopyFailureMs = Math.max(0, Number(copyFailures[normalizedPath]) || 0);
+    if (
+      lastCopyFailureMs > 0 &&
+      Date.now() - lastCopyFailureMs < copyRetryMs &&
+      !normalizedPath.startsWith(`${config.timelineAttachmentsDir}${path.sep}`)
+    ) {
+      nextPaths.push(normalizedPath);
+      continue;
     }
 
     let existingSourcePath = normalizedPath;
     try {
       await fs.access(existingSourcePath);
-    } catch {
-      existingSourcePath = await findReplyUploadFallback(config, normalizedPath, usedFallbacks);
-      if (!existingSourcePath) {
-        continue;
+    } catch (error) {
+      if (!isFileAccessDeniedError(error)) {
+        existingSourcePath = await findReplyUploadFallback(config, normalizedPath, usedFallbacks);
+        if (!existingSourcePath) {
+          continue;
+        }
+        usedFallbacks.add(existingSourcePath);
       }
-      usedFallbacks.add(existingSourcePath);
     }
 
     let persistentPath = existingSourcePath;
@@ -5441,6 +5550,11 @@ async function normalizePersistedTimelineImagePaths({ config, state, imagePaths 
       persistentPath = await copyTimelineAttachmentToPersistentDir(config, existingSourcePath) || existingSourcePath;
     }
 
+    if (persistentPath === existingSourcePath && !existingSourcePath.startsWith(`${config.timelineAttachmentsDir}${path.sep}`)) {
+      copyFailures[normalizedPath] = Date.now();
+    } else {
+      delete copyFailures[normalizedPath];
+    }
     aliases[normalizedPath] = persistentPath;
     nextPaths.push(persistentPath);
   }
@@ -5787,8 +5901,8 @@ async function processScannedEvent({ config, runtime, state, event }) {
 async function querySqliteCompletionRows({ logsDbFile, cursorId, minTsSec = 0 }) {
   const conditions = [
     `id > ${Math.max(0, Number(cursorId) || 0)}`,
-    `target = 'codex_api::endpoint::responses_websocket'`,
-    `feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%'`,
+    `target IN ('codex_api::endpoint::responses_websocket', 'codex_api::sse::responses')`,
+    `(feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%' OR feedback_log_body LIKE '%SSE event: {"type":"response.output_item.done"%')`,
     `feedback_log_body LIKE '%"type":"message"%'`,
     `feedback_log_body LIKE '%"role":"assistant"%'`,
     `feedback_log_body LIKE '%"phase":"final_answer"%'`,
@@ -5799,10 +5913,24 @@ async function querySqliteCompletionRows({ logsDbFile, cursorId, minTsSec = 0 })
   }
 
   const sql = `
-    SELECT id, ts, thread_id, feedback_log_body
+    SELECT
+      logs.id,
+      logs.ts,
+      logs.thread_id,
+      logs.feedback_log_body,
+      (
+        SELECT ctx.feedback_log_body
+        FROM logs AS ctx
+        WHERE ctx.id < logs.id
+          AND ctx.id >= logs.id - 5
+          AND ctx.target = 'codex_otel.log_only'
+          AND ctx.feedback_log_body LIKE '%conversation.id=%'
+        ORDER BY ctx.id DESC
+        LIMIT 1
+      ) AS context_log_body
     FROM logs
     WHERE ${conditions.join("\n      AND ")}
-    ORDER BY id ASC
+    ORDER BY logs.id ASC
     LIMIT ${SQLITE_COMPLETION_BATCH_SIZE}
   `;
 
@@ -5848,16 +5976,8 @@ async function runSqliteJsonQuery(dbFile, sql) {
 
 function buildSqliteCompletionEvent({ row, config, runtime }) {
   const body = String(row?.feedback_log_body ?? "");
-  const marker = "websocket event: ";
-  const markerIndex = body.indexOf(marker);
-  if (markerIndex === -1) {
-    return null;
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(body.slice(markerIndex + marker.length));
-  } catch {
+  const payload = parseResponsesEventPayload(body);
+  if (!payload) {
     return null;
   }
 
@@ -5870,7 +5990,12 @@ function buildSqliteCompletionEvent({ row, config, runtime }) {
     return null;
   }
 
-  const threadId = cleanText(row.thread_id || extractThreadIdFromLogBody(body));
+  const contextLogBody = String(row?.context_log_body ?? "");
+  const threadId = cleanText(
+    row.thread_id ||
+    extractThreadIdFromLogBody(body) ||
+    extractThreadIdFromLogBody(contextLogBody)
+  );
   const turnId = cleanText(extractTurnIdFromLogBody(body) || item.id || row.id);
   if (!threadId || !turnId) {
     return null;
@@ -8954,6 +9079,14 @@ function deriveClaudeSdkCliThreadLabel(messageText, conversationId = "") {
   if (/^You are scoring Moltbook posts? for an AI agent\b/iu.test(single)) {
     return "Moltbook scoring";
   }
+  if (/^You are drafting a reply on behalf of the agent described below\b/iu.test(single) ||
+      /\bYou are replying to the following post on Moltbook\b/iu.test(single)) {
+    return "Moltbook reply drafting";
+  }
+  if (/^You are composing an original post on Moltbook\b/iu.test(single) ||
+      /\bAvailable submolts:\s*general,\s*builds,\s*tooling,\s*agents,\s*infrastructure\b.*\bSUBMOLT:\s*.*\bTITLE:\s*.*\bINTENT:\s*/iu.test(single)) {
+    return "Moltbook post drafting";
+  }
   if (/^Codex from another agent:/iu.test(single)) {
     return truncate(cleanText(single.replace(/^Codex from another agent:\s*/iu, "")), 90) || "Cross-agent task";
   }
@@ -8974,6 +9107,46 @@ function isHiddenClaudeInternalScoringText(text) {
   return /^You are scoring Moltbook posts? for an AI agent\b/iu.test(single);
 }
 
+function isMoltbookHarnessThreadLabel(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single) {
+    return false;
+  }
+  return (
+    single === "Moltbook reply drafting" ||
+    single === "Moltbook post drafting" ||
+    /^You are drafting a reply on behalf of the agent described below\b/iu.test(single) ||
+    /^You are composing an original post on Moltbook\b/iu.test(single) ||
+    /\bYou are replying to the following post on Moltbook\b/iu.test(single) ||
+    /\bAvailable submolts:\s*general,\s*builds,\s*tooling,\s*agents,\s*infrastructure\b.*\bSUBMOLT:\s*.*\bTITLE:\s*.*\bINTENT:\s*/iu.test(single)
+  );
+}
+
+function isHiddenMoltbookHarnessPromptText(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single) {
+    return false;
+  }
+  return (
+    /^You are drafting a reply on behalf of the agent described below\b/iu.test(single) ||
+    /^You are composing an original post on Moltbook\b/iu.test(single) ||
+    /\bYou are replying to the following post on Moltbook\b/iu.test(single) ||
+    /\bAvailable submolts:\s*general,\s*builds,\s*tooling,\s*agents,\s*infrastructure\b.*\bSUBMOLT:\s*.*\bTITLE:\s*.*\bINTENT:\s*/iu.test(single)
+  );
+}
+
+function isHiddenMoltbookHarnessOutputText(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single) {
+    return false;
+  }
+  return (
+    /^INTENT:\s+.+\s+---\s+.+/isu.test(single) ||
+    /^SUBMOLT:\s+.+\s+TITLE:\s+.+\s+INTENT:\s+.+\s+---\s+.+/isu.test(single) ||
+    single === "NO_MATCH"
+  );
+}
+
 function isHiddenCodexApprovalAssessmentText(text) {
   const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
   if (!single) {
@@ -8983,7 +9156,7 @@ function isHiddenCodexApprovalAssessmentText(text) {
 }
 
 function shouldHideInternalTimelineItem(item) {
-  return shouldHideClaudeInternalItem(item) || shouldHideCodexInternalApprovalItem(item);
+  return shouldHideClaudeInternalItem(item) || shouldHideCodexInternalApprovalItem(item) || shouldHideMoltbookHarnessItem(item);
 }
 
 function shouldHideClaudeInternalItem(item) {
@@ -9002,6 +9175,29 @@ function shouldHideClaudeInternalItem(item) {
     isHiddenClaudeInternalScoringText(item.summary) ||
     isHiddenClaudeInternalScoringText(item.detailText) ||
     isHiddenClaudeInternalScoringText(item.message)
+  );
+}
+
+function shouldHideMoltbookHarnessItem(item) {
+  if (!isPlainObject(item)) {
+    return false;
+  }
+  const provider = normalizeProvider(item.provider);
+  if (provider !== "claude" && provider !== "codex") {
+    return false;
+  }
+
+  return (
+    isMoltbookHarnessThreadLabel(item.threadLabel) ||
+    isMoltbookHarnessThreadLabel(item.title) ||
+    isHiddenMoltbookHarnessPromptText(item.messageText) ||
+    isHiddenMoltbookHarnessPromptText(item.summary) ||
+    isHiddenMoltbookHarnessPromptText(item.detailText) ||
+    isHiddenMoltbookHarnessPromptText(item.message) ||
+    isHiddenMoltbookHarnessOutputText(item.messageText) ||
+    isHiddenMoltbookHarnessOutputText(item.summary) ||
+    isHiddenMoltbookHarnessOutputText(item.detailText) ||
+    isHiddenMoltbookHarnessOutputText(item.message)
   );
 }
 
@@ -9823,6 +10019,16 @@ function base64UrlDecode(value) {
   return Buffer.from(String(value), "base64url").toString("utf8");
 }
 
+function constantTimeStringEqual(a, b) {
+  // Pad-then-compare so the timing leak is bounded by the longer string's
+  // length rather than the matching prefix. Caller still gets a clean
+  // boolean — no behavioural difference from `===`.
+  const left = Buffer.from(String(a ?? ""), "utf8");
+  const right = Buffer.from(String(b ?? ""), "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
 function signSessionPayload(payload, secret) {
   const encoded = base64UrlEncode(JSON.stringify(payload));
   const signature = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
@@ -10159,6 +10365,7 @@ function buildSessionPayload({ config, state, session }) {
     webPushEnabled: config.webPushEnabled,
     httpsEnabled: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
     appVersion: appPackageVersion,
+    webAppBuildId: WEB_APP_BUILD_ID,
     deviceId: session.deviceId || null,
     temporaryPairing: session.temporaryPairing === true,
     ...buildSessionLocalePayload(config, state, session.deviceId),
@@ -10519,8 +10726,15 @@ function validatePairingPayload(payload, config, state) {
 
   const code = cleanText(payload?.code ?? "").toUpperCase();
   const token = cleanText(payload?.token ?? "");
-  const matchesCode = code && cleanText(config.pairingCode).toUpperCase() === code;
-  const matchesToken = token && cleanText(config.pairingToken) === token;
+  // Constant-time compare both sides — even with the 8/15min lockout the
+  // pairing token is long enough that a measurable timing prefix-attack
+  // could meaningfully reduce the brute-force search space.
+  const matchesCode =
+    !!code &&
+    constantTimeStringEqual(cleanText(config.pairingCode).toUpperCase(), code);
+  const matchesToken =
+    !!token &&
+    constantTimeStringEqual(cleanText(config.pairingToken), token);
   if (matchesToken) {
     return { ok: true, credential: `token:${token}` };
   }
@@ -11337,7 +11551,7 @@ function buildTimelineResponse(runtime, state, config, locale) {
     threadLabel: entry.threadLabel,
     summary: entry.summary,
     fileEventType: normalizeTimelineFileEventType(entry.fileEventType ?? ""),
-    imageUrls: buildTimelineEntryImageUrls(entry),
+    imageUrls: buildTimelineEntryImageUrls(entry, config),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     diffAvailable: Boolean(entry.diffAvailable),
     diffAddedLines: Math.max(0, Number(entry.diffAddedLines) || 0),
@@ -11846,7 +12060,35 @@ function buildHistoryDetail(item, locale, runtime = null) {
   };
 }
 
-function buildTimelineEntryImageUrls(entry) {
+function signTimelineEntryImageUrl(config, token, index, filePath) {
+  const secret = cleanText(config?.sessionSecret || "");
+  const normalizedToken = cleanText(token || "");
+  const normalizedPath = filePath ? path.resolve(String(filePath)) : "";
+  const normalizedIndex = Math.max(0, Number(index) || 0);
+  if (!secret || !normalizedToken || !normalizedPath) {
+    return "";
+  }
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${normalizedToken}\n${normalizedIndex}\n${normalizedPath}`)
+    .digest("base64url");
+}
+
+function isValidTimelineEntryImageSignature(config, url, token, index, filePath) {
+  const provided = cleanText(url?.searchParams?.get("imageToken") || "");
+  if (!provided) {
+    return false;
+  }
+  const expected = signTimelineEntryImageUrl(config, token, index, filePath);
+  if (!expected) {
+    return false;
+  }
+  const left = Buffer.from(provided, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function buildTimelineEntryImageUrls(entry, config = null) {
   const imagePaths = normalizeTimelineImagePaths(entry?.imagePaths ?? []);
   if (imagePaths.length === 0) {
     return [];
@@ -11855,10 +12097,14 @@ function buildTimelineEntryImageUrls(entry) {
   if (!token) {
     return [];
   }
-  return imagePaths.map((_, index) => `/api/timeline/${encodeURIComponent(token)}/images/${index}`);
+  return imagePaths.map((filePath, index) => {
+    const imageToken = signTimelineEntryImageUrl(config, token, index, filePath);
+    const suffix = imageToken ? `?imageToken=${encodeURIComponent(imageToken)}` : "";
+    return `/api/timeline/${encodeURIComponent(token)}/images/${index}${suffix}`;
+  });
 }
 
-function buildTimelineMessageDetail(entry, locale, runtime = null) {
+function buildTimelineMessageDetail(entry, locale, runtime = null, config = null) {
   return {
     kind: entry.kind,
     token: entry.token,
@@ -11867,7 +12113,7 @@ function buildTimelineMessageDetail(entry, locale, runtime = null) {
     threadLabel: entry.threadLabel || "",
     createdAtMs: Number(entry.createdAtMs) || 0,
     messageHtml: renderMessageHtml(entry.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
-    imageUrls: buildTimelineEntryImageUrls(entry),
+    imageUrls: buildTimelineEntryImageUrls(entry, config),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
     interruptNotice: interruptedDetailNotice(entry.messageText, locale),
@@ -13172,7 +13418,7 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   if (timelineMessageKinds.has(kind)) {
     const entry = timelineEntryByToken(runtime, token, kind);
     if (!entry) return null;
-    const detail = buildTimelineMessageDetail(entry, locale, runtime);
+    const detail = buildTimelineMessageDetail(entry, locale, runtime, config);
     // Add reply support for Codex assistant_final entries only (replaces completion reply).
     // Check directly against timeline entries (not history items) to avoid
     // maxHistoryItems eviction issues.
@@ -13373,8 +13619,11 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
 }
 
-function resolveTimelineEntryImagePath(runtime, token, index) {
-  const entry = timelineEntryByToken(runtime, token);
+function resolveTimelineEntryImagePath(runtime, state, token, index) {
+  const normalizedToken = cleanText(token || "");
+  const entry = timelineEntryByToken(runtime, normalizedToken)
+    || (state?.recentTimelineEntries ?? []).find((candidate) => cleanText(candidate?.token || "") === normalizedToken)
+    || null;
   if (!entry) {
     return "";
   }
@@ -13658,7 +13907,7 @@ function buildWebAppHtml({ pairToken }) {
       </div>
     </div>
     <div id="app"></div>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="${WEB_APP_SCRIPT_URL}"></script>
   </body>
 </html>`;
 }
@@ -13671,6 +13920,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
   const requestHandler = async (req, res) => {
     try {
       const url = new URL(req.url, config.nativeApprovalPublicBaseUrl);
+      refreshPairingConfigFromEnvFile(config);
 
       if (url.pathname === "/health") {
         return writeJson(res, 200, { ok: true });
@@ -13908,9 +14158,10 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
         const sessionPayload = buildSessionPayload({ config, state, session });
         if (!session.authenticated) {
-          return writeJson(res, 200, { session: sessionPayload });
+          return writeJson(res, 200, { appBuildId: WEB_APP_BUILD_ID, session: sessionPayload });
         }
         return writeJson(res, 200, {
+          appBuildId: WEB_APP_BUILD_ID,
           session: sessionPayload,
           inbox: buildInboxFastResponse(runtime, state, config, localeInfo.locale),
           timeline: buildTimelineResponse(runtime, state, config, localeInfo.locale),
@@ -14732,7 +14983,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       //
       // Body: { relayUrl: string | null }
       //   - empty string / null  → falls back to DEFAULT_RELAY_URL
-      //   - non-empty string     → must be ws:// or wss://
+      //   - non-empty string     → must be wss://, except ws:// loopback for local dev
       // Persists + hot-restarts (only restarts if currently enabled, since
       // a dormant handle has nothing to reconnect).
       if (url.pathname === "/api/remote-pairing/relay-url" && req.method === "POST") {
@@ -14745,21 +14996,14 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
         }
         const raw = body?.relayUrl;
-        let normalized = "";
-        if (raw == null || raw === "") {
-          normalized = "";
-        } else if (typeof raw === "string") {
-          const trimmed = raw.trim();
-          if (!/^wss?:\/\//u.test(trimmed)) {
-            return writeJson(res, 400, {
-              error: "invalid-relay-url",
-              message: "relayUrl must be ws:// or wss:// (or empty for default)",
-            });
-          }
-          normalized = trimmed;
-        } else {
-          return writeJson(res, 400, { error: "invalid-relay-url" });
+        const relayUrlResult = normalizeRemotePairingRelayUrl(raw ?? "");
+        if (!relayUrlResult.ok) {
+          return writeJson(res, 400, {
+            error: "invalid-relay-url",
+            message: relayUrlResult.message,
+          });
         }
+        const normalized = relayUrlResult.value;
         config.remotePairingRelayUrl = normalized;
         try {
           await persistRemotePairingEnv({ relayUrl: normalized || null });
@@ -14836,7 +15080,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       // the bridge via the relay (when off-LAN).
       //
       // Body: { phonePubHex: string (64-hex), label?: string (≤200 chars) }
-      // Returns: { ok, pairingId, phonePub, phoneFingerprint, bridgePubHex,
+      // Returns: { ok, pairingId, relayToken, phonePub, phoneFingerprint, bridgePubHex,
       //            bridgeFingerprint, relayUrl, label, addedAtMs }
       //
       // Side effects:
@@ -14895,6 +15139,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         }
         const existing = existingPairings.find((p) => p.phonePub === phonePubHex);
         const pairingId = existing?.pairingId || crypto.randomUUID();
+        const relayToken = existing?.relayToken || undefined;
 
         // Bridge identity — generates on first call. We can't lean on
         // runtime.remotePairingHandle here because the relay may be OFF
@@ -14913,7 +15158,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
         let entry;
         try {
-          entry = buildPairing({ pairingId, phonePub: phonePubHex, label });
+          entry = buildPairing({ pairingId, relayToken, phonePub: phonePubHex, label });
         } catch (err) {
           return writeJson(res, 400, {
             error: "build-pairing-failed",
@@ -14952,6 +15197,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         return writeJson(res, 200, {
           ok: true,
           pairingId: entry.pairingId,
+          relayToken: entry.relayToken,
           phonePub: entry.phonePub,
           phoneFingerprint: entry.phoneFingerprint,
           bridgePubHex,
@@ -16311,17 +16557,19 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       const apiTimelineImageMatch = url.pathname.match(/^\/api\/timeline\/([^/]+)\/images\/(\d+)$/u);
       if (apiTimelineImageMatch && req.method === "GET") {
-        const session = requireApiSession(req, res, config, state);
-        if (!session) {
-          return;
-        }
         const token = decodeURIComponent(apiTimelineImageMatch[1]);
         const index = Number(apiTimelineImageMatch[2]) || 0;
-        const filePath = resolveTimelineEntryImagePath(runtime, token, index);
+        const filePath = resolveTimelineEntryImagePath(runtime, state, token, index);
         if (!filePath) {
           res.statusCode = 404;
           res.end("not-found");
           return;
+        }
+        if (!isValidTimelineEntryImageSignature(config, url, token, index, filePath)) {
+          const session = requireApiSession(req, res, config, state);
+          if (!session) {
+            return;
+          }
         }
         try {
           const body = await fs.readFile(filePath);
@@ -18430,6 +18678,7 @@ function buildConfig(cli) {
   const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
   const stateFile = resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json"));
   return {
+    envFile: resolveEnvFile(cli.envFile),
     dryRun: cli.dryRun || truthy(process.env.DRY_RUN),
     once: cli.once,
     codexHome,
@@ -18449,7 +18698,7 @@ function buildConfig(cli) {
     // to the relay. Toggle with REMOTE_PAIRING_ENABLED=true in
     // ~/.viveworker/remote-pairing.env (or any source loadEnvFile reads).
     remotePairingEnabled: boolEnv("REMOTE_PAIRING_ENABLED", false),
-    remotePairingRelayUrl: cleanText(process.env.REMOTE_PAIRING_RELAY_URL || ""),
+    remotePairingRelayUrl: remotePairingRelayUrlFromEnv(),
     // share.viveworker.com — HTML hosting backed by the same A2A credentials.
     // Override for staging / self-hosted deployments via VIVEWORKER_SHARE_URL.
     a2aShareUrl: stripTrailingSlash(
@@ -19088,30 +19337,68 @@ function resolveEnvFile(explicitPath) {
   return path.join(workspaceRoot, "viveworker.env");
 }
 
+function parseEnvText(text) {
+  const output = {};
+  for (const rawLine of String(text || "").split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const separator = line.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    output[key] = value;
+  }
+  return output;
+}
+
 function loadEnvFile(filePath) {
   try {
-    const text = readFileSync(filePath, "utf8");
-    for (const rawLine of text.split(/\r?\n/u)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) {
-        continue;
-      }
-
-      const separator = line.indexOf("=");
-      if (separator === -1) {
-        continue;
-      }
-
-      const key = line.slice(0, separator).trim();
-      let value = line.slice(separator + 1).trim();
-      if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      process.env[key] = value;
-    }
+    Object.assign(process.env, parseEnvText(readFileSync(filePath, "utf8")));
   } catch {
     // Optional env file.
   }
+}
+
+function refreshPairingConfigFromEnvFile(config) {
+  if (!config?.envFile) {
+    return false;
+  }
+
+  let entries;
+  try {
+    entries = parseEnvText(readFileSync(config.envFile, "utf8"));
+  } catch {
+    return false;
+  }
+
+  const nextCode = entries.PAIRING_CODE ?? "";
+  const nextToken = entries.PAIRING_TOKEN ?? "";
+  const nextExpiresAtMs = Number(entries.PAIRING_EXPIRES_AT_MS) || 0;
+  if (
+    config.pairingCode === nextCode &&
+    config.pairingToken === nextToken &&
+    Number(config.pairingExpiresAtMs) === nextExpiresAtMs
+  ) {
+    return false;
+  }
+
+  config.pairingCode = nextCode;
+  config.pairingToken = nextToken;
+  config.pairingExpiresAtMs = nextExpiresAtMs;
+  process.env.PAIRING_CODE = nextCode;
+  process.env.PAIRING_TOKEN = nextToken;
+  process.env.PAIRING_EXPIRES_AT_MS = String(nextExpiresAtMs);
+  console.log(`[pairing] refreshed credentials from ${config.envFile}`);
+  return true;
 }
 
 async function maybeRotateStartupPairingEnv(envFile) {
@@ -19969,21 +20256,68 @@ function isInlineImagePlaceholderText(value) {
   return cleanText(stripInlineImagePlaceholderMarkup(value)) === "" && /<\/?image\b/iu.test(String(value || ""));
 }
 
+function stripCodexUserAttachmentEnvelope(value) {
+  const source = String(value || "");
+  if (!/Files mentioned by the user:/iu.test(source) || !/My request for Codex:/iu.test(source)) {
+    return source;
+  }
+
+  const marker = source.match(/\bMy request for Codex:\s*/iu);
+  if (!marker || marker.index == null) {
+    return source;
+  }
+  return source.slice(marker.index + marker[0].length).trim();
+}
+
 function normalizeTimelineMessageText(value, locale = DEFAULT_LOCALE) {
-  return normalizeLongText(replaceTurnAbortedMarkup(stripInlineImagePlaceholderMarkup(value), locale));
+  return normalizeLongText(
+    replaceTurnAbortedMarkup(
+      stripCodexUserAttachmentEnvelope(stripInlineImagePlaceholderMarkup(value)),
+      locale
+    )
+  );
+}
+
+function extractTimelineImagePaths(value) {
+  const source = String(value || "");
+  if (!/Files mentioned by the user:/iu.test(source)) {
+    return [];
+  }
+
+  const paths = [];
+  for (const match of source.matchAll(/(\/Users\/[^\n\r]+?\.(?:png|jpe?g|webp|gif|heic|heif))(?:\s|$)/giu)) {
+    const filePath = cleanText(match[1] || "");
+    if (filePath) {
+      paths.push(filePath);
+    }
+  }
+  return normalizeTimelineImagePaths(paths);
 }
 
 function normalizeTimelineImagePaths(value) {
   if (!Array.isArray(value)) {
     return [];
   }
-  return value
-    .map((entry) => cleanText(entry || ""))
-    .filter(Boolean);
+  const output = [];
+  const seen = new Set();
+  for (const entry of value) {
+    const normalized = cleanText(entry || "");
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
 }
 
 function normalizeNotificationText(value, locale = DEFAULT_LOCALE) {
-  return normalizeLongText(replaceTurnAbortedMarkup(stripNotificationMarkup(value), locale))
+  return normalizeLongText(
+    replaceTurnAbortedMarkup(
+      stripCodexUserAttachmentEnvelope(stripNotificationMarkup(value)),
+      locale
+    )
+  )
     .replace(/\n{2,}/gu, "\n")
     .trim();
 }
@@ -20042,6 +20376,65 @@ function safeJsonParse(value) {
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/gu, " ").trim();
+}
+
+function normalizeRemotePairingRelayUrl(value) {
+  const trimmed = cleanText(value);
+  if (!trimmed) {
+    return { ok: true, value: "" };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      ok: false,
+      message: "relayUrl must be a valid URL",
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      message: "relayUrl must not include credentials",
+    };
+  }
+
+  if (parsed.protocol === "wss:") {
+    return { ok: true, value: trimmed };
+  }
+
+  if (parsed.protocol === "ws:" && isLoopbackRelayHost(parsed.hostname)) {
+    return { ok: true, value: trimmed };
+  }
+
+  return {
+    ok: false,
+    message: "relayUrl must use wss://; ws:// is allowed only for localhost or loopback development",
+  };
+}
+
+function isLoopbackRelayHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/gu, "");
+  return (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/u.test(host)
+  );
+}
+
+function remotePairingRelayUrlFromEnv() {
+  const raw = process.env.REMOTE_PAIRING_RELAY_URL || "";
+  const result = normalizeRemotePairingRelayUrl(raw);
+  if (result.ok) {
+    return result.value;
+  }
+  if (cleanText(raw)) {
+    console.warn(`[remote-pairing] ignoring REMOTE_PAIRING_RELAY_URL: ${result.message}`);
+  }
+  return "";
 }
 
 function extractTitleOnlyJsonTitle(value) {

@@ -32,6 +32,7 @@ import {
   RpcTimeoutError,
   RpcClientClosedError,
   RpcTransportFailedError,
+  RpcTransportError,
   RpcCancelledByPeerError,
   STATE,
 } from "../../web/remote-pairing/rpc-client.js";
@@ -137,6 +138,7 @@ function makeClient(extraOpts = {}) {
   const client = new RemotePairingRpcClient({
     relayUrl: "wss://example",
     pairingId: "pair-test",
+    relayToken: "v1.testtesttesttesttesttesttesttest.abc",
     identityKeypair: fakeIdentityKeypair(),
     remoteStatic: new Uint8Array(32),
     transportFactory: factory,
@@ -213,6 +215,57 @@ test("fetch: GET sends a req frame; matching res resolves with helpers", async (
 
   assert.equal(client.pendingCount, 0);
   client.close();
+});
+
+test("fetch: called before connect waits for CONNECTED before sending", async () => {
+  const { client, transport } = makeClient();
+
+  const p = client.fetch({
+    method: "GET",
+    path: "/api/bootstrap",
+  });
+
+  assert.equal(transport._sent.length, 0, "request must not send before connect resolves");
+  await waitFor(() => transport._sent.length === 1);
+  const sent = lastSentFrame(transport);
+  assert.equal(sent.type, RPC.REQUEST);
+  assert.equal(sent.path, "/api/bootstrap");
+
+  transport._injectMessage(encodeResponse({
+    id: sent.id,
+    status: 200,
+    body: JSON.stringify({ boot: true }),
+  }));
+
+  const res = await p;
+  assert.deepEqual(res.json(), { boot: true });
+  client.close();
+});
+
+test("fetch: connect failure rejects with RpcTransportError", async () => {
+  const transport = {
+    get state() { return STATE.DISCONNECTED; },
+    get isConnected() { return false; },
+    get channelBinding() { return null; },
+    connect() { return Promise.reject(new Error("dial failed")); },
+    send() { throw new Error("should not send"); },
+    close() {},
+    kick() {},
+  };
+  const client = new RemotePairingRpcClient({
+    relayUrl: "wss://example",
+    pairingId: "pair-test",
+    relayToken: "v1.testtesttesttesttesttesttesttest.abc",
+    identityKeypair: fakeIdentityKeypair(),
+    remoteStatic: new Uint8Array(32),
+    transportFactory: () => transport,
+    defaultTimeoutMs: 1_000,
+  });
+
+  await assert.rejects(
+    client.fetch({ method: "GET", path: "/api/bootstrap" }),
+    RpcTransportError,
+  );
 });
 
 test("fetch: POST with string body; bodyEncoding utf8 (default)", async () => {

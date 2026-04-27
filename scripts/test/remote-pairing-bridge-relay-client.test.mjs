@@ -17,7 +17,6 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -37,6 +36,10 @@ import {
   encodeCancel,
   decode as decodeRpc,
 } from "../lib/remote-pairing/rpc.mjs";
+import {
+  startWranglerDev,
+  stopWranglerDev,
+} from "./remote-pairing-wrangler-dev.mjs";
 
 // ===========================================================================
 // Stub WebSocket — for unit tests. Records events but never fires `open`.
@@ -265,6 +268,7 @@ test("getSessions() snapshot has the documented shape", async () => {
   const [snap] = client.getSessions();
   assert.equal(snap.pairingId, "p-1");
   assert.equal(snap.label, "Some phone");
+  assert.equal(snap.phonePub, bytesToHex(phoneKp.pub));
   assert.equal(typeof snap.state, "string");
   assert.equal(snap.lastSeenAtMs, null);
   assert.equal(snap.channelBindingHex, null);
@@ -281,39 +285,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(HERE, "../../worker-pairing");
 const RELAY_URL = `ws://127.0.0.1:${DEV_PORT}`;
 
-/** @type {ReturnType<typeof spawn> | null} */
-let wranglerProc = null;
+let wranglerHandle = null;
 
 test.before(async () => {
-  wranglerProc = spawn(
-    "npx",
-    ["--no-install", "wrangler", "dev", "--local", "--port", String(DEV_PORT)],
-    {
-      cwd: WORKER_DIR,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, WRANGLER_LOG: "warn" },
-    },
-  );
-  wranglerProc.stdout.on("data", () => {});
-  wranglerProc.stderr.on("data", () => {});
-
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${DEV_PORT}/healthz`);
-      if (res.ok) return;
-    } catch { /* not ready */ }
-    await sleep(500);
-  }
-  wranglerProc.kill();
-  throw new Error("wrangler dev failed to start within 60s");
+  wranglerHandle = await startWranglerDev({ workerDir: WORKER_DIR, port: DEV_PORT });
 });
 
 test.after(async () => {
-  if (wranglerProc && wranglerProc.exitCode == null) {
-    wranglerProc.kill("SIGTERM");
-    await sleep(250);
-  }
+  await stopWranglerDev(wranglerHandle);
 });
 
 // ---------------------------------------------------------------------------
@@ -341,6 +320,7 @@ async function spawnBridgeAndPhone(cfg) {
   const pairings = cfg.pairings ?? [
     buildPairing({ pairingId, phonePub: phoneKeypair.pub, label: cfg.label }),
   ];
+  const phonePairing = pairings.find((p) => p.pairingId === pairingId) ?? pairings[0];
 
   const dispatch = cfg.dispatch ?? (async () => ({
     status: 200,
@@ -365,6 +345,7 @@ async function spawnBridgeAndPhone(cfg) {
   const phoneTransport = new RemotePairingTransport({
     relayUrl: RELAY_URL,
     pairingId,
+    relayToken: phonePairing.relayToken,
     role: "phone",
     initiator: true,
     identityKeypair: phoneKeypair,
@@ -578,23 +559,26 @@ test("sendEvent(pairingId, ...) targets exactly one session", async () => {
   const idA = uniquePairingId("evt-A");
   const idB = uniquePairingId("evt-B");
 
+  const pairingA = buildPairing({ pairingId: idA, phonePub: phoneAKp.pub, label: "A" });
+  const pairingB = buildPairing({ pairingId: idB, phonePub: phoneBKp.pub, label: "B" });
   const client = new BridgeRelayClient({
     relayUrl: RELAY_URL,
     identityKeypair: bridgeKp,
     pairings: [
-      buildPairing({ pairingId: idA, phonePub: phoneAKp.pub, label: "A" }),
-      buildPairing({ pairingId: idB, phonePub: phoneBKp.pub, label: "B" }),
+      pairingA,
+      pairingB,
     ],
     dispatch: async () => ({ status: 200 }),
     WebSocketImpl: WebSocket,
   });
   await client.start();
 
-  const recv = (phoneKp, pairingId) => {
+  const recv = (phoneKp, pairing) => {
     const got = [];
     const t = new RemotePairingTransport({
       relayUrl: RELAY_URL,
-      pairingId,
+      pairingId: pairing.pairingId,
+      relayToken: pairing.relayToken,
       role: "phone",
       initiator: true,
       identityKeypair: phoneKp,
@@ -604,8 +588,8 @@ test("sendEvent(pairingId, ...) targets exactly one session", async () => {
     });
     return { transport: t, got };
   };
-  const phoneA = recv(phoneAKp, idA);
-  const phoneB = recv(phoneBKp, idB);
+  const phoneA = recv(phoneAKp, pairingA);
+  const phoneB = recv(phoneBKp, pairingB);
   await Promise.all([phoneA.transport.connect(), phoneB.transport.connect()]);
 
   try {
@@ -635,6 +619,7 @@ test("phone with non-paired keypair fails the allowlist check", async () => {
   const expectedPhoneKp = generateIdentityKeypair();
   const wrongPhoneKp = generateIdentityKeypair();
   const pairingId = uniquePairingId("allowlist-reject");
+  const expectedPairing = buildPairing({ pairingId, phonePub: expectedPhoneKp.pub, label: "expected" });
 
   const stateLog = [];
   const errors = [];
@@ -642,7 +627,7 @@ test("phone with non-paired keypair fails the allowlist check", async () => {
     relayUrl: RELAY_URL,
     identityKeypair: bridgeKp,
     // Pair the EXPECTED phone — the wrong one will fail allowlist.
-    pairings: [buildPairing({ pairingId, phonePub: expectedPhoneKp.pub, label: "expected" })],
+    pairings: [expectedPairing],
     dispatch: async () => ({ status: 200 }),
     onSessionState: (ev) => stateLog.push(ev),
     onError: (err) => errors.push(err),
@@ -654,6 +639,7 @@ test("phone with non-paired keypair fails the allowlist check", async () => {
   const wrongPhone = new RemotePairingTransport({
     relayUrl: RELAY_URL,
     pairingId,
+    relayToken: expectedPairing.relayToken,
     role: "phone",
     initiator: true,
     identityKeypair: wrongPhoneKp,
@@ -667,16 +653,16 @@ test("phone with non-paired keypair fails the allowlist check", async () => {
   try {
     // Wait for the bridge to detect the mismatch and tear its session down.
     await waitFor(
-      () => errors.some((e) => /doesn't match pairing/.test(e?.message ?? "")),
+      () => errors.some((e) => /peer pubkey mismatch/.test(e?.message ?? "")),
       "bridge never reported allowlist mismatch",
       5_000,
     );
     // Once the bridge closes its responder side, the relay drops the routing
     // and the phone-side WS closes too (eventually). We don't strictly need
     // to assert that here — the allowlist error is the contract.
-    const mismatch = errors.find((e) => /doesn't match pairing/.test(e?.message ?? ""));
+    const mismatch = errors.find((e) => /peer pubkey mismatch/.test(e?.message ?? ""));
     assert.ok(mismatch, "expected an allowlist-mismatch error");
-    assert.match(mismatch.message, new RegExp(bytesToHex(wrongPhoneKp.pub)));
+    assert.match(mismatch.message, /phone:/);
   } finally {
     wrongPhone.close();
     client.close();
@@ -744,10 +730,11 @@ test("onSeen is invoked with pairing + channel binding on handshake", async () =
   const bridgeKp = generateIdentityKeypair();
   const phoneKp = generateIdentityKeypair();
   const pairingId = uniquePairingId("onseen");
+  const pairing = buildPairing({ pairingId, phonePub: phoneKp.pub });
   const client = new BridgeRelayClient({
     relayUrl: RELAY_URL,
     identityKeypair: bridgeKp,
-    pairings: [buildPairing({ pairingId, phonePub: phoneKp.pub })],
+    pairings: [pairing],
     dispatch: async () => ({ status: 200 }),
     onSeen: (info) => { seenCalls.push(info); },
     WebSocketImpl: WebSocket,
@@ -757,6 +744,7 @@ test("onSeen is invoked with pairing + channel binding on handshake", async () =
   const phone = new RemotePairingTransport({
     relayUrl: RELAY_URL,
     pairingId,
+    relayToken: pairing.relayToken,
     role: "phone",
     initiator: true,
     identityKeypair: phoneKp,

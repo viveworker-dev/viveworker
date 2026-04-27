@@ -41,6 +41,7 @@ viveworker.env
 passkey/
 npm_recovery_codes.txt
 .viveworker-attachments/
+web/remote-pairing.bundle.js.map
 
 # Local launchd output
 launchd/*.plist

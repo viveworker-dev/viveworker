@@ -10,6 +10,7 @@
  *   const client = new RemotePairingRpcClient({
  *     relayUrl: "wss://pairing.viveworker.com",
  *     pairingId,
+ *     relayToken,
  *     identityKeypair,        // phone's static X25519 keypair
  *     remoteStatic,           // bridge's static pub (from LAN pairing)
  *     onConnected: () => {},
@@ -73,6 +74,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = 60_000;
  *
  * @property {string} relayUrl
  * @property {string} pairingId
+ * @property {string} relayToken
  * @property {{priv: Uint8Array, pub: Uint8Array}} identityKeypair
  * @property {Uint8Array} remoteStatic              bridge's static pub
  * @property {"phone" | "bridge"} [role]            defaults "phone"
@@ -166,6 +168,7 @@ export class RemotePairingRpcClient {
     this._transport = factory({
       relayUrl: opts.relayUrl,
       pairingId: opts.pairingId,
+      relayToken: opts.relayToken,
       role: opts.role ?? "phone",
       initiator: opts.initiator,
       identityKeypair: opts.identityKeypair,
@@ -330,16 +333,32 @@ export class RemotePairingRpcClient {
       };
       this._pending.set(id, slot);
 
-      // Send. If the transport rejects synchronously (not connected),
-      // surface that as a fetch error.
-      try {
-        this._transport.send(frame);
-        slot.sent = true;
-      } catch (err) {
-        this._cleanupSlot(slot);
-        this._pending.delete(id);
-        reject(wrapTransportError(err));
-      }
+      // Ensure the encrypted channel is up before sending. This lets callers
+      // issue fetch() immediately after constructing the client; the request
+      // waits for the first handshake instead of failing with "not connected".
+      Promise.resolve()
+        .then(() => this.connect())
+        .then(() => {
+          if (!this._pending.has(id)) return; // timed out / aborted / closed while connecting
+          if (req.signal?.aborted) {
+            this._abortSlot(id, req.signal);
+            return;
+          }
+          try {
+            this._transport.send(frame);
+            slot.sent = true;
+          } catch (err) {
+            this._cleanupSlot(slot);
+            this._pending.delete(id);
+            reject(wrapTransportError(err));
+          }
+        })
+        .catch((err) => {
+          if (!this._pending.has(id)) return;
+          this._cleanupSlot(slot);
+          this._pending.delete(id);
+          reject(err instanceof RpcClientClosedError ? err : wrapTransportError(err));
+        });
     });
   }
 

@@ -1,19 +1,24 @@
-const CACHE_NAME = "viveworker-v68";
+const CACHE_NAME = "viveworker-v105";
+const APP_BUILD_ID = "20260427-timeline-image-permission";
+const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
+const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
-// Cold off-LAN start requires the remote-pairing modules in the precache —
-// otherwise app.js's ESM imports for keys/pairing-state/api-router/etc. hit
-// the network and fail (LAN unreachable, relay can't help because the relay
-// transport itself lives in those very modules). Add the bundle for the
-// crypto primitives the modules pull in via import "../remote-pairing.bundle.js".
+// Cold off-LAN start requires the app shell plus remote-pairing modules in the
+// precache. The first installed /app?pairToken=... navigation may happen before
+// this service worker controls the page, so cache /app during install instead
+// of relying on a later stale-while-revalidate pass.
 //
 // Bumping CACHE_NAME forces a re-cache so existing clients pick up the wider
 // asset set on next launch.
 const APP_ASSETS = [
+  "/app",
+  APP_SCRIPT_URL,
   "/app.css",
   "/app.js",
   "/i18n.js",
   "/icons/viveworker-v-pulse.svg",
+  API_ROUTER_URL,
   "/remote-pairing/api-router.js",
   "/remote-pairing/keys.js",
   "/remote-pairing/pairing-state.js",
@@ -23,7 +28,51 @@ const APP_ASSETS = [
   "/remote-pairing.bundle.js",
 ];
 const APP_ROUTES = new Set(["/", "/app", "/app/"]);
-const CACHED_PATHS = new Set(APP_ASSETS);
+const CACHED_PATHS = new Set(APP_ASSETS.map((asset) => new URL(asset, self.location.origin).pathname));
+const VERSIONED_CACHE_PATHS = new Set([
+  "/app.js",
+  "/remote-pairing/api-router.js",
+]);
+const NETWORK_FIRST_PATHS = new Set([
+  "/app.js",
+  "/remote-pairing/api-router.js",
+]);
+const APP_NAVIGATION_NETWORK_TIMEOUT_MS = 1800;
+const ASSET_NETWORK_TIMEOUT_MS = 900;
+const APP_SHELL_FALLBACK_HTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#101418">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/viveworker-icon-192.png">
+    <link rel="stylesheet" href="/app.css">
+    <style>
+      html, body { min-height: 100%; margin: 0; background: #081015; color: #f5fbff; }
+      .boot-splash { position: fixed; inset: 0; display: grid; place-items: center; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; background: radial-gradient(circle at 50% 18%, rgba(47, 143, 103, 0.22), transparent 30%), linear-gradient(180deg, #081015 0%, #091015 100%); }
+      .boot-splash__card { display: grid; justify-items: center; gap: 0.9rem; text-align: center; }
+      .boot-splash__logo { width: 6rem; height: 6rem; border-radius: 28%; }
+      .boot-splash__title { margin: 0; font-size: 2rem; letter-spacing: -0.04em; }
+      .boot-splash__status { margin: 0; color: rgba(205, 220, 231, 0.72); }
+      .viveworker-ready .boot-splash { opacity: 0; visibility: hidden; }
+    </style>
+    <title>viveworker</title>
+  </head>
+  <body>
+    <div id="boot-splash" class="boot-splash" role="status" aria-live="polite" aria-label="viveworker is starting">
+      <div class="boot-splash__card">
+        <img class="boot-splash__logo" src="/icons/viveworker-v-pulse.svg" alt="" width="112" height="112" decoding="async">
+        <h1 class="boot-splash__title">viveworker</h1>
+        <p class="boot-splash__status">Starting</p>
+      </div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="${APP_SCRIPT_URL}"></script>
+  </body>
+</html>`;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -64,12 +113,20 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (APP_ROUTES.has(url.pathname)) {
-    event.respondWith(staleWhileRevalidate(event, "/app"));
+    event.respondWith(networkFirstWithFallback(event, "/app", {
+      timeoutMs: APP_NAVIGATION_NETWORK_TIMEOUT_MS,
+      fallbackAppShell: true,
+    }));
     return;
   }
 
   if (CACHED_PATHS.has(url.pathname)) {
-    event.respondWith(staleWhileRevalidate(event, url.pathname));
+    const cacheKey = cacheKeyForUrl(url);
+    event.respondWith(
+      NETWORK_FIRST_PATHS.has(url.pathname)
+        ? networkFirstWithFallback(event, cacheKey, { timeoutMs: ASSET_NETWORK_TIMEOUT_MS })
+        : staleWhileRevalidate(event, cacheKey)
+    );
   }
 });
 
@@ -225,19 +282,15 @@ function shouldBroadcastRemotePairingWake(payload) {
   return kind === "remote-pairing-wake" || kind === "remote-pairing-event";
 }
 
-// Cache-first with background revalidation. Flips the previous networkFirst
-// strategy: instead of blocking first paint on a fresh fetch of the ~450KB
-// app shell (HTML + app.js + app.css + i18n.js) every launch, we serve the
-// cached copy immediately and refresh it in the background for the next
-// visit. Updates still land quickly because the SW itself is served fresh
-// from the bridge (`/sw.js` is excluded from this handler above), and a new
-// SW's `install` event pre-populates the cache with the latest assets
-// before `activate`/`clients.claim()` triggers a reload in page script.
-async function staleWhileRevalidate(event, cacheKey) {
-  const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match(cacheKey);
+function cacheKeyForUrl(url) {
+  if (VERSIONED_CACHE_PATHS.has(url.pathname) && url.search) {
+    return `${url.pathname}${url.search}`;
+  }
+  return url.pathname;
+}
 
-  const networkPromise = fetch(event.request, { cache: "no-store" })
+function fetchAndCache(event, cache, cacheKey) {
+  return fetch(event.request, { cache: "no-store" })
     .then(async (response) => {
       if (response && response.ok) {
         await cache.put(cacheKey, response.clone());
@@ -245,6 +298,58 @@ async function staleWhileRevalidate(event, cacheKey) {
       return response;
     })
     .catch(() => null);
+}
+
+async function networkFirstWithFallback(event, cacheKey, options = {}) {
+  const cache = await caches.open(CACHE_NAME);
+  const cachedPromise = cache.match(cacheKey);
+  const networkPromise = fetchAndCache(event, cache, cacheKey);
+  const timeoutMs = Math.max(0, Number(options.timeoutMs ?? 0) || 0);
+
+  let response = null;
+  if (timeoutMs > 0) {
+    response = await Promise.race([
+      networkPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+  } else {
+    response = await networkPromise;
+  }
+
+  if (response) {
+    return response;
+  }
+
+  // If the network attempt is still pending after the timeout, keep the
+  // Service Worker alive so LAN updates are cached for the next launch.
+  event.waitUntil(networkPromise);
+
+  const cached = await cachedPromise;
+  if (cached) {
+    return cached;
+  }
+
+  if (options.fallbackAppShell) {
+    return new Response(APP_SHELL_FALLBACK_HTML, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  const lateResponse = await networkPromise;
+  return lateResponse || Response.error();
+}
+
+// Cache-first with background revalidation for non-critical assets. App entry
+// points stay network-first so LAN refreshes can replace stale PWA code before
+// the device goes back to relay-only mode.
+async function staleWhileRevalidate(event, cacheKey) {
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match(cacheKey);
+  const networkPromise = fetchAndCache(event, cache, cacheKey);
 
   if (cached) {
     // Keep the SW alive long enough to persist the background refresh even
@@ -256,6 +361,15 @@ async function staleWhileRevalidate(event, cacheKey) {
   const response = await networkPromise;
   if (response) {
     return response;
+  }
+  if (cacheKey === "/app") {
+    return new Response(APP_SHELL_FALLBACK_HTML, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
   }
   return Response.error();
 }

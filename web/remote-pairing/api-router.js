@@ -41,16 +41,17 @@
  * Response shape:
  *
  *   The router returns a *minimal Fetch-Response-compatible* object on
- *   success — `{ ok, status, statusText, headers, json(), text() }` — so
- *   the existing `apiGet` / `apiPost` code paths in `app.js` work
- *   unchanged. HTTP error statuses (4xx/5xx) are NOT thrown; the caller
- *   checks `response.ok` exactly as with native fetch.
+ *   success — `{ ok, status, statusText, headers, json(), text(),
+ *   arrayBuffer() }` — so the existing `apiGet` / `apiPost` code paths in
+ *   `app.js` work unchanged, and binary assets such as timeline images can
+ *   also ride the relay. HTTP error statuses (4xx/5xx) are NOT thrown; the
+ *   caller checks `response.ok` exactly as with native fetch.
  *
  * Out of scope for this module:
  *
- *   - FormData uploads through the relay (would need multipart-aware
- *     RPC body handling). Throws a clear error so the call site can
- *     fall back to a different upload path.
+ *   - Streaming uploads. FormData uploads are supported by serializing
+ *     them to a buffered multipart body before handing them to the RPC
+ *     layer; truly streaming request bodies remain out of scope.
  *   - Server-Sent Events / streaming responses. The RpcClient delivers
  *     whole bodies; long-poll endpoints work fine, but `text/event-stream`
  *     does not.
@@ -61,7 +62,11 @@
  *     fix on that side, not here.
  */
 
-import { RemotePairingRpcClient } from "./rpc-client.js";
+import {
+  RemotePairingRpcClient,
+  RpcTransportError,
+  RpcTransportFailedError,
+} from "./rpc-client.js";
 import { bindWakeEvents } from "./wake.js";
 import { ensureIdentityKeypair, hexToBytes } from "./keys.js";
 import { loadPairingState } from "./pairing-state.js";
@@ -86,6 +91,14 @@ const STICKY_RELAY_MS = 5 * 60 * 1000;
  */
 const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
 
+/**
+ * Default timeout for the LAN probe before falling back to relay.
+ * Off-LAN `.local` fetches can hang for a long time on iOS instead of failing
+ * quickly, which leaves boot() stuck on the splash screen. Keep this short:
+ * LAN is the fast path, and slow/unreachable LAN should become relay.
+ */
+const DEFAULT_LAN_TIMEOUT_MS = 2_500;
+
 // ---------------------------------------------------------------------------
 // Module state (singleton client + telemetry)
 // ---------------------------------------------------------------------------
@@ -93,8 +106,8 @@ const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
 /** @type {import("./rpc-client.js").RemotePairingRpcClient | null} */
 let _client = null;
 
-/** pairingId the live `_client` was built for. Used to detect re-pair. */
-let _clientPairingId = null;
+/** pairing capability the live `_client` was built for. Used to detect re-pair. */
+let _clientPairingKey = null;
 
 /** Returned by `bindWakeEvents`; called on client teardown. */
 let _wakeUnbind = null;
@@ -166,6 +179,7 @@ async function buildRpcClient(record, opts = {}) {
     client = new ClientCtor({
       relayUrl: record.relayUrl,
       pairingId: record.pairingId,
+      relayToken: record.relayToken,
       identityKeypair: { priv: kp.priv, pub: kp.pub },
       remoteStatic,
       logger,
@@ -204,15 +218,17 @@ async function getOrInitClient(opts = {}) {
       _telemetry.clientResets++;
       try { _client.close(); } catch { /* ignore */ }
       _client = null;
-      _clientPairingId = null;
+      _clientPairingKey = null;
       if (_wakeUnbind) { try { _wakeUnbind(); } catch { /* ignore */ } _wakeUnbind = null; }
     }
     return null;
   }
 
-  // Re-pair under a different bridge → throw away the old client so we
-  // re-handshake with the new bridge static key.
-  if (_client && _clientPairingId && _clientPairingId !== record.pairingId) {
+  const pairingKey = `${record.pairingId}:${record.relayToken}`;
+
+  // Re-pair under a different bridge/token → throw away the old client so we
+  // re-handshake with the new bridge static key and relay capability.
+  if (_client && _clientPairingKey && _clientPairingKey !== pairingKey) {
     _telemetry.clientResets++;
     try { _client.close(); } catch { /* ignore */ }
     _client = null;
@@ -223,7 +239,7 @@ async function getOrInitClient(opts = {}) {
 
   _client = await buildRpcClient(record, opts);
   if (!_client) return null;
-  _clientPairingId = record.pairingId;
+  _clientPairingKey = pairingKey;
 
   // Wire wake events. If `bindWakeEvents` throws (e.g. weird test env),
   // log and continue — we'd rather have a working client without
@@ -243,6 +259,19 @@ async function getOrInitClient(opts = {}) {
   return _client;
 }
 
+function resetRelayClientForRetry() {
+  if (_client) {
+    _telemetry.clientResets++;
+    try { _client.close(); } catch { /* ignore */ }
+  }
+  _client = null;
+  _clientPairingKey = null;
+  if (_wakeUnbind) {
+    try { _wakeUnbind(); } catch { /* ignore */ }
+  }
+  _wakeUnbind = null;
+}
+
 // ---------------------------------------------------------------------------
 // Response adapter — RpcResponse → minimal Fetch-Response shape
 // ---------------------------------------------------------------------------
@@ -257,6 +286,7 @@ async function getOrInitClient(opts = {}) {
  *   - `headers`      plain object (rpc carries headers as a Record)
  *   - `json()`       async, throws on non-JSON body
  *   - `text()`       async
+ *   - `arrayBuffer()` async
  *
  * Other Fetch-Response APIs (Body.bodyUsed, Body.body stream, redirected,
  * type, url, clone()) are deliberately not provided — none of them are
@@ -273,6 +303,7 @@ function adaptRpcResponse(rpcRes) {
     headers: rpcRes.headers ?? {},
     json: async () => rpcRes.json(),
     text: async () => rpcRes.text(),
+    arrayBuffer: async () => rpcRes.arrayBuffer(),
   };
 }
 
@@ -300,28 +331,67 @@ function urlToRelayPath(url) {
 
 async function attemptLanFetch(url, init, opts) {
   const fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
+  const timeoutMs = opts.lanTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS;
+  const timeoutEnabled = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortController !== "undefined";
+  let didTimeout = false;
+  let timer = null;
+  let controller = null;
+  let externalAbortHandler = null;
+  let fetchInit = init;
+
+  if (timeoutEnabled) {
+    if (init.signal?.aborted) {
+      throw abortError(init.signal);
+    }
+    controller = new AbortController();
+    if (init.signal) {
+      externalAbortHandler = () => controller.abort(init.signal.reason);
+      init.signal.addEventListener("abort", externalAbortHandler, { once: true });
+    }
+    timer = setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+    }, timeoutMs);
+    fetchInit = { ...init, signal: controller.signal };
+  }
+
   try {
-    const response = await fetchImpl(url, init);
+    const response = await fetchImpl(url, fetchInit);
     _telemetry.lanOk++;
     return { ok: true, response };
   } catch (err) {
     // Caller cancelled → re-throw so we don't keep wasting time on relay.
-    if (err && err.name === "AbortError") {
+    if (err && err.name === "AbortError" && !didTimeout) {
       throw err;
     }
+    const lanErr = didTimeout ? new TypeError("LAN fetch timed out") : err;
     _telemetry.lanFail++;
     _telemetry.lastLanFailAt = nowMs(opts);
     _stickyRelayUntilMs = _telemetry.lastLanFailAt + STICKY_RELAY_MS;
-    return { ok: false, err };
+    return { ok: false, err: lanErr };
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (init.signal && externalAbortHandler) {
+      init.signal.removeEventListener("abort", externalAbortHandler);
+    }
   }
+}
+
+function abortError(signal) {
+  if (signal?.reason instanceof Error) {
+    const err = signal.reason;
+    if (!err.name) err.name = "AbortError";
+    return err;
+  }
+  const err = new Error("aborted");
+  err.name = "AbortError";
+  return err;
 }
 
 /**
  * Whether the request body is a shape the relay's RPC layer can carry.
- * The rpc layer accepts string / Uint8Array / ArrayBuffer / null. FormData
- * (multipart upload) and Blob/ReadableStream (raw binary) need explicit
- * encoding work that's out of scope for Phase 7 — see `routedFetch` for
- * how those are surfaced to the caller.
+ * The rpc layer accepts string / Uint8Array / ArrayBuffer / null.
+ * FormData is handled separately by serializing it to multipart bytes.
  */
 function isRelayCompatibleBody(body) {
   if (body === null || body === undefined) return true;
@@ -335,6 +405,132 @@ function isFormDataBody(body) {
   return typeof FormData !== "undefined" && body instanceof FormData;
 }
 
+function headersToPlainObject(headers) {
+  const out = {};
+  if (!headers) return out;
+
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    headers.forEach((value, key) => {
+      out[String(key).toLowerCase()] = String(value);
+    });
+    return out;
+  }
+
+  if (Array.isArray(headers)) {
+    for (const pair of headers) {
+      if (!pair || pair.length < 2) continue;
+      out[String(pair[0]).toLowerCase()] = String(pair[1]);
+    }
+    return out;
+  }
+
+  if (typeof headers[Symbol.iterator] === "function" && typeof headers !== "string") {
+    for (const [key, value] of headers) {
+      out[String(key).toLowerCase()] = String(value);
+    }
+    return out;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined || value === null) continue;
+    out[String(key).toLowerCase()] = String(value);
+  }
+  return out;
+}
+
+function setRelayHeader(headers, name, value) {
+  headers[String(name).toLowerCase()] = String(value);
+}
+
+function escapeMultipartHeaderValue(value) {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, "\\\"")
+    .replace(/[\r\n]/g, " ");
+}
+
+function safeMultipartContentType(value) {
+  const type = String(value || "application/octet-stream").replace(/[\r\n]/g, "").trim();
+  return type || "application/octet-stream";
+}
+
+function randomBoundary() {
+  const bytes = new Uint8Array(12);
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj?.getRandomValues) {
+    cryptoObj.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return `----viveworker-relay-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function concatBytes(chunks, totalLength) {
+  const out = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function isBlobLike(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof value.arrayBuffer === "function" &&
+    typeof value.type === "string",
+  );
+}
+
+async function encodeFormDataForRelay(formData, signal) {
+  if (!formData || typeof formData.entries !== "function") {
+    throw new TypeError("relay FormData body must be iterable");
+  }
+
+  const boundary = randomBoundary();
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let totalLength = 0;
+  const pushText = (text) => {
+    const bytes = encoder.encode(text);
+    chunks.push(bytes);
+    totalLength += bytes.byteLength;
+  };
+  const pushBytes = (bytes) => {
+    chunks.push(bytes);
+    totalLength += bytes.byteLength;
+  };
+
+  for (const [name, value] of formData.entries()) {
+    if (signal?.aborted) throw abortError(signal);
+
+    pushText(`--${boundary}\r\n`);
+    if (isBlobLike(value)) {
+      const filename = value.name || "blob";
+      pushText(
+        `Content-Disposition: form-data; name="${escapeMultipartHeaderValue(name)}"; filename="${escapeMultipartHeaderValue(filename)}"\r\n`,
+      );
+      pushText(`Content-Type: ${safeMultipartContentType(value.type)}\r\n\r\n`);
+      pushBytes(new Uint8Array(await value.arrayBuffer()));
+      pushText("\r\n");
+    } else {
+      pushText(`Content-Disposition: form-data; name="${escapeMultipartHeaderValue(name)}"\r\n\r\n`);
+      pushText(String(value));
+      pushText("\r\n");
+    }
+  }
+
+  pushText(`--${boundary}--\r\n`);
+  return {
+    body: concatBytes(chunks, totalLength),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
 async function attemptRelayFetch(url, init, opts) {
   const client = await getOrInitClient(opts);
   if (!client) {
@@ -342,10 +538,20 @@ async function attemptRelayFetch(url, init, opts) {
   }
 
   let body = init.body ?? null;
+  const headers = headersToPlainObject(init.headers ?? {});
+  if (isFormDataBody(body)) {
+    try {
+      const encoded = await encodeFormDataForRelay(body, init.signal);
+      body = encoded.body;
+      setRelayHeader(headers, "content-type", encoded.contentType);
+      setRelayHeader(headers, "content-length", String(encoded.body.byteLength));
+    } catch (err) {
+      return { ok: false, err };
+    }
+  }
   if (!isRelayCompatibleBody(body)) {
-    // Defensive — `routedFetch` already filters FormData / etc. before
-    // we get here, so reaching this branch means a programmer error
-    // upstream. Surface synchronously so the bug is loud.
+    // Defensive — FormData is encoded above, so reaching this branch means
+    // a programmer handed us a body shape the RPC layer still cannot carry.
     return {
       ok: false,
       err: new TypeError("relay body must be string, Uint8Array, ArrayBuffer, or null"),
@@ -363,7 +569,7 @@ async function attemptRelayFetch(url, init, opts) {
     const rpcRes = await client.fetch({
       method: (init.method || "GET").toUpperCase(),
       path,
-      headers: init.headers ?? {},
+      headers,
       body,
       signal: init.signal,
       timeoutMs: opts.timeoutMs ?? DEFAULT_RELAY_TIMEOUT_MS,
@@ -372,10 +578,21 @@ async function attemptRelayFetch(url, init, opts) {
     return { ok: true, response: adaptRpcResponse(rpcRes) };
   } catch (err) {
     if (err && err.name === "AbortError") throw err;
+    if (!opts.__relayRetried && shouldResetRelayClient(err)) {
+      resetRelayClientForRetry();
+      return attemptRelayFetch(url, init, { ...opts, __relayRetried: true });
+    }
     _telemetry.relayFail++;
     _telemetry.lastRelayFailAt = nowMs(opts);
     return { ok: false, err };
   }
+}
+
+function shouldResetRelayClient(err) {
+  return err instanceof RpcTransportError ||
+    err instanceof RpcTransportFailedError ||
+    err?.name === "RpcTransportError" ||
+    err?.name === "RpcTransportFailedError";
 }
 
 function nowMs(opts) {
@@ -403,6 +620,7 @@ function nowMs(opts) {
  *   now?: () => number,
  *   logger?: object,
  *   timeoutMs?: number,
+ *   lanTimeoutMs?: number,
  *   loadPairingState?: typeof loadPairingState,
  *   ensureIdentityKeypair?: typeof ensureIdentityKeypair,
  *   RemotePairingRpcClient?: typeof RemotePairingRpcClient,
@@ -419,18 +637,9 @@ function nowMs(opts) {
  */
 export async function routedFetch(url, init = {}, opts = {}) {
   const t = nowMs(opts);
-  const bodyIsFormData = isFormDataBody(init.body);
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
-    if (bodyIsFormData) {
-      // FormData can't ride the relay (no multipart in the RPC layer).
-      // Skip relay entirely and try LAN; if LAN's also down, surface a
-      // specific error instead of pretending the relay would have worked.
-      const lan = await attemptLanFetch(url, init, opts);
-      if (lan.ok) return lan.response;
-      throw new Error("formdata-over-relay-unsupported");
-    }
     const r = await attemptRelayFetch(url, init, opts);
     if (r.ok) return r.response;
     // Relay also failed. Drop sticky preference and try LAN once — maybe
@@ -446,13 +655,6 @@ export async function routedFetch(url, init = {}, opts = {}) {
   // Happy path: LAN first.
   const lan = await attemptLanFetch(url, init, opts);
   if (lan.ok) return lan.response;
-
-  // LAN failed (entered sticky-relay window inside attemptLanFetch).
-  // FormData can't fall back to the relay — fail loudly so the caller
-  // can route the upload another way (or wait for LAN to come back).
-  if (bodyIsFormData) {
-    throw new Error("formdata-over-relay-unsupported");
-  }
 
   // Try relay once before giving up.
   const r = await attemptRelayFetch(url, init, opts);
@@ -471,7 +673,7 @@ export function __getTelemetry() {
     ..._telemetry,
     stickyRelayUntilMs: _stickyRelayUntilMs,
     hasClient: Boolean(_client),
-    clientPairingId: _clientPairingId,
+    clientPairingKey: _clientPairingKey,
   };
 }
 
@@ -484,7 +686,7 @@ export function __resetForTest() {
     try { _client.close(); } catch { /* ignore */ }
   }
   _client = null;
-  _clientPairingId = null;
+  _clientPairingKey = null;
   if (_wakeUnbind) {
     try { _wakeUnbind(); } catch { /* ignore */ }
   }
@@ -497,3 +699,4 @@ export function __resetForTest() {
 // sticky-window boundary without hard-coding 5 minutes in two places.
 export const __STICKY_RELAY_MS = STICKY_RELAY_MS;
 export const __DEFAULT_RELAY_TIMEOUT_MS = DEFAULT_RELAY_TIMEOUT_MS;
+export const __DEFAULT_LAN_TIMEOUT_MS = DEFAULT_LAN_TIMEOUT_MS;

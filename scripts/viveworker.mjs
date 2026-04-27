@@ -863,13 +863,16 @@ async function runStart(cliOptions) {
   }
 
   progress.update("cli.start.progress.bridge");
-  await startDetachedBridge({
-    envFile,
-    logFile: resolvePath(cliOptions.logFile || defaultLogFile),
-    pidFile,
-  });
+  const alreadyHealthy = await waitForHealth(healthUrl, { attempts: 1, intervalMs: 0 });
+  if (!alreadyHealthy) {
+    await startDetachedBridge({
+      envFile,
+      logFile: resolvePath(cliOptions.logFile || defaultLogFile),
+      pidFile,
+    });
+  }
   progress.update("cli.start.progress.health");
-  const healthy = await waitForHealth(healthUrl);
+  const healthy = alreadyHealthy || await waitForHealth(healthUrl);
   const pairingReady = healthy && rotatedPairing.rotated
     ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
     : true;
@@ -1691,6 +1694,11 @@ function buildLaunchAgentPlist({ label, nodePath, bridgeScript, envFile, logFile
 }
 
 async function startDetachedBridge({ envFile, logFile, pidFile }) {
+  const existingPid = await maybeReadPid(pidFile);
+  if (existingPid && isProcessRunning(existingPid)) {
+    return { pid: existingPid, alreadyRunning: true };
+  }
+
   await fs.mkdir(path.dirname(logFile), { recursive: true });
   const logHandle = await fs.open(logFile, "a");
   const child = spawn(process.execPath, [bridgeScript, "--env-file", envFile], {
@@ -1700,6 +1708,7 @@ async function startDetachedBridge({ envFile, logFile, pidFile }) {
   child.unref();
   await logHandle.close();
   await fs.writeFile(pidFile, `${child.pid}\n`, "utf8");
+  return { pid: child.pid, alreadyRunning: false };
 }
 
 async function maybeReadPid(pidFile) {
@@ -1709,6 +1718,18 @@ async function maybeReadPid(pidFile) {
     return Number.isFinite(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
+  }
+}
+
+function isProcessRunning(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 

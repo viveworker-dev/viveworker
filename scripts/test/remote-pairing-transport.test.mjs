@@ -20,7 +20,6 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -28,10 +27,15 @@ import { dirname, resolve } from "node:path";
 import WebSocket from "ws";
 
 import { generateIdentityKeypair } from "../lib/remote-pairing/noise.mjs";
+import { generateRelayToken } from "../lib/remote-pairing/pairings.mjs";
 import {
   RemotePairingTransport,
   STATE,
 } from "../../web/remote-pairing/transport.js";
+import {
+  startWranglerDev,
+  stopWranglerDev,
+} from "./remote-pairing-wrangler-dev.mjs";
 
 // ---------------------------------------------------------------------------
 // Shared wrangler-dev instance
@@ -42,44 +46,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(HERE, "../../worker-pairing");
 const RELAY_URL = `ws://127.0.0.1:${DEV_PORT}`;
 
-/** @type {ReturnType<typeof spawn> | null} */
-let wranglerProc = null;
+let wranglerHandle = null;
 
 test.before(async () => {
-  wranglerProc = spawn(
-    "npx",
-    ["--no-install", "wrangler", "dev", "--local", "--port", String(DEV_PORT)],
-    {
-      cwd: WORKER_DIR,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, WRANGLER_LOG: "warn" },
-    },
-  );
-  // Quietly drain wrangler output (don't print to stderr or it muddies the
-  // test reporter; uncomment for debugging).
-  wranglerProc.stdout.on("data", () => {});
-  wranglerProc.stderr.on("data", () => {});
-
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${DEV_PORT}/healthz`);
-      if (res.ok) return;
-    } catch {
-      // not ready
-    }
-    await sleep(500);
-  }
-  wranglerProc.kill();
-  throw new Error("wrangler dev failed to start within 60s");
+  wranglerHandle = await startWranglerDev({ workerDir: WORKER_DIR, port: DEV_PORT });
 });
 
 test.after(async () => {
-  if (wranglerProc && wranglerProc.exitCode == null) {
-    wranglerProc.kill("SIGTERM");
-    // wait briefly for the port to free so other test runs don't collide
-    await sleep(250);
-  }
+  await stopWranglerDev(wranglerHandle);
 });
 
 // ---------------------------------------------------------------------------
@@ -90,7 +64,7 @@ function uniquePairingId(label) {
   return `txp-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-function buildPeer({ pairingId, role, identityKeypair, remoteStatic }) {
+function buildPeer({ pairingId, relayToken, role, identityKeypair, remoteStatic, transportOptions = {} }) {
   /** @type {Array<Uint8Array>} */
   const inbox = [];
   /** @type {Array<{resolve: (v: Uint8Array) => void}>} */
@@ -104,6 +78,7 @@ function buildPeer({ pairingId, role, identityKeypair, remoteStatic }) {
   const transport = new RemotePairingTransport({
     relayUrl: RELAY_URL,
     pairingId,
+    relayToken,
     role,
     identityKeypair,
     remoteStatic,
@@ -118,6 +93,7 @@ function buildPeer({ pairingId, role, identityKeypair, remoteStatic }) {
       handshakeCount += 1;
     },
     WebSocketImpl: WebSocket,
+    ...transportOptions,
   });
 
   function next(timeoutMs = 5_000) {
@@ -148,12 +124,13 @@ async function pair(label) {
   const phoneKeys = generateIdentityKeypair();
   const bridgeKeys = generateIdentityKeypair();
   const pairingId = uniquePairingId(label);
+  const relayToken = generateRelayToken(pairingId);
   const phone = buildPeer({
-    pairingId, role: "phone",
+    pairingId, relayToken, role: "phone",
     identityKeypair: phoneKeys, remoteStatic: bridgeKeys.pub,
   });
   const bridge = buildPeer({
-    pairingId, role: "bridge",
+    pairingId, relayToken, role: "bridge",
     identityKeypair: bridgeKeys,
   });
   await Promise.all([phone.transport.connect(), bridge.transport.connect()]);
@@ -171,6 +148,50 @@ test("handshake reaches STATE.CONNECTED on both peers", async () => {
     assert.equal(bridge.transport.state, STATE.CONNECTED);
     assert.equal(phone.handshakeCount, 1);
     assert.equal(bridge.handshakeCount, 1);
+  } finally {
+    phone.transport.close();
+    bridge.transport.close();
+  }
+});
+
+test("bridge responder waits past handshake timeout for a late phone", async () => {
+  const phoneKeys = generateIdentityKeypair();
+  const bridgeKeys = generateIdentityKeypair();
+  const pairingId = uniquePairingId("late-phone");
+  const relayToken = generateRelayToken(pairingId);
+  const bridge = buildPeer({
+    pairingId,
+    relayToken,
+    role: "bridge",
+    identityKeypair: bridgeKeys,
+    transportOptions: {
+      handshakeTimeoutMs: 60,
+      pingIntervalMs: 20,
+      backoffMs: [50],
+    },
+  });
+
+  const bridgeConnect = bridge.transport.connect();
+  await waitForState(bridge.transport, STATE.HANDSHAKING, { timeoutMs: 5_000 });
+  await sleep(180);
+  assert.equal(bridge.transport.state, STATE.HANDSHAKING);
+
+  const phone = buildPeer({
+    pairingId,
+    relayToken,
+    role: "phone",
+    identityKeypair: phoneKeys,
+    remoteStatic: bridgeKeys.pub,
+    transportOptions: {
+      handshakeTimeoutMs: 5_000,
+      backoffMs: [50],
+    },
+  });
+
+  try {
+    await Promise.all([bridgeConnect, phone.transport.connect()]);
+    assert.equal(phone.transport.state, STATE.CONNECTED);
+    assert.equal(bridge.transport.state, STATE.CONNECTED);
   } finally {
     phone.transport.close();
     bridge.transport.close();
@@ -217,9 +238,11 @@ test("send/recv round-trips in both directions", async () => {
 });
 
 test("send() before connect() throws synchronously", () => {
+  const pairingId = uniquePairingId("nopre");
   const t = new RemotePairingTransport({
     relayUrl: RELAY_URL,
-    pairingId: uniquePairingId("nopre"),
+    pairingId,
+    relayToken: generateRelayToken(pairingId),
     role: "phone",
     identityKeypair: generateIdentityKeypair(),
     remoteStatic: generateIdentityKeypair().pub,
@@ -231,9 +254,11 @@ test("send() before connect() throws synchronously", () => {
 
 test("close() during opening tears down without throwing", async () => {
   // Point at a port nothing's listening on; the WS will fail to open.
+  const pairingId = uniquePairingId("close-during-open");
   const t = new RemotePairingTransport({
     relayUrl: "ws://127.0.0.1:1",
-    pairingId: uniquePairingId("close-during-open"),
+    pairingId,
+    relayToken: generateRelayToken(pairingId),
     role: "phone",
     identityKeypair: generateIdentityKeypair(),
     remoteStatic: generateIdentityKeypair().pub,

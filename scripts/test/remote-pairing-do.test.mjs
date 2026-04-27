@@ -80,19 +80,56 @@ function toU8(d) {
 const enc = (s) => new TextEncoder().encode(s);
 
 /**
+ * Build a Uint8Array of exactly the given byte length, filled with bytes that
+ * match a recognisable pattern (hex `0xAA`). Used to fake a Noise IK msg1 in
+ * tests — pairing-do.js only checks the wire size, never the contents.
+ */
+const fakeBytes = (n, fill = 0xaa) => new Uint8Array(n).fill(fill);
+
+/**
+ * Build a Uint8Array shaped like a Noise IK msg1 with empty payload:
+ *   ephemeral pub (32) + encrypted static (32 + 16) + payload tag (16) = 96 B.
+ * pairing-do.js's fresh-handshake gate accepts only this exact size from a
+ * brand-new phone socket; junk-sized DATA frames must not evict the bridge.
+ */
+const fakeNoiseIkMsg1 = () => fakeBytes(96, 0xab);
+
+/**
  * Hook a fake WS into a freshly-built PairingChannel as `role`. Mirrors what
  * `fetch()` does when a peer connects, minus the WebSocketPair/upgrade dance.
  */
 function connect(channel, role, ws) {
+  const existing = channel.peers.get(role);
+  if (existing?.socket?.readyState === 1) {
+    ws.close(4003, "active");
+    return false;
+  }
   channel.state.acceptWebSocket(ws, [role]);
   ws.serializeAttachment({ role });
-  const existing = channel.peers.get(role);
+  const existingOutbox = existing?.outbox ?? [];
+  const existingLastSent = existing?.lastSent ?? 0;
+  const existingColdWake = existing?.coldWake === true;
   channel.peers.set(role, {
     socket: ws,
-    outbox: existing?.outbox ?? [],
-    lastSent: existing?.lastSent ?? 0,
-    coldWake: false,
+    outbox: existingOutbox,
+    lastSent: existingLastSent,
+    coldWake: existingColdWake,
+    awaitingFirstFrame: true,
   });
+  const other = channel.peers.get(role === "phone" ? "bridge" : "phone");
+  if (
+    role === "bridge" &&
+    !existingColdWake &&
+    existingLastSent === 0 &&
+    existingOutbox.length === 0 &&
+    other?.socket?.readyState === 1 &&
+    !other.awaitingFirstFrame
+  ) {
+    for (const entry of other.outbox) {
+      ws.send(entry.wire);
+    }
+  }
+  return true;
 }
 
 /**
@@ -107,6 +144,7 @@ function reattachAfterHibernation(channel, role, ws) {
     outbox: [],
     lastSent: 0,
     coldWake: true,
+    awaitingFirstFrame: true,
   });
 }
 
@@ -161,6 +199,209 @@ test("DATA buffered when peer is offline; nothing forwarded", async () => {
 
   assert.equal(channel.peers.get("phone").outbox.length, 1);
   assert.equal(channel.peers.has("bridge"), false);
+});
+
+test("DATA buffered while peer is offline drains when peer connects later", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+
+  const wire = encodeData({ seq: 1, mid: generateMid(), payload: enc("msg1") });
+  await channel.webSocketMessage(phone, wire.buffer);
+
+  const bridge = new FakeWS();
+  connect(channel, "bridge", bridge);
+
+  assert.equal(bridge.sent.length, 1);
+  assert.deepEqual(bridge.sent[0], wire);
+});
+
+test("stale DATA from a disconnected peer is not drained into a later peer", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+
+  const wire = encodeData({ seq: 1, mid: generateMid(), payload: enc("stale-msg1") });
+  await channel.webSocketMessage(phone, wire.buffer);
+  await channel.webSocketClose(phone, 1006, "abnormal", false);
+
+  const bridge = new FakeWS();
+  connect(channel, "bridge", bridge);
+
+  assert.equal(bridge.sent.length, 0);
+});
+
+test("active same-role duplicate is rejected without evicting the existing socket", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const firstPhone = new FakeWS();
+  connect(channel, "phone", firstPhone);
+
+  const secondPhone = new FakeWS();
+  const accepted = connect(channel, "phone", secondPhone);
+
+  assert.equal(accepted, false);
+  assert.equal(firstPhone.closed, null);
+  assert.deepEqual(secondPhone.closed, { code: 4003, reason: "active" });
+  assert.equal(channel.peers.get("phone").socket, firstPhone);
+});
+
+test("fresh DATA on same-role reconnect discards stale handshake outbox", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const firstPhone = new FakeWS();
+  connect(channel, "phone", firstPhone);
+
+  // Use a real-shaped Noise IK msg1 — the DO's fresh-handshake gate only
+  // fires on payloads that match the Noise IK msg1 size.
+  const stale = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(firstPhone, stale.buffer);
+  assert.equal(channel.peers.get("phone").outbox.length, 1);
+  await channel.webSocketClose(firstPhone, 1006, "abnormal", false);
+
+  const secondPhone = new FakeWS();
+  connect(channel, "phone", secondPhone);
+  assert.equal(channel.peers.get("phone").socket, secondPhone);
+
+  const fresh = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(secondPhone, fresh.buffer);
+
+  const out = channel.peers.get("phone").outbox;
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0].wire, fresh);
+});
+
+test("passive same-role reconnect does not drain stale outbox before resume or fresh DATA", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const firstBridge = new FakeWS();
+  connect(channel, "bridge", firstBridge);
+
+  const stale = encodeData({ seq: 1, mid: generateMid(), payload: enc("old-msg2") });
+  await channel.webSocketMessage(firstBridge, stale.buffer);
+  await channel.webSocketClose(firstBridge, 1006, "abnormal", false);
+
+  const secondBridge = new FakeWS();
+  connect(channel, "bridge", secondBridge);
+  await channel.webSocketMessage(secondBridge, encodePing());
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+
+  assert.equal(phone.sent.length, 0);
+});
+
+test("fresh phone handshake does not flow into a connected stale bridge session", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const oldBridge = new FakeWS();
+  connect(channel, "bridge", oldBridge);
+
+  // Make the bridge look like it has an existing Noise session/outbox.
+  const oldBridgeFrame = encodeData({ seq: 10, mid: generateMid(), payload: enc("old-response") });
+  await channel.webSocketMessage(oldBridge, oldBridgeFrame.buffer);
+  assert.equal(channel.peers.get("bridge").awaitingFirstFrame, false);
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+  // Use a real-shaped Noise IK msg1 — the DO only kicks the counterparty
+  // when the phone's first DATA frame looks like a plausible msg1.
+  const freshMsg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, freshMsg1.buffer);
+
+  assert.deepEqual(oldBridge.closed, { code: 4004, reason: "fresh-handshake" });
+  assert.equal(oldBridge.sent.length, 0, "fresh msg1 must not be forwarded into stale bridge session");
+  assert.equal(channel.peers.get("bridge").socket, null);
+  assert.equal(channel.peers.get("bridge").coldWake, true);
+  assert.equal(channel.peers.get("phone").outbox.length, 1);
+  assert.deepEqual(channel.peers.get("phone").outbox[0].wire, freshMsg1);
+});
+
+test("malformed first DATA from phone does not evict the active bridge", async () => {
+  // An attacker who has acquired the relay token + pairingId but holds no
+  // valid Noise key can still open a phone socket. They MUST NOT be able to
+  // close the bridge socket by sending arbitrary garbage — only a payload
+  // that's structurally plausible as a Noise IK msg1 may flag the
+  // counterparty for fresh handshake.
+  const channel = new PairingChannel(new FakeState(), {});
+  const oldBridge = new FakeWS();
+  connect(channel, "bridge", oldBridge);
+  const oldBridgeFrame = encodeData({ seq: 10, mid: generateMid(), payload: enc("old-response") });
+  await channel.webSocketMessage(oldBridge, oldBridgeFrame.buffer);
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+  // 12 bytes — not a valid Noise IK msg1 size. The DO should forward this
+  // as ordinary DATA and leave the bridge socket alone.
+  const junk = encodeData({ seq: 1, mid: generateMid(), payload: fakeBytes(12) });
+  await channel.webSocketMessage(phone, junk.buffer);
+
+  assert.equal(oldBridge.closed, null, "bridge must not be closed by malformed phone DATA");
+  assert.equal(channel.peers.get("bridge").socket, oldBridge);
+  // The frame is forwarded to the bridge anyway — the bridge's own Noise
+  // transport will detect the AEAD mismatch and tear itself down. The DO
+  // doesn't help the attacker accelerate that teardown.
+  assert.equal(oldBridge.sent.length, 1);
+});
+
+test("first DATA with non-1 seq from phone does not evict the active bridge", async () => {
+  // A Noise IK msg1 always rides on envelope seq=1 (first frame of a fresh
+  // socket). If the phone's first frame has any other seq, treat it as a
+  // misbehaving / malicious peer rather than a fresh handshake.
+  const channel = new PairingChannel(new FakeState(), {});
+  const oldBridge = new FakeWS();
+  connect(channel, "bridge", oldBridge);
+  const oldBridgeFrame = encodeData({ seq: 10, mid: generateMid(), payload: enc("old-response") });
+  await channel.webSocketMessage(oldBridge, oldBridgeFrame.buffer);
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+  const wrongSeq = encodeData({ seq: 2, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, wrongSeq.buffer);
+
+  assert.equal(oldBridge.closed, null);
+  assert.equal(channel.peers.get("bridge").socket, oldBridge);
+});
+
+test("stale bridge reconnect gets RESUME_FAIL before buffered fresh phone msg1", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const oldBridge = new FakeWS();
+  connect(channel, "bridge", oldBridge);
+
+  const oldBridgeFrame = encodeData({ seq: 10, mid: generateMid(), payload: enc("old-response") });
+  await channel.webSocketMessage(oldBridge, oldBridgeFrame.buffer);
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+  const freshMsg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, freshMsg1.buffer);
+
+  const newBridge = new FakeWS();
+  connect(channel, "bridge", newBridge);
+  assert.equal(newBridge.sent.length, 0, "fresh msg1 waits until bridge observes RESUME_FAIL");
+
+  await channel.webSocketMessage(newBridge, encodeResumeReq(999).buffer);
+
+  assert.equal(newBridge.sent.length, 2);
+  const fail = decode(newBridge.sent[0]);
+  assert.equal(fail.type, FRAME_RESUME_FAIL);
+  assert.equal(fail.reason, RESUME_FAIL_HIBERNATED);
+  const replayedMsg1 = decode(newBridge.sent[1]);
+  assert.equal(replayedMsg1.seq, 1);
+  assert.deepEqual(newBridge.sent[1], freshMsg1);
+});
+
+test("bridge's first DATA frame does not evict the active phone", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  connect(channel, "phone", phone);
+
+  const msg1 = encodeData({ seq: 1, mid: generateMid(), payload: enc("msg1") });
+  await channel.webSocketMessage(phone, msg1.buffer);
+
+  connect(channel, "bridge", bridge);
+  const msg2 = encodeData({ seq: 1, mid: generateMid(), payload: enc("msg2") });
+  await channel.webSocketMessage(bridge, msg2.buffer);
+
+  assert.equal(phone.closed, null);
+  assert.equal(channel.peers.get("phone").socket, phone);
 });
 
 test("ACK from bridge GCs phone's outbox up to the acked seq", async () => {
@@ -372,3 +613,38 @@ test("webSocketClose marks peer's socket null but preserves outbox", async () =>
   assert.equal(channel.peers.get("phone").socket, null);
   assert.equal(channel.peers.get("phone").outbox.length, 1, "outbox preserved for resume");
 });
+
+test("trimOutbox enforces a cumulative byte cap", async () => {
+  // A handful of huge frames must not be able to occupy more than the byte
+  // cap. We can't import the constant directly (private to the module), but
+  // 8 MB is the spec — push past it with 5 × 2 MB frames and confirm the
+  // oldest entries get dropped to bring totalBytes back under the cap.
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  connect(channel, "phone", phone);
+  connect(channel, "bridge", bridge);
+
+  // First frame must look like a Noise IK msg1 (96 bytes) so the
+  // fresh-handshake gate doesn't wipe the outbox after we push later frames.
+  const msg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, msg1.buffer);
+
+  // Now push five 2 MB DATA frames. Each one alone is fine; together they
+  // exceed the 8 MB outbox cap.
+  const huge = fakeBytes(2 * 1024 * 1024, 0x42);
+  for (let i = 2; i <= 6; i++) {
+    const wire = encodeData({ seq: i, mid: generateMid(), payload: huge });
+    await channel.webSocketMessage(phone, wire.buffer);
+  }
+
+  const outbox = channel.peers.get("phone").outbox;
+  let totalBytes = 0;
+  for (const entry of outbox) totalBytes += entry.wire.length;
+  assert.ok(totalBytes <= 8 * 1024 * 1024 + 8 * 1024,
+    `expected outbox bytes <= 8 MB cap, got ${totalBytes}`);
+  // At least one entry got evicted (we pushed 6, cap drops to ~4 of the
+  // 2 MB frames + msg1).
+  assert.ok(outbox.length < 6, `expected oldest entries to be evicted, length=${outbox.length}`);
+});
+

@@ -88,7 +88,7 @@ const RELOAD_DEBOUNCE_MS = 250;
  * @property {string} relayUrl
  * @property {string | null} identityFingerprint
  * @property {string | null} identityPubHex
- * @property {Array<{ pairingId: string, label: string, state: string,
+ * @property {Array<{ pairingId: string, label: string, phonePub: string, state: string,
  *   lastSeenAtMs: number | null, channelBindingHex: string | null,
  *   phoneFingerprint: string }>} sessions
  */
@@ -164,15 +164,15 @@ export async function startRemotePairingRelay(opts) {
     dispatch,
     onSessionState: ({ pairingId, state, prev }) => {
       if (state === prev) return;
-      log.debug?.(`[remote-pairing] ${pairingId} ${prev} → ${state}`);
+      log.debug?.(`[remote-pairing] ${redactPairingId(pairingId)} ${prev} → ${state}`);
     },
     onError: (err, ctx) => {
       log.warn?.(
-        `[remote-pairing] error${ctx?.pairingId ? ` (pairingId=${ctx.pairingId})` : ""}: ${err?.message}`,
+        `[remote-pairing] error${ctx?.pairingId ? ` (${redactPairingId(ctx.pairingId)})` : ""}: ${err?.message}`,
       );
     },
     onSeen: ({ pairing, atMs }) => {
-      log.debug?.(`[remote-pairing] ${pairing.pairingId} seen at ${new Date(atMs).toISOString()}`);
+      log.debug?.(`[remote-pairing] ${redactPairingId(pairing.pairingId)} seen at ${new Date(atMs).toISOString()}`);
     },
     WebSocketImpl,
     pingIntervalMs: opts.pingIntervalMs,
@@ -273,6 +273,11 @@ function normalizeLogger(logger) {
     error: typeof logger.error === "function" ? logger.error.bind(logger) : undefined,
     info: typeof logger.info === "function" ? logger.info.bind(logger) : undefined,
   };
+}
+
+function redactPairingId(pairingId) {
+  const value = String(pairingId || "");
+  return value ? `pairing:${value.slice(0, 6)}…` : "pairing:unknown";
 }
 
 function fingerprintPub(pub) {

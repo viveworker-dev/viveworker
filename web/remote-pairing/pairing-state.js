@@ -6,6 +6,7 @@
  * to reach the same bridge over the relay when off-LAN:
  *
  *   - pairingId         (relay slot identifier; opaque to the phone)
+ *   - relayToken        (capability required by the public relay)
  *   - bridgePubHex      (bridge's X25519 static pubkey — the phone uses
  *                        it as the responder static for Noise IK)
  *   - bridgeFingerprint (canonical "AB:CD:EF…" form for display)
@@ -18,12 +19,12 @@
  *
  * Why localStorage and not IndexedDB:
  *   - The X25519 *private* key lives in IndexedDB (keys.js) because
- *     it's the secret half of the identity. This file is metadata —
- *     pairingId, bridge pubkey, relay URL, label — and the security
- *     story is identical to "the phone can read its own session cookie":
- *     localStorage is origin-scoped to the bridge URL, and there's
- *     nothing here that wouldn't already be visible to a malicious
- *     script on the same origin.
+ *     it's the secret half of the identity. This file stores routing
+ *     capability metadata — including `relayToken`, which can reach the
+ *     correct relay room but still cannot decrypt or authenticate the Noise
+ *     channel without the IndexedDB private key. Treat XSS on this origin as
+ *     device compromise, just like an attacker reading same-origin session
+ *     state.
  *   - localStorage is synchronous, which is convenient on the bootstrap
  *     hot path where we want to know "is this phone enrolled?" before
  *     we even have a chance to await anything.
@@ -36,17 +37,18 @@
  *   here so that future migration is local.
  *
  * Schema versioning:
- *   `version: 1` lets us reject + clear unknown shapes on bootstrap.
+ *   The `version` field lets us reject + clear unknown shapes on bootstrap.
  *   When the format evolves, bump the constant and write a migrator.
  */
 
 const STORAGE_KEY = "viveworker.remote-pairing.state";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /**
  * @typedef {Object} RemotePairingState
  * @property {number} version            schema version (== SCHEMA_VERSION)
  * @property {string} pairingId          relay slot identifier
+ * @property {string} relayToken         relay capability token
  * @property {string} phonePub           lowercase 64-hex of the phone's X25519 pub
  * @property {string} phoneFingerprint   canonical "AB:CD:EF…" of phonePub
  * @property {string} bridgePubHex       lowercase 64-hex of the bridge's X25519 pub
@@ -108,6 +110,7 @@ export function loadPairingState(opts) {
   // that and any garbage we'd find here came from a corrupted localStorage.
   const required = [
     "pairingId",
+    "relayToken",
     "phonePub",
     "phoneFingerprint",
     "bridgePubHex",
@@ -122,6 +125,7 @@ export function loadPairingState(opts) {
   return {
     version: SCHEMA_VERSION,
     pairingId: parsed.pairingId,
+    relayToken: parsed.relayToken,
     phonePub: parsed.phonePub.toLowerCase(),
     phoneFingerprint: parsed.phoneFingerprint,
     bridgePubHex: parsed.bridgePubHex.toLowerCase(),
@@ -151,6 +155,7 @@ export function savePairingState(record, opts) {
   // than persisting "undefined" strings.
   for (const key of [
     "pairingId",
+    "relayToken",
     "phonePub",
     "phoneFingerprint",
     "bridgePubHex",
@@ -164,6 +169,7 @@ export function savePairingState(record, opts) {
   const out = {
     version: SCHEMA_VERSION,
     pairingId: record.pairingId,
+    relayToken: record.relayToken,
     phonePub: record.phonePub.toLowerCase(),
     phoneFingerprint: record.phoneFingerprint,
     bridgePubHex: record.bridgePubHex.toLowerCase(),

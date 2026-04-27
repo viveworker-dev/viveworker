@@ -1,5 +1,7 @@
 :root {
   color-scheme: dark;
+  --visual-viewport-left: 0px;
+  --visual-viewport-width: 100vw;
   --font-ui: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
   --bg: #091015;
   --bg-soft: #0f1921;
@@ -36,7 +38,10 @@ html {
   width: 100%;
   max-width: 100%;
   overflow-x: hidden;
+  overscroll-behavior-x: none;
   background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -46,6 +51,7 @@ body {
   margin: 0;
   min-height: 100vh;
   overflow-x: hidden;
+  overscroll-behavior-x: none;
   font-family: var(--font-ui);
   color: var(--text);
   background:
@@ -59,7 +65,9 @@ a {
 }
 
 button,
-input {
+input,
+textarea,
+select {
   font: inherit;
 }
 
@@ -70,14 +78,16 @@ code {
 }
 
 #app {
-  width: 100%;
-  max-width: 100%;
+  width: 100vw;
+  max-width: 100vw;
   min-width: 0;
+  overflow-x: clip;
 }
 
 .app-shell {
-  width: 100%;
-  max-width: 100%;
+  width: 100vw;
+  max-width: 100vw;
+  min-width: 0;
   min-height: 100vh;
   overflow-x: clip;
   padding:
@@ -85,6 +95,14 @@ code {
     1rem
     calc(8.6rem + env(safe-area-inset-bottom))
     1rem;
+}
+
+@supports (width: 100dvw) {
+  #app,
+  .app-shell {
+    width: 100dvw;
+    max-width: 100dvw;
+  }
 }
 
 .app-shell--mobile:not(.app-shell--detail)::after {
@@ -111,6 +129,9 @@ code {
 }
 
 .app-shell--detail {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }
 
@@ -418,6 +439,7 @@ code {
 .settings-stack,
 .stack,
 .choice-stack {
+  width: 100%;
   display: grid;
   gap: 1rem;
   min-width: 0;
@@ -442,6 +464,7 @@ code {
 }
 
 .screen-block--detail {
+  width: 100%;
   min-height: calc(100dvh - 8rem);
 }
 
@@ -968,6 +991,58 @@ code {
   overflow-wrap: anywhere;
 }
 
+.settings-row__value--enabled,
+.settings-info-row__value--enabled {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.62rem;
+  padding: 0.16rem 0.52rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.settings-row__value--enabled,
+.settings-info-row__value--enabled {
+  border: 1px solid rgba(112, 202, 157, 0.24);
+  background: rgba(112, 202, 157, 0.12);
+  color: rgba(185, 239, 208, 0.96);
+}
+
+.settings-row__value--disabled,
+.settings-info-row__value--disabled {
+  color: rgba(231, 243, 250, 0.68);
+}
+
+.settings-row__value--attention,
+.settings-info-row__value--attention {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.62rem;
+  padding: 0.16rem 0.52rem;
+  border-radius: 999px;
+  border: 1px solid rgba(240, 180, 40, 0.26);
+  background: rgba(240, 180, 40, 0.11);
+  color: rgba(255, 220, 140, 0.96);
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.settings-row__value--disconnected,
+.settings-info-row__value--disconnected {
+  color: rgba(205, 220, 231, 0.54);
+}
+
 .settings-info-row--stacked .settings-info-row__value {
   text-align: left;
 }
@@ -1127,6 +1202,25 @@ code {
   font-size: 0.78rem;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.device-card__badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.device-card__badge--live {
+  border-color: rgba(112, 202, 157, 0.28);
+  background: rgba(112, 202, 157, 0.14);
+  color: #c8f3d9;
+}
+
+.device-card__badge--offline {
+  border-color: rgba(156, 181, 197, 0.14);
+  background: rgba(156, 181, 197, 0.1);
+  color: var(--muted);
 }
 
 .device-card__meta {
@@ -1741,6 +1835,12 @@ code {
 }
 
 @media (max-width: 640px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
   .wallet-step-card__header {
     flex-direction: column;
   }
@@ -2609,6 +2709,8 @@ code {
 }
 
 .detail-shell--mobile {
+  width: 100%;
+  max-width: 100%;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   min-height: calc(100dvh - 5.6rem);
@@ -2622,6 +2724,8 @@ code {
 }
 
 .mobile-detail-screen {
+  width: 100%;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -2629,8 +2733,11 @@ code {
 }
 
 .mobile-detail-scroll {
+  width: 100%;
+  max-width: 100%;
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   padding: 0 0.42rem 0.78rem;
   display: flex;
@@ -2642,6 +2749,10 @@ code {
 
 .mobile-detail-scroll--detail {
   gap: 0.14rem;
+}
+
+.mobile-detail-screen--has-reply-dock .mobile-detail-scroll--detail {
+  padding-bottom: calc(6rem + env(safe-area-inset-bottom));
 }
 
 .detail-action-bar {
@@ -2723,6 +2834,8 @@ code {
 .detail-body {
   overflow-wrap: anywhere;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .detail-card--body .detail-body {
@@ -2738,6 +2851,8 @@ code {
 }
 
 .detail-body.markdown {
+  min-width: 0;
+  max-width: 100%;
   line-height: 1.62;
   color: #f3fbff;
 }
@@ -2777,6 +2892,7 @@ code {
 }
 
 .detail-body.markdown pre {
+  max-width: 100%;
   overflow: auto;
   padding: 0.82rem 0.88rem;
   border: 1px solid var(--line);
@@ -2785,6 +2901,7 @@ code {
 }
 
 .detail-body.markdown table {
+  max-width: 100%;
   display: block;
   overflow-x: auto;
 }
@@ -2803,8 +2920,15 @@ code {
   align-items: stretch;
   gap: 0.52rem;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   align-self: start;
   padding: 0.68rem 0.78rem;
+}
+
+.detail-card > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .detail-card--mobile {
@@ -3417,6 +3541,8 @@ code {
 .reply-composer {
   display: grid;
   gap: 0.78rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reply-composer--readonly {
@@ -3425,6 +3551,8 @@ code {
 .reply-composer__copy {
   display: grid;
   gap: 0.34rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reply-composer__title {
@@ -3441,6 +3569,8 @@ code {
 .reply-composer__form {
   display: grid;
   gap: 0.8rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reply-composer__context {
@@ -3498,6 +3628,7 @@ code {
 }
 .reply-composer__textarea {
   width: 100%;
+  min-width: 0;
   min-height: 14rem;
   padding: 0.85rem 0.95rem;
   border-radius: 14px;
@@ -3505,7 +3636,7 @@ code {
   background: rgba(7, 12, 16, 0.96);
   color: var(--text);
   font: inherit;
-  font-size: 1rem;
+  font-size: max(1rem, 16px);
   line-height: 1.55;
   resize: vertical;
 }
@@ -3513,6 +3644,166 @@ code {
 .reply-composer__textarea:focus {
   outline: none;
   border-color: var(--accent, #6ea8ff);
+}
+
+.reply-dock {
+  position: fixed;
+  left: calc(var(--visual-viewport-left, 0px) + max(1rem, env(safe-area-inset-left)));
+  bottom: calc(0.88rem + env(safe-area-inset-bottom));
+  z-index: 36;
+  width: calc(var(--visual-viewport-width, 100vw) - max(1rem, env(safe-area-inset-left)) - max(1rem, env(safe-area-inset-right)));
+  max-width: calc(var(--visual-viewport-width, 100vw) - max(1rem, env(safe-area-inset-left)) - max(1rem, env(safe-area-inset-right)));
+  pointer-events: none;
+}
+
+.reply-dock__button {
+  width: 100%;
+  min-height: 3.45rem;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  padding: 0.82rem 1rem;
+  border: 1px solid rgba(156, 181, 197, 0.18);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(28, 42, 52, 0.96), rgba(17, 28, 36, 0.96)),
+    rgba(20, 31, 40, 0.94);
+  color: rgba(236, 248, 255, 0.94);
+  box-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  pointer-events: auto;
+  text-align: center;
+}
+
+.reply-dock__label {
+  font-size: 1rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.reply-dock__hint {
+  color: rgba(244, 255, 248, 0.74);
+  font-size: 0.78rem;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.reply-sheet-backdrop {
+  position: fixed;
+  top: 0;
+  right: auto;
+  bottom: 0;
+  left: var(--visual-viewport-left, 0px);
+  width: var(--visual-viewport-width, 100vw);
+  max-width: var(--visual-viewport-width, 100vw);
+  z-index: 44;
+  background: rgba(2, 7, 10, 0.56);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  animation: reply-sheet-backdrop-in 160ms ease-out both;
+}
+
+.reply-sheet {
+  position: fixed;
+  left: var(--visual-viewport-left, 0px);
+  right: auto;
+  bottom: 0;
+  z-index: 45;
+  width: var(--visual-viewport-width, 100vw);
+  min-width: 0;
+  max-width: var(--visual-viewport-width, 100vw);
+  max-height: min(82dvh, 42rem);
+  display: grid;
+  gap: 0.72rem;
+  padding:
+    0.78rem
+    max(0.9rem, env(safe-area-inset-right))
+    calc(0.9rem + env(safe-area-inset-bottom))
+    max(0.9rem, env(safe-area-inset-left));
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid rgba(156, 181, 197, 0.18);
+  border-bottom: 0;
+  border-radius: 28px 28px 0 0;
+  background:
+    linear-gradient(180deg, rgba(28, 42, 52, 0.98), rgba(13, 22, 29, 0.98)),
+    var(--panel-strong);
+  box-shadow: 0 -22px 58px rgba(0, 0, 0, 0.42);
+  animation: reply-sheet-in 190ms cubic-bezier(0.2, 0.9, 0.24, 1) both;
+}
+
+.reply-sheet > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.reply-sheet__handle {
+  justify-self: center;
+  width: 2.75rem;
+  height: 0.28rem;
+  border-radius: 999px;
+  background: rgba(205, 220, 231, 0.28);
+}
+
+.reply-sheet__close {
+  position: absolute;
+  top: 0.82rem;
+  right: max(0.9rem, env(safe-area-inset-right));
+  width: 2.45rem;
+  height: 2.45rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(156, 181, 197, 0.16);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(236, 248, 255, 0.9);
+}
+
+.reply-sheet__close span {
+  display: block;
+  transform: translateY(-0.03em);
+  font-size: 1.45rem;
+  line-height: 1;
+}
+
+.reply-sheet .detail-card--reply {
+  width: 100%;
+  max-width: 100%;
+  margin-top: 0;
+  padding: 0.58rem 0 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.reply-sheet .reply-composer__description {
+  padding: 0.5rem 0.12rem;
+}
+
+.reply-sheet .reply-field__input {
+  min-height: 9rem;
+}
+
+@keyframes reply-sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes reply-sheet-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .a2a-task-response {
@@ -3572,11 +3863,15 @@ code {
 
 .reply-field {
   gap: 0.5rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reply-field__shell {
   display: grid;
   gap: 0.52rem;
+  min-width: 0;
+  max-width: 100%;
   padding: 0.82rem 0.9rem 0.76rem;
   border-radius: 18px;
   border: 1px solid var(--line);
@@ -3586,6 +3881,7 @@ code {
 .reply-field__input {
   width: 100%;
   min-height: 7.4rem;
+  min-width: 0;
   padding: 0;
   border-radius: 0;
   border: 0;
@@ -3593,6 +3889,7 @@ code {
   color: var(--text);
   resize: vertical;
   font: inherit;
+  font-size: max(1rem, 16px);
   line-height: 1.58;
 }
 
@@ -3606,9 +3903,11 @@ code {
 
 .reply-field__toolbar {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: end;
   gap: 0.72rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .reply-attachment-trigger {
@@ -3709,6 +4008,7 @@ code {
   align-items: center;
   gap: 0.62rem;
   min-width: 0;
+  max-width: 100%;
   cursor: pointer;
 }
 
@@ -3852,7 +4152,12 @@ code {
   gap: 0.32rem;
 }
 
-.reply-mode-switch--settings .reply-mode-switch__hint {
+.reply-mode-switch--settings > .reply-mode-switch__copy {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.reply-mode-switch--settings > .reply-mode-switch__hint {
   grid-column: 1;
   grid-row: 1;
 }
@@ -4927,14 +5232,104 @@ button[aria-busy="true"]:not(.is-loading) {
   color: #ff8a8a;
 }
 
-/* ─── Remote pairing settings (Phase 5c) ───────────────────────────────
- * Two new shapes:
- *   1. Inline input + button (relay URL editor). The pattern reuses the
- *      `wallet-step-card__field-input` look (dark sunken input on a dark
- *      page) without the wallet-card wrapper, since this page is plainer.
- *   2. Per-pairing summary card with header (label + live/offline badge),
- *      a two-column dl of meta rows, and a danger-button action footer.
- */
+/* ─── Remote connection settings ────────────────────────────────────── */
+.settings-remote-connection {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.92rem 1rem 1rem;
+  border: 1px solid rgba(112, 202, 157, 0.16);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(47, 143, 103, 0.12), rgba(22, 28, 35, 0.96)),
+    rgba(22, 28, 35, 0.96);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
+}
+
+.settings-remote-connection__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.settings-remote-connection__copy {
+  display: grid;
+  gap: 0.32rem;
+  min-width: 0;
+}
+
+.settings-remote-connection__title {
+  margin: 0;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.settings-remote-connection__trust {
+  margin: 0;
+  padding: 0 0.2rem;
+  color: var(--muted);
+  font-size: 0.83rem;
+  line-height: 1.48;
+}
+
+.settings-remote-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 1.85rem;
+  padding: 0.24rem 0.66rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.settings-remote-status--success {
+  background: rgba(112, 202, 157, 0.16);
+  color: #b9efd0;
+}
+
+.settings-remote-status--warning {
+  background: rgba(210, 170, 99, 0.16);
+  color: #f5ddb1;
+}
+
+.settings-remote-status--muted {
+  background: rgba(156, 181, 197, 0.12);
+  color: var(--muted);
+}
+
+.settings-remote-device-card {
+  gap: 0.55rem;
+}
+
+.settings-remote-device-hint {
+  margin-top: 0.78rem;
+  padding: 0;
+}
+
+.settings-remote-details {
+  padding: 0.92rem 1rem;
+  border: 1px solid rgba(156, 181, 197, 0.08);
+  border-radius: 18px;
+  background: rgba(22, 28, 35, 0.78);
+}
+
+.settings-remote-details summary {
+  color: rgba(205, 220, 231, 0.72);
+  font-size: 0.86rem;
+}
+
+.settings-remote-details[open] summary {
+  margin-bottom: 0.85rem;
+  color: var(--text);
+}
+
 .settings-input-row {
   display: flex;
   flex-wrap: wrap;

@@ -11,6 +11,7 @@
 #   SCOUT_HARNESS   — "claude" or "codex" (default: auto-detect)
 #   SCOUT_FLAGS     — extra flags for scout (e.g. "--submolts builds,general --max-daily 5")
 #   SCOUT_TIMEOUT   — propose timeout in seconds (default: 900)
+#   SCOUT_DRAFT_TIMEOUT — LLM draft timeout in seconds (default: 120)
 #   SCOUT_WINDOW    — batch window in seconds (default: 1800 = 30 min)
 #   COMPOSE_MAX     — max original posts per day (default: 1)
 set -euo pipefail
@@ -26,6 +27,8 @@ NODE="$(command -v node)"
 VIVEWORKER="$SCRIPT_DIR/viveworker.mjs"
 PERSONA_FILE="$HOME/.viveworker/moltbook-persona.md"
 WINDOW_SEC="${SCOUT_WINDOW:-1800}"
+PROPOSE_TIMEOUT_SEC="${SCOUT_TIMEOUT:-900}"
+DRAFT_TIMEOUT_SEC="${SCOUT_DRAFT_TIMEOUT:-120}"
 
 # Seconds until a given hour (local time). Used for compose slot timeouts.
 seconds_until_hour() {
@@ -85,7 +88,12 @@ candidate_should_skip() {
 
 # Temp file for JSON interchange
 SCOUT_TMP=$(mktemp /tmp/viveworker-scout-XXXXXX.json)
-trap 'rm -f "$SCOUT_TMP"' EXIT
+LOCK_DIR="${TMPDIR:-/tmp}/viveworker-moltbook-scout.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[scout-auto] another scout run is already active — skipping this invocation"
+  exit 0
+fi
+trap 'rm -f "$SCOUT_TMP"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 read_field() {
   "$NODE" -e "
@@ -243,15 +251,15 @@ if [ "$PICK_STATUS" = "picked" ]; then
   echo "[scout-auto] batch complete: picked '$BEST_TITLE' by @$BEST_AUTHOR (score=$BEST_SCORE, considered=$CONSIDERED)"
 
   # Fetch post content from Moltbook API
-  POST_DATA=$("$NODE" --input-type=module -e "
+  POST_DATA=$(MOLTBOOK_API_MODULE="$SCRIPT_DIR/moltbook-api.mjs" "$NODE" --input-type=module -e "
     import { readFileSync } from 'fs';
     const env = readFileSync(process.env.HOME + '/.viveworker/moltbook.env', 'utf8');
     for(const line of env.split('\n')){
       const m = line.match(/^(\w+)=(.*)\$/);
       if(m) process.env[m[1]] = m[2];
     }
-    const { createMoltbookClient } = await import('./scripts/moltbook-api.mjs');
-    const { client: mb } = await createMoltbookClient();
+    const { createMoltbookClient } = await import('file://' + process.env.MOLTBOOK_API_MODULE);
+    const mb = createMoltbookClient(process.env.MOLTBOOK_API_KEY);
     try {
       const post = await mb('/posts/${BEST_POST_ID}');
       const p = post?.post || post;
@@ -297,13 +305,13 @@ PROMPT_EOF
   echo "[scout-auto] drafting via $HARNESS for '$BEST_TITLE'"
   DRAFT_TEXT=""
   if [ "$HARNESS" = "claude" ]; then
-    DRAFT_TEXT=$("$HARNESS_BIN" -p "$DRAFT_PROMPT" --output-format text) || true
+    DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$DRAFT_PROMPT" --output-format text 2>/dev/null) || true
   elif [ "$HARNESS" = "codex" ]; then
-    DRAFT_TEXT=$("$HARNESS_BIN" exec "$DRAFT_PROMPT") || true
+    DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec "$DRAFT_PROMPT" 2>/dev/null) || true
   fi
 
   if [ -z "$DRAFT_TEXT" ]; then
-    echo "[scout-auto] error: harness returned empty draft"
+    echo "[scout-auto] error: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
     exit 1
   fi
 
@@ -335,7 +343,7 @@ PROMPT_EOF
     --post-body "$POST_CONTENT" \
     --intent "$INTENT" \
     --text "$REPLY_BODY" \
-    --timeout "$WINDOW_SEC"
+    --timeout "$PROPOSE_TIMEOUT_SEC"
 
   exit 0
 fi

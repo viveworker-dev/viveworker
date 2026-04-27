@@ -21,15 +21,19 @@
  *     "pairings": [
  *       {
  *         "pairingId":            "<relay slot, opaque string>",
+ *         "relayToken":           "<relay capability token>",
  *         "phonePub":              "<lowercase hex 32 bytes — phone's X25519 static pub>",
  *         "phoneFingerprint":      "ABCD-EF12-3456",
  *         "label":                 "iPhone (LAN-paired 2026-04-25)",
  *         "addedAtMs":             1714000000000,
- *         "lastSeenAtMs":          null,
- *         "lastSeenChannelBinding": null
+ *         "lastSeenAtMs":          null
  *       }
  *     ]
  *   }
+ *
+ *   Older files may include a "lastSeenChannelBinding" field (debug-only,
+ *   never read by the runtime). It's ignored on load and dropped on the
+ *   next save — see normalizePairing().
  *
  * Trust model:
  *   The presence of a phone pubkey in this list means "the user explicitly
@@ -45,6 +49,7 @@
  *   so we don't need cross-process locking.
  */
 
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -68,6 +73,10 @@ const FORMAT_VERSION = 1;
 // owns a handful of devices. 200 matches MAX_PAIRED_DEVICES on the LAN side
 // so the limits agree.
 export const MAX_PAIRINGS = 200;
+export const RELAY_TOKEN_VERSION = "v1";
+export const RELAY_TOKEN_POW_BITS = 16;
+export const RELAY_TOKEN_RE = /^v1\.[A-Za-z0-9_-]{32}\.[a-z0-9]{1,13}$/u;
+const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
 
 // ---------------------------------------------------------------------------
 // Pairing typedef
@@ -76,12 +85,12 @@ export const MAX_PAIRINGS = 200;
 /**
  * @typedef {Object} Pairing
  * @property {string} pairingId        relay slot identifier; opaque to us
+ * @property {string} relayToken       bearer-ish relay capability for this slot
  * @property {string} phonePub         lowercase hex of the phone's X25519 pub
  * @property {string} phoneFingerprint human-readable "ABCD-EF12-3456" of phonePub
  * @property {string} label            user-visible label (e.g. "iPhone (LAN 2026-04-25)")
  * @property {number} addedAtMs        epoch ms at LAN pair time
  * @property {number | null} lastSeenAtMs            epoch ms of most recent successful relay handshake
- * @property {string | null} lastSeenChannelBinding  hex of last channel binding (debug only)
  */
 
 // ---------------------------------------------------------------------------
@@ -206,20 +215,21 @@ export function findByPairingId(pairings, pairingId) {
  * Stamp last-seen metadata on a pairing in-place (pure function; returns
  * a new array). Useful for "show last connect time in the settings UI".
  *
+ * The legacy `channelBinding` argument is accepted for backward
+ * compatibility but ignored — channel bindings are handshake-scoped and
+ * persisting them gave a relay-traffic correlation handle for no benefit.
+ *
  * @param {Pairing[]} pairings
  * @param {string} phonePub
  * @param {{ atMs: number, channelBinding?: Uint8Array | null }} info
  */
-export function markSeen(pairings, phonePub, { atMs, channelBinding = null }) {
+export function markSeen(pairings, phonePub, { atMs }) {
   const norm = String(phonePub || "").toLowerCase();
   return pairings.map((p) => {
     if (p.phonePub !== norm) return p;
     return {
       ...p,
       lastSeenAtMs: atMs,
-      lastSeenChannelBinding: channelBinding
-        ? bytesToHex(asU8(channelBinding))
-        : p.lastSeenChannelBinding,
     };
   });
 }
@@ -253,22 +263,26 @@ export async function removePairingPersisted(phonePub, filePath = REMOTE_PAIRING
  * stamps `addedAtMs`. The caller is expected to invent the `pairingId`
  * (typically a UUID) and the `label`.
  *
- * @param {{ pairingId: string, phonePub: Uint8Array | string, label?: string }} input
+ * @param {{ pairingId: string, relayToken?: string, phonePub: Uint8Array | string, label?: string }} input
  * @returns {Pairing}
  */
-export function buildPairing({ pairingId, phonePub, label }) {
+export function buildPairing({ pairingId, phonePub, label, relayToken }) {
   const pubBytes = asU8(phonePub);
   if (pubBytes.length !== IDENTITY_KEY_BYTES) {
     throw new RangeError(`phonePub must be ${IDENTITY_KEY_BYTES} bytes, got ${pubBytes.length}`);
   }
+  const id = String(pairingId);
+  const token = relayToken
+    ? normalizeRelayToken(id, relayToken)
+    : generateRelayToken(id);
   return {
-    pairingId: String(pairingId),
+    pairingId: id,
+    relayToken: token,
     phonePub: bytesToHex(pubBytes),
     phoneFingerprint: fingerprintIdentity(pubBytes),
     label: label ? String(label) : "",
     addedAtMs: Date.now(),
     lastSeenAtMs: null,
-    lastSeenChannelBinding: null,
   };
 }
 
@@ -281,6 +295,9 @@ function normalizePairing(raw, ctx) {
     throw new TypeError(`pairing[${ctx}]: not an object`);
   }
   const pairingId = stringOrThrow(raw.pairingId, `pairing[${ctx}].pairingId`);
+  const relayToken = raw.relayToken == null || raw.relayToken === ""
+    ? generateRelayToken(pairingId)
+    : normalizeRelayToken(pairingId, raw.relayToken);
   const phonePubRaw = stringOrThrow(raw.phonePub, `pairing[${ctx}].phonePub`).toLowerCase();
   // Validate phonePub by parsing the hex — catches obvious garbage early.
   let phonePubBytes;
@@ -304,15 +321,60 @@ function normalizePairing(raw, ctx) {
     throw new Error(`pairing[${ctx}].phoneFingerprint: ${err.message}`);
   }
 
+  // lastSeenChannelBinding from older schemas is intentionally dropped —
+  // see the file-level comment.
   return {
     pairingId,
+    relayToken,
     phonePub: phonePubRaw,
     phoneFingerprint: fingerprint,
     label: raw.label != null ? String(raw.label) : "",
     addedAtMs: numOrNull(raw.addedAtMs) ?? Date.now(),
     lastSeenAtMs: numOrNull(raw.lastSeenAtMs),
-    lastSeenChannelBinding: stringOrNull(raw.lastSeenChannelBinding),
   };
+}
+
+export function generateRelayToken(pairingId) {
+  const nonce = randomBytes(24).toString("base64url");
+  let counter = randomBytes(6).readUIntBE(0, 6);
+  for (;;) {
+    const token = `${RELAY_TOKEN_VERSION}.${nonce}.${counter.toString(36)}`;
+    if (verifyRelayToken(pairingId, token)) return token;
+    counter = (counter + 1) % Number.MAX_SAFE_INTEGER;
+  }
+}
+
+export function verifyRelayToken(pairingId, relayToken) {
+  const id = stringOrThrow(String(pairingId || ""), "pairingId");
+  const token = stringOrThrow(String(relayToken || ""), "relayToken");
+  if (!RELAY_TOKEN_RE.test(token)) return false;
+  const digest = createHash("sha256")
+    .update(`${RELAY_TOKEN_DOMAIN}:${id}:${token}`)
+    .digest();
+  return countLeadingZeroBits(digest) >= RELAY_TOKEN_POW_BITS;
+}
+
+function normalizeRelayToken(pairingId, relayToken) {
+  const token = stringOrThrow(String(relayToken || ""), "relayToken");
+  if (!verifyRelayToken(pairingId, token)) {
+    throw new Error("relayToken failed validation");
+  }
+  return token;
+}
+
+function countLeadingZeroBits(bytes) {
+  let bits = 0;
+  for (const b of bytes) {
+    if (b === 0) {
+      bits += 8;
+      continue;
+    }
+    for (let i = 7; i >= 0; i--) {
+      if ((b & (1 << i)) !== 0) return bits;
+      bits += 1;
+    }
+  }
+  return bits;
 }
 
 function stringOrThrow(v, name) {
@@ -320,10 +382,6 @@ function stringOrThrow(v, name) {
     throw new TypeError(`${name} must be a non-empty string`);
   }
   return v;
-}
-
-function stringOrNull(v) {
-  return typeof v === "string" && v.length > 0 ? v : null;
 }
 
 function numOrNull(v) {
