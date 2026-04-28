@@ -24,6 +24,7 @@
  *         "relayToken":           "<relay capability token>",
  *         "phonePub":              "<lowercase hex 32 bytes — phone's X25519 static pub>",
  *         "phoneFingerprint":      "ABCD-EF12-3456",
+ *         "deviceId":              "<LAN trusted-device id, when enrolled from an authenticated browser>",
  *         "label":                 "iPhone (LAN-paired 2026-04-25)",
  *         "addedAtMs":             1714000000000,
  *         "lastSeenAtMs":          null
@@ -88,6 +89,7 @@ const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
  * @property {string} relayToken       bearer-ish relay capability for this slot
  * @property {string} phonePub         lowercase hex of the phone's X25519 pub
  * @property {string} phoneFingerprint human-readable "ABCD-EF12-3456" of phonePub
+ * @property {string} [deviceId]       LAN trusted-device id associated at enroll time
  * @property {string} label            user-visible label (e.g. "iPhone (LAN 2026-04-25)")
  * @property {number} addedAtMs        epoch ms at LAN pair time
  * @property {number | null} lastSeenAtMs            epoch ms of most recent successful relay handshake
@@ -160,7 +162,7 @@ export async function savePairings(pairings, filePath = REMOTE_PAIRINGS_FILE) {
   ) + "\n";
 
   // Atomic write: temp file + rename on the same volume.
-  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(6).toString("hex")}`;
   await fs.writeFile(tmpPath, body, { mode: 0o600 });
   await fs.rename(tmpPath, filePath);
 }
@@ -254,6 +256,16 @@ export async function removePairingPersisted(phonePub, filePath = REMOTE_PAIRING
   return next;
 }
 
+export async function markSeenPersisted(phonePub, info, filePath = REMOTE_PAIRINGS_FILE) {
+  const current = await loadPairings(filePath);
+  const next = markSeen(current, phonePub, info);
+  const changed = next.some((p, index) => p.lastSeenAtMs !== current[index]?.lastSeenAtMs);
+  if (changed) {
+    await savePairings(next, filePath);
+  }
+  return next;
+}
+
 // ---------------------------------------------------------------------------
 // Helper used by clients to build an entry from a phone pubkey
 // ---------------------------------------------------------------------------
@@ -263,10 +275,10 @@ export async function removePairingPersisted(phonePub, filePath = REMOTE_PAIRING
  * stamps `addedAtMs`. The caller is expected to invent the `pairingId`
  * (typically a UUID) and the `label`.
  *
- * @param {{ pairingId: string, relayToken?: string, phonePub: Uint8Array | string, label?: string }} input
+ * @param {{ pairingId: string, relayToken?: string, phonePub: Uint8Array | string, label?: string, deviceId?: string }} input
  * @returns {Pairing}
  */
-export function buildPairing({ pairingId, phonePub, label, relayToken }) {
+export function buildPairing({ pairingId, phonePub, label, relayToken, deviceId }) {
   const pubBytes = asU8(phonePub);
   if (pubBytes.length !== IDENTITY_KEY_BYTES) {
     throw new RangeError(`phonePub must be ${IDENTITY_KEY_BYTES} bytes, got ${pubBytes.length}`);
@@ -275,7 +287,7 @@ export function buildPairing({ pairingId, phonePub, label, relayToken }) {
   const token = relayToken
     ? normalizeRelayToken(id, relayToken)
     : generateRelayToken(id);
-  return {
+  const record = {
     pairingId: id,
     relayToken: token,
     phonePub: bytesToHex(pubBytes),
@@ -284,6 +296,11 @@ export function buildPairing({ pairingId, phonePub, label, relayToken }) {
     addedAtMs: Date.now(),
     lastSeenAtMs: null,
   };
+  const cleanDeviceId = normalizeOptionalText(deviceId);
+  if (cleanDeviceId) {
+    record.deviceId = cleanDeviceId;
+  }
+  return record;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +340,7 @@ function normalizePairing(raw, ctx) {
 
   // lastSeenChannelBinding from older schemas is intentionally dropped —
   // see the file-level comment.
-  return {
+  const out = {
     pairingId,
     relayToken,
     phonePub: phonePubRaw,
@@ -332,6 +349,11 @@ function normalizePairing(raw, ctx) {
     addedAtMs: numOrNull(raw.addedAtMs) ?? Date.now(),
     lastSeenAtMs: numOrNull(raw.lastSeenAtMs),
   };
+  const deviceId = normalizeOptionalText(raw.deviceId);
+  if (deviceId) {
+    out.deviceId = deviceId;
+  }
+  return out;
 }
 
 export function generateRelayToken(pairingId) {
@@ -386,6 +408,11 @@ function stringOrThrow(v, name) {
 
 function numOrNull(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function normalizeOptionalText(v) {
+  if (v == null) return "";
+  return String(v).trim().slice(0, 200);
 }
 
 function asU8(v) {

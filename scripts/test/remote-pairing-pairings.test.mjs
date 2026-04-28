@@ -27,6 +27,7 @@ import {
   verifyRelayToken,
   addPairingPersisted,
   removePairingPersisted,
+  markSeenPersisted,
   MAX_PAIRINGS,
 } from "../lib/remote-pairing/pairings.mjs";
 import { generateIdentityKeypair, bytesToHex } from "../lib/remote-pairing/keys-core.mjs";
@@ -66,6 +67,22 @@ test("save then load roundtrips all fields", async () => {
   const loaded = await loadPairings(filePath);
   assert.equal(loaded.length, 1);
   assert.deepEqual(loaded[0], p);
+});
+
+test("save then load preserves associated LAN deviceId when present", async () => {
+  const filePath = await tmpFile();
+  const kp = generateIdentityKeypair();
+  const p = buildPairing({
+    pairingId: "slot-device",
+    phonePub: kp.pub,
+    label: "iPhone test",
+    deviceId: "device-123",
+  });
+
+  await savePairings([p], filePath);
+  const loaded = await loadPairings(filePath);
+
+  assert.equal(loaded[0].deviceId, "device-123");
 });
 
 test("file mode is 0o600 after save", async () => {
@@ -294,17 +311,30 @@ test("removePairingPersisted is idempotent on missing pub (no extra writes)", as
   assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs, "no-op should not rewrite the file");
 });
 
+test("markSeenPersisted stamps and saves lastSeenAtMs", async () => {
+  const filePath = await tmpFile();
+  const a = fakePairing();
+  await savePairings([a], filePath);
+
+  const next = await markSeenPersisted(a.phonePub, { atMs: 123456789 }, filePath);
+  assert.equal(next[0].lastSeenAtMs, 123456789);
+
+  const loaded = await loadPairings(filePath);
+  assert.equal(loaded[0].lastSeenAtMs, 123456789);
+});
+
 // ---------------------------------------------------------------------------
 // buildPairing helper
 // ---------------------------------------------------------------------------
 
 test("buildPairing computes fingerprint + addedAtMs", () => {
   const kp = generateIdentityKeypair();
-  const p = buildPairing({ pairingId: "slot-x", phonePub: kp.pub, label: "test" });
+  const p = buildPairing({ pairingId: "slot-x", phonePub: kp.pub, label: "test", deviceId: "device-abc" });
   assert.equal(p.pairingId, "slot-x");
   assert.equal(verifyRelayToken(p.pairingId, p.relayToken), true);
   assert.equal(p.phonePub, bytesToHex(kp.pub));
   assert.match(p.phoneFingerprint, /^[A-Z0-9]+(-[A-Z0-9]+)*$/);
+  assert.equal(p.deviceId, "device-abc");
   assert.equal(p.label, "test");
   assert.ok(p.addedAtMs > 0);
   assert.equal(p.lastSeenAtMs, null);

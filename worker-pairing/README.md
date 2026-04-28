@@ -146,17 +146,16 @@ What this Worker guarantees today:
 
 - ✅ Two-peer rendezvous by `pairingId + relayToken` (DO `idFromName`).
 - ✅ Per-pairing relay capability token with edge proof-of-work check.
-- ✅ Soft per-isolate throttling for repeated invalid relay tokens.
+- ✅ Cloudflare-managed throttling for invalid tokens and valid WS upgrades.
 - ✅ DATA frame routing without payload inspection.
 - ✅ Replay buffer with ACK-driven GC and TTL safety net.
 - ✅ RESUME flow (OK + replay / FAIL on gap or hibernation).
 - ✅ PING/PONG keepalive support (relay-local).
-- ✅ Active same-role sockets are not evicted by unauthenticated duplicate upgrades.
+- ✅ Same-role reconnects perform controlled `4003 replaced` handoff for iOS/PWA recovery.
 - ✅ Hibernatable DO — no $$ for idle pairings.
 
 What still needs to land before the PWA can use this for real:
 
-- 🔜 **Cloudflare-managed rate limits / abuse counters** for sustained public traffic.
 - 🔜 **Real-runtime smoke test stability** against `wrangler dev` in CI.
 - 🔜 **Hibernation timing measurement** — confirm CF actually unloads
   the DO under expected idle patterns; tune ping interval if not.

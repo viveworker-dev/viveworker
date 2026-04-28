@@ -113,6 +113,7 @@ export default {
       // through DO instances.
       const upgradeRl = await safeRateLimit(env.WS_UPGRADE_RL, `${pairingId}:${cfIp}`);
       if (upgradeRl && !upgradeRl.success) {
+        console.log(`[relay-ws-rate-limit] pairing=${shortPairing(pairingId)} role=${role}`);
         return new Response("too many ws upgrade attempts", {
           status: 429,
           headers: { "retry-after": "60" },
@@ -124,6 +125,7 @@ export default {
       // bot traffic must pay the token proof-of-work before allocating a DO.
       const id = env.PAIRING_CHANNEL.idFromName(await relayChannelName(pairingId, relayToken));
       const stub = env.PAIRING_CHANNEL.get(id);
+      console.log(`[relay-ws-upgrade] pairing=${shortPairing(pairingId)} role=${role}`);
       return stub.fetch(request);
     }
 
@@ -136,6 +138,10 @@ async function verifyRelayToken(pairingId, relayToken) {
   if (!RELAY_TOKEN_RE.test(relayToken)) return false;
   const digest = await sha256Bytes(`${RELAY_TOKEN_DOMAIN}:${pairingId}:${relayToken}`);
   return countLeadingZeroBits(digest) >= RELAY_TOKEN_POW_BITS;
+}
+
+function shortPairing(pairingId) {
+  return String(pairingId || "").slice(0, 8);
 }
 
 /**

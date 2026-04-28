@@ -1,5 +1,5 @@
-const CACHE_NAME = "viveworker-v105";
-const APP_BUILD_ID = "20260427-timeline-image-permission";
+const CACHE_NAME = "viveworker-v110";
+const APP_BUILD_ID = "20260428-remote-device-match";
 const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
 const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";

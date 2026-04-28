@@ -32,7 +32,7 @@ import { promises as fs } from "node:fs";
 import { watch as fsWatch } from "node:fs";
 
 import { ensureIdentityKeypair, REMOTE_PAIRING_ENV_FILE } from "./keys.mjs";
-import { loadPairings, REMOTE_PAIRINGS_FILE } from "./pairings.mjs";
+import { loadPairings, markSeenPersisted, REMOTE_PAIRINGS_FILE } from "./pairings.mjs";
 import { createHttpDispatch } from "./http-dispatch.mjs";
 import { BridgeRelayClient } from "./bridge-relay-client.mjs";
 import { bytesToHex } from "./keys-core.mjs";
@@ -171,8 +171,11 @@ export async function startRemotePairingRelay(opts) {
         `[remote-pairing] error${ctx?.pairingId ? ` (${redactPairingId(ctx.pairingId)})` : ""}: ${err?.message}`,
       );
     },
-    onSeen: ({ pairing, atMs }) => {
+    onSeen: ({ pairing, atMs, channelBinding }) => {
       log.debug?.(`[remote-pairing] ${redactPairingId(pairing.pairingId)} seen at ${new Date(atMs).toISOString()}`);
+      markSeenPersisted(pairing.phonePub, { atMs, channelBinding }, pairingsFile).catch((err) => {
+        log.warn?.(`[remote-pairing] last-seen persist failed for ${redactPairingId(pairing.pairingId)}: ${err?.message}`);
+      });
     },
     WebSocketImpl,
     pingIntervalMs: opts.pingIntervalMs,

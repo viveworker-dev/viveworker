@@ -101,8 +101,7 @@ const fakeNoiseIkMsg1 = () => fakeBytes(96, 0xab);
 function connect(channel, role, ws) {
   const existing = channel.peers.get(role);
   if (existing?.socket?.readyState === 1) {
-    ws.close(4003, "active");
-    return false;
+    existing.socket.close(4003, "replaced");
   }
   channel.state.acceptWebSocket(ws, [role]);
   ws.serializeAttachment({ role });
@@ -116,19 +115,25 @@ function connect(channel, role, ws) {
     coldWake: existingColdWake,
     awaitingFirstFrame: true,
   });
-  const other = channel.peers.get(role === "phone" ? "bridge" : "phone");
-  if (
-    role === "bridge" &&
-    !existingColdWake &&
-    existingLastSent === 0 &&
-    existingOutbox.length === 0 &&
-    other?.socket?.readyState === 1 &&
-    !other.awaitingFirstFrame
-  ) {
-    for (const entry of other.outbox) {
-      ws.send(entry.wire);
-    }
-  }
+  // Replay on attach is no longer triggered by the DO at upgrade time.
+  // Tests that need to drive replay should send an explicit RESUME_REQ
+  // after `connect(...)` to mirror what the real transport does.
+  return true;
+}
+
+/**
+ * Convenience: do `connect()` plus an immediate RESUME_REQ(0). Mirrors what
+ * a real transport does in `_handleOpen` — without this, the DO's
+ * "don't direct-forward to a peer that hasn't sent its first frame yet"
+ * gate keeps frames buffered and tests that exercise post-attach DATA
+ * forwarding never see anything delivered.
+ *
+ * Use the bare `connect(...)` for tests that explicitly want to assert
+ * pre-RESUME_REQ behaviour.
+ */
+async function connectAndAnnounce(channel, role, ws, lastSeenSeq = 0) {
+  if (!connect(channel, role, ws)) return false;
+  await channel.webSocketMessage(ws, encodeResumeReq(lastSeenSeq).buffer);
   return true;
 }
 
@@ -156,8 +161,12 @@ test("DATA from phone is forwarded to bridge and buffered in phone's outbox", as
   const channel = new PairingChannel(new FakeState(), {});
   const phone = new FakeWS();
   const bridge = new FakeWS();
-  connect(channel, "phone", phone);
-  connect(channel, "bridge", bridge);
+  await connectAndAnnounce(channel, "phone", phone);
+  await connectAndAnnounce(channel, "bridge", bridge);
+  // Drop the RESUME_OK responses from the announce step so the assertions
+  // below can focus on the actual DATA roundtrip.
+  bridge.sent.length = 0;
+  phone.sent.length = 0;
 
   const mid = generateMid();
   const wire = encodeData({ seq: 1, mid, payload: enc("hello") });
@@ -201,7 +210,7 @@ test("DATA buffered when peer is offline; nothing forwarded", async () => {
   assert.equal(channel.peers.has("bridge"), false);
 });
 
-test("DATA buffered while peer is offline drains when peer connects later", async () => {
+test("DATA buffered while peer is offline replays after the peer's RESUME_REQ", async () => {
   const channel = new PairingChannel(new FakeState(), {});
   const phone = new FakeWS();
   connect(channel, "phone", phone);
@@ -212,8 +221,16 @@ test("DATA buffered while peer is offline drains when peer connects later", asyn
   const bridge = new FakeWS();
   connect(channel, "bridge", bridge);
 
-  assert.equal(bridge.sent.length, 1);
-  assert.deepEqual(bridge.sent[0], wire);
+  // No replay-on-attach any more — the DO waits for the peer's RESUME_REQ.
+  assert.equal(bridge.sent.length, 0);
+
+  await channel.webSocketMessage(bridge, encodeResumeReq(0).buffer);
+
+  // RESUME_OK + replayed phone frame.
+  assert.equal(bridge.sent.length, 2);
+  const ok = decode(bridge.sent[0]);
+  assert.equal(ok.type, FRAME_RESUME_OK);
+  assert.deepEqual(bridge.sent[1], wire);
 });
 
 test("stale DATA from a disconnected peer is not drained into a later peer", async () => {
@@ -231,7 +248,7 @@ test("stale DATA from a disconnected peer is not drained into a later peer", asy
   assert.equal(bridge.sent.length, 0);
 });
 
-test("active same-role duplicate is rejected without evicting the existing socket", async () => {
+test("active same-role duplicate performs a controlled replace", async () => {
   const channel = new PairingChannel(new FakeState(), {});
   const firstPhone = new FakeWS();
   connect(channel, "phone", firstPhone);
@@ -239,10 +256,29 @@ test("active same-role duplicate is rejected without evicting the existing socke
   const secondPhone = new FakeWS();
   const accepted = connect(channel, "phone", secondPhone);
 
-  assert.equal(accepted, false);
-  assert.equal(firstPhone.closed, null);
-  assert.deepEqual(secondPhone.closed, { code: 4003, reason: "active" });
-  assert.equal(channel.peers.get("phone").socket, firstPhone);
+  assert.equal(accepted, true);
+  assert.deepEqual(firstPhone.closed, { code: 4003, reason: "replaced" });
+  assert.equal(secondPhone.closed, null);
+  assert.equal(channel.peers.get("phone").socket, secondPhone);
+});
+
+test("late DATA from a replaced same-role socket is ignored", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const firstPhone = new FakeWS();
+  const bridge = new FakeWS();
+  connect(channel, "phone", firstPhone);
+  await connectAndAnnounce(channel, "bridge", bridge);
+  bridge.sent.length = 0;
+
+  const secondPhone = new FakeWS();
+  connect(channel, "phone", secondPhone);
+
+  const stale = encodeData({ seq: 9, mid: generateMid(), payload: enc("stale") });
+  await channel.webSocketMessage(firstPhone, stale.buffer);
+
+  assert.equal(bridge.sent.length, 0);
+  assert.equal(channel.peers.get("phone").socket, secondPhone);
+  assert.equal(channel.peers.get("phone").outbox.length, 0);
 });
 
 test("fresh DATA on same-role reconnect discards stale handshake outbox", async () => {
@@ -387,6 +423,116 @@ test("stale bridge reconnect gets RESUME_FAIL before buffered fresh phone msg1",
   assert.deepEqual(newBridge.sent[1], freshMsg1);
 });
 
+test("bridge restart while phone has stale session: bridge RESUME_FAIL forces phone reset", async () => {
+  // Real-world bridge restart sequence: both peers have been actively
+  // exchanging transport frames. The bridge process is restarted, which
+  // wipes the in-memory Noise transport session on the bridge side. The
+  // phone keeps its existing session (its WS to the relay is preserved by
+  // the hibernation API) and continues sending transport DATA encrypted
+  // with the old keys. If the DO replays those buffered frames into the
+  // freshly-connected bridge — which is sitting in handshake mode — they
+  // AEAD-fail in a tight loop until the phone's WS happens to time out.
+  //
+  // The fix: when the new bridge announces itself with RESUME_REQ(0), the
+  // DO sees the asymmetry (lastSeenSeq=0 despite previously-active
+  // bridge.lastSent>0) and treats it as state loss. RESUME_FAIL goes to
+  // the bridge, the phone's WS is booted so its transport drops the stale
+  // session and reconnects with a real msg1, and both sides end up doing
+  // a clean fresh handshake.
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  await connectAndAnnounce(channel, "phone", phone);
+  await connectAndAnnounce(channel, "bridge", bridge);
+
+  // Both peers exchange a few transport frames so the DO records non-zero
+  // lastSent on each slot — this is what the state-loss heuristic keys on.
+  for (let seq = 1; seq <= 3; seq++) {
+    await channel.webSocketMessage(phone, encodeData({
+      seq,
+      mid: generateMid(),
+      payload: enc(`phone-data-${seq}`),
+    }).buffer);
+  }
+  for (let seq = 1; seq <= 2; seq++) {
+    await channel.webSocketMessage(bridge, encodeData({
+      seq,
+      mid: generateMid(),
+      payload: enc(`bridge-data-${seq}`),
+    }).buffer);
+  }
+  assert.equal(channel.peers.get("phone").outbox.length, 3);
+  assert.equal(channel.peers.get("bridge").lastSent, 2);
+
+  // Simulate bridge process restart: old bridge socket dies, then a fresh
+  // socket attaches with no session and sends RESUME_REQ(0).
+  await channel.webSocketClose(bridge, 1006, "abnormal", false);
+  const newBridge = new FakeWS();
+  connect(channel, "bridge", newBridge);
+  // Before the new bridge announces itself, nothing has been replayed.
+  assert.equal(newBridge.sent.length, 0);
+
+  await channel.webSocketMessage(newBridge, encodeResumeReq(0).buffer);
+
+  // Bridge gets RESUME_FAIL — the DO refuses to silently RESUME_OK + replay
+  // ciphertext into a session-less responder.
+  assert.equal(newBridge.sent.length, 1);
+  assert.equal(decode(newBridge.sent[0]).type, FRAME_RESUME_FAIL);
+
+  // Phone WS gets booted so its transport will reconnect with a fresh
+  // handshake instead of continuing to ship stale-keys DATA into the
+  // responder's handshake state.
+  assert.deepEqual(phone.closed, { code: 4004, reason: "counterparty-reset" });
+  assert.equal(channel.peers.get("phone").socket, null);
+  assert.equal(channel.peers.get("phone").coldWake, true);
+  assert.equal(channel.peers.get("phone").awaitingFirstFrame, true);
+  // Stale outbox is wiped — no risk of replaying old ciphertext into the
+  // next handshake.
+  assert.equal(channel.peers.get("phone").outbox.length, 0);
+  assert.equal(channel.peers.get("phone").lastSent, 0);
+});
+
+test("bridge responder may send msg2 after RESUME_FAIL without being treated as missing msg1", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const oldPhone = new FakeWS();
+  const oldBridge = new FakeWS();
+  await connectAndAnnounce(channel, "phone", oldPhone);
+  await connectAndAnnounce(channel, "bridge", oldBridge);
+
+  // Make the bridge slot look previously active, then restart the bridge so
+  // RESUME_REQ(0) takes the state-loss path.
+  await channel.webSocketMessage(oldBridge, encodeData({
+    seq: 1,
+    mid: generateMid(),
+    payload: enc("old-bridge-data"),
+  }).buffer);
+  await channel.webSocketClose(oldBridge, 1006, "abnormal", false);
+
+  const newBridge = new FakeWS();
+  connect(channel, "bridge", newBridge);
+  await channel.webSocketMessage(newBridge, encodeResumeReq(0).buffer);
+
+  assert.equal(decode(newBridge.sent[0]).type, FRAME_RESUME_FAIL);
+  assert.deepEqual(oldPhone.closed, { code: 4004, reason: "counterparty-reset" });
+  assert.equal(channel.peers.get("bridge").expectFreshHandshake, false);
+
+  const newPhone = new FakeWS();
+  connect(channel, "phone", newPhone);
+  await channel.webSocketMessage(newPhone, encodeResumeReq(0).buffer);
+  assert.equal(decode(newPhone.sent[0]).type, FRAME_RESUME_FAIL);
+
+  const freshMsg1 = encodeData({ seq: 17, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(newPhone, freshMsg1.buffer);
+  assert.deepEqual(newBridge.sent[1], freshMsg1);
+
+  const msg2 = encodeData({ seq: 1, mid: generateMid(), payload: fakeBytes(48) });
+  await channel.webSocketMessage(newBridge, msg2.buffer);
+
+  assert.equal(newBridge.closed, null);
+  assert.equal(channel.peers.get("bridge").socket, newBridge);
+  assert.deepEqual(newPhone.sent[1], msg2);
+});
+
 test("bridge's first DATA frame does not evict the active phone", async () => {
   const channel = new PairingChannel(new FakeState(), {});
   const phone = new FakeWS();
@@ -452,8 +598,10 @@ test("RESUME_REQ replays counterparty frames after lastSeenSeq", async () => {
   const channel = new PairingChannel(new FakeState(), {});
   const phone = new FakeWS();
   const bridge = new FakeWS();
-  connect(channel, "phone", phone);
-  connect(channel, "bridge", bridge);
+  await connectAndAnnounce(channel, "phone", phone);
+  await connectAndAnnounce(channel, "bridge", bridge);
+  phone.sent.length = 0;
+  bridge.sent.length = 0;
 
   // Bridge sends 3 frames; we want to test replay to phone.
   const frames = [];
@@ -539,6 +687,54 @@ test("RESUME_REQ after cold wake returns RESUME_FAIL(HIBERNATED)", async () => {
   const got = decode(phone.sent[0]);
   assert.equal(got.type, FRAME_RESUME_FAIL);
   assert.equal(got.reason, RESUME_FAIL_HIBERNATED);
+});
+
+test("fresh phone msg1 after DO hibernation reaches the waiting bridge", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  reattachAfterHibernation(channel, "phone", phone);
+  reattachAfterHibernation(channel, "bridge", bridge);
+
+  const freshMsg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, freshMsg1.buffer);
+
+  assert.equal(bridge.closed, null);
+  assert.equal(bridge.sent.length, 1);
+  assert.deepEqual(bridge.sent[0], freshMsg1);
+});
+
+test("fresh phone msg1 after RESUME_FAIL may use monotonic seq", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  reattachAfterHibernation(channel, "phone", phone);
+  reattachAfterHibernation(channel, "bridge", bridge);
+
+  await channel.webSocketMessage(phone, encodeResumeReq(0).buffer);
+  assert.equal(decode(phone.sent[0]).type, FRAME_RESUME_FAIL);
+
+  const freshMsg1 = encodeData({ seq: 17, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, freshMsg1.buffer);
+
+  assert.equal(bridge.closed, null);
+  assert.equal(bridge.sent.length, 1);
+  assert.deepEqual(bridge.sent[0], freshMsg1);
+});
+
+test("malformed phone DATA after DO hibernation stays buffered until bridge announces", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  const bridge = new FakeWS();
+  reattachAfterHibernation(channel, "phone", phone);
+  reattachAfterHibernation(channel, "bridge", bridge);
+
+  const junk = encodeData({ seq: 1, mid: generateMid(), payload: fakeBytes(12) });
+  await channel.webSocketMessage(phone, junk.buffer);
+
+  assert.equal(bridge.closed, null);
+  assert.equal(bridge.sent.length, 0);
+  assert.equal(channel.peers.get("phone").outbox.length, 1);
 });
 
 test("Constructor re-attaches sockets from getWebSockets() and marks them coldWake", () => {
@@ -647,4 +843,3 @@ test("trimOutbox enforces a cumulative byte cap", async () => {
   // 2 MB frames + msg1).
   assert.ok(outbox.length < 6, `expected oldest entries to be evicted, length=${outbox.length}`);
 });
-

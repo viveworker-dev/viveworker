@@ -32,8 +32,8 @@ import {
   DEFAULT_RELAY_URL,
   __RELOAD_DEBOUNCE_MS,
 } from "../lib/remote-pairing/orchestrator.mjs";
-import { savePairings, buildPairing } from "../lib/remote-pairing/pairings.mjs";
-import { generateIdentityKeypair } from "../lib/remote-pairing/keys-core.mjs";
+import { loadPairings, savePairings, buildPairing } from "../lib/remote-pairing/pairings.mjs";
+import { generateIdentityKeypair, hexToBytes } from "../lib/remote-pairing/keys-core.mjs";
 import { STATE } from "../../web/remote-pairing/transport.js";
 
 // ---------------------------------------------------------------------------
@@ -644,6 +644,40 @@ test("logger.info is invoked with identity + pairings count summary", async () =
       "expected an info log line announcing the identity");
     assert.ok(infos.some((m) => /loaded 1 paired phone/.test(m)),
       "expected an info log line announcing the pairings count");
+
+    handle.close();
+  } finally {
+    await tmp.cleanup();
+  }
+});
+
+test("successful relay handshake persists pairings lastSeenAtMs", async () => {
+  const tmp = await makeTmp();
+  try {
+    const pairing = makePairing();
+    await savePairings([pairing], tmp.pairingsFile);
+
+    const handle = await startRemotePairingRelay({
+      requestListener: () => {},
+      identityKeypairFile: tmp.keysFile,
+      pairingsFile: tmp.pairingsFile,
+      WebSocketImpl: makeStubWebSocketImpl(),
+      watchPairingsFile: false,
+    });
+
+    const session = handle.client._sessions.get(pairing.pairingId);
+    assert.ok(session, "expected a BridgePairingSession for the test pairing");
+
+    const before = Date.now();
+    session._handleHandshakeComplete({
+      channelBinding: new Uint8Array(32).fill(0x11),
+      remoteStatic: hexToBytes(pairing.phonePub),
+    });
+
+    await sleep(20);
+    const loaded = await loadPairings(tmp.pairingsFile);
+    assert.equal(loaded.length, 1);
+    assert.ok(loaded[0].lastSeenAtMs >= before);
 
     handle.close();
   } finally {

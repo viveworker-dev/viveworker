@@ -19,6 +19,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  inspectPairingState,
   loadPairingState,
   savePairingState,
   clearPairingState,
@@ -70,6 +71,14 @@ function makeRecord(overrides = {}) {
 test("loadPairingState returns null when storage is empty", () => {
   const storage = makeStorage();
   assert.equal(loadPairingState({ storage }), null);
+});
+
+test("inspectPairingState reports missing storage record as enrollable", () => {
+  const storage = makeStorage();
+  const info = inspectPairingState({ storage });
+  assert.equal(info.status, "missing");
+  assert.equal(info.needsEnrollment, true);
+  assert.equal(info.record, null);
 });
 
 test("save → load round-trips a full record", () => {
@@ -141,6 +150,52 @@ test("loadPairingState returns null when the schema version mismatches", () => {
     JSON.stringify({ ...makeRecord(), version: __SCHEMA_VERSION + 1 }),
   );
   assert.equal(loadPairingState({ storage }), null);
+});
+
+test("inspectPairingState marks legacy v1 records for LAN refresh", () => {
+  const storage = makeStorage();
+  const legacy = makeRecord();
+  delete legacy.relayToken;
+  storage.setItem(
+    __STORAGE_KEY,
+    JSON.stringify({ ...legacy, version: 1 }),
+  );
+
+  assert.equal(loadPairingState({ storage }), null);
+  const info = inspectPairingState({ storage });
+  assert.equal(info.status, "legacy-v1");
+  assert.equal(info.needsEnrollment, true);
+  assert.equal(info.legacyRecord.pairingId, legacy.pairingId);
+  assert.equal(info.legacyRecord.relayUrl, legacy.relayUrl);
+});
+
+test("inspectPairingState marks v2 records without relayToken for LAN refresh", () => {
+  const storage = makeStorage();
+  const record = makeRecord();
+  delete record.relayToken;
+  storage.setItem(
+    __STORAGE_KEY,
+    JSON.stringify({ ...record, version: __SCHEMA_VERSION }),
+  );
+
+  assert.equal(loadPairingState({ storage }), null);
+  const info = inspectPairingState({ storage });
+  assert.equal(info.status, "missing-token");
+  assert.equal(info.needsEnrollment, true);
+});
+
+test("inspectPairingState returns ready for valid v2 records", () => {
+  const storage = makeStorage();
+  const record = makeRecord();
+  storage.setItem(
+    __STORAGE_KEY,
+    JSON.stringify({ ...record, version: __SCHEMA_VERSION }),
+  );
+
+  const info = inspectPairingState({ storage });
+  assert.equal(info.status, "ready");
+  assert.equal(info.needsEnrollment, false);
+  assert.equal(info.record.pairingId, record.pairingId);
 });
 
 test("loadPairingState returns null on missing required fields", () => {

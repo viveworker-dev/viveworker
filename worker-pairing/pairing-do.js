@@ -132,8 +132,15 @@ export class PairingChannel {
     //                 meaningful frame is DATA, this is a fresh handshake
     //                 rather than RESUME, so stale same-role outbox entries
     //                 from earlier failed handshakes must be discarded.
+    //     expectFreshHandshake: boolean
+    //                 true after this peer received RESUME_FAIL. Clients keep
+    //                 envelope seq monotonic across re-handshakes, so the
+    //                 next fresh Noise msg1 may have seq>1.
+    //     freshHandshakeBuffered: boolean
+    //                 true when the outbox contains a buffered fresh msg1
+    //                 that may be rendezvous-drained to a waiting bridge.
     //   }
-    /** @type {Map<string, { socket: WebSocket|null, outbox: Array<{seq:number, mid:Uint8Array, ts:number, wire:Uint8Array}>, lastSent: number, coldWake: boolean, awaitingFirstFrame?: boolean }>} */
+    /** @type {Map<string, { socket: WebSocket|null, outbox: Array<{seq:number, mid:Uint8Array, ts:number, wire:Uint8Array}>, lastSent: number, coldWake: boolean, awaitingFirstFrame?: boolean, expectFreshHandshake?: boolean, freshHandshakeBuffered?: boolean }>} */
     this.peers = new Map();
 
     // Re-attach any sockets that survived hibernation. Their attachment
@@ -152,6 +159,8 @@ export class PairingChannel {
         lastSent: 0,
         coldWake: true,
         awaitingFirstFrame: true,
+        expectFreshHandshake: false,
+        freshHandshakeBuffered: false,
       });
     }
   }
@@ -171,14 +180,21 @@ export class PairingChannel {
     if (!role || !VALID_ROLES.has(role)) {
       return new Response("invalid role", { status: 400 });
     }
+    const pairingHint = shortPairingFromUrl(url);
 
     const existing = this.peers.get(role);
-    // Security hardening: do not let a fresh, unauthenticated same-role WS
-    // evict an already-open socket. Legitimate reconnects retry after the old
-    // socket actually closes; attackers with only metadata cannot knock an
-    // active peer offline by racing duplicate upgrades.
+    const replacing = Boolean(existing?.socket && isOpen(existing.socket));
     if (existing?.socket && isOpen(existing.socket)) {
-      return new Response("role already connected", { status: 409 });
+      // Controlled same-role replace. iOS can briefly keep the old PWA WS
+      // alive while a foregrounded/reloaded tab opens the new one; rejecting
+      // that second socket leaves legitimate off-LAN reconnects stuck. The
+      // relay token + rate limit gate admission, and Noise/allowlist still
+      // authenticate the channel before any bridge RPC is served.
+      try {
+        existing.socket.close(CODE_REPLACED, "replaced");
+      } catch {
+        // Already closed — fine.
+      }
     }
 
     const pair = new WebSocketPair();
@@ -186,7 +202,7 @@ export class PairingChannel {
     const server = pair[1];
 
     this.state.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role });
+    server.serializeAttachment({ role, pairing: pairingHint });
 
     // Preserve any existing outbox + lastSent so a reconnecting peer can
     // RESUME. lastSent is what lets us answer "yes, you've seen everything"
@@ -194,24 +210,35 @@ export class PairingChannel {
     const existingOutbox = existing?.outbox ?? [];
     const existingLastSent = existing?.lastSent ?? 0;
     const existingColdWake = existing?.coldWake === true;
+    const existingExpectFreshHandshake = existing?.expectFreshHandshake === true;
+    const existingFreshHandshakeBuffered = existing?.freshHandshakeBuffered === true;
     this.peers.set(role, {
       socket: server,
       outbox: existingOutbox,
       lastSent: existingLastSent,
       coldWake: existingColdWake,
       awaitingFirstFrame: true,
+      expectFreshHandshake: existingExpectFreshHandshake,
+      freshHandshakeBuffered: existingFreshHandshakeBuffered,
     });
 
     const otherRole = role === "phone" ? "bridge" : "phone";
     const other = this.peers.get(otherRole);
-    const shouldDrainOnAccept =
-      role === "bridge" &&
-      !existingColdWake &&
-      existingLastSent === 0 &&
-      existingOutbox.length === 0;
-    if (shouldDrainOnAccept) {
-      drainOutboxToSocket(other, server);
-    }
+    console.log(
+      `[relay-do-accept] pairing=${pairingHint} role=${role}` +
+      ` replacing=${replacing ? "1" : "0"}` +
+      ` otherOpen=${other?.socket && isOpen(other.socket) ? "1" : "0"}` +
+      ` cold=${existingColdWake ? "1" : "0"}` +
+      ` outbox=${existingOutbox.length}` +
+      ` lastSent=${existingLastSent}`,
+    );
+
+    // Note: replay/drain on attach used to live here. It's now driven
+    // exclusively by the RESUME_REQ path — every reconnecting transport
+    // (live session OR fresh process) sends RESUME_REQ as its first frame
+    // after WS open, so the same replay code handles both cases coherently
+    // and there's no double-delivery race with shouldDrainOnAccept firing
+    // before the inbound RESUME_REQ arrives.
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -250,9 +277,18 @@ export class PairingChannel {
       this._closeWithError(ws, CODE_INTERNAL, "no peer state");
       return;
     }
+    if (peer.socket !== ws) {
+      // A same-role replacement can race with frames already in flight from
+      // the old socket. Those frames belong to a stale transport session and
+      // must not be routed through the newly accepted peer slot.
+      console.log(`[relay-do-stale-socket] pairing=${pairingOf(ws)} role=${role}`);
+      try { ws.close(CODE_REPLACED, "stale-socket"); } catch {}
+      return;
+    }
 
     const otherRole = role === "phone" ? "bridge" : "phone";
     const other = this.peers.get(otherRole);
+    const pairingHint = pairingOf(ws);
 
     switch (frame.type) {
       case FRAME_DATA: {
@@ -264,13 +300,34 @@ export class PairingChannel {
         // to convince the DO to evict the bridge socket on the basis of
         // arbitrary garbage in `frame.payload`.
         const looksLikeFreshMsg1 =
-          peer.awaitingFirstFrame === true &&
           role === "phone" &&
-          frame.seq === FIRST_DATA_SEQ &&
-          frame.payload?.length === NOISE_IK_MSG1_BYTES;
+          frame.payload?.length === NOISE_IK_MSG1_BYTES &&
+          (
+            (peer.awaitingFirstFrame === true && frame.seq === FIRST_DATA_SEQ) ||
+            peer.expectFreshHandshake === true
+          );
+        if (peer.awaitingFirstFrame || looksLikeFreshMsg1) {
+          console.log(
+            `[relay-do-data] pairing=${pairingHint} role=${role}` +
+            ` seq=${frame.seq}` +
+            ` bytes=${frame.payload?.length ?? 0}` +
+            ` freshMsg1=${looksLikeFreshMsg1 ? "1" : "0"}` +
+            ` otherOpen=${other?.socket && isOpen(other.socket) ? "1" : "0"}` +
+            ` otherAwait=${other?.awaitingFirstFrame ? "1" : "0"}`,
+          );
+        }
         if (looksLikeFreshMsg1) {
           applyFreshHandshakeReset(peer);
           prepareCounterpartyForFreshHandshake(other);
+        } else if (peer.expectFreshHandshake) {
+          // We explicitly told this peer to discard stale Noise keys. Any
+          // non-msg1 DATA here is stale ciphertext; buffering it would poison
+          // the next rendezvous attempt.
+          peer.outbox = [];
+          peer.lastSent = 0;
+          peer.freshHandshakeBuffered = false;
+          this._closeWithError(ws, CODE_HIBERNATED, "expected-fresh-handshake");
+          return;
         } else if (peer.awaitingFirstFrame) {
           // We've now seen a non-fresh-handshake first frame. Clear the flag
           // so we don't keep evaluating the kick condition for every
@@ -285,13 +342,32 @@ export class PairingChannel {
         peer.outbox.push({ seq: frame.seq, mid: frame.mid, ts: Date.now(), wire });
         if (frame.seq > peer.lastSent) peer.lastSent = frame.seq;
         peer.coldWake = false; // any successful message clears the cold flag
+        peer.freshHandshakeBuffered = looksLikeFreshMsg1;
         trimOutbox(peer.outbox);
-        // Forward to peer if they're connected.
-        if (other?.socket && isOpen(other.socket)) {
-          trySend(other.socket, wire);
+        // Forward to peer if they're connected AND past their first-frame
+        // gate. Fresh phone msg1 is the one exception: after Durable Object
+        // hibernation the bridge socket can still be alive while DO memory
+        // has reset to awaitingFirstFrame=true. Holding msg1 in that state
+        // deadlocks the responder, so let the real handshake opener through.
+        if (
+          other?.socket &&
+          isOpen(other.socket) &&
+          (other.awaitingFirstFrame !== true || looksLikeFreshMsg1)
+        ) {
+          const sent = trySend(other.socket, wire);
+          if (looksLikeFreshMsg1 || !sent) {
+            console.log(
+              `[relay-do-forward] pairing=${pairingHint} role=${role}` +
+              ` to=${otherRole}` +
+              ` seq=${frame.seq}` +
+              ` freshMsg1=${looksLikeFreshMsg1 ? "1" : "0"}` +
+              ` sent=${sent ? "1" : "0"}`,
+            );
+          }
         }
-        // (If the other peer is offline, the frame just sits in our outbox
-        // until they reconnect with RESUME_REQ or the buffer ages out.)
+        // (If the other peer is offline or still awaiting its first frame,
+        // the frame just sits in our outbox until they reconnect with
+        // RESUME_REQ or the buffer ages out.)
         break;
       }
 
@@ -316,6 +392,14 @@ export class PairingChannel {
 
       case FRAME_RESUME_REQ: {
         peer.awaitingFirstFrame = false;
+        console.log(
+          `[relay-do-resume-req] pairing=${pairingHint} role=${role}` +
+          ` lastSeen=${frame.lastSeenSeq}` +
+          ` cold=${peer.coldWake ? "1" : "0"}` +
+          ` lastSent=${peer.lastSent}` +
+          ` otherLastSent=${other?.lastSent ?? 0}` +
+          ` otherOutbox=${other?.outbox?.length ?? 0}`,
+        );
         this._handleResume(ws, peer, other, frame.lastSeenSeq);
         break;
       }
@@ -343,6 +427,7 @@ export class PairingChannel {
     if (!role) return;
     const peer = this.peers.get(role);
     if (peer && peer.socket === ws) {
+      console.log(`[relay-do-close] pairing=${pairingOf(ws)} role=${role} code=${code} reason=${String(reason || "").slice(0, 48)}`);
       peer.socket = null;
       // Keep the outbox so a quick reconnect can RESUME from here.
     }
@@ -363,9 +448,26 @@ export class PairingChannel {
   _handleResume(ws, peer, other, lastSeenSeq) {
     // The peer is saying "I last saw seq=lastSeenSeq from the other side."
     // We need to replay frames in OTHER's outbox with seq > lastSeenSeq.
+    const role = roleOf(ws) || "unknown";
     if (peer.coldWake) {
-      sendResumeFailAndMaybeDrainFreshHandshake(ws, other, RESUME_FAIL_HIBERNATED);
+      console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=HIBERNATED cold=1`);
+      sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       peer.coldWake = false;
+      return;
+    }
+
+    // State-loss heuristic: if the peer says it's seen nothing yet
+    // (lastSeenSeq=0) BUT it had previously been active (peer.lastSent>0,
+    // i.e., the DO has buffered frames this peer once sent), the peer must
+    // have lost its in-memory transport session — process restart, fresh
+    // PWA install, etc. Replaying counterparty frames into a peer that
+    // can't decrypt them just produces an AEAD-fail loop, so treat this
+    // exactly like a RESUME_FAIL: the new peer has to redo the handshake,
+    // and the counterparty has to come along for the ride (otherwise it'd
+    // keep shipping ciphertext encrypted with the dead session's keys).
+    if (lastSeenSeq === 0 && peer.lastSent > 0) {
+      console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=STATE_LOSS`);
+      sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       return;
     }
 
@@ -376,6 +478,7 @@ export class PairingChannel {
     // for the last DATA already GC'd the outbox). Also covers the fresh
     // session start where both sides are at 0.
     if (lastSeenSeq >= otherLastSent) {
+      console.log(`[relay-do-resume-ok] pairing=${pairingOf(ws)} role=${role} currentSeq=${otherLastSent} replay=0`);
       trySend(ws, encodeResumeOk(otherLastSent));
       return;
     }
@@ -384,7 +487,8 @@ export class PairingChannel {
       // Other has sent more than peer claims to have seen, but our buffer
       // is empty. Either we hibernated (lost the buffer), or peer's
       // counter is desynced. Either way, force a re-handshake.
-      sendResumeFailAndMaybeDrainFreshHandshake(ws, other, RESUME_FAIL_HIBERNATED);
+      console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=EMPTY_BUFFER`);
+      sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       return;
     }
 
@@ -392,18 +496,21 @@ export class PairingChannel {
 
     if (lastSeenSeq + 1 < earliestBuffered) {
       // Gap: we'd skip frames the peer hasn't seen. Force re-handshake.
-      sendResumeFailAndMaybeDrainFreshHandshake(ws, other, RESUME_FAIL_BUFFER_EXPIRED);
+      console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=BUFFER_EXPIRED`);
+      sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_BUFFER_EXPIRED);
       return;
     }
 
     // OK — confirm the resume point, then replay everything strictly after
     // lastSeenSeq. We send RESUME_OK first so the peer knows the bounds.
     trySend(ws, encodeResumeOk(otherLastSent));
+    let replayed = 0;
     for (const entry of other.outbox) {
       if (entry.seq > lastSeenSeq) {
-        trySend(ws, entry.wire);
+        if (trySend(ws, entry.wire)) replayed++;
       }
     }
+    console.log(`[relay-do-resume-ok] pairing=${pairingOf(ws)} role=${role} currentSeq=${otherLastSent} replay=${replayed}`);
   }
 
   // -------------------------------------------------------------------------
@@ -436,11 +543,23 @@ function roleOf(ws) {
   return att?.role && VALID_ROLES.has(att.role) ? att.role : null;
 }
 
+function pairingOf(ws) {
+  const att = safeAttachment(ws);
+  return typeof att?.pairing === "string" && att.pairing ? att.pairing : "unknown";
+}
+
+function shortPairingFromUrl(url) {
+  const match = String(url?.pathname || "").match(/^\/v1\/pairing\/([^/]+)\/ws$/);
+  return match ? String(match[1]).slice(0, 8) : "unknown";
+}
+
 function applyFreshHandshakeReset(peer) {
   // A DATA frame as the first meaningful frame means this socket is starting
   // a fresh Noise handshake. Any same-role DATA left over from previous
   // failed handshakes would corrupt the new transcript if replayed later.
   peer.awaitingFirstFrame = false;
+  peer.expectFreshHandshake = false;
+  peer.freshHandshakeBuffered = false;
   peer.outbox = [];
   peer.lastSent = 0;
   peer.coldWake = false;
@@ -448,6 +567,19 @@ function applyFreshHandshakeReset(peer) {
 
 function prepareCounterpartyForFreshHandshake(peer) {
   if (!peer) return;
+
+  // Don't kick a counterparty that has no live session yet. A peer with
+  // `lastSent === 0` and an empty outbox has either just attached and only
+  // sent RESUME_REQ(0) (so it's already in handshake mode waiting for
+  // msg1/msg2), or it's been freshly reset by sendResumeFailAndMaybeDrain
+  // FreshHandshake. Kicking in either case would trigger a feedback loop:
+  // peer reconnects → RESUME_REQ(0) → state-loss heuristic → counterparty
+  // gets closed by sendResumeFail... → counterparty reconnects → fresh
+  // msg1 → kick again → ...
+  if (peer.lastSent === 0 && peer.outbox.length === 0) {
+    return;
+  }
+
   peer.outbox = [];
   peer.lastSent = 0;
 
@@ -475,22 +607,100 @@ function prepareCounterpartyForFreshHandshake(peer) {
   }
 }
 
-function sendResumeFailAndMaybeDrainFreshHandshake(ws, other, reason) {
+function sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, reason) {
+  const role = roleOf(ws);
   trySend(ws, encodeResumeFail(reason));
-  if (roleOf(ws) !== "bridge") {
+
+  // The peer that just received RESUME_FAIL will discard its session and
+  // do a fresh handshake. Anything still queued in its DO outbox was
+  // encrypted with the soon-to-be-discarded transport keys, so the new
+  // session can't replay it — drop the buffer instead of leaking stale
+  // ciphertext into the next handshake.
+  if (peer) {
+    peer.outbox = [];
+    peer.lastSent = 0;
+    // Only the phone/initiator's next DATA should be a Noise IK msg1. The
+    // bridge is the responder; after RESUME_FAIL it waits for msg1 and then
+    // sends msg2. Marking bridge as expectFreshHandshake causes that valid
+    // msg2 to be rejected as "expected-fresh-handshake".
+    peer.expectFreshHandshake = role === "phone";
+    peer.freshHandshakeBuffered = false;
+  }
+
+  if (role !== "bridge") {
+    // Phone got RESUME_FAIL — phone-side transport drops its session and
+    // restarts the handshake on its own; no further DO-side action needed.
     return;
   }
-  drainOutboxToSocket(other, ws);
+
+  // Bridge got RESUME_FAIL → bridge will sit in handshake mode (responder)
+  // waiting for a *fresh* msg1 from phone. Three cases for the phone slot:
+  //
+  //   (a) phone has a buffered fresh-handshake msg1
+  //         Either it just connected (awaitingFirstFrame=true) or it already
+  //         pushed its msg1 (the applyFreshHandshakeReset path leaves outbox
+  //         = [msg1] with seq=1 / 96-byte payload). Drain that to the bridge
+  //         so the handshake can complete.
+  //
+  //   (b) phone has stale post-handshake transport DATA
+  //         The outbox is encrypted with keys the new bridge transport will
+  //         never have. Forwarding it would AEAD-fail in a tight loop and
+  //         starve the bridge of a real msg1. Close the phone WS so the
+  //         phone-side transport drops its session and reconnects with
+  //         fresh handshake state.
+  //
+  //   (c) phone has nothing buffered and is idle
+  //         No fresh msg1 either. Close the WS for the same reason as (b).
+  if (other?.awaitingFirstFrame || phoneOutboxLooksLikeFreshHandshake(other)) {
+    drainOutboxToSocket(other, ws);
+    return;
+  }
+  if (other?.socket && isOpen(other.socket)) {
+    other.outbox = [];
+    other.lastSent = 0;
+    other.coldWake = true;
+    other.awaitingFirstFrame = true;
+    other.expectFreshHandshake = false;
+    other.freshHandshakeBuffered = false;
+    try {
+      other.socket.close(CODE_HIBERNATED, "counterparty-reset");
+    } catch {
+      // Already closed — nothing to do.
+    }
+    other.socket = null;
+  }
+}
+
+/**
+ * Heuristic: does this peer's DO outbox look like the result of an
+ * applyFreshHandshakeReset → push(msg1) sequence?
+ *
+ * applyFreshHandshakeReset truncates the outbox to [] and resets lastSent=0.
+ * The triggering frame (a Noise IK msg1, 96-byte payload) is then pushed.
+ * The frame may have seq>1 after RESUME_FAIL because clients keep envelope
+ * sequencing monotonic across re-handshakes, so we track the fresh marker
+ * explicitly instead of inferring it from seq.
+ */
+function phoneOutboxLooksLikeFreshHandshake(peer) {
+  if (peer?.freshHandshakeBuffered !== true) return false;
+  if (!peer?.outbox || peer.outbox.length !== 1) return false;
+  try {
+    const frame = decode(peer.outbox[0].wire);
+    return frame.type === FRAME_DATA && frame.payload?.length === NOISE_IK_MSG1_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 function drainOutboxToSocket(peer, ws) {
   // Only rendezvous-drain for a peer that is still connected and waiting.
   // If that peer has already gone away, its buffered handshake frames are
   // stale and should not be replayed into a future fresh handshake.
+  const allowAwaitingFreshHandshake = phoneOutboxLooksLikeFreshHandshake(peer);
   if (
     !peer?.socket ||
     !isOpen(peer.socket) ||
-    peer.awaitingFirstFrame ||
+    (peer.awaitingFirstFrame && !allowAwaitingFreshHandshake) ||
     !peer.outbox?.length ||
     !ws ||
     !isOpen(ws)

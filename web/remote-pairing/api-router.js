@@ -98,6 +98,9 @@ const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
  * LAN is the fast path, and slow/unreachable LAN should become relay.
  */
 const DEFAULT_LAN_TIMEOUT_MS = 2_500;
+const PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
+const PAIRING_STATE_SCHEMA_VERSION = 2;
+const PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
 
 // ---------------------------------------------------------------------------
 // Module state (singleton client + telemetry)
@@ -117,6 +120,9 @@ let _stickyRelayUntilMs = 0;
 
 /** Counters for the diagnostics overlay / tests. */
 let _telemetry = newTelemetry();
+
+/** Last reason getOrInitClient could not build a relay client. */
+let _lastPairingStateStatus = null;
 
 function newTelemetry() {
   return {
@@ -221,8 +227,10 @@ async function getOrInitClient(opts = {}) {
       _clientPairingKey = null;
       if (_wakeUnbind) { try { _wakeUnbind(); } catch { /* ignore */ } _wakeUnbind = null; }
     }
+    _lastPairingStateStatus = inspectPairingStateForRelay(opts);
     return null;
   }
+  _lastPairingStateStatus = { status: "ready", needsEnrollment: false };
 
   const pairingKey = `${record.pairingId}:${record.relayToken}`;
 
@@ -238,7 +246,10 @@ async function getOrInitClient(opts = {}) {
   if (_client) return _client;
 
   _client = await buildRpcClient(record, opts);
-  if (!_client) return null;
+  if (!_client) {
+    _lastPairingStateStatus = { status: "client-unavailable", needsEnrollment: false };
+    return null;
+  }
   _clientPairingKey = pairingKey;
 
   // Wire wake events. If `bindWakeEvents` throws (e.g. weird test env),
@@ -257,6 +268,82 @@ async function getOrInitClient(opts = {}) {
   }
 
   return _client;
+}
+
+function inspectPairingStateForRelay(opts) {
+  const inspect = opts.inspectPairingState ?? inspectBrowserPairingState;
+  try {
+    return inspect();
+  } catch {
+    return { status: "malformed", needsEnrollment: true };
+  }
+}
+
+function inspectBrowserPairingState() {
+  let store;
+  try {
+    store = globalThis.localStorage ?? null;
+  } catch {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+  if (!store) {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+  let raw;
+  try {
+    raw = store.getItem(PAIRING_STATE_STORAGE_KEY);
+  } catch {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+  if (!raw) {
+    return { status: "missing", needsEnrollment: true };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { status: "malformed", needsEnrollment: true };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "malformed", needsEnrollment: true };
+  }
+  if (parsed.version === PAIRING_STATE_LEGACY_SCHEMA_VERSION) {
+    return { status: "legacy-v1", needsEnrollment: true };
+  }
+  if (parsed.version !== PAIRING_STATE_SCHEMA_VERSION) {
+    return { status: "unsupported-version", needsEnrollment: true };
+  }
+  if (typeof parsed.relayToken !== "string" || parsed.relayToken.length === 0) {
+    return { status: "missing-token", needsEnrollment: true };
+  }
+  return { status: "ready", needsEnrollment: false };
+}
+
+function remotePairingEnrollmentRequiredError(info) {
+  const status = info?.status || "missing";
+  const err = new Error(
+    "Remote connection needs to be refreshed. Open viveworker once on the same Wi-Fi as your PC, then try again off-LAN.",
+  );
+  err.name = "RemotePairingEnrollmentRequiredError";
+  err.code = "remote-pairing-enrollment-required";
+  err.reason = status;
+  return err;
+}
+
+function relayClientUnavailableError(info) {
+  if (info?.needsEnrollment !== false) {
+    return remotePairingEnrollmentRequiredError(info);
+  }
+  const err = new Error("remote relay client unavailable");
+  err.name = "RemotePairingUnavailableError";
+  err.code = "remote-pairing-unavailable";
+  err.reason = info?.status || "client-unavailable";
+  return err;
+}
+
+function isRemotePairingEnrollmentRequiredError(err) {
+  return err?.code === "remote-pairing-enrollment-required" ||
+    err?.name === "RemotePairingEnrollmentRequiredError";
 }
 
 function resetRelayClientForRetry() {
@@ -338,6 +425,7 @@ async function attemptLanFetch(url, init, opts) {
   let controller = null;
   let externalAbortHandler = null;
   let fetchInit = init;
+  let timeoutPromise = null;
 
   if (timeoutEnabled) {
     if (init.signal?.aborted) {
@@ -348,15 +436,22 @@ async function attemptLanFetch(url, init, opts) {
       externalAbortHandler = () => controller.abort(init.signal.reason);
       init.signal.addEventListener("abort", externalAbortHandler, { once: true });
     }
-    timer = setTimeout(() => {
-      didTimeout = true;
-      controller.abort();
-    }, timeoutMs);
+    timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        didTimeout = true;
+        const err = new TypeError("LAN fetch timed out");
+        try { controller.abort(err); } catch { /* ignore */ }
+        reject(err);
+      }, timeoutMs);
+    });
     fetchInit = { ...init, signal: controller.signal };
   }
 
   try {
-    const response = await fetchImpl(url, fetchInit);
+    const fetchPromise = fetchImpl(url, fetchInit);
+    const response = timeoutPromise
+      ? await Promise.race([fetchPromise, timeoutPromise])
+      : await fetchPromise;
     _telemetry.lanOk++;
     return { ok: true, response };
   } catch (err) {
@@ -534,7 +629,7 @@ async function encodeFormDataForRelay(formData, signal) {
 async function attemptRelayFetch(url, init, opts) {
   const client = await getOrInitClient(opts);
   if (!client) {
-    return { ok: false, err: new Error("no-relay-client") };
+    return { ok: false, err: relayClientUnavailableError(_lastPairingStateStatus) };
   }
 
   let body = init.body ?? null;
@@ -622,6 +717,7 @@ function nowMs(opts) {
  *   timeoutMs?: number,
  *   lanTimeoutMs?: number,
  *   loadPairingState?: typeof loadPairingState,
+ *   inspectPairingState?: () => { status?: string, needsEnrollment?: boolean },
  *   ensureIdentityKeypair?: typeof ensureIdentityKeypair,
  *   RemotePairingRpcClient?: typeof RemotePairingRpcClient,
  *   bindWakeEvents?: typeof bindWakeEvents,
@@ -647,6 +743,7 @@ export async function routedFetch(url, init = {}, opts = {}) {
     _stickyRelayUntilMs = 0;
     const lan = await attemptLanFetch(url, init, opts);
     if (lan.ok) return lan.response;
+    if (isRemotePairingEnrollmentRequiredError(r.err)) throw r.err;
     // Both dead. Surface LAN error since it's typically the more
     // actionable one ("Failed to fetch" → "obviously offline").
     throw lan.err;
@@ -659,6 +756,7 @@ export async function routedFetch(url, init = {}, opts = {}) {
   // Try relay once before giving up.
   const r = await attemptRelayFetch(url, init, opts);
   if (r.ok) return r.response;
+  if (isRemotePairingEnrollmentRequiredError(r.err)) throw r.err;
 
   throw lan.err;
 }
@@ -677,6 +775,10 @@ export function __getTelemetry() {
   };
 }
 
+export function getRoutingTelemetry() {
+  return __getTelemetry();
+}
+
 /**
  * Reset all internal state. Used by tests; safe but pointless in
  * production. Closes the live RpcClient and unbinds wake events.
@@ -693,6 +795,7 @@ export function __resetForTest() {
   _wakeUnbind = null;
   _stickyRelayUntilMs = 0;
   _telemetry = newTelemetry();
+  _lastPairingStateStatus = null;
 }
 
 // Test-visible constants for tests that want to assert behavior at the

@@ -47,7 +47,7 @@ const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "func
   ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
   : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
-const WEB_APP_BUILD_ID = "20260427-timeline-image-permission";
+const WEB_APP_BUILD_ID = "20260428-remote-device-match";
 const WEB_APP_SCRIPT_URL = `/app.js?v=${WEB_APP_BUILD_ID}`;
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
@@ -8388,6 +8388,12 @@ function normalizeIpcErrorMessage(errorValue) {
   return cleanText(String(errorValue ?? "")) || "ipc-request-failed";
 }
 
+function isStartTurnAckTimeout(errorValue) {
+  const message = normalizeIpcErrorMessage(errorValue);
+  return message === "thread-follower-start-turn-timeout" ||
+    message === "turn/start-timeout";
+}
+
 function buildDefaultCollaborationMode(threadState) {
   // Fallback turns must leave Plan mode unless the caller explicitly opts in.
   return buildRequestedCollaborationMode(threadState, "default");
@@ -10355,6 +10361,35 @@ function buildDeviceSummary({ config, state, deviceId, record, currentDeviceId, 
   };
 }
 
+function inferLegacyRelayDeviceId(state, config, pairing) {
+  const active = activeTrustedDevices(state, config);
+  if (active.length === 1) {
+    return active[0].deviceId;
+  }
+
+  const addedAtMs = Number(pairing?.addedAtMs) || 0;
+  if (addedAtMs <= 0) {
+    return "";
+  }
+  const nearby = active.filter(({ record }) => {
+    const pairedAtMs = Number(record?.pairedAtMs) || 0;
+    return pairedAtMs > 0 && Math.abs(pairedAtMs - addedAtMs) <= 10 * 60 * 1000;
+  });
+  return nearby.length === 1 ? nearby[0].deviceId : "";
+}
+
+function resolveRelaySessionDeviceId(state, config, pairing, fallbackDeviceId) {
+  const explicit = cleanText(pairing?.deviceId || "");
+  if (explicit) {
+    return explicit;
+  }
+  const inferred = inferLegacyRelayDeviceId(state, config, pairing);
+  if (inferred) {
+    return inferred;
+  }
+  return cleanText(pairing?.phoneFingerprint || "") || cleanText(fallbackDeviceId || "") || null;
+}
+
 // Shared between `/api/session` and `/api/bootstrap` so both return an
 // identical session shape.
 function buildSessionPayload({ config, state, session }) {
@@ -10415,6 +10450,7 @@ function readSession(req, config, state) {
   // the phone proved possession of `pairing.phonePub`.
   const relay = req.viveworker;
   if (relay?.fromRelay && relay.pairing?.pairingId) {
+    const relayDeviceId = resolveRelaySessionDeviceId(state, config, relay.pairing, deviceId);
     return {
       authenticated: true,
       sessionId: `relay:${relay.pairing.pairingId}`,
@@ -10423,9 +10459,10 @@ function readSession(req, config, state) {
       // — there's no cookie expiry to track. 0 = "no fixed expiry, the
       // transport layer manages liveness".
       expiresAtMs: 0,
-      deviceId: relay.pairing.phoneFingerprint || deviceId,
+      deviceId: relayDeviceId,
       fromRelay: true,
       pairingId: relay.pairing.pairingId,
+      relayPhoneFingerprint: relay.pairing.phoneFingerprint || "",
     };
   }
 
@@ -12605,6 +12642,18 @@ async function handleCompletionReply({
   );
   let lastError = null;
   const ownerClientId = runtime.threadOwnerClientIds.get(conversationId) ?? null;
+  const finalizeReplyAccepted = async () => {
+    if (timelineImageAliases.length > 0) {
+      const aliases = isPlainObject(state.timelineImagePathAliases)
+        ? state.timelineImagePathAliases
+        : (state.timelineImagePathAliases = {});
+      for (const [sourcePath, persistentPath] of timelineImageAliases) {
+        aliases[sourcePath] = persistentPath;
+      }
+      await saveState(config.stateFile, state);
+    }
+    scheduleBestEffortFileCleanup(stagedWorkspaceImagePaths);
+  };
 
   for (const candidate of turnCandidates) {
     try {
@@ -12627,18 +12676,19 @@ async function handleCompletionReply({
       console.log(
         `[completion-reply] success candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
       );
-      if (timelineImageAliases.length > 0) {
-        const aliases = isPlainObject(state.timelineImagePathAliases)
-          ? state.timelineImagePathAliases
-          : (state.timelineImagePathAliases = {});
-        for (const [sourcePath, persistentPath] of timelineImageAliases) {
-          aliases[sourcePath] = persistentPath;
-        }
-        await saveState(config.stateFile, state);
-      }
-      scheduleBestEffortFileCleanup(stagedWorkspaceImagePaths);
+      await finalizeReplyAccepted();
       return;
     } catch (error) {
+      if (isStartTurnAckTimeout(error)) {
+        // Codex can create the turn but fail to send the bridge an ACK before
+        // its internal follower timeout fires. Retrying risks duplicate user
+        // turns, so treat this as accepted and let the timeline catch up.
+        console.log(
+          `[completion-reply] accepted candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(error)}`
+        );
+        await finalizeReplyAccepted();
+        return;
+      }
       lastError = error;
       console.log(
         `[completion-reply] failed candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} error=${normalizeIpcErrorMessage(error)} raw=${inspect(error?.ipcError ?? error, { depth: 6, breakLength: 160 })}`
@@ -14908,6 +14958,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             label: p.label || "",
             phonePub: p.phonePub,
             phoneFingerprint: p.phoneFingerprint,
+            deviceId: p.deviceId || null,
             addedAtMs: p.addedAtMs ?? null,
             lastSeenAtMs: p.lastSeenAtMs ?? null,
           }));
@@ -15158,7 +15209,13 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
         let entry;
         try {
-          entry = buildPairing({ pairingId, relayToken, phonePub: phonePubHex, label });
+          entry = buildPairing({
+            pairingId,
+            relayToken,
+            phonePub: phonePubHex,
+            label,
+            deviceId: session.deviceId,
+          });
         } catch (err) {
           return writeJson(res, 400, {
             error: "build-pairing-failed",
@@ -15200,6 +15257,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           relayToken: entry.relayToken,
           phonePub: entry.phonePub,
           phoneFingerprint: entry.phoneFingerprint,
+          deviceId: entry.deviceId || null,
           bridgePubHex,
           bridgeFingerprint,
           relayUrl,

@@ -43,6 +43,7 @@
 
 const STORAGE_KEY = "viveworker.remote-pairing.state";
 const SCHEMA_VERSION = 2;
+const LEGACY_SCHEMA_VERSION = 1;
 
 /**
  * @typedef {Object} RemotePairingState
@@ -137,6 +138,70 @@ export function loadPairingState(opts) {
 }
 
 /**
+ * Inspect the raw stored pairing state without silently collapsing every
+ * non-v2 shape to null. This lets the app distinguish "not enrolled yet"
+ * from "legacy v1 record needs a LAN refresh after relayToken hardening".
+ *
+ * @param {{ storage?: Storage }} [opts]
+ * @returns {{
+ *   status: "ready" | "missing" | "legacy-v1" | "missing-token" | "malformed" | "unsupported-version" | "storage-unavailable",
+ *   needsEnrollment: boolean,
+ *   record: RemotePairingState | null,
+ *   legacyRecord?: object | null,
+ * }}
+ */
+export function inspectPairingState(opts) {
+  const store = getStorage(opts);
+  if (!store) {
+    return stateStatus("storage-unavailable", false);
+  }
+
+  let raw;
+  try {
+    raw = store.getItem(STORAGE_KEY);
+  } catch {
+    return stateStatus("storage-unavailable", false);
+  }
+  if (!raw) {
+    return stateStatus("missing", true);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return stateStatus("malformed", true);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return stateStatus("malformed", true);
+  }
+
+  if (parsed.version === LEGACY_SCHEMA_VERSION) {
+    return {
+      ...stateStatus("legacy-v1", true),
+      legacyRecord: normalizeLegacyRecordForInspection(parsed),
+    };
+  }
+
+  if (parsed.version !== SCHEMA_VERSION) {
+    return stateStatus("unsupported-version", true);
+  }
+
+  if (typeof parsed.relayToken !== "string" || parsed.relayToken.length === 0) {
+    return stateStatus("missing-token", true);
+  }
+
+  const record = loadPairingState(opts);
+  if (!record) {
+    return stateStatus("malformed", true);
+  }
+  return {
+    ...stateStatus("ready", false),
+    record,
+  };
+}
+
+/**
  * Persist a pairing state record. Overwrites any existing record (the
  * single-record assumption above — re-enrolling under the same origin
  * replaces the previous bridge).
@@ -207,6 +272,29 @@ export function clearPairingState(opts) {
   } catch {
     // ignore
   }
+}
+
+function stateStatus(status, needsEnrollment) {
+  return {
+    status,
+    needsEnrollment,
+    record: null,
+    legacyRecord: null,
+  };
+}
+
+function normalizeLegacyRecordForInspection(parsed) {
+  return {
+    version: LEGACY_SCHEMA_VERSION,
+    pairingId: typeof parsed.pairingId === "string" ? parsed.pairingId : "",
+    phonePub: typeof parsed.phonePub === "string" ? parsed.phonePub.toLowerCase() : "",
+    phoneFingerprint: typeof parsed.phoneFingerprint === "string" ? parsed.phoneFingerprint : "",
+    bridgePubHex: typeof parsed.bridgePubHex === "string" ? parsed.bridgePubHex.toLowerCase() : "",
+    bridgeFingerprint: typeof parsed.bridgeFingerprint === "string" ? parsed.bridgeFingerprint : "",
+    relayUrl: typeof parsed.relayUrl === "string" ? parsed.relayUrl : "",
+    label: typeof parsed.label === "string" ? parsed.label : "",
+    addedAtMs: Number.isFinite(parsed.addedAtMs) ? parsed.addedAtMs : 0,
+  };
 }
 
 // Test-visible constants for tests that want to assert raw key shape.

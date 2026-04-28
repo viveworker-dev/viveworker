@@ -394,7 +394,7 @@ const translations = {
     "settings.device.section.current": "This device",
     "settings.device.section.other": "Other trusted devices",
     "settings.device.thisDevice": "This device",
-    "settings.device.emptyCurrent": "This device is not in the active trusted-device list right now. Its previous trust may have expired or been revoked. Re-pair it from your Mac with `npx viveworker pair` if needed.",
+    "settings.device.emptyCurrent": "This browser is not matched to an active LAN trusted-device record right now. If you're connected remotely, viveworker may still be using your remote pairing; otherwise re-pair from your Mac with `npx viveworker pair`.",
     "settings.device.emptyOther": "No other trusted devices are active. Expired or revoked devices are hidden here. Re-pair another device from your Mac with `npx viveworker pair` if needed.",
     "settings.device.addAnother.title": "Add another device",
     "settings.device.addAnother.heading": "Add a new device or browser",
@@ -678,6 +678,7 @@ const translations = {
     "notice.loggedOutDeviceRemoved": "Logged out and removed this device. Pair again before using viveworker here.",
     "error.networkHint":
       "Try reopening the latest HTTPS URL in your browser, then re-add the Home Screen app if needed.",
+    "error.remotePairingNeedsLanRefresh": "Remote connection needs a one-time refresh. Open viveworker once on the same Wi-Fi as your PC, then try off-LAN again.",
     "error.webPushDisabled": "Web Push is not enabled on the server.",
     "error.notificationsRequireHttps": "Notifications require HTTPS.",
     "error.pushUnsupported": "This browser does not support Web Push.",
@@ -1375,7 +1376,7 @@ const translations = {
     "settings.device.section.current": "この端末",
     "settings.device.section.other": "他の信頼済み端末",
     "settings.device.thisDevice": "この端末",
-    "settings.device.emptyCurrent": "この端末は現在の有効な信頼済み端末一覧には入っていません。以前の信頼期限が切れたか、削除された可能性があります。必要なら Mac で `npx viveworker pair` を実行して再ペアリングしてください。",
+    "settings.device.emptyCurrent": "このブラウザは、LAN 側の信頼済み端末としてはまだ照合できていません。リモート接続中なら、viveworker はリモートペアリングで認証しています。必要な場合だけ Mac で `npx viveworker pair` を実行してください。",
     "settings.device.emptyOther": "他に有効な信頼済み端末はありません。",
     "settings.device.addAnother.title": "端末を追加する",
     "settings.device.addAnother.heading": "新しい端末 / ブラウザを追加",
@@ -1659,6 +1660,7 @@ const translations = {
     "notice.loggedOutDeviceRemoved": "ログアウトし、この端末の信頼も削除しました。次回は再 pairing が必要です。",
     "error.networkHint":
       "最新の HTTPS URL をブラウザで開き直して、必要ならホーム画面アプリを追加し直してください。",
+    "error.remotePairingNeedsLanRefresh": "リモート接続の更新が必要です。一度 PC と同じ WiFi で viveworker を開いてから、もう一度 LAN 外で試してください。",
     "error.webPushDisabled": "サーバー側で Web Push が有効ではありません。",
     "error.notificationsRequireHttps": "通知には HTTPS が必要です。",
     "error.pushUnsupported": "このブラウザは Web Push に対応していません。",

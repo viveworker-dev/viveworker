@@ -5,10 +5,10 @@ import {
   savePairingState as saveRemotePairingState,
   clearPairingState as clearRemotePairingState,
 } from "./remote-pairing/pairing-state.js";
-import { routedFetch } from "./remote-pairing/api-router.js?v=20260427-timeline-image-permission";
+import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-remote-device-match";
 
 const DESKTOP_BREAKPOINT = 980;
-const APP_BUILD_ID = "20260427-timeline-image-permission";
+const APP_BUILD_ID = "20260428-remote-device-match";
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
@@ -21,6 +21,9 @@ const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
 const MAX_TIMELINE_IMAGE_OBJECT_URLS = 80;
+const REMOTE_PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
+const REMOTE_PAIRING_STATE_SCHEMA_VERSION = 2;
+const REMOTE_PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
 const timelineImageObjectUrlCache = new Map();
 
 const state = {
@@ -216,8 +219,8 @@ let didReloadForServiceWorker = false;
 let lastViewportMode = isDesktopLayout();
 
 boot().catch((error) => {
-  const message = error.message || String(error);
-  const hint = /Load failed|Failed to fetch|NetworkError|fetch/i.test(message)
+  const message = bootErrorMessage(error);
+  const hint = shouldShowNetworkHint(error, message)
     ? `<p class="muted">${escapeHtml(L("error.networkHint"))}</p>`
     : "";
   dismissBootSplash();
@@ -232,6 +235,67 @@ boot().catch((error) => {
     </main>
   `;
 });
+
+function bootErrorMessage(error) {
+  if (isRemotePairingEnrollmentRequired(error)) {
+    return L("error.remotePairingNeedsLanRefresh");
+  }
+  return error?.message || String(error);
+}
+
+function shouldShowNetworkHint(error, message) {
+  if (isRemotePairingEnrollmentRequired(error)) {
+    return false;
+  }
+  return /Load failed|Failed to fetch|NetworkError|fetch/i.test(message);
+}
+
+function isRemotePairingEnrollmentRequired(error) {
+  return error?.code === "remote-pairing-enrollment-required" ||
+    error?.name === "RemotePairingEnrollmentRequiredError";
+}
+
+function inspectRemotePairingStateForEnrollment() {
+  let store;
+  try {
+    store = globalThis.localStorage ?? null;
+  } catch {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+  if (!store) {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+
+  let raw;
+  try {
+    raw = store.getItem(REMOTE_PAIRING_STATE_STORAGE_KEY);
+  } catch {
+    return { status: "storage-unavailable", needsEnrollment: false };
+  }
+  if (!raw) {
+    return { status: "missing", needsEnrollment: true };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { status: "malformed", needsEnrollment: true };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "malformed", needsEnrollment: true };
+  }
+  if (parsed.version === REMOTE_PAIRING_STATE_LEGACY_SCHEMA_VERSION) {
+    return { status: "legacy-v1", needsEnrollment: true };
+  }
+  if (parsed.version !== REMOTE_PAIRING_STATE_SCHEMA_VERSION) {
+    return { status: "unsupported-version", needsEnrollment: true };
+  }
+  if (typeof parsed.relayToken !== "string" || parsed.relayToken.length === 0) {
+    return { status: "missing-token", needsEnrollment: true };
+  }
+  return { status: "ready", needsEnrollment: false };
+}
 
 async function boot() {
   updateManifestHref(initialPairToken);
@@ -297,6 +361,7 @@ async function boot() {
     return;
   }
 
+  await maybeAutoEnrollRemotePairingFromLan();
   await consumePendingNotificationIntent();
   // `?focusPending=claude` marks this tab as the Claude-hook-opened popup:
   // auto-navigate to the newest unresolved Claude pending (plan/question)
@@ -383,6 +448,21 @@ async function boot() {
       })
       .catch(() => {});
   }, 3000);
+}
+
+async function maybeAutoEnrollRemotePairingFromLan() {
+  if (!state.session?.authenticated) {
+    return null;
+  }
+  const pairingState = inspectRemotePairingStateForEnrollment();
+  if (!pairingState.needsEnrollment) {
+    return null;
+  }
+  const telemetry = getRoutingTelemetry();
+  if (!telemetry || telemetry.lanOk <= 0) {
+    return null;
+  }
+  return enrollRemotePairing();
 }
 
 async function registerServiceWorker() {

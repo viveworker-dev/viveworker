@@ -83,12 +83,14 @@ const DEFAULT_PING_INTERVAL_MS = 30_000;          // CF idle timeout is ~100s
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
 const MAX_PRE_CONNECT_BACKOFF_MS = 4_000;
+const RELAY_RESET_RECONNECT_MS = 250;
 const DEFAULT_PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 
 // CloseEvent codes we emit. 1000 is normal; 4xxx is application-defined.
 const CLOSE_NORMAL = 1000;
 const CLOSE_HANDSHAKE_TIMEOUT = 4001;
 const CLOSE_FATAL = 4002;
+const CLOSE_RELAY_RESET_SESSION = 4004;
 
 // ---------------------------------------------------------------------------
 // RemotePairingTransport
@@ -359,6 +361,19 @@ export class RemotePairingTransport {
       this._sendResumeReq(this._lastSeenPeerSeq);
       this._startHandshakeTimer(); // doubles as resume timeout
     } else {
+      // No session — process restart, fresh PWA install, etc. We still
+      // announce ourselves with RESUME_REQ(0) so the relay can detect the
+      // state-loss case (peer.lastSent > 0 vs lastSeenSeq = 0) and force the
+      // counterparty into a fresh handshake too. Without this, a peer that
+      // still has a live session keeps sending transport DATA encrypted
+      // with the old keys, and the responder side reads them as malformed
+      // msg1 frames in a tight AEAD-failure loop.
+      //
+      // We don't enter RESUMING state for this case — there's no session to
+      // feed replay frames into anyway. RESUME_OK / RESUME_FAIL responses
+      // arrive while we're already in HANDSHAKING and get warn-logged-and-
+      // ignored by the existing `state !== RESUMING` guards.
+      this._sendResumeReq(0);
       this._beginHandshake();
     }
   }
@@ -420,6 +435,10 @@ export class RemotePairingTransport {
 
   _handleResumeOk(frame) {
     if (this._state !== STATE.RESUMING) {
+      if (this._state === STATE.HANDSHAKING && !this._session) {
+        this._log.debug?.(`ignoring RESUME_OK during fresh handshake currentSeq=${frame.currentSeq}`);
+        return;
+      }
       this._log.warn?.(`unexpected RESUME_OK in state=${this._state}`);
       return;
     }
@@ -433,6 +452,10 @@ export class RemotePairingTransport {
 
   _handleResumeFail(frame) {
     if (this._state !== STATE.RESUMING) {
+      if (this._state === STATE.HANDSHAKING && !this._session) {
+        this._log.debug?.(`ignoring RESUME_FAIL during fresh handshake reason=${describeResumeFail(frame.reason)}`);
+        return;
+      }
       this._log.warn?.(`unexpected RESUME_FAIL in state=${this._state}`);
       return;
     }
@@ -453,9 +476,19 @@ export class RemotePairingTransport {
     if (this._closed) return;          // user-initiated; close() already settled
     if (this._state === STATE.FAILED) return; // already terminal
 
+    const isRelayReset = Number(evt?.code) === CLOSE_RELAY_RESET_SESSION;
+    if (isRelayReset) {
+      this._log.debug?.(`relay requested fresh handshake reason=${evt?.reason || ""}`);
+      this._dropNoiseState();
+    }
+
     this._log.debug?.(`ws closed code=${evt?.code} reason=${evt?.reason}`);
     this._setState(STATE.DISCONNECTED, { code: evt?.code, reason: evt?.reason });
-    this._scheduleReconnect();
+    if (isRelayReset) {
+      this._scheduleRelayResetReconnect();
+    } else {
+      this._scheduleReconnect();
+    }
   }
 
   _handleError(evt) {
@@ -597,6 +630,20 @@ export class RemotePairingTransport {
     }, delay);
   }
 
+  _scheduleRelayResetReconnect() {
+    if (this._closed) return;
+    // 4004 means the relay wants both peers to discard stale Noise state and
+    // rendezvous again. Treat it as a protocol reset, not a network failure,
+    // so app boot does not sit behind the exponential backoff ladder.
+    this._reconnectAttempt = 0;
+    const delay = RELAY_RESET_RECONNECT_MS;
+    this._log.debug?.(`reconnect in ${delay}ms (relay reset)`);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (!this._closed) this._open();
+    }, delay);
+  }
+
   _cancelReconnectTimer() {
     if (this._reconnectTimer != null) {
       clearTimeout(this._reconnectTimer);
@@ -664,6 +711,9 @@ export class RemotePairingTransport {
     if (this._state === newState) return;
     const prev = this._state;
     this._state = newState;
+    if (newState === STATE.CONNECTED) {
+      this._reconnectAttempt = 0;
+    }
     try {
       this._onStateChange(newState, prev, info);
     } catch (err) {
@@ -692,6 +742,11 @@ export class RemotePairingTransport {
       this._connectPromise.reject(err);
       this._connectPromise = null;
     }
+  }
+
+  _dropNoiseState() {
+    this._session = null;
+    this._handshake = null;
   }
 }
 

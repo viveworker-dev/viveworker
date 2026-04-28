@@ -432,6 +432,9 @@ class BridgePairingSession {
     this._onStateChange(state, prev, info);
     if (state === STATE.CONNECTED) {
       this._restartAttempt = 0;
+      if (this._channelBinding) {
+        this._markSeen();
+      }
       return;
     }
     if (state === STATE.FAILED && !this._closed) {
@@ -501,6 +504,11 @@ class BridgePairingSession {
       return;
     }
     this._channelBinding = new Uint8Array(channelBinding);
+    this._markSeen();
+  }
+
+  _markSeen() {
+    if (!this._channelBinding) return;
     this._lastSeenAtMs = Date.now();
     try {
       const maybe = this._onSeen({

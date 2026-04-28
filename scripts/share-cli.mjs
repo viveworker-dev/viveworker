@@ -34,27 +34,21 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { Blob, File } from "node:buffer";
+import {
+  buildX402PaymentHeader,
+  decodeXPaymentResponseHeader,
+  getX402PaymentRequestId,
+  parseX402ResponseBody,
+  selectX402PaymentRequirement,
+  SUPPORTED_X402_BUYER_NETWORKS,
+} from "@hazbase/auth";
 
 const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
 const CONFIG_ENV_FILE = path.join(os.homedir(), ".viveworker", "config.env");
 const DEFAULT_SHARE_URL = "https://share.viveworker.com";
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // mirror worker
-const X402_VERSION = 1;
 const PAYMENT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
-const SUPPORTED_BUYER_NETWORKS = {
-  base: {
-    chainId: 8453,
-    label: "Base",
-    usdcName: "USD Coin",
-    usdcVersion: "2",
-  },
-  "base-sepolia": {
-    chainId: 84532,
-    label: "Base Sepolia",
-    usdcName: "USDC",
-    usdcVersion: "2",
-  },
-};
+const SUPPORTED_BUYER_NETWORKS = SUPPORTED_X402_BUYER_NETWORKS;
 
 // Mirror share-worker/worker.js SHARE_TYPES. Keep in sync by inspection —
 // scripts/ and share-worker/ don't share a module. Adding a new type here
@@ -772,8 +766,8 @@ async function handlePay(args) {
     throw new Error(`Expected HTTP 402 payment requirements, got ${initial.status}`);
   }
 
-  const x402 = parseX402Body(initialText);
-  const requirement = selectPaymentRequirement(x402);
+  const x402 = parseX402ResponseBody(initialText);
+  const requirement = selectX402PaymentRequirement(x402);
   const paymentSummary = summarizeRequirement(requirement);
   if (flags["dry-run"] || flags.dryRun) {
     const dryRun = {
@@ -802,7 +796,7 @@ async function handlePay(args) {
     },
   }, 60_000);
   const paidBytes = Buffer.from(await paid.arrayBuffer());
-  const responsePreview = decodePaymentResponseHeader(paid.headers.get("x-payment-response"));
+  const responsePreview = decodeXPaymentResponseHeader(paid.headers.get("x-payment-response"));
 
   if (!paid.ok) {
     let body = {};
@@ -885,46 +879,6 @@ async function handleDelete(args) {
   console.log(`✅ Deleted ${slug}`);
 }
 
-function parseX402Body(text) {
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object") return parsed;
-  } catch {}
-
-  const match = String(text || "").match(
-    /<script[^>]+type=["']application\/x-x402\+json["'][^>]*>([\s\S]*?)<\/script>/iu
-  );
-  if (match) {
-    try {
-      return JSON.parse(match[1]);
-    } catch {}
-  }
-  throw new Error("HTTP 402 response did not contain a valid x402 JSON body");
-}
-
-function selectPaymentRequirement(x402) {
-  const accepts = Array.isArray(x402?.accepts) ? x402.accepts : [];
-  const requirement = accepts.find((item) =>
-    item &&
-    item.scheme === "exact" &&
-    Object.prototype.hasOwnProperty.call(SUPPORTED_BUYER_NETWORKS, String(item.network || ""))
-  );
-  if (!requirement) {
-    const networks = accepts.map((item) => item?.network).filter(Boolean).join(", ") || "none";
-    throw new Error(`No supported x402 exact payment option found (offered: ${networks})`);
-  }
-  if (!ETH_ADDR_REGEX.test(String(requirement.payTo || ""))) {
-    throw new Error("x402 payment requirement has an invalid payTo address");
-  }
-  if (!ETH_ADDR_REGEX.test(String(requirement.asset || ""))) {
-    throw new Error("x402 payment requirement has an invalid asset address");
-  }
-  if (!/^\d+$/u.test(String(requirement.maxAmountRequired || ""))) {
-    throw new Error("x402 payment requirement has an invalid amount");
-  }
-  return requirement;
-}
-
 function summarizeRequirement(requirement) {
   const network = SUPPORTED_BUYER_NETWORKS[String(requirement.network)];
   return {
@@ -960,7 +914,7 @@ function resolveBuyerWalletMode(flags) {
 async function requestEoaPayment({ url, requirement, paymentSummary, flags }) {
   await requirePaymentApproval({ url, paymentSummary, flags });
   const privateKey = resolveBuyerPrivateKey();
-  const payment = await buildXPaymentHeader(requirement, privateKey);
+  const payment = await buildX402PaymentHeader({ requirement, privateKey });
   return {
     header: payment.header,
     payer: payment.payer,
@@ -970,9 +924,7 @@ async function requestEoaPayment({ url, requirement, paymentSummary, flags }) {
 }
 
 async function requestHazbaseWalletPayment({ url, x402, requirement, paymentSummary, flags }) {
-  const paymentRequestId = cleanPaymentRequestId(
-    x402?.paymentRequestId || x402?.hazbase?.paymentRequestId || requirement?.extra?.paymentRequestId || ""
-  );
+  const paymentRequestId = getX402PaymentRequestId(x402, requirement);
   if (!paymentRequestId) {
     throw new Error("This 402 response does not expose a hazBase paymentRequestId; --wallet hazbase requires a hazBase-backed share.");
   }
@@ -1007,11 +959,6 @@ async function requestHazbaseWalletPayment({ url, x402, requirement, paymentSumm
     submittedUserOpHash: response.body.submittedUserOpHash || "",
     transactionHash: response.body.transactionHash || "",
   };
-}
-
-function cleanPaymentRequestId(value) {
-  const text = String(value || "").trim();
-  return /^[a-zA-Z0-9:_-]{8,160}$/u.test(text) ? text : "";
 }
 
 async function requirePaymentApproval({ url, paymentSummary, flags }) {
@@ -1201,69 +1148,6 @@ function resolveBuyerPrivateKey() {
     );
   }
   return raw.startsWith("0x") ? raw : `0x${raw}`;
-}
-
-async function buildXPaymentHeader(requirement, privateKey) {
-  const ethers = await import("ethers");
-  const network = SUPPORTED_BUYER_NETWORKS[String(requirement.network)];
-  if (!network) throw new Error(`Unsupported buyer network: ${requirement.network}`);
-
-  const wallet = new ethers.Wallet(privateKey);
-  const now = Math.floor(Date.now() / 1000);
-  const maxTimeout = Number(requirement.maxTimeoutSeconds || 60);
-  const validAfter = String(Math.max(0, now - 30));
-  const validBefore = String(now + Math.max(30, Math.min(300, Number.isFinite(maxTimeout) ? maxTimeout : 60)));
-  const authorization = {
-    from: wallet.address,
-    to: ethers.getAddress(String(requirement.payTo)),
-    value: String(requirement.maxAmountRequired),
-    validAfter,
-    validBefore,
-    nonce: `0x${crypto.randomBytes(32).toString("hex")}`,
-  };
-  const domain = {
-    name: String(requirement.extra?.name || network.usdcName),
-    version: String(requirement.extra?.version || network.usdcVersion),
-    chainId: network.chainId,
-    verifyingContract: ethers.getAddress(String(requirement.asset)),
-  };
-  const types = {
-    TransferWithAuthorization: [
-      { name: "from", type: "address" },
-      { name: "to", type: "address" },
-      { name: "value", type: "uint256" },
-      { name: "validAfter", type: "uint256" },
-      { name: "validBefore", type: "uint256" },
-      { name: "nonce", type: "bytes32" },
-    ],
-  };
-  const signature = await wallet.signTypedData(domain, types, authorization);
-  const payload = {
-    x402Version: X402_VERSION,
-    scheme: String(requirement.scheme || "exact"),
-    network: String(requirement.network),
-    payload: {
-      signature,
-      authorization,
-    },
-  };
-  return {
-    header: Buffer.from(JSON.stringify(payload)).toString("base64"),
-    payer: wallet.address,
-    payload,
-  };
-}
-
-function decodePaymentResponseHeader(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-  try {
-    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
-    const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
-    return JSON.parse(Buffer.from(normalized + padding, "base64").toString("utf8"));
-  } catch {
-    return { raw };
-  }
 }
 
 async function writeOrPreviewPaidBody(flags, res, bytes) {

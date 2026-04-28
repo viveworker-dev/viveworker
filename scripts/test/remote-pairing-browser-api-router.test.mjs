@@ -141,6 +141,7 @@ function makeFakeFetch(behaviors) {
   //   { mode: "throw", err }              — throws err on call
   //   { mode: "abort" }                   — throws AbortError
   //   { mode: "hang" }                    — waits until init.signal aborts
+  //   { mode: "hang-ignore-abort" }       — never settles, even after abort
   let i = 0;
   const calls = [];
   async function fakeFetch(url, init) {
@@ -168,6 +169,9 @@ function makeFakeFetch(behaviors) {
           reject(err);
         }, { once: true });
       });
+    }
+    if (beh.mode === "hang-ignore-abort") {
+      return await new Promise(() => {});
     }
     const status = beh.status ?? 200;
     const body = beh.body ?? "{}";
@@ -200,6 +204,12 @@ function makeOpts(overrides = {}) {
   const { FakeRpc, calls: rpcCalls } = overrides.rpcPair ?? makeFakeRpcClientCtor();
   const { fakeBind, calls: wakeCalls } = overrides.wakePair ?? makeFakeBindWakeEvents();
   const loadPairingState = overrides.loadPairingState ?? makeLoadPairingState();
+  const inspectPairingState = overrides.inspectPairingState ?? (() => {
+    const record = loadPairingState();
+    return record
+      ? { status: "ready", needsEnrollment: false, record }
+      : { status: "missing", needsEnrollment: true, record: null };
+  });
   return {
     opts: {
       fetch: fakeFetch,
@@ -208,6 +218,7 @@ function makeOpts(overrides = {}) {
       ensureIdentityKeypair: fakeEnsureIdentityKeypair,
       bindWakeEvents: fakeBind,
       loadPairingState,
+      inspectPairingState,
       logger: { warn() {}, debug() {}, error() {} },
     },
     clock,
@@ -289,6 +300,23 @@ test("LAN hang times out → falls back to relay successfully", async () => {
   const res = await routedFetch("/api/bootstrap", {}, { ...opts, lanTimeoutMs: 10 });
   assert.equal(res.ok, true);
   assert.deepEqual(await res.json(), { via: "relay-after-timeout" });
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(rpcCalls.constructed, 1);
+  assert.equal(rpcCalls.fetch.length, 1);
+  assert.equal(rpcCalls.fetch[0].path, "/api/bootstrap");
+  assert.equal(__getTelemetry().lanFail, 1);
+});
+
+test("LAN fetch that ignores AbortController still hard-times out", async () => {
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "hang-ignore-abort" }]),
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"hard-timeout-relay"}' }),
+    }),
+  });
+  const res = await routedFetch("/api/bootstrap", {}, { ...opts, lanTimeoutMs: 10 });
+  assert.equal(res.ok, true);
+  assert.deepEqual(await res.json(), { via: "hard-timeout-relay" });
   assert.equal(fetchCalls.length, 1);
   assert.equal(rpcCalls.constructed, 1);
   assert.equal(rpcCalls.fetch.length, 1);
@@ -522,9 +550,30 @@ test("unpair (record removed) closes the live client and refuses to relay", asyn
   assert.equal(rpcCalls.constructed, 1);
 
   activeRecord = null;  // user unpaired
-  // Both LAN (TypeError) AND relay (no client) fail → router throws LAN err.
-  await assert.rejects(routedFetch("/api/b", {}, opts));
+  // Both LAN and relay fail, but the relay failure is actionable: refresh
+  // remote pairing on LAN so a v2 relay token can be stored.
+  await assert.rejects(
+    routedFetch("/api/b", {}, opts),
+    (err) => err?.code === "remote-pairing-enrollment-required" && err?.reason === "missing",
+  );
   assert.equal(rpcCalls.close, 1, "client should be closed once on unpair");
+});
+
+test("missing relay state throws an enrollment refresh error when off-LAN", async () => {
+  const { opts, rpcCalls } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "throw", err: new TypeError("Failed to fetch") }]),
+    loadPairingState: () => null,
+    inspectPairingState: () => ({ status: "legacy-v1", needsEnrollment: true, record: null }),
+  });
+
+  await assert.rejects(
+    routedFetch("/api/bootstrap", {}, opts),
+    (err) =>
+      err?.name === "RemotePairingEnrollmentRequiredError" &&
+      err?.code === "remote-pairing-enrollment-required" &&
+      err?.reason === "legacy-v1",
+  );
+  assert.equal(rpcCalls.constructed, 0);
 });
 
 test("bindWakeEvents is called once at client construction time", async () => {
