@@ -689,19 +689,51 @@ test("RESUME_REQ after cold wake returns RESUME_FAIL(HIBERNATED)", async () => {
   assert.equal(got.reason, RESUME_FAIL_HIBERNATED);
 });
 
-test("fresh phone msg1 after DO hibernation reaches the waiting bridge", async () => {
+test("fresh phone msg1 reaches a fresh waiting bridge", async () => {
   const channel = new PairingChannel(new FakeState(), {});
   const phone = new FakeWS();
   const bridge = new FakeWS();
-  reattachAfterHibernation(channel, "phone", phone);
-  reattachAfterHibernation(channel, "bridge", bridge);
+  connect(channel, "phone", phone);
+  connect(channel, "bridge", bridge);
 
   const freshMsg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
   await channel.webSocketMessage(phone, freshMsg1.buffer);
 
   assert.equal(bridge.closed, null);
-  assert.equal(bridge.sent.length, 1);
-  assert.deepEqual(bridge.sent[0], freshMsg1);
+  assert.equal(bridge.sent.length, 0, "msg1 waits for bridge RESUME_REQ to avoid duplicate replay");
+
+  await channel.webSocketMessage(bridge, encodeResumeReq(0).buffer);
+  assert.equal(bridge.sent.length, 2);
+  assert.equal(decode(bridge.sent[0]).type, FRAME_RESUME_OK);
+  assert.deepEqual(bridge.sent[1], freshMsg1);
+});
+
+test("fresh phone msg1 resets a cold-wake bridge socket before replay", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const bridge = new FakeWS();
+  reattachAfterHibernation(channel, "bridge", bridge);
+
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+  await channel.webSocketMessage(phone, encodeResumeReq(0).buffer);
+  assert.equal(decode(phone.sent[0]).type, FRAME_RESUME_OK);
+
+  const freshMsg1 = encodeData({ seq: 1, mid: generateMid(), payload: fakeNoiseIkMsg1() });
+  await channel.webSocketMessage(phone, freshMsg1.buffer);
+
+  assert.deepEqual(bridge.closed, { code: 4004, reason: "fresh-handshake" });
+  assert.equal(bridge.sent.length, 0, "fresh msg1 must not be delivered into a hibernated old bridge session");
+  assert.equal(channel.peers.get("phone").outbox.length, 1);
+  assert.deepEqual(channel.peers.get("phone").outbox[0].wire, freshMsg1);
+
+  await channel.webSocketClose(bridge, 4004, "fresh-handshake", false);
+  const newBridge = new FakeWS();
+  connect(channel, "bridge", newBridge);
+  await channel.webSocketMessage(newBridge, encodeResumeReq(0).buffer);
+
+  assert.equal(newBridge.sent.length, 2);
+  assert.equal(decode(newBridge.sent[0]).type, FRAME_RESUME_FAIL);
+  assert.deepEqual(newBridge.sent[1], freshMsg1);
 });
 
 test("fresh phone msg1 after RESUME_FAIL may use monotonic seq", async () => {
@@ -717,9 +749,17 @@ test("fresh phone msg1 after RESUME_FAIL may use monotonic seq", async () => {
   const freshMsg1 = encodeData({ seq: 17, mid: generateMid(), payload: fakeNoiseIkMsg1() });
   await channel.webSocketMessage(phone, freshMsg1.buffer);
 
-  assert.equal(bridge.closed, null);
-  assert.equal(bridge.sent.length, 1);
-  assert.deepEqual(bridge.sent[0], freshMsg1);
+  assert.deepEqual(bridge.closed, { code: 4004, reason: "fresh-handshake" });
+  assert.equal(bridge.sent.length, 0);
+
+  await channel.webSocketClose(bridge, 4004, "fresh-handshake", false);
+  const newBridge = new FakeWS();
+  connect(channel, "bridge", newBridge);
+  await channel.webSocketMessage(newBridge, encodeResumeReq(0).buffer);
+
+  assert.equal(newBridge.sent.length, 2);
+  assert.equal(decode(newBridge.sent[0]).type, FRAME_RESUME_FAIL);
+  assert.deepEqual(newBridge.sent[1], freshMsg1);
 });
 
 test("malformed phone DATA after DO hibernation stays buffered until bridge announces", async () => {

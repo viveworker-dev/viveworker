@@ -101,6 +101,7 @@ const DEFAULT_LAN_TIMEOUT_MS = 2_500;
 const PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
 const PAIRING_STATE_SCHEMA_VERSION = 2;
 const PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
+const ROUTING_STATUS_EVENT = "viveworker:remote-routing-status";
 
 // ---------------------------------------------------------------------------
 // Module state (singleton client + telemetry)
@@ -124,6 +125,9 @@ let _telemetry = newTelemetry();
 /** Last reason getOrInitClient could not build a relay client. */
 let _lastPairingStateStatus = null;
 
+/** Last transport route that completed successfully. */
+let _lastSuccessfulRoute = null;
+
 function newTelemetry() {
   return {
     lanOk: 0,
@@ -134,6 +138,35 @@ function newTelemetry() {
     lastRelayFailAt: 0,
     clientResets: 0,
   };
+}
+
+function emitRoutingStatus(phase, opts = {}, detail = {}) {
+  if (opts.suppressRoutingStatus === true) {
+    return;
+  }
+  const payload = {
+    phase,
+    ...detail,
+    atMs: nowMs(opts),
+  };
+  if (typeof opts.onRouteStatus === "function") {
+    try {
+      opts.onRouteStatus(payload);
+    } catch {
+      // Status updates must never affect network routing.
+    }
+  }
+  const target = globalThis;
+  if (
+    typeof target?.dispatchEvent === "function" &&
+    typeof target?.CustomEvent === "function"
+  ) {
+    try {
+      target.dispatchEvent(new target.CustomEvent(ROUTING_STATUS_EVENT, { detail: payload }));
+    } catch {
+      // Ignore non-browser/test environments.
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +222,19 @@ async function buildRpcClient(record, opts = {}) {
       identityKeypair: { priv: kp.priv, pub: kp.pub },
       remoteStatic,
       logger,
+      onStateChange: (next, previous, info = {}) => {
+        emitRoutingStatus("remote-transport-state", opts, {
+          state: String(next || ""),
+          previousState: String(previous || ""),
+          reason: String(info?.reason || ""),
+          code: Number(info?.code) || undefined,
+          resumed: typeof info?.resumed === "boolean" ? info.resumed : undefined,
+        });
+      },
       onError: (err) => {
+        emitRoutingStatus("remote-transport-error", opts, {
+          reason: err?.message || String(err || ""),
+        });
         logger.warn?.("[api-router] rpc onError:", err?.message || err);
       },
     });
@@ -417,6 +462,7 @@ function urlToRelayPath(url) {
 // ---------------------------------------------------------------------------
 
 async function attemptLanFetch(url, init, opts) {
+  emitRoutingStatus("lan-checking", opts, { url: String(url || "") });
   const fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const timeoutMs = opts.lanTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS;
   const timeoutEnabled = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortController !== "undefined";
@@ -453,6 +499,8 @@ async function attemptLanFetch(url, init, opts) {
       ? await Promise.race([fetchPromise, timeoutPromise])
       : await fetchPromise;
     _telemetry.lanOk++;
+    _lastSuccessfulRoute = "lan";
+    emitRoutingStatus("lan-connected", opts, { url: String(url || "") });
     return { ok: true, response };
   } catch (err) {
     // Caller cancelled → re-throw so we don't keep wasting time on relay.
@@ -463,6 +511,10 @@ async function attemptLanFetch(url, init, opts) {
     _telemetry.lanFail++;
     _telemetry.lastLanFailAt = nowMs(opts);
     _stickyRelayUntilMs = _telemetry.lastLanFailAt + STICKY_RELAY_MS;
+    emitRoutingStatus("lan-failed", opts, {
+      url: String(url || ""),
+      reason: lanErr?.message || String(lanErr),
+    });
     return { ok: false, err: lanErr };
   } finally {
     if (timer) clearTimeout(timer);
@@ -627,6 +679,7 @@ async function encodeFormDataForRelay(formData, signal) {
 }
 
 async function attemptRelayFetch(url, init, opts) {
+  emitRoutingStatus("remote-connecting", opts, { url: String(url || "") });
   const client = await getOrInitClient(opts);
   if (!client) {
     return { ok: false, err: relayClientUnavailableError(_lastPairingStateStatus) };
@@ -670,6 +723,8 @@ async function attemptRelayFetch(url, init, opts) {
       timeoutMs: opts.timeoutMs ?? DEFAULT_RELAY_TIMEOUT_MS,
     });
     _telemetry.relayOk++;
+    _lastSuccessfulRoute = "relay";
+    emitRoutingStatus("remote-connected", opts, { url: String(url || "") });
     return { ok: true, response: adaptRpcResponse(rpcRes) };
   } catch (err) {
     if (err && err.name === "AbortError") throw err;
@@ -679,6 +734,10 @@ async function attemptRelayFetch(url, init, opts) {
     }
     _telemetry.relayFail++;
     _telemetry.lastRelayFailAt = nowMs(opts);
+    emitRoutingStatus("remote-failed", opts, {
+      url: String(url || ""),
+      reason: err?.message || String(err),
+    });
     return { ok: false, err };
   }
 }
@@ -721,6 +780,9 @@ function nowMs(opts) {
  *   ensureIdentityKeypair?: typeof ensureIdentityKeypair,
  *   RemotePairingRpcClient?: typeof RemotePairingRpcClient,
  *   bindWakeEvents?: typeof bindWakeEvents,
+ *   onRouteStatus?: (event: { phase: string, atMs: number, url?: string, sticky?: boolean, reason?: string, state?: string, previousState?: string, code?: number, resumed?: boolean }) => void,
+ *   suppressRoutingStatus?: boolean,
+ *   preferRelayError?: boolean,
  * }} [opts]
  * @returns {Promise<{
  *   ok: boolean,
@@ -736,6 +798,7 @@ export async function routedFetch(url, init = {}, opts = {}) {
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
+    emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: true });
     const r = await attemptRelayFetch(url, init, opts);
     if (r.ok) return r.response;
     // Relay also failed. Drop sticky preference and try LAN once — maybe
@@ -744,6 +807,7 @@ export async function routedFetch(url, init = {}, opts = {}) {
     const lan = await attemptLanFetch(url, init, opts);
     if (lan.ok) return lan.response;
     if (isRemotePairingEnrollmentRequiredError(r.err)) throw r.err;
+    if (opts.preferRelayError && r.err) throw r.err;
     // Both dead. Surface LAN error since it's typically the more
     // actionable one ("Failed to fetch" → "obviously offline").
     throw lan.err;
@@ -754,9 +818,11 @@ export async function routedFetch(url, init = {}, opts = {}) {
   if (lan.ok) return lan.response;
 
   // Try relay once before giving up.
+  emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: false });
   const r = await attemptRelayFetch(url, init, opts);
   if (r.ok) return r.response;
   if (isRemotePairingEnrollmentRequiredError(r.err)) throw r.err;
+  if (opts.preferRelayError && r.err) throw r.err;
 
   throw lan.err;
 }
@@ -770,6 +836,7 @@ export function __getTelemetry() {
   return {
     ..._telemetry,
     stickyRelayUntilMs: _stickyRelayUntilMs,
+    lastRoute: _lastSuccessfulRoute,
     hasClient: Boolean(_client),
     clientPairingKey: _clientPairingKey,
   };
@@ -796,6 +863,7 @@ export function __resetForTest() {
   _stickyRelayUntilMs = 0;
   _telemetry = newTelemetry();
   _lastPairingStateStatus = null;
+  _lastSuccessfulRoute = null;
 }
 
 // Test-visible constants for tests that want to assert behavior at the

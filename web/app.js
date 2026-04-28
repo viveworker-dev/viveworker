@@ -5,10 +5,10 @@ import {
   savePairingState as saveRemotePairingState,
   clearPairingState as clearRemotePairingState,
 } from "./remote-pairing/pairing-state.js";
-import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-remote-device-match";
+import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-client-update-copy";
 
 const DESKTOP_BREAKPOINT = 980;
-const APP_BUILD_ID = "20260428-remote-device-match";
+const APP_BUILD_ID = "20260428-client-update-copy";
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
@@ -24,6 +24,18 @@ const MAX_TIMELINE_IMAGE_OBJECT_URLS = 80;
 const REMOTE_PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
 const REMOTE_PAIRING_STATE_SCHEMA_VERSION = 2;
 const REMOTE_PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
+const BOOT_SPLASH_SLOW_HINT_MS = 10000;
+const BOOT_SPLASH_REMOTE_SWITCHING_MIN_MS = 650;
+const BOOTSTRAP_REMOTE_TIMEOUT_MS = 12_000;
+const BOOT_TRACE_MAX_EVENTS = 90;
+const BOOT_TRACE_MAX_VALUE_LENGTH = 120;
+const BOOT_SPLASH_STAGE = Object.freeze({
+  initial: -1,
+  checking: 0,
+  switching: 1,
+  establishing: 2,
+  loading: 3,
+});
 const timelineImageObjectUrlCache = new Map();
 
 const state = {
@@ -165,9 +177,114 @@ function hazbasePasskeyHostSupport() {
 
 const app = document.querySelector("#app");
 let bootSplashDismissed = false;
+let bootSplashHintTimer = null;
+let bootSplashHintVisible = false;
+let bootSplashDeferredStatusTimer = null;
+let bootSplashRemoteRouteSeen = false;
+let bootSplashRemoteSwitchingShownAtMs = 0;
+let bootSplashStatusStage = BOOT_SPLASH_STAGE.initial;
+let bootSplashPendingStatusStage = BOOT_SPLASH_STAGE.initial;
+const bootTraceStartedAtMs = Date.now();
+const bootTraceStartPerfMs = bootTraceNow();
+const bootTraceId = makeBootTraceId();
+let bootTraceEvents = [];
+let bootTraceClosed = false;
+let bootTraceSent = false;
 
 if (typeof window !== "undefined") {
   window.__viveworkerAppBuild = APP_BUILD_ID;
+  window.__viveworkerBootTraceId = bootTraceId;
+}
+
+function bootTraceNow() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function makeBootTraceId() {
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  return `${Date.now().toString(36)}-${randomPart}`;
+}
+
+function sanitizeBootTraceValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value).slice(0, BOOT_TRACE_MAX_VALUE_LENGTH);
+}
+
+function sanitizeBootTraceUrl(value) {
+  const raw = sanitizeBootTraceValue(value);
+  if (!raw) {
+    return "";
+  }
+  try {
+    const base = window.location?.origin || "https://localhost";
+    const url = new URL(raw, base);
+    return url.pathname;
+  } catch {
+    return raw.split("?")[0].slice(0, BOOT_TRACE_MAX_VALUE_LENGTH);
+  }
+}
+
+function recordBootTraceEvent(type, detail = {}) {
+  if (bootTraceClosed) {
+    return;
+  }
+  const event = {
+    type: sanitizeBootTraceValue(type),
+    tMs: Math.max(0, Math.round(bootTraceNow() - bootTraceStartPerfMs)),
+  };
+  const phase = sanitizeBootTraceValue(detail.phase);
+  const url = sanitizeBootTraceUrl(detail.url);
+  const stateValue = sanitizeBootTraceValue(detail.state);
+  const previousState = sanitizeBootTraceValue(detail.previousState);
+  const reason = sanitizeBootTraceValue(detail.reason);
+  if (phase) event.phase = phase;
+  if (url) event.url = url;
+  if (stateValue) event.state = stateValue;
+  if (previousState) event.previousState = previousState;
+  if (reason) event.reason = reason;
+  if (detail.sticky === true || detail.sticky === false) event.sticky = detail.sticky;
+  if (Number.isFinite(Number(detail.code))) event.code = Number(detail.code);
+  if (detail.resumed === true || detail.resumed === false) event.resumed = detail.resumed;
+  bootTraceEvents.push(event);
+  if (bootTraceEvents.length > BOOT_TRACE_MAX_EVENTS) {
+    bootTraceEvents = bootTraceEvents.slice(-BOOT_TRACE_MAX_EVENTS);
+  }
+}
+
+function flushBootTrace(reason, extra = {}) {
+  if (bootTraceSent) {
+    return;
+  }
+  bootTraceSent = true;
+  bootTraceClosed = true;
+  const payload = {
+    traceId: bootTraceId,
+    reason: sanitizeBootTraceValue(reason),
+    appBuildId: APP_BUILD_ID,
+    locale: state.locale || DEFAULT_LOCALE,
+    startedAtMs: bootTraceStartedAtMs,
+    totalMs: Math.max(0, Math.round(bootTraceNow() - bootTraceStartPerfMs)),
+    remoteRouteSeen: bootSplashRemoteRouteSeen,
+    finalStage: bootSplashStatusStage,
+    userAgent: navigator.userAgent || "",
+    events: bootTraceEvents,
+    ...extra,
+  };
+  queueMicrotask(() => {
+    routedFetch("/api/remote-pairing/boot-trace", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    }, { suppressRoutingStatus: true }).catch(() => {});
+  });
 }
 
 function syncVisualViewportMetrics() {
@@ -199,6 +316,11 @@ function dismissBootSplash() {
     return;
   }
   bootSplashDismissed = true;
+  clearBootSplashHintTimer();
+  clearBootSplashDeferredStatusTimer();
+  if (typeof window !== "undefined") {
+    window.removeEventListener("viveworker:remote-routing-status", handleBootRoutingStatus);
+  }
   const splash = document.querySelector("#boot-splash");
   document.body?.classList.add("viveworker-ready");
   if (!splash) {
@@ -208,6 +330,147 @@ function dismissBootSplash() {
   window.setTimeout(() => {
     splash.remove();
   }, 280);
+}
+
+function setBootSplashStatus(key, stage = bootSplashStatusStage) {
+  if (bootSplashDismissed || typeof document === "undefined") {
+    return false;
+  }
+  if (stage < bootSplashStatusStage) {
+    return false;
+  }
+  const message = L(key);
+  const status = document.querySelector("#boot-splash-status");
+  const splash = document.querySelector("#boot-splash");
+  if (status && status.textContent !== message) {
+    status.textContent = message;
+  }
+  if (splash) {
+    splash.setAttribute("aria-label", `${L("common.appName")} ${message}`);
+  }
+  if (bootSplashRemoteRouteSeen) {
+    ensureBootSplashHintTimer();
+  }
+  bootSplashStatusStage = Math.max(bootSplashStatusStage, stage);
+  return true;
+}
+
+function ensureBootSplashHintTimer() {
+  if (bootSplashHintTimer != null || bootSplashHintVisible || bootSplashDismissed) {
+    return;
+  }
+  bootSplashHintTimer = window.setTimeout(() => {
+    bootSplashHintTimer = null;
+    showBootSplashHint();
+  }, BOOT_SPLASH_SLOW_HINT_MS);
+}
+
+function clearBootSplashHintTimer() {
+  if (bootSplashHintTimer != null) {
+    window.clearTimeout(bootSplashHintTimer);
+    bootSplashHintTimer = null;
+  }
+}
+
+function clearBootSplashDeferredStatusTimer() {
+  if (bootSplashDeferredStatusTimer != null) {
+    window.clearTimeout(bootSplashDeferredStatusTimer);
+    bootSplashDeferredStatusTimer = null;
+  }
+  bootSplashPendingStatusStage = BOOT_SPLASH_STAGE.initial;
+}
+
+function showBootSplashHint() {
+  if (bootSplashDismissed || bootSplashHintVisible || typeof document === "undefined") {
+    return;
+  }
+  const hint = document.querySelector("#boot-splash-hint");
+  if (!hint) {
+    return;
+  }
+  bootSplashHintVisible = true;
+  hint.textContent = L("boot.status.slowHint");
+  hint.hidden = false;
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(() => {
+      hint.classList.add("is-visible");
+    });
+  } else {
+    hint.classList.add("is-visible");
+  }
+}
+
+function bootSplashNow() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function showBootRemoteSwitchingStatus() {
+  bootSplashRemoteRouteSeen = true;
+  const effectiveStage = Math.max(bootSplashStatusStage, bootSplashPendingStatusStage);
+  if (effectiveStage >= BOOT_SPLASH_STAGE.switching) {
+    ensureBootSplashHintTimer();
+    return;
+  }
+  bootSplashRemoteSwitchingShownAtMs = bootSplashNow();
+  clearBootSplashDeferredStatusTimer();
+  setBootSplashStatus("boot.status.switchingRemote", BOOT_SPLASH_STAGE.switching);
+}
+
+function setBootRemoteStatusAfterSwitching(key, stage) {
+  bootSplashRemoteRouteSeen = true;
+  const effectiveStage = Math.max(bootSplashStatusStage, bootSplashPendingStatusStage);
+  if (stage <= effectiveStage) {
+    ensureBootSplashHintTimer();
+    return;
+  }
+  if (bootSplashStatusStage < BOOT_SPLASH_STAGE.switching) {
+    showBootRemoteSwitchingStatus();
+  }
+  const elapsedMs = bootSplashRemoteSwitchingShownAtMs > 0
+    ? bootSplashNow() - bootSplashRemoteSwitchingShownAtMs
+    : BOOT_SPLASH_REMOTE_SWITCHING_MIN_MS;
+  const delayMs = Math.max(0, BOOT_SPLASH_REMOTE_SWITCHING_MIN_MS - elapsedMs);
+  clearBootSplashDeferredStatusTimer();
+  if (delayMs <= 0) {
+    setBootSplashStatus(key, stage);
+    return;
+  }
+  bootSplashDeferredStatusTimer = window.setTimeout(() => {
+    bootSplashDeferredStatusTimer = null;
+    bootSplashPendingStatusStage = BOOT_SPLASH_STAGE.initial;
+    setBootSplashStatus(key, stage);
+  }, delayMs);
+  bootSplashPendingStatusStage = stage;
+}
+
+function handleBootRoutingStatus(event) {
+  if (bootSplashDismissed) {
+    return;
+  }
+  recordBootTraceEvent("route", event?.detail || {});
+  const phase = event?.detail?.phase || "";
+  switch (phase) {
+    case "lan-checking":
+      setBootSplashStatus("boot.status.checkingLan", BOOT_SPLASH_STAGE.checking);
+      break;
+    case "lan-failed":
+    case "remote-switching":
+      showBootRemoteSwitchingStatus();
+      break;
+    case "remote-connecting":
+      setBootRemoteStatusAfterSwitching("boot.status.establishingRemote", BOOT_SPLASH_STAGE.establishing);
+      break;
+    case "lan-connected":
+      // Same-LAN startup is fast and already covered by the checking message.
+      break;
+    case "remote-connected":
+      setBootRemoteStatusAfterSwitching("boot.status.loadingData", BOOT_SPLASH_STAGE.loading);
+      break;
+    default:
+      break;
+  }
 }
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
@@ -223,6 +486,9 @@ boot().catch((error) => {
   const hint = shouldShowNetworkHint(error, message)
     ? `<p class="muted">${escapeHtml(L("error.networkHint"))}</p>`
     : "";
+  flushBootTrace("boot-error", {
+    error: sanitizeBootTraceValue(error?.code || error?.name || message),
+  });
   dismissBootSplash();
   app.innerHTML = `
     <main class="onboarding-shell">
@@ -240,11 +506,14 @@ function bootErrorMessage(error) {
   if (isRemotePairingEnrollmentRequired(error)) {
     return L("error.remotePairingNeedsLanRefresh");
   }
+  if (isRemotePairingUnavailable(error)) {
+    return L("error.remotePairingUnavailable");
+  }
   return error?.message || String(error);
 }
 
 function shouldShowNetworkHint(error, message) {
-  if (isRemotePairingEnrollmentRequired(error)) {
+  if (isRemotePairingEnrollmentRequired(error) || isRemotePairingUnavailable(error)) {
     return false;
   }
   return /Load failed|Failed to fetch|NetworkError|fetch/i.test(message);
@@ -253,6 +522,15 @@ function shouldShowNetworkHint(error, message) {
 function isRemotePairingEnrollmentRequired(error) {
   return error?.code === "remote-pairing-enrollment-required" ||
     error?.name === "RemotePairingEnrollmentRequiredError";
+}
+
+function isRemotePairingUnavailable(error) {
+  return error?.code === "remote-pairing-unavailable" ||
+    error?.code === "remote-pairing-unreachable" ||
+    error?.name === "RemotePairingUnavailableError" ||
+    error?.name === "RpcTimeoutError" ||
+    error?.name === "RpcTransportError" ||
+    error?.name === "RpcTransportFailedError";
 }
 
 function inspectRemotePairingStateForEnrollment() {
@@ -298,12 +576,17 @@ function inspectRemotePairingStateForEnrollment() {
 }
 
 async function boot() {
+  recordBootTraceEvent("boot-start", {
+    url: window.location?.pathname || "/app",
+  });
   updateManifestHref(initialPairToken);
   syncVisualViewportMetrics();
+  setBootSplashStatus("boot.status.checkingLan", BOOT_SPLASH_STAGE.checking);
   // SW register + update() can take hundreds of ms and does not need to gate
   // first paint. Fire and forget; the `controllerchange` reload handler wired
   // up inside `registerServiceWorker` still picks up new versions.
   registerServiceWorker().catch(() => {});
+  window.addEventListener("viveworker:remote-routing-status", handleBootRoutingStatus);
   navigator.serviceWorker?.addEventListener("message", handleServiceWorkerMessage);
   window.addEventListener("resize", syncVisualViewportMetrics, { passive: true });
   window.visualViewport?.addEventListener("resize", syncVisualViewportMetrics, { passive: true });
@@ -316,6 +599,10 @@ async function boot() {
   // Single round-trip for session + inbox(pending/completed) + timeline +
   // devices. See `refreshBootstrap` for why we collapsed the boot fan-out.
   await refreshBootstrap();
+  if (bootSplashRemoteRouteSeen) {
+    setBootRemoteStatusAfterSwitching("boot.status.loadingData", BOOT_SPLASH_STAGE.loading);
+  }
+  flushBootTrace("bootstrap-complete");
 
   if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
     try {
@@ -465,6 +752,20 @@ async function maybeAutoEnrollRemotePairingFromLan() {
   return enrollRemotePairing();
 }
 
+function isRemotePairingUsingRelay() {
+  const telemetry = getRoutingTelemetry();
+  if (!telemetry) {
+    return false;
+  }
+  if (telemetry.lastRoute === "lan") {
+    return false;
+  }
+  if (telemetry.lastRoute === "relay") {
+    return true;
+  }
+  return telemetry.relayOk > 0 && Number(telemetry.stickyRelayUntilMs || 0) > Date.now();
+}
+
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) {
     return;
@@ -595,7 +896,12 @@ async function refreshSession() {
 // iOS PWAs where connection reuse is aggressive. Leaves the diff and
 // external-status probes as separate background phases in `boot()`.
 async function refreshBootstrap() {
-  const bootstrap = await apiGet("/api/bootstrap");
+  recordBootTraceEvent("bootstrap-start", { url: "/api/bootstrap" });
+  const bootstrap = await apiGet("/api/bootstrap", {
+    timeoutMs: BOOTSTRAP_REMOTE_TIMEOUT_MS,
+    preferRelayError: true,
+  });
+  recordBootTraceEvent("bootstrap-response", { url: "/api/bootstrap" });
   state.session = bootstrap?.session || null;
   applyServerAppBuildId(bootstrap?.appBuildId || state.session?.webAppBuildId);
   syncPairingTokenState(desiredBootstrapPairingToken());
@@ -2048,7 +2354,6 @@ function renderMobileTopBar(detail) {
   return `
     <header class="mobile-topbar">
       <div class="mobile-topbar__heading">
-        <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("common.appName"))}</span>
         <h1 class="mobile-topbar__title">${escapeHtml(meta.title)}</h1>
       </div>
     </header>
@@ -8136,6 +8441,10 @@ function bindShellInteractions() {
     checkbox.addEventListener("change", async () => {
       const next = checkbox.checked === true;
       const previous = state.remotePairingStatus?.enabled === true;
+      if (!next && isRemotePairingUsingRelay() && !window.confirm(L("settings.remotePairing.toggle.offConfirm"))) {
+        checkbox.checked = previous;
+        return;
+      }
       state.remotePairingNotice = "";
       state.remotePairingError = "";
       state.remotePairingPending = "toggle";
@@ -9825,7 +10134,7 @@ function pruneTimelineImageObjectUrlCache() {
   }
 }
 
-async function apiGet(url) {
+async function apiGet(url, opts = {}) {
   // routedFetch tries LAN first, then falls back to the relay tunnel when
   // the phone is off-LAN. Returns a fetch-Response-compatible object so the
   // rest of this function is identical to a plain `fetch()` call.
@@ -9834,7 +10143,7 @@ async function apiGet(url) {
     headers: {
       Accept: "application/json",
     },
-  });
+  }, opts);
   if (!response.ok) {
     const errorInfo = await readError(response);
     const error = new Error(errorInfo.message);

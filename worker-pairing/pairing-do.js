@@ -299,13 +299,18 @@ export class PairingChannel {
         // proof-of-work can knock on this DO. We don't want such a knock
         // to convince the DO to evict the bridge socket on the basis of
         // arbitrary garbage in `frame.payload`.
+        const looksLikeFirstFreshMsg1 =
+          role === "phone" &&
+          frame.payload?.length === NOISE_IK_MSG1_BYTES &&
+          frame.seq === FIRST_DATA_SEQ &&
+          (
+            peer.awaitingFirstFrame === true ||
+            peer.lastSent === 0
+          );
         const looksLikeFreshMsg1 =
           role === "phone" &&
           frame.payload?.length === NOISE_IK_MSG1_BYTES &&
-          (
-            (peer.awaitingFirstFrame === true && frame.seq === FIRST_DATA_SEQ) ||
-            peer.expectFreshHandshake === true
-          );
+          (looksLikeFirstFreshMsg1 || peer.expectFreshHandshake === true);
         if (peer.awaitingFirstFrame || looksLikeFreshMsg1) {
           console.log(
             `[relay-do-data] pairing=${pairingHint} role=${role}` +
@@ -344,15 +349,15 @@ export class PairingChannel {
         peer.coldWake = false; // any successful message clears the cold flag
         peer.freshHandshakeBuffered = looksLikeFreshMsg1;
         trimOutbox(peer.outbox);
-        // Forward to peer if they're connected AND past their first-frame
-        // gate. Fresh phone msg1 is the one exception: after Durable Object
-        // hibernation the bridge socket can still be alive while DO memory
-        // has reset to awaitingFirstFrame=true. Holding msg1 in that state
-        // deadlocks the responder, so let the real handshake opener through.
+        // Forward to peer only after it has announced itself with RESUME_REQ
+        // (which clears awaitingFirstFrame). If a phone msg1 races ahead of
+        // the bridge's RESUME_REQ, buffer it and let the resume path replay
+        // it once; direct-forwarding here would let the bridge receive msg1
+        // twice (direct + replay) and fail the Noise transcript.
         if (
           other?.socket &&
           isOpen(other.socket) &&
-          (other.awaitingFirstFrame !== true || looksLikeFreshMsg1)
+          other.awaitingFirstFrame !== true
         ) {
           const sent = trySend(other.socket, wire);
           if (looksLikeFreshMsg1 || !sent) {
@@ -576,7 +581,15 @@ function prepareCounterpartyForFreshHandshake(peer) {
   // peer reconnects → RESUME_REQ(0) → state-loss heuristic → counterparty
   // gets closed by sendResumeFail... → counterparty reconnects → fresh
   // msg1 → kick again → ...
-  if (peer.lastSent === 0 && peer.outbox.length === 0) {
+  //
+  // Exception: after Durable Object hibernation, a WebSocket can survive
+  // while the in-memory Noise/outbox state is gone. The client behind that
+  // socket may still believe it is CONNECTED with old keys, but the DO sees
+  // `lastSent=0/outbox=[]/awaitingFirstFrame=true`. If a fresh phone msg1
+  // arrives in that state, the safe and fast move is to close the cold-wake
+  // socket with 4004 so the bridge reconnects and receives the buffered msg1,
+  // rather than leaving the phone to wait for its handshake timeout.
+  if (peer.lastSent === 0 && peer.outbox.length === 0 && peer.coldWake !== true) {
     return;
   }
 
@@ -588,7 +601,7 @@ function prepareCounterpartyForFreshHandshake(peer) {
   // would decrypt as "invalid tag" on that old session. Close it and force
   // its next RESUME_REQ to get RESUME_FAIL; once it re-enters HANDSHAKING we
   // can replay the buffered msg1 into the fresh responder.
-  if (peer.socket && isOpen(peer.socket) && !peer.awaitingFirstFrame) {
+  if (peer.socket && isOpen(peer.socket) && (!peer.awaitingFirstFrame || peer.coldWake === true)) {
     peer.coldWake = true;
     try {
       peer.socket.close(CODE_HIBERNATED, "fresh-handshake");

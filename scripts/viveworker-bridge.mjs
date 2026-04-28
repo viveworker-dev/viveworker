@@ -47,7 +47,7 @@ const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "func
   ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
   : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
-const WEB_APP_BUILD_ID = "20260428-remote-device-match";
+const WEB_APP_BUILD_ID = "20260428-client-update-copy";
 const WEB_APP_SCRIPT_URL = `/app.js?v=${WEB_APP_BUILD_ID}`;
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
@@ -13913,6 +13913,23 @@ function buildWebAppHtml({ pairToken }) {
         font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
         font-size: 0.9rem;
         letter-spacing: 0.02em;
+        min-height: 1.25em;
+        transition: opacity 160ms ease, transform 160ms ease;
+      }
+      .boot-splash__hint {
+        max-width: 15rem;
+        margin: -0.35rem 0 0;
+        color: rgba(178, 196, 210, 0.58);
+        font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
+        font-size: 0.78rem;
+        line-height: 1.45;
+        opacity: 0;
+        transform: translateY(-0.2rem);
+        transition: opacity 220ms ease, transform 220ms ease;
+      }
+      .boot-splash__hint.is-visible {
+        opacity: 1;
+        transform: translateY(0);
       }
       .boot-splash__dots {
         display: inline-grid;
@@ -13939,6 +13956,8 @@ function buildWebAppHtml({ pairToken }) {
       }
       @media (prefers-reduced-motion: reduce) {
         .boot-splash,
+        .boot-splash__status,
+        .boot-splash__hint,
         .boot-splash__dots span {
           transition: none;
           animation: none;
@@ -13952,11 +13971,22 @@ function buildWebAppHtml({ pairToken }) {
       <div class="boot-splash__card">
         <img class="boot-splash__logo" src="/icons/viveworker-v-pulse.svg" alt="" width="112" height="112" decoding="async">
         <h1 class="boot-splash__title">viveworker</h1>
-        <p class="boot-splash__status">Starting</p>
+        <p id="boot-splash-status" class="boot-splash__status">Checking your trusted Wi-Fi...</p>
+        <p id="boot-splash-hint" class="boot-splash__hint" hidden>The first remote connection can take tens of seconds.</p>
         <span class="boot-splash__dots" aria-hidden="true"><span></span><span></span><span></span></span>
       </div>
     </div>
     <div id="app"></div>
+    <script>
+      (() => {
+        const isJa = (navigator.language || "").toLowerCase().startsWith("ja");
+        const message = isJa ? "同じWi-Fi内のPCを確認中..." : "Checking your trusted Wi-Fi...";
+        const status = document.getElementById("boot-splash-status");
+        const splash = document.getElementById("boot-splash");
+        if (status) status.textContent = message;
+        if (splash) splash.setAttribute("aria-label", \`viveworker \${message}\`);
+      })();
+    </script>
     <script type="module" src="${WEB_APP_SCRIPT_URL}"></script>
   </body>
 </html>`;
@@ -13964,6 +13994,88 @@ function buildWebAppHtml({ pairToken }) {
 
 function resolvePagePairingToken({ req, config, state, requestedToken }) {
   return resolveManifestPairingToken({ config, state, requestedToken });
+}
+
+function normalizeBootTraceEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return null;
+  }
+  const normalized = {
+    tMs: Math.max(0, Math.min(600_000, Math.round(Number(event.tMs) || 0))),
+    type: cleanText(event.type || "").slice(0, 80),
+  };
+  if (!normalized.type) {
+    return null;
+  }
+  const phase = cleanText(event.phase || "").slice(0, 80);
+  const stateValue = cleanText(event.state || "").slice(0, 80);
+  const previousState = cleanText(event.previousState || "").slice(0, 80);
+  const reason = cleanText(event.reason || "").slice(0, 120);
+  const urlPath = cleanText(event.url || "").split("?")[0].slice(0, 120);
+  if (phase) normalized.phase = phase;
+  if (stateValue) normalized.state = stateValue;
+  if (previousState) normalized.previousState = previousState;
+  if (reason) normalized.reason = reason;
+  if (urlPath) normalized.url = urlPath;
+  if (event.sticky === true || event.sticky === false) normalized.sticky = event.sticky;
+  if (Number.isFinite(Number(event.code))) normalized.code = Math.round(Number(event.code));
+  if (event.resumed === true || event.resumed === false) normalized.resumed = event.resumed;
+  return normalized;
+}
+
+function formatBootTraceEvent(event) {
+  const parts = [`${event.tMs}ms`, event.type];
+  if (event.phase) parts.push(event.phase);
+  if (event.state) {
+    parts.push(event.previousState ? `${event.previousState}->${event.state}` : event.state);
+  }
+  if (event.url) parts.push(event.url);
+  if (event.reason) parts.push(`reason=${event.reason}`);
+  if (event.sticky === true) parts.push("sticky=1");
+  if (event.code) parts.push(`code=${event.code}`);
+  if (event.resumed === true || event.resumed === false) parts.push(`resumed=${event.resumed ? 1 : 0}`);
+  return parts.join(":");
+}
+
+function logRemotePairingBootTrace(body, session, req) {
+  const traceId = cleanText(body?.traceId || "").slice(0, 80) || "unknown";
+  const reason = cleanText(body?.reason || "").slice(0, 80) || "unknown";
+  const appBuildId = cleanText(body?.appBuildId || "").slice(0, 80) || "unknown";
+  const totalMs = Math.max(0, Math.min(600_000, Math.round(Number(body?.totalMs) || 0)));
+  const remoteRouteSeen = body?.remoteRouteSeen === true;
+  const eventList = Array.isArray(body?.events) ? body.events : [];
+  const events = eventList
+    .slice(-90)
+    .map(normalizeBootTraceEvent)
+    .filter(Boolean);
+  const phases = events
+    .filter((event) => event.type === "route" && event.phase)
+    .map((event) => `${event.tMs}:${event.phase}`)
+    .join(" > ");
+  const transport = events
+    .filter((event) => event.phase === "remote-transport-state" || event.phase === "remote-transport-error")
+    .map((event) => {
+      if (event.phase === "remote-transport-error") return `${event.tMs}:error(${event.reason || "unknown"})`;
+      return `${event.tMs}:${event.previousState || "?"}->${event.state || "?"}${event.reason ? `(${event.reason})` : ""}`;
+    })
+    .join(" > ");
+  const deviceId = cleanText(session?.deviceId || "").slice(0, 60) || "unknown";
+  const ua = requestUserAgent(req).slice(0, 90);
+
+  console.log(
+    `[remote-pairing-boot] trace=${traceId} device=${deviceId} reason=${reason} ` +
+    `total=${totalMs}ms remote=${remoteRouteSeen ? 1 : 0} build=${appBuildId} ` +
+    `events=${events.length} ua=${JSON.stringify(ua)}`
+  );
+  if (phases) {
+    console.log(`[remote-pairing-boot-phases] trace=${traceId} ${phases}`);
+  }
+  if (transport) {
+    console.log(`[remote-pairing-boot-transport] trace=${traceId} ${transport}`);
+  }
+  if (totalMs >= 5_000 || remoteRouteSeen) {
+    console.log(`[remote-pairing-boot-detail] trace=${traceId} ${events.map(formatBootTraceEvent).join(" | ")}`);
+  }
 }
 
 function createNativeApprovalServer({ config, runtime, state }) {
@@ -14975,6 +15087,28 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           pairings,
           pairingsFile: REMOTE_PAIRINGS_FILE,
         });
+      }
+
+      // POST /api/remote-pairing/boot-trace — PWA cold-start timing.
+      //
+      // This is intentionally diagnostics-only: it does not mutate state and
+      // only logs a sanitized, capped phase timeline so off-LAN boot latency
+      // can be debugged without attaching Safari Web Inspector to the phone.
+      if (url.pathname === "/api/remote-pairing/boot-trace" && req.method === "POST") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        try {
+          logRemotePairingBootTrace(body, session, req);
+        } catch (err) {
+          console.warn(`[remote-pairing-boot] failed to log trace: ${err?.message}`);
+        }
+        return writeJson(res, 200, { ok: true });
       }
 
       // POST /api/remote-pairing/toggle — flip on/off without restart.

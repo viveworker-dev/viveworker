@@ -265,6 +265,7 @@ test("LAN HTTP 4xx is NOT treated as a transport failure", async () => {
   const tel = __getTelemetry();
   assert.equal(tel.lanFail, 0);
   assert.equal(tel.stickyRelayUntilMs, 0);
+  assert.equal(tel.lastRoute, "lan");
 });
 
 // ---------------------------------------------------------------------------
@@ -288,6 +289,27 @@ test("LAN TypeError → falls back to relay successfully", async () => {
   assert.equal(rpcCalls.fetch.length, 1);
   // The relay fetch carried the path correctly.
   assert.equal(rpcCalls.fetch[0].path, "/api/foo");
+});
+
+test("routing status events describe LAN-to-relay boot progress", async () => {
+  const events = [];
+  const { opts } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "throw", err: new TypeError("Failed to fetch") }]),
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay"}' }),
+    }),
+  });
+  opts.onRouteStatus = (event) => events.push(event.phase);
+
+  const res = await routedFetch("/api/bootstrap", {}, opts);
+  assert.equal(res.ok, true);
+  assert.deepEqual(events, [
+    "lan-checking",
+    "lan-failed",
+    "remote-switching",
+    "remote-connecting",
+    "remote-connected",
+  ]);
 });
 
 test("LAN hang times out → falls back to relay successfully", async () => {
@@ -360,6 +382,22 @@ test("both LAN and relay fail → throws the LAN error", async () => {
     }),
   });
   await assert.rejects(routedFetch("/api/foo", {}, opts), (err) => err === lanErr);
+});
+
+test("preferRelayError surfaces the relay error after LAN fallback fails", async () => {
+  const relayErr = new Error("rpc timed out");
+  relayErr.name = "RpcTimeoutError";
+  const { opts } = makeOpts({
+    fetchPair: makeFakeFetch([{ mode: "throw", err: new TypeError("Failed to fetch") }]),
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => { throw relayErr; },
+    }),
+  });
+
+  await assert.rejects(
+    routedFetch("/api/bootstrap", {}, { ...opts, preferRelayError: true }),
+    (err) => err === relayErr,
+  );
 });
 
 test("AbortError on LAN re-throws immediately, no relay attempt", async () => {
@@ -658,6 +696,7 @@ test("telemetry counts LAN successes and relay successes", async () => {
   assert.equal(tel.lanFail, 1);
   assert.equal(tel.relayOk, 1);
   assert.equal(tel.relayFail, 0);
+  assert.equal(tel.lastRoute, "relay");
   assert.ok(tel.stickyRelayUntilMs > 0);
   assert.equal(tel.hasClient, true);
 });

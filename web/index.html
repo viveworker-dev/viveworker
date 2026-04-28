@@ -52,6 +52,23 @@
         font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
         font-size: 0.9rem;
         letter-spacing: 0.02em;
+        min-height: 1.25em;
+        transition: opacity 160ms ease, transform 160ms ease;
+      }
+      .boot-splash__hint {
+        max-width: 15rem;
+        margin: -0.35rem 0 0;
+        color: rgba(178, 196, 210, 0.58);
+        font-family: "Avenir Next", "SF Pro Rounded", "SF Pro Text", "Helvetica Neue", sans-serif;
+        font-size: 0.78rem;
+        line-height: 1.45;
+        opacity: 0;
+        transform: translateY(-0.2rem);
+        transition: opacity 220ms ease, transform 220ms ease;
+      }
+      .boot-splash__hint.is-visible {
+        opacity: 1;
+        transform: translateY(0);
       }
       .boot-splash__dots {
         display: inline-grid;
@@ -78,6 +95,8 @@
       }
       @media (prefers-reduced-motion: reduce) {
         .boot-splash,
+        .boot-splash__status,
+        .boot-splash__hint,
         .boot-splash__dots span {
           transition: none;
           animation: none;
@@ -91,11 +110,22 @@
       <div class="boot-splash__card">
         <img class="boot-splash__logo" src="/icons/viveworker-v-pulse.svg" alt="" width="112" height="112" decoding="async">
         <h1 class="boot-splash__title">viveworker</h1>
-        <p class="boot-splash__status">Starting</p>
+        <p id="boot-splash-status" class="boot-splash__status">Checking your trusted Wi-Fi...</p>
+        <p id="boot-splash-hint" class="boot-splash__hint" hidden>The first remote connection can take tens of seconds.</p>
         <span class="boot-splash__dots" aria-hidden="true"><span></span><span></span><span></span></span>
       </div>
     </div>
     <div id="app"></div>
-    <script type="module" src="/app.js?v=20260428-remote-device-match"></script>
+    <script>
+      (() => {
+        const isJa = (navigator.language || "").toLowerCase().startsWith("ja");
+        const message = isJa ? "同じWi-Fi内のPCを確認中..." : "Checking your trusted Wi-Fi...";
+        const status = document.getElementById("boot-splash-status");
+        const splash = document.getElementById("boot-splash");
+        if (status) status.textContent = message;
+        if (splash) splash.setAttribute("aria-label", `viveworker ${message}`);
+      })();
+    </script>
+    <script type="module" src="/app.js?v=20260428-client-update-copy"></script>
   </body>
 </html>

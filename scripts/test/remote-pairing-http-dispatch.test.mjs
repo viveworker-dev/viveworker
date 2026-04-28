@@ -422,6 +422,7 @@ test("classifyRelayPath allows ordinary /api/* paths", () => {
   assert.deepEqual(classifyRelayPath("/api/threads/list"), { allowed: true });
   assert.deepEqual(classifyRelayPath("/api/timeline?since=123"), { allowed: true });
   assert.deepEqual(classifyRelayPath("/api/session"), { allowed: true });
+  assert.deepEqual(classifyRelayPath("/api/remote-pairing/boot-trace"), { allowed: true });
 });
 
 test("classifyRelayPath rejects non-/api paths", () => {

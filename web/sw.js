@@ -1,5 +1,5 @@
-const CACHE_NAME = "viveworker-v110";
-const APP_BUILD_ID = "20260428-remote-device-match";
+const CACHE_NAME = "viveworker-v120";
+const APP_BUILD_ID = "20260428-client-update-copy";
 const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
 const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
@@ -56,7 +56,9 @@ const APP_SHELL_FALLBACK_HTML = `<!doctype html>
       .boot-splash__card { display: grid; justify-items: center; gap: 0.9rem; text-align: center; }
       .boot-splash__logo { width: 6rem; height: 6rem; border-radius: 28%; }
       .boot-splash__title { margin: 0; font-size: 2rem; letter-spacing: -0.04em; }
-      .boot-splash__status { margin: 0; color: rgba(205, 220, 231, 0.72); }
+      .boot-splash__status { min-height: 1.25em; margin: 0; color: rgba(205, 220, 231, 0.72); }
+      .boot-splash__hint { max-width: 15rem; margin: -0.35rem 0 0; color: rgba(178, 196, 210, 0.58); font-size: 0.78rem; line-height: 1.45; opacity: 0; transition: opacity 220ms ease; }
+      .boot-splash__hint.is-visible { opacity: 1; }
       .viveworker-ready .boot-splash { opacity: 0; visibility: hidden; }
     </style>
     <title>viveworker</title>
@@ -66,10 +68,21 @@ const APP_SHELL_FALLBACK_HTML = `<!doctype html>
       <div class="boot-splash__card">
         <img class="boot-splash__logo" src="/icons/viveworker-v-pulse.svg" alt="" width="112" height="112" decoding="async">
         <h1 class="boot-splash__title">viveworker</h1>
-        <p class="boot-splash__status">Starting</p>
+        <p id="boot-splash-status" class="boot-splash__status">Checking your trusted Wi-Fi...</p>
+        <p id="boot-splash-hint" class="boot-splash__hint" hidden>The first remote connection can take tens of seconds.</p>
       </div>
     </div>
     <div id="app"></div>
+    <script>
+      (() => {
+        const isJa = (navigator.language || "").toLowerCase().startsWith("ja");
+        const message = isJa ? "同じWi-Fi内のPCを確認中..." : "Checking your trusted Wi-Fi...";
+        const status = document.getElementById("boot-splash-status");
+        const splash = document.getElementById("boot-splash");
+        if (status) status.textContent = message;
+        if (splash) splash.setAttribute("aria-label", "viveworker " + message);
+      })();
+    </script>
     <script type="module" src="${APP_SCRIPT_URL}"></script>
   </body>
 </html>`;
