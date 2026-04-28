@@ -5,7 +5,7 @@
 [![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-`viveworker` is an open mobile control surface for Codex Desktop, Claude Desktop, Claude Code, A2A tasks, File Share, and Moltbook.
+`viveworker` is an open mobile control surface for Codex Desktop, Claude Desktop, Claude Code, Remote connection, A2A tasks, File Share, and Moltbook.
 
 When your AI desktop session needs an approval, asks whether to implement a plan, wants you to choose from options, finishes a task, needs to hand off a file, or receives a task from another agent while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
 
@@ -31,6 +31,7 @@ keep your AI session moving, keep context close, and keep your momentum.
 
 - **AI coding sessions**: approvals, plan checks, questions, completions, and mobile code review for Codex and Claude
 - **Thread Sharing**: pass context, plan-review requests, or full handoffs between Codex and Claude sessions
+- **Remote connection**: reach your Mac from a paired device outside your LAN through an end-to-end encrypted relay
 - **File Share**: host static files on a private URL, with optional password protection and expiry
 - **Moltbook ops**: draft posts, scout replies, and handle incoming responses from the same phone UI
 - **A2A relay**: receive tasks from other agents, approve them on your phone, and execute locally on your Mac
@@ -50,8 +51,9 @@ one phone, one local control surface, multiple agent workflows.
 It gets even more fun with a Mac mini.
 Leave Codex or Claude running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your device handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
 
-`viveworker` is designed for local use — the bridge runs on your LAN and is not exposed to the Internet.
-External communication is handled through the A2A relay (`a2a.viveworker.com`), which the bridge polls outbound.
+`viveworker` starts from a local-first model: the bridge runs on your Mac and is not exposed directly to the Internet.
+When Remote connection is enabled, paired devices can also reach that bridge off-LAN through an end-to-end encrypted relay.
+External agent communication is handled separately through the A2A relay (`a2a.viveworker.com`), which the bridge polls outbound.
 
 ## Mac mini Ideas
 
@@ -116,6 +118,22 @@ After setup:
 - use the Home Screen app for daily use
 - use the pairing URL only for first-time setup or when you intentionally add another device
 - keep using the Home Screen app if you want notifications to work reliably
+
+## Remote Connection
+
+Remote connection lets a paired device reach your Mac even when it is not on the same Wi-Fi.
+
+Enable it from `Settings > Remote connection` in the Home Screen app. The bridge still stays local on your Mac; it does not open an inbound public port. Instead, the Mac and the paired device meet through the relay, and the actual traffic is end-to-end encrypted between the paired device and your bridge.
+
+Security details:
+
+- only devices already paired on your LAN can use Remote connection
+- the relay token can be rotated manually from the paired device when you are back on the same LAN
+- existing devices refresh their relay token automatically during LAN enrollment after the rotation window
+- connection events and token rotations appear in `Settings > Remote connection > Connection history`
+- if a device is lost, revoke it from `Settings > Remote connection` or `Settings > Devices`
+
+If Remote connection is turned off, off-LAN devices cannot reach the Mac again until you return to the same Wi-Fi and turn it back on.
 
 ## Common Commands
 
@@ -392,6 +410,7 @@ Today the project already exposes practical integration points through:
 
 - Codex + Claude Desktop support
 - Claude hooks
+- Remote connection for paired devices
 - A2A relay + Agent Card
 - File Share URLs
 - Thread Sharing across sessions
@@ -404,6 +423,7 @@ make `viveworker` the default local/mobile surface that other AI tools can plug 
 If you want to build on `viveworker`, these are the main surfaces to think in:
 
 - **Approvals and structured decisions**: approvals, plan checks, multiple-choice questions, and completions all land in the same mobile flow
+- **Remote connection**: keep that mobile flow reachable from paired devices even when they are outside the LAN
 - **Thread Sharing**: move notes, plan reviews, and handoffs between Codex and Claude sessions with phone approval in the loop
 - **File Share**: hand back static artefacts as private URLs instead of chat attachments
 - **A2A relay**: receive or send external agent tasks through a public relay while execution stays local
@@ -416,6 +436,7 @@ These parts already feel like core product surface, not side experiments:
 - Codex mobile approvals, questions, completions, and code review
 - Claude Desktop integration through hooks
 - trusted-LAN pairing, HTTPS, PWA install, and Web Push
+- Remote connection for paired devices, with E2E relay traffic, token rotation, and connection history
 - A2A task intake + approval + local execution
 - File Share for static artefacts
 - Thread Sharing between Codex and Claude sessions
@@ -474,8 +495,11 @@ If you can map your tool onto one of those paths, you probably do not need a bra
 
 ## Security Model
 
-- use `viveworker` only on a trusted LAN
+- pair devices only on a trusted LAN
 - do not expose the bridge directly to the Internet
+- Remote connection uses a relay only for rendezvous/transport; paired-device traffic is end-to-end encrypted to your bridge
+- relay tokens can be rotated manually and are refreshed automatically during LAN enrollment after the rotation window
+- remote connection activity is recorded locally in `~/.viveworker/remote-pairing-audit.jsonl`
 - if you lose a paired device, revoke it from `Settings > Devices`
 - use `pair` only when you want to add another trusted device
 - A2A relay authentication: external agents must provide a valid API key (`X-A2A-Key` header), and registration requires GitHub OAuth
@@ -490,6 +514,7 @@ If you later want a second wake-up notification path, you can add `ntfy` alongsi
 ## Troubleshooting
 
 - If the `.local` URL does not open, use the printed IP-based URL
+- If Remote connection does not work off-LAN, open `Settings > Remote connection` once on the same Wi-Fi as the Mac and confirm the device is registered
 - If pairing has expired, run `npx viveworker pair`
 - If notifications do not appear, make sure you opened the Home Screen app, not just a browser tab
 - If Web Push is enabled, make sure you are opening the HTTPS URL
@@ -512,3 +537,7 @@ Planned next steps include:
 - ✅ ~~Android support~~ (Apr 1, 2026)
 - ✅ ~~Moltbook integration~~ (Apr 10, 2026)
 - ✅ ~~A2A protocol support~~ (Apr 12, 2026)
+- ✅ ~~File Share~~ (Apr 18, 2026)
+- ✅ ~~Auto Pilot~~ (Apr 21, 2026)
+- ✅ ~~x402 / pay-per-unlock flow (testnet)~~ (Apr 25, 2026)
+- ✅ ~~Remote connection~~ (Apr 28, 2026)

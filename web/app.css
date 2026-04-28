@@ -5313,6 +5313,68 @@ button[aria-busy="true"]:not(.is-loading) {
   padding: 0;
 }
 
+.settings-remote-audit-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.settings-remote-audit-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.65rem;
+  padding: 0.72rem 0.78rem;
+  border: 1px solid rgba(156, 181, 197, 0.08);
+  border-radius: 15px;
+  background: rgba(14, 21, 27, 0.62);
+}
+
+.settings-remote-audit-dot {
+  width: 0.58rem;
+  height: 0.58rem;
+  margin-top: 0.32rem;
+  border-radius: 999px;
+  background: rgba(156, 181, 197, 0.44);
+  box-shadow: 0 0 0 4px rgba(156, 181, 197, 0.08);
+}
+
+.settings-remote-audit-dot--success {
+  background: #70ca9d;
+  box-shadow: 0 0 0 4px rgba(112, 202, 157, 0.12);
+}
+
+.settings-remote-audit-dot--danger {
+  background: #e98686;
+  box-shadow: 0 0 0 4px rgba(233, 134, 134, 0.12);
+}
+
+.settings-remote-audit-body {
+  min-width: 0;
+}
+
+.settings-remote-audit-title {
+  margin: 0;
+  color: rgba(231, 243, 250, 0.9);
+  font-size: 0.86rem;
+  font-weight: 760;
+  line-height: 1.35;
+}
+
+.settings-remote-audit-meta {
+  margin: 0.18rem 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.settings-remote-audit-time {
+  color: rgba(173, 194, 207, 0.72);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
 .settings-remote-details {
   padding: 0.92rem 1rem;
   border: 1px solid rgba(156, 181, 197, 0.08);

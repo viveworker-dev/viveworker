@@ -16,6 +16,7 @@
  *   - label             (whatever the phone sent at enroll time)
  *   - addedAtMs         (server-side timestamp; phones with skewed clocks
  *                        still see a coherent "added on" date)
+ *   - relayTokenUpdatedAtMs (server-side timestamp of the latest relayToken)
  *
  * Why localStorage and not IndexedDB:
  *   - The X25519 *private* key lives in IndexedDB (keys.js) because
@@ -57,6 +58,7 @@ const LEGACY_SCHEMA_VERSION = 1;
  * @property {string} relayUrl           ws:// or wss:// URL the bridge is on
  * @property {string} label              user-visible device label
  * @property {number} addedAtMs          server-side enroll time
+ * @property {number} relayTokenUpdatedAtMs server-side token update time, 0 for legacy records
  */
 
 /**
@@ -134,6 +136,9 @@ export function loadPairingState(opts) {
     relayUrl: parsed.relayUrl,
     label: typeof parsed.label === "string" ? parsed.label : "",
     addedAtMs: Number.isFinite(parsed.addedAtMs) ? parsed.addedAtMs : 0,
+    relayTokenUpdatedAtMs: Number.isFinite(parsed.relayTokenUpdatedAtMs)
+      ? parsed.relayTokenUpdatedAtMs
+      : 0,
   };
 }
 
@@ -242,6 +247,9 @@ export function savePairingState(record, opts) {
     relayUrl: record.relayUrl,
     label: typeof record.label === "string" ? record.label : "",
     addedAtMs: Number.isFinite(record.addedAtMs) ? record.addedAtMs : Date.now(),
+    relayTokenUpdatedAtMs: Number.isFinite(record.relayTokenUpdatedAtMs)
+      ? record.relayTokenUpdatedAtMs
+      : 0,
   };
   try {
     store.setItem(STORAGE_KEY, JSON.stringify(out));
@@ -294,6 +302,9 @@ function normalizeLegacyRecordForInspection(parsed) {
     relayUrl: typeof parsed.relayUrl === "string" ? parsed.relayUrl : "",
     label: typeof parsed.label === "string" ? parsed.label : "",
     addedAtMs: Number.isFinite(parsed.addedAtMs) ? parsed.addedAtMs : 0,
+    relayTokenUpdatedAtMs: Number.isFinite(parsed.relayTokenUpdatedAtMs)
+      ? parsed.relayTokenUpdatedAtMs
+      : 0,
   };
 }
 

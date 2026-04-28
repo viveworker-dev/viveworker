@@ -85,6 +85,7 @@ import { Readable } from "node:stream";
 const RELAY_DENIED_PATHS = new Set([
   "/api/remote-pairing/lan-enroll",
   "/api/remote-pairing/revoke",
+  "/api/remote-pairing/rotate-token",
   "/api/session/pair",
 ]);
 

@@ -27,6 +27,7 @@
  *         "deviceId":              "<LAN trusted-device id, when enrolled from an authenticated browser>",
  *         "label":                 "iPhone (LAN-paired 2026-04-25)",
  *         "addedAtMs":             1714000000000,
+ *         "relayTokenUpdatedAtMs":  1714000000000,
  *         "lastSeenAtMs":          null
  *       }
  *     ]
@@ -92,6 +93,7 @@ const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
  * @property {string} [deviceId]       LAN trusted-device id associated at enroll time
  * @property {string} label            user-visible label (e.g. "iPhone (LAN 2026-04-25)")
  * @property {number} addedAtMs        epoch ms at LAN pair time
+ * @property {number | null} relayTokenUpdatedAtMs epoch ms of most recent relay token rotation
  * @property {number | null} lastSeenAtMs            epoch ms of most recent successful relay handshake
  */
 
@@ -266,6 +268,26 @@ export async function markSeenPersisted(phonePub, info, filePath = REMOTE_PAIRIN
   return next;
 }
 
+export async function rotateRelayTokenPersisted(phonePub, filePath = REMOTE_PAIRINGS_FILE) {
+  const current = await loadPairings(filePath);
+  const norm = String(phonePub || "").toLowerCase();
+  let rotated = null;
+  const next = current.map((p) => {
+    if (p.phonePub !== norm) return p;
+    rotated = {
+      ...p,
+      relayToken: generateRelayToken(p.pairingId),
+      relayTokenUpdatedAtMs: Date.now(),
+    };
+    return rotated;
+  });
+  if (!rotated) {
+    return { rotated: null, pairings: current };
+  }
+  await savePairings(next, filePath);
+  return { rotated, pairings: next };
+}
+
 // ---------------------------------------------------------------------------
 // Helper used by clients to build an entry from a phone pubkey
 // ---------------------------------------------------------------------------
@@ -275,10 +297,10 @@ export async function markSeenPersisted(phonePub, info, filePath = REMOTE_PAIRIN
  * stamps `addedAtMs`. The caller is expected to invent the `pairingId`
  * (typically a UUID) and the `label`.
  *
- * @param {{ pairingId: string, relayToken?: string, phonePub: Uint8Array | string, label?: string, deviceId?: string }} input
+ * @param {{ pairingId: string, relayToken?: string, relayTokenUpdatedAtMs?: number | null, phonePub: Uint8Array | string, label?: string, deviceId?: string }} input
  * @returns {Pairing}
  */
-export function buildPairing({ pairingId, phonePub, label, relayToken, deviceId }) {
+export function buildPairing({ pairingId, phonePub, label, relayToken, relayTokenUpdatedAtMs, deviceId }) {
   const pubBytes = asU8(phonePub);
   if (pubBytes.length !== IDENTITY_KEY_BYTES) {
     throw new RangeError(`phonePub must be ${IDENTITY_KEY_BYTES} bytes, got ${pubBytes.length}`);
@@ -294,6 +316,7 @@ export function buildPairing({ pairingId, phonePub, label, relayToken, deviceId 
     phoneFingerprint: fingerprintIdentity(pubBytes),
     label: label ? String(label) : "",
     addedAtMs: Date.now(),
+    relayTokenUpdatedAtMs: numOrNull(relayTokenUpdatedAtMs) ?? Date.now(),
     lastSeenAtMs: null,
   };
   const cleanDeviceId = normalizeOptionalText(deviceId);
@@ -347,6 +370,7 @@ function normalizePairing(raw, ctx) {
     phoneFingerprint: fingerprint,
     label: raw.label != null ? String(raw.label) : "",
     addedAtMs: numOrNull(raw.addedAtMs) ?? Date.now(),
+    relayTokenUpdatedAtMs: numOrNull(raw.relayTokenUpdatedAtMs),
     lastSeenAtMs: numOrNull(raw.lastSeenAtMs),
   };
   const deviceId = normalizeOptionalText(raw.deviceId);

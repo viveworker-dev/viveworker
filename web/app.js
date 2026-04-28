@@ -5,10 +5,10 @@ import {
   savePairingState as saveRemotePairingState,
   clearPairingState as clearRemotePairingState,
 } from "./remote-pairing/pairing-state.js";
-import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-client-update-copy";
+import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-remote-token-refresh";
 
 const DESKTOP_BREAKPOINT = 980;
-const APP_BUILD_ID = "20260428-client-update-copy";
+const APP_BUILD_ID = "20260428-remote-token-refresh";
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
@@ -27,6 +27,7 @@ const REMOTE_PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
 const BOOT_SPLASH_SLOW_HINT_MS = 10000;
 const BOOT_SPLASH_REMOTE_SWITCHING_MIN_MS = 650;
 const BOOTSTRAP_REMOTE_TIMEOUT_MS = 12_000;
+const REMOTE_PAIRING_TOKEN_REFRESH_MS = 30 * 24 * 60 * 60 * 1000;
 const BOOT_TRACE_MAX_EVENTS = 90;
 const BOOT_TRACE_MAX_VALUE_LENGTH = 120;
 const BOOT_SPLASH_STAGE = Object.freeze({
@@ -742,14 +743,28 @@ async function maybeAutoEnrollRemotePairingFromLan() {
     return null;
   }
   const pairingState = inspectRemotePairingStateForEnrollment();
-  if (!pairingState.needsEnrollment) {
-    return null;
-  }
   const telemetry = getRoutingTelemetry();
   if (!telemetry || telemetry.lanOk <= 0) {
     return null;
   }
+  if (!pairingState.needsEnrollment) {
+    const record = pairingState.record || loadRemotePairingState();
+    if (!shouldRefreshRemotePairingTokenFromLan(record)) {
+      return null;
+    }
+  }
   return enrollRemotePairing();
+}
+
+function shouldRefreshRemotePairingTokenFromLan(record) {
+  if (!record) {
+    return false;
+  }
+  const updatedAt = Number(record.relayTokenUpdatedAtMs) || 0;
+  if (!updatedAt) {
+    return true;
+  }
+  return Date.now() - updatedAt >= REMOTE_PAIRING_TOKEN_REFRESH_MS;
 }
 
 function isRemotePairingUsingRelay() {
@@ -1792,6 +1807,9 @@ async function enrollRemotePairing(label) {
       relayUrl: response.relayUrl,
       label: response.label || "",
       addedAtMs: Number.isFinite(response.addedAtMs) ? response.addedAtMs : Date.now(),
+      relayTokenUpdatedAtMs: Number.isFinite(response.relayTokenUpdatedAtMs)
+        ? response.relayTokenUpdatedAtMs
+        : Date.now(),
     });
     if (!saved) {
       // Storage is full / disabled; the bridge still has the pairing,
@@ -4013,12 +4031,58 @@ function settingsDisconnectedValue() {
   return L("settings.status.disconnected");
 }
 
+function settingsSupportedValue(supported) {
+  return supported ? L("settings.status.supported") : L("settings.status.unsupported");
+}
+
+function settingsInstalledValue(installed) {
+  return installed ? L("settings.status.installed") : L("settings.status.notInstalled");
+}
+
 function settingsNotificationRootValue(context) {
-  if (context.push?.subscribed === true) {
+  if (context.push?.serverSubscribed === true) {
     return L("common.enabled");
+  }
+  if (context.push?.clientSubscribed === true) {
+    return settingsNeedsActionValue();
   }
   if (context.permission === "denied") {
     return settingsNeedsActionValue();
+  }
+  return L("common.disabled");
+}
+
+function notificationPermissionValue(permission) {
+  const key = `settings.permission.${permission || "default"}`;
+  const translated = L(key);
+  return translated === key ? String(permission || "") : translated;
+}
+
+function notificationReceiveValue(push) {
+  if (push?.serverSubscribed === true) {
+    return L("common.enabled");
+  }
+  if (push?.clientSubscribed === true) {
+    return L("settings.status.actionNeeded");
+  }
+  return L("common.disabled");
+}
+
+function notificationOverallValue(context) {
+  if (context.push?.serverSubscribed === true) {
+    return L("common.enabled");
+  }
+  if (context.permission === "denied") {
+    return L("settings.status.blocked");
+  }
+  if (!context.serverEnabled) {
+    return L("settings.status.notAvailable");
+  }
+  if (!context.supportsPushValue) {
+    return L("settings.status.unsupported");
+  }
+  if (!context.secureContext || !context.standalone || context.permission !== "granted") {
+    return L("settings.status.actionNeeded");
   }
   return L("common.disabled");
 }
@@ -4064,14 +4128,15 @@ function isRemotePairingSessionReachable(session) {
   return value === "connected" || value === "open" || value === "running" || value === "opening" || value === "handshaking" || value === "resuming";
 }
 
-function remotePairingStatusModel(status) {
+function remotePairingStatusModel(status, opts = {}) {
   const enabled = status?.enabled === true;
   const sessions = Array.isArray(status?.sessions) ? status.sessions : [];
   const pairings = Array.isArray(status?.pairings) ? status.pairings : [];
+  const usingRelay = opts.usingRelay === true;
   if (!enabled) {
     return { key: "disabled", tone: "muted", label: L("settings.remotePairing.status.disabled") };
   }
-  if (sessions.some(isRemotePairingSessionConnected)) {
+  if (usingRelay && sessions.some(isRemotePairingSessionConnected)) {
     return { key: "connected", tone: "success", label: L("settings.remotePairing.status.connected") };
   }
   if (sessions.some(isRemotePairingSessionReachable)) {
@@ -4081,6 +4146,53 @@ function remotePairingStatusModel(status) {
     return { key: "waiting", tone: "warning", label: L("settings.remotePairing.status.waiting") };
   }
   return { key: "waiting", tone: "muted", label: L("settings.remotePairing.status.waiting") };
+}
+
+function remotePairingAuditTypeLabel(type) {
+  const key = `settings.remotePairing.audit.type.${type || "unknown"}`;
+  const translated = L(key);
+  return translated === key ? L("settings.remotePairing.audit.type.unknown") : translated;
+}
+
+function remotePairingAuditOutcomeTone(outcome) {
+  if (outcome === "success") return "success";
+  if (outcome === "failure") return "danger";
+  return "muted";
+}
+
+function remotePairingAuditMeta(event) {
+  return [
+    event?.label,
+    event?.phoneFingerprint,
+    event?.relayHost,
+    event?.reason,
+  ].filter(Boolean).join(" / ");
+}
+
+function renderRemotePairingAudit(events) {
+  const list = Array.isArray(events) ? events.slice(0, 10) : [];
+  if (!list.length) {
+    return `<div class="settings-copy-block"><p class="muted">${escapeHtml(L("settings.remotePairing.audit.empty"))}</p></div>`;
+  }
+  return `
+    <div class="settings-remote-audit-list">
+      ${list.map((event) => {
+        const tone = remotePairingAuditOutcomeTone(event?.outcome);
+        const title = remotePairingAuditTypeLabel(event?.type);
+        const meta = remotePairingAuditMeta(event);
+        return `
+          <article class="settings-remote-audit-item">
+            <span class="settings-remote-audit-dot settings-remote-audit-dot--${escapeHtml(tone)}" aria-hidden="true"></span>
+            <div class="settings-remote-audit-body">
+              <p class="settings-remote-audit-title">${escapeHtml(title)}</p>
+              ${meta ? `<p class="settings-remote-audit-meta">${escapeHtml(meta)}</p>` : ""}
+            </div>
+            <time class="settings-remote-audit-time">${escapeHtml(formatSettingsTimestamp(event?.atMs))}</time>
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
 }
 
 function settingsPageMeta(page) {
@@ -4146,14 +4258,14 @@ function settingsPageMeta(page) {
         id: "a2aRelay",
         title: L("settings.a2aRelay.title"),
         description: L("settings.a2aRelay.copy"),
-        icon: "link",
+        icon: "agent-network",
       };
     case "a2aShare":
       return {
         id: "a2aShare",
         title: L("settings.a2aShare.title"),
         description: L("settings.a2aShare.copy"),
-        icon: "link",
+        icon: "file-event",
       };
     case "wallet":
       return {
@@ -4167,7 +4279,7 @@ function settingsPageMeta(page) {
         id: "remotePairing",
         title: L("settings.remotePairing.title"),
         description: L("settings.remotePairing.copy"),
-        icon: "link",
+        icon: "remote-connection",
       };
     case "a2aExecutor":
       // Executor settings integrated into a2aRelay page — redirect.
@@ -4224,9 +4336,8 @@ function renderSettingsRoot(context, { mobile }) {
     }),
     state.session?.remotePairingAvailable ? renderSettingsNavRow({
       page: "remotePairing",
-      icon: "link",
+      icon: "remote-connection",
       title: L("settings.remotePairing.title"),
-      subtitle: L("settings.remotePairing.subtitle"),
       value: settingsEnabledValue(context.remotePairing?.enabled === true),
     }) : "",
   ];
@@ -4263,13 +4374,13 @@ function renderSettingsRoot(context, { mobile }) {
         }) : "",
         state.session?.a2aRelayEnabled ? renderSettingsNavRow({
           page: "a2aRelay",
-          icon: "link",
+          icon: "agent-network",
           title: L("settings.a2aRelay.title"),
           value: settingsA2aRelayRootValue(context),
         }) : "",
         state.session?.a2aShareEnabled ? renderSettingsNavRow({
           page: "a2aShare",
-          icon: "link",
+          icon: "file-event",
           title: L("settings.a2aShare.title"),
           value: settingsA2aShareRootValue(context),
         }) : "",
@@ -4357,12 +4468,14 @@ function renderSettingsSubpage(context, { mobile }) {
 }
 
 function renderSettingsNotificationsPage(context) {
-  const { push, permission, secureContext, standalone, supportsPushValue, serverEnabled } = context;
-  const notificationEnabled = push.subscribed === true;
+  const { push, permission, standalone } = context;
+  const notificationEnabled = push.serverSubscribed === true;
   const statusRows = [
-    renderSettingsInfoRow(L("settings.row.status"), notificationEnabled ? L("common.enabled") : L("common.disabled")),
-    renderSettingsInfoRow(L("settings.row.notificationPermission"), permission === "granted" ? L("common.enabled") : L("common.disabled")),
-    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), notificationEnabled ? L("common.enabled") : L("common.disabled")),
+    renderSettingsInfoRow(L("settings.row.status"), notificationOverallValue(context)),
+    renderSettingsInfoRow(L("settings.row.notificationPermission"), notificationPermissionValue(permission), {
+      valueTone: permission === "granted" ? "enabled" : permission === "denied" ? "attention" : "disabled",
+    }),
+    renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), notificationReceiveValue(push)),
     push.lastSuccessfulDeliveryAtMs
       ? renderSettingsInfoRow(
           L("settings.row.lastSuccessfulDelivery"),
@@ -4373,12 +4486,6 @@ function renderSettingsNotificationsPage(context) {
   return `
     <div class="settings-page">
       ${renderSettingsGroup("", statusRows)}
-      ${renderSettingsGroup(L("settings.group.advanced"), [
-        renderSettingsInfoRow(L("settings.row.serverWebPush"), serverEnabled ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.secureContext"), secureContext ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), standalone ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), supportsPushValue ? L("common.enabled") : L("common.disabled")),
-      ])}
       ${state.pushNotice ? `<p class="inline-alert inline-alert--success">${escapeHtml(state.pushNotice)}</p>` : ""}
       ${state.pushError ? `<p class="inline-alert inline-alert--danger">${escapeHtml(state.pushError)}</p>` : ""}
       ${renderSettingsActionPanel(renderSettingsNotificationActions({
@@ -4472,16 +4579,12 @@ function renderSettingsAdvancedPage(context) {
       ${renderSettingsGroup("", [
         renderSettingsInfoRow(L("settings.row.serverWebPush"), context.serverEnabled ? L("common.enabled") : L("common.disabled")),
         renderSettingsInfoRow(L("settings.row.secureContext"), context.secureContext ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.homeScreenApp"), context.standalone ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.notificationPermission"), context.permission === "granted" ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.browserSupport"), context.supportsPushValue ? L("common.enabled") : L("common.disabled")),
-        renderSettingsInfoRow(L("settings.row.currentDeviceSubscribed"), context.push.subscribed ? L("common.enabled") : L("common.disabled")),
-        context.push.lastSuccessfulDeliveryAtMs
-          ? renderSettingsInfoRow(
-              L("settings.row.lastSuccessfulDelivery"),
-              new Date(context.push.lastSuccessfulDeliveryAtMs).toLocaleString(state.locale)
-            )
-          : "",
+        renderSettingsInfoRow(L("settings.row.homeScreenApp"), settingsInstalledValue(context.standalone), {
+          valueTone: context.standalone ? "enabled" : "disabled",
+        }),
+        renderSettingsInfoRow(L("settings.row.browserSupport"), settingsSupportedValue(context.supportsPushValue), {
+          valueTone: context.supportsPushValue ? "enabled" : "disabled",
+        }),
         renderSettingsInfoRow(L("settings.row.version"), state.appVersion || L("common.unavailable")),
       ].filter(Boolean), { listClassName: "settings-list settings-list--compact" })}
       ${versionNotice}
@@ -4555,8 +4658,11 @@ function settingsNavValueTone(value, explicitTone = "") {
   if (text === L("common.disabled") || text === L("settings.status.disabled")) {
     return "disabled";
   }
-  if (text === L("settings.status.actionNeeded")) {
+  if (text === L("settings.status.actionNeeded") || text === L("settings.status.blocked")) {
     return "attention";
+  }
+  if (text === L("settings.status.supported") || text === L("settings.status.installed")) {
+    return "enabled";
   }
   if (text === L("settings.status.disconnected")) {
     return "disconnected";
@@ -5349,12 +5455,15 @@ function renderSettingsRemotePairingPage(context) {
     identityFingerprint: null,
     sessions: [],
     pairings: [],
+    auditEvents: [],
   };
 
   const enabled = status.enabled === true;
   const sessions = Array.isArray(status.sessions) ? status.sessions : [];
   const pairings = Array.isArray(status.pairings) ? status.pairings : [];
-  const statusModel = remotePairingStatusModel(status);
+  const auditEvents = Array.isArray(status.auditEvents) ? status.auditEvents : [];
+  const usingRelay = isRemotePairingUsingRelay();
+  const statusModel = remotePairingStatusModel(status, { usingRelay });
   const sessionsByPub = new Map(
     sessions.map((s) => [String(s.phonePub || "").toLowerCase(), s]),
   );
@@ -5503,6 +5612,7 @@ function renderSettingsRemotePairingPage(context) {
     if (localRegistered) {
       const fingerprint = localPairing.phoneFingerprint
         || localPairing.phonePub.slice(0, 16);
+      const rotatePending = state.remotePairingPending === "rotateToken";
       return renderSettingsGroup(L("settings.remotePairing.thisDevice.title"), [
         `
           <div class="device-list">
@@ -5521,6 +5631,15 @@ function renderSettingsRemotePairingPage(context) {
                 ${renderDeviceMetaRow(L("settings.remotePairing.status.title"), statusModel.label)}
                 ${renderDeviceMetaRow(L("settings.remotePairing.thisDevice.fingerprint"), fingerprint)}
               </div>
+              <div class="device-card__actions">
+                <button type="button"
+                  class="secondary secondary--wide"
+                  data-remote-pairing-rotate-token
+                  ${rotatePending || usingRelay ? "disabled" : ""}>
+                  ${escapeHtml(L("settings.remotePairing.token.rotate"))}
+                </button>
+              </div>
+              ${usingRelay ? `<p class="settings-page-copy muted settings-remote-device-hint">${escapeHtml(L("settings.remotePairing.token.lanOnly"))}</p>` : ""}
             </article>
           </div>
         `,
@@ -5558,6 +5677,9 @@ function renderSettingsRemotePairingPage(context) {
       </div>
     </details>
   `;
+  const auditSection = renderSettingsGroup(L("settings.remotePairing.audit.title"), [
+    renderRemotePairingAudit(auditEvents),
+  ]);
 
   const noticeBlock = state.remotePairingNotice
     ? `<p class="settings-page-copy">${escapeHtml(state.remotePairingNotice)}</p>`
@@ -5573,6 +5695,7 @@ function renderSettingsRemotePairingPage(context) {
       ${connectionSection}
       ${thisDeviceSection}
       ${renderSettingsGroup(L("settings.remotePairing.pairings.otherTitle"), [pairingsRows])}
+      ${auditSection}
       ${detailsSection}
     </div>
   `;
@@ -8460,6 +8583,7 @@ function bindShellInteractions() {
           identityFingerprint: null,
           sessions: [],
           pairings: [],
+          auditEvents: [],
         };
       }
       await renderShell();
@@ -8503,6 +8627,41 @@ function bindShellInteractions() {
         state.remotePairingError = error?.errorKey === "invalid-relay-url"
           ? L("settings.remotePairing.error.invalidRelayUrl")
           : L("settings.remotePairing.error.relayUrlFailed");
+      } finally {
+        state.remotePairingPending = "";
+        await renderShell();
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-remote-pairing-rotate-token]")) {
+    button.addEventListener("click", async () => {
+      const local = loadRemotePairingState();
+      if (!local?.phonePub) return;
+      state.remotePairingNotice = "";
+      state.remotePairingError = "";
+      state.remotePairingPending = "rotateToken";
+      await renderShell();
+      try {
+        const response = await apiPost("/api/remote-pairing/rotate-token", { phonePub: local.phonePub });
+        saveRemotePairingState({
+          pairingId: response.pairingId,
+          relayToken: response.relayToken,
+          phonePub: response.phonePub,
+          phoneFingerprint: response.phoneFingerprint,
+          bridgePubHex: response.bridgePubHex,
+          bridgeFingerprint: response.bridgeFingerprint,
+          relayUrl: response.relayUrl,
+          label: response.label || local.label || "",
+          addedAtMs: Number.isFinite(response.addedAtMs) ? response.addedAtMs : local.addedAtMs,
+          relayTokenUpdatedAtMs: Number.isFinite(response.relayTokenUpdatedAtMs)
+            ? response.relayTokenUpdatedAtMs
+            : Date.now(),
+        });
+        state.remotePairingNotice = L("settings.remotePairing.notice.tokenRotated");
+        await fetchRemotePairingStatus();
+      } catch (error) {
+        state.remotePairingError = L("settings.remotePairing.error.tokenRotateFailed");
       } finally {
         state.remotePairingPending = "";
         await renderShell();
@@ -9862,6 +10021,10 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="7.2" y="2.8" width="9.6" height="18.4" rx="2.4"/><path d="M10 6.7h4"/><circle cx="12" cy="17.6" r="0.7" fill="currentColor" stroke="none"/></svg>`;
     case "language":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5c3.8 0 7 3.8 7 8.5s-3.2 8.5-7 8.5-7-3.8-7-8.5 3.2-8.5 7-8.5Z"/><path d="M5.8 9h12.4"/><path d="M5.8 15h12.4"/><path d="M12 3.8c1.9 2 3 4.9 3 8.2s-1.1 6.2-3 8.2c-1.9-2-3-4.9-3-8.2s1.1-6.2 3-8.2Z"/></svg>`;
+    case "agent-network":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.8" cy="7.2" r="2.7"/><circle cx="17.2" cy="7.2" r="2.7"/><circle cx="12" cy="17" r="3"/><path d="M9.2 8.8 11 14.1"/><path d="m14.8 8.8-1.9 5.3"/><path d="M9.5 7.2h5"/></svg>`;
+    case "remote-connection":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="12" width="14" height="7" rx="2"/><path d="M9 19h6"/><path d="M12 12v7"/><path d="M8.2 8.8a5.4 5.4 0 0 1 7.6 0"/><path d="M10.2 6.3a8.2 8.2 0 0 1 3.6 0"/><path d="M11.2 9.8a1.2 1.2 0 0 1 1.6 0"/></svg>`;
     case "link":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 13.6 8.3 15.7a3 3 0 0 1-4.2-4.2l2.8-2.8a3 3 0 0 1 4.2 0"/><path d="m13.6 10.4 2.1-2.1a3 3 0 1 1 4.2 4.2l-2.8 2.8a3 3 0 0 1-4.2 0"/><path d="m9.5 14.5 5-5"/></svg>`;
     case "clip":

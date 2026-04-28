@@ -69,6 +69,7 @@ const RELOAD_DEBOUNCE_MS = 250;
  * @property {number} [handshakeTimeoutMs]        forwarded to BridgeRelayClient
  * @property {Uint8Array} [prologue]              forwarded to BridgeRelayClient
  * @property {boolean} [watchPairingsFile]        defaults to true
+ * @property {(event: object) => void | Promise<void>} [auditEventSink]
  */
 
 /**
@@ -128,6 +129,7 @@ export async function startRemotePairingRelay(opts) {
 
   const relayUrl = (opts.relayUrl ?? process.env.REMOTE_PAIRING_RELAY_URL ?? DEFAULT_RELAY_URL).trim();
   if (!relayUrl) throw new Error("startRemotePairingRelay: empty relayUrl");
+  const audit = createAuditEmitter(opts.auditEventSink, log);
 
   const identityKeypairFile = opts.identityKeypairFile ?? REMOTE_PAIRING_ENV_FILE;
   const pairingsFile = opts.pairingsFile ?? REMOTE_PAIRINGS_FILE;
@@ -162,14 +164,57 @@ export async function startRemotePairingRelay(opts) {
     pairings: initialPairings,
     pairingsFile, // for reload()
     dispatch,
-    onSessionState: ({ pairingId, state, prev }) => {
+    onSessionState: ({ pairingId, phoneFingerprint, label, deviceId, state, prev }) => {
       if (state === prev) return;
       log.debug?.(`[remote-pairing] ${redactPairingId(pairingId)} ${prev} → ${state}`);
+      if (state === "connected") {
+        audit({
+          type: "session_connected",
+          outcome: "success",
+          pairingId: redactPairingId(pairingId),
+          phoneFingerprint,
+          label,
+          deviceId,
+          state,
+          previousState: prev,
+        });
+      } else if (state === "failed") {
+        audit({
+          type: "session_failed",
+          outcome: "failure",
+          pairingId: redactPairingId(pairingId),
+          phoneFingerprint,
+          label,
+          deviceId,
+          state,
+          previousState: prev,
+        });
+      } else if (prev === "connected" && state === "disconnected") {
+        audit({
+          type: "session_disconnected",
+          outcome: "info",
+          pairingId: redactPairingId(pairingId),
+          phoneFingerprint,
+          label,
+          deviceId,
+          state,
+          previousState: prev,
+        });
+      }
     },
     onError: (err, ctx) => {
       log.warn?.(
         `[remote-pairing] error${ctx?.pairingId ? ` (${redactPairingId(ctx.pairingId)})` : ""}: ${err?.message}`,
       );
+      audit({
+        type: "session_error",
+        outcome: "failure",
+        pairingId: ctx?.pairingId ? redactPairingId(ctx.pairingId) : "",
+        phoneFingerprint: ctx?.phoneFingerprint,
+        label: ctx?.label,
+        deviceId: ctx?.deviceId,
+        reason: err?.message || "remote pairing error",
+      });
     },
     onSeen: ({ pairing, atMs, channelBinding }) => {
       log.debug?.(`[remote-pairing] ${redactPairingId(pairing.pairingId)} seen at ${new Date(atMs).toISOString()}`);
@@ -281,6 +326,22 @@ function normalizeLogger(logger) {
 function redactPairingId(pairingId) {
   const value = String(pairingId || "");
   return value ? `pairing:${value.slice(0, 6)}…` : "pairing:unknown";
+}
+
+function createAuditEmitter(sink, log) {
+  if (typeof sink !== "function") return () => {};
+  return (event) => {
+    try {
+      const maybe = sink(event);
+      if (maybe && typeof maybe.then === "function") {
+        maybe.catch((err) => {
+          log.warn?.(`[remote-pairing] audit write failed: ${err?.message}`);
+        });
+      }
+    } catch (err) {
+      log.warn?.(`[remote-pairing] audit write failed: ${err?.message}`);
+    }
+  };
 }
 
 function fingerprintPub(pub) {

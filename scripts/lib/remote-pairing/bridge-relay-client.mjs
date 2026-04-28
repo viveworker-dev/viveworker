@@ -117,8 +117,8 @@ export const MAX_INFLIGHT_PER_SESSION = 64;
  * @returns {void | Promise<void>}
  */
 
-/** @callback OnSessionStateFn @param {{ pairingId: string, state: string, prev: string, info?: object }} ev */
-/** @callback OnErrorFn @param {Error} err @param {{ pairingId?: string }} [ctx] */
+/** @callback OnSessionStateFn @param {{ pairingId: string, phoneFingerprint?: string, label?: string, deviceId?: string, state: string, prev: string, info?: object }} ev */
+/** @callback OnErrorFn @param {Error} err @param {{ pairingId?: string, phoneFingerprint?: string, label?: string, deviceId?: string, phase?: string }} [ctx] */
 
 /**
  * @typedef {import("./pairings.mjs").Pairing} Pairing
@@ -263,8 +263,21 @@ export class BridgeRelayClient {
       dispatch: this._dispatch,
       onSeen: this._onSeen,
       onStateChange: (state, prev, info) =>
-        this._onSessionState({ pairingId: pairing.pairingId, state, prev, info }),
-      onError: (err) => this._onError(err, { pairingId: pairing.pairingId }),
+        this._onSessionState({
+          pairingId: pairing.pairingId,
+          phoneFingerprint: pairing.phoneFingerprint,
+          label: pairing.label,
+          deviceId: pairing.deviceId,
+          state,
+          prev,
+          info,
+        }),
+      onError: (err) => this._onError(err, {
+        pairingId: pairing.pairingId,
+        phoneFingerprint: pairing.phoneFingerprint,
+        label: pairing.label,
+        deviceId: pairing.deviceId,
+      }),
       logger: this._log,
       WebSocketImpl: this._opts.WebSocketImpl,
       pingIntervalMs: this._opts.pingIntervalMs,

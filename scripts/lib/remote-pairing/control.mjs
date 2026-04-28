@@ -42,6 +42,7 @@ const ENV_KEY_RELAY_URL = "REMOTE_PAIRING_RELAY_URL";
  *   config: { remotePairingEnabled: boolean, remotePairingRelayUrl: string },
  *   requestListener: import("./http-dispatch.mjs").RequestListener,
  *   logger?: { debug?: Function, warn?: Function, info?: Function, error?: Function },
+ *   auditEventSink?: (event: object) => void | Promise<void>,
  * }} args
  * @returns {Promise<import("./orchestrator.mjs").RemotePairingHandle>}
  */
@@ -50,6 +51,7 @@ export async function restartRemotePairingRelay({
   config,
   requestListener,
   logger,
+  auditEventSink,
 }) {
   if (!runtime || typeof runtime !== "object") {
     throw new TypeError("restartRemotePairingRelay: runtime required");
@@ -75,6 +77,7 @@ export async function restartRemotePairingRelay({
     relayUrl: config.remotePairingRelayUrl || undefined,
     requestListener,
     logger,
+    auditEventSink,
   });
   runtime.remotePairingHandle = handle;
   return handle;

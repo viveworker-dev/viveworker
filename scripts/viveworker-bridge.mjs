@@ -23,7 +23,8 @@ import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult
 import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems } from "./moltbook-api.mjs";
 import { startRemotePairingRelay, DEFAULT_RELAY_URL } from "./lib/remote-pairing/orchestrator.mjs";
 import { restartRemotePairingRelay, persistRemotePairingEnv, getRemotePairingStatus } from "./lib/remote-pairing/control.mjs";
-import { loadPairings, removePairingPersisted, addPairingPersisted, buildPairing, REMOTE_PAIRINGS_FILE } from "./lib/remote-pairing/pairings.mjs";
+import { appendRemotePairingAuditEvent, readRemotePairingAuditEvents } from "./lib/remote-pairing/audit.mjs";
+import { loadPairings, removePairingPersisted, addPairingPersisted, rotateRelayTokenPersisted, buildPairing, REMOTE_PAIRINGS_FILE } from "./lib/remote-pairing/pairings.mjs";
 import { ensureIdentityKeypair } from "./lib/remote-pairing/keys.mjs";
 import { fingerprintIdentity, bytesToHex } from "./lib/remote-pairing/keys-core.mjs";
 
@@ -47,7 +48,7 @@ const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "func
   ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
   : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
-const WEB_APP_BUILD_ID = "20260428-client-update-copy";
+const WEB_APP_BUILD_ID = "20260428-remote-token-refresh";
 const WEB_APP_SCRIPT_URL = `/app.js?v=${WEB_APP_BUILD_ID}`;
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
@@ -59,6 +60,7 @@ const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
 const PAIRING_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
+const REMOTE_PAIRING_RELAY_TOKEN_ROTATION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
@@ -14078,6 +14080,45 @@ function logRemotePairingBootTrace(body, session, req) {
   }
 }
 
+function recordRemotePairingAudit(event) {
+  appendRemotePairingAuditEvent({
+    atMs: Date.now(),
+    ...event,
+  }).catch((err) => {
+    console.warn(`[remote-pairing-audit] write failed: ${err?.message}`);
+  });
+}
+
+function remotePairingAuditFieldsForPairing(pairing) {
+  if (!pairing) return {};
+  return {
+    pairingId: redactShortId(pairing.pairingId),
+    phoneFingerprint: pairing.phoneFingerprint || "",
+    label: pairing.label || "",
+    deviceId: pairing.deviceId || "",
+  };
+}
+
+function redactShortId(value) {
+  const text = cleanText(value || "").slice(0, 80);
+  return text ? `${text.slice(0, 6)}…` : "";
+}
+
+function relayHostForAudit(value) {
+  try {
+    return new URL(value || DEFAULT_RELAY_URL).host;
+  } catch {
+    return "";
+  }
+}
+
+function shouldAutoRotateRemotePairingToken(pairing, now = Date.now()) {
+  if (!pairing) return false;
+  const updatedAt = Number(pairing.relayTokenUpdatedAtMs) || 0;
+  if (!updatedAt) return true;
+  return now - updatedAt >= REMOTE_PAIRING_RELAY_TOKEN_ROTATION_MS;
+}
+
 function createNativeApprovalServer({ config, runtime, state }) {
   const requestHandler = async (req, res) => {
     try {
@@ -15063,6 +15104,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         if (!session) return;
         const status = getRemotePairingStatus(runtime);
         let pairings = [];
+        let auditEvents = [];
         try {
           const list = await loadPairings();
           pairings = list.map((p) => ({
@@ -15072,10 +15114,16 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             phoneFingerprint: p.phoneFingerprint,
             deviceId: p.deviceId || null,
             addedAtMs: p.addedAtMs ?? null,
+            relayTokenUpdatedAtMs: p.relayTokenUpdatedAtMs ?? null,
             lastSeenAtMs: p.lastSeenAtMs ?? null,
           }));
         } catch (err) {
           console.warn(`[remote-pairing] status: failed to load pairings: ${err?.message}`);
+        }
+        try {
+          auditEvents = await readRemotePairingAuditEvents({ limit: 12 });
+        } catch (err) {
+          console.warn(`[remote-pairing] status: failed to load audit log: ${err?.message}`);
         }
         return writeJson(res, 200, {
           enabled: status.enabled,
@@ -15085,6 +15133,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           identityPubHex: status.identityPubHex,
           sessions: status.sessions,
           pairings,
+          auditEvents,
           pairingsFile: REMOTE_PAIRINGS_FILE,
         });
       }
@@ -15135,6 +15184,12 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         }
         const next = body.enabled;
         config.remotePairingEnabled = next;
+        recordRemotePairingAudit({
+          type: next ? "relay_enabled" : "relay_disabled",
+          outcome: "info",
+          deviceId: session.deviceId || "",
+          relayHost: relayHostForAudit(config.remotePairingRelayUrl || DEFAULT_RELAY_URL),
+        });
         try {
           await persistRemotePairingEnv({ enabled: next });
         } catch (err) {
@@ -15149,6 +15204,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             config,
             requestListener: requestHandler,
             logger: console,
+            auditEventSink: recordRemotePairingAudit,
           });
         } catch (err) {
           console.error(`[remote-pairing] hot-restart failed: ${err?.message}`);
@@ -15190,6 +15246,12 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         }
         const normalized = relayUrlResult.value;
         config.remotePairingRelayUrl = normalized;
+        recordRemotePairingAudit({
+          type: "relay_url_changed",
+          outcome: "info",
+          deviceId: session.deviceId || "",
+          relayHost: relayHostForAudit(normalized || DEFAULT_RELAY_URL),
+        });
         try {
           await persistRemotePairingEnv({ relayUrl: normalized || null });
         } catch (err) {
@@ -15202,6 +15264,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
               config,
               requestListener: requestHandler,
               logger: console,
+              auditEventSink: recordRemotePairingAudit,
             });
           } catch (err) {
             console.error(`[remote-pairing] hot-restart failed: ${err?.message}`);
@@ -15241,9 +15304,11 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         }
         let beforeLen = 0;
         let afterLen = 0;
+        let removedPairing = null;
         try {
           const before = await loadPairings();
           beforeLen = before.length;
+          removedPairing = before.find((p) => p.phonePub === phonePub) || null;
           const after = await removePairingPersisted(phonePub);
           afterLen = after.length;
         } catch (err) {
@@ -15257,7 +15322,117 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             console.warn(`[remote-pairing] reloadNow after revoke failed: ${err?.message}`);
           }
         }
+        if (removed) {
+          recordRemotePairingAudit({
+            type: "pairing_revoked",
+            outcome: "info",
+            deviceId: session.deviceId || "",
+            ...remotePairingAuditFieldsForPairing(removedPairing),
+          });
+        }
         return writeJson(res, 200, { ok: true, removed, remaining: afterLen });
+      }
+
+      // POST /api/remote-pairing/rotate-token — rotate the relay capability
+      // for the current LAN-reachable paired phone. This endpoint is also
+      // denied inside the relay dispatcher, so an off-LAN phone cannot rotate
+      // itself into a split-brain state where the bridge updated but the PWA
+      // failed to persist the new token.
+      if (url.pathname === "/api/remote-pairing/rotate-token" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        const phonePub = typeof body?.phonePub === "string" ? body.phonePub.trim().toLowerCase() : "";
+        if (!/^[0-9a-f]{64}$/u.test(phonePub)) {
+          return writeJson(res, 400, {
+            error: "invalid-phone-pub",
+            message: "phonePub must be a 64-char hex string",
+          });
+        }
+
+        let current = [];
+        try {
+          current = await loadPairings();
+        } catch (err) {
+          return writeJson(res, 500, { error: "load-pairings-failed", message: err.message });
+        }
+        const existing = current.find((p) => p.phonePub === phonePub) || null;
+        if (!existing) {
+          return writeJson(res, 404, { error: "pairing-not-found" });
+        }
+        if (existing.deviceId && session.deviceId && existing.deviceId !== session.deviceId) {
+          recordRemotePairingAudit({
+            type: "token_rotate_denied",
+            outcome: "failure",
+            deviceId: session.deviceId || "",
+            reason: "device mismatch",
+            ...remotePairingAuditFieldsForPairing(existing),
+          });
+          return writeJson(res, 403, { error: "device-mismatch" });
+        }
+
+        let rotated;
+        try {
+          ({ rotated } = await rotateRelayTokenPersisted(phonePub));
+        } catch (err) {
+          recordRemotePairingAudit({
+            type: "token_rotate_failed",
+            outcome: "failure",
+            deviceId: session.deviceId || "",
+            reason: err.message,
+            ...remotePairingAuditFieldsForPairing(existing),
+          });
+          return writeJson(res, 500, { error: "rotate-token-failed", message: err.message });
+        }
+        if (!rotated) {
+          return writeJson(res, 404, { error: "pairing-not-found" });
+        }
+
+        if (runtime.remotePairingHandle) {
+          try {
+            await runtime.remotePairingHandle.reloadNow();
+          } catch (err) {
+            console.warn(`[remote-pairing] reloadNow after token rotation failed: ${err?.message}`);
+          }
+        }
+
+        let bridgeKeypair;
+        try {
+          bridgeKeypair = await ensureIdentityKeypair();
+        } catch (err) {
+          return writeJson(res, 500, {
+            error: "bridge-keypair-failed",
+            message: err.message,
+          });
+        }
+        const relayUrl = (config.remotePairingRelayUrl || "").trim() || DEFAULT_RELAY_URL;
+        recordRemotePairingAudit({
+          type: "token_rotated",
+          outcome: "success",
+          deviceId: session.deviceId || "",
+          relayHost: relayHostForAudit(relayUrl),
+          ...remotePairingAuditFieldsForPairing(rotated),
+        });
+
+        return writeJson(res, 200, {
+          ok: true,
+          pairingId: rotated.pairingId,
+          relayToken: rotated.relayToken,
+          phonePub: rotated.phonePub,
+          phoneFingerprint: rotated.phoneFingerprint,
+          deviceId: rotated.deviceId || null,
+          bridgePubHex: bytesToHex(bridgeKeypair.pub),
+          bridgeFingerprint: fingerprintIdentity(bridgeKeypair.pub),
+          relayUrl,
+          label: rotated.label,
+          addedAtMs: rotated.addedAtMs,
+          relayTokenUpdatedAtMs: rotated.relayTokenUpdatedAtMs ?? null,
+        });
       }
 
       // POST /api/remote-pairing/lan-enroll — finalize a LAN pairing by
@@ -15324,7 +15499,9 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         }
         const existing = existingPairings.find((p) => p.phonePub === phonePubHex);
         const pairingId = existing?.pairingId || crypto.randomUUID();
-        const relayToken = existing?.relayToken || undefined;
+        const autoRotateToken = shouldAutoRotateRemotePairingToken(existing);
+        const relayToken = autoRotateToken ? undefined : existing?.relayToken || undefined;
+        const relayTokenUpdatedAtMs = autoRotateToken ? Date.now() : existing?.relayTokenUpdatedAtMs;
 
         // Bridge identity — generates on first call. We can't lean on
         // runtime.remotePairingHandle here because the relay may be OFF
@@ -15346,6 +15523,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           entry = buildPairing({
             pairingId,
             relayToken,
+            relayTokenUpdatedAtMs,
             phonePub: phonePubHex,
             label,
             deviceId: session.deviceId,
@@ -15377,6 +15555,23 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             console.warn(`[remote-pairing] reloadNow after lan-enroll failed: ${err?.message}`);
           }
         }
+        recordRemotePairingAudit({
+          type: existing ? "pairing_refreshed" : "pairing_enrolled",
+          outcome: "success",
+          deviceId: session.deviceId || "",
+          relayHost: relayHostForAudit(config.remotePairingRelayUrl || DEFAULT_RELAY_URL),
+          ...remotePairingAuditFieldsForPairing(entry),
+        });
+        if (existing && autoRotateToken) {
+          recordRemotePairingAudit({
+            type: "token_auto_rotated",
+            outcome: "success",
+            deviceId: session.deviceId || "",
+            relayHost: relayHostForAudit(config.remotePairingRelayUrl || DEFAULT_RELAY_URL),
+            reason: existing.relayTokenUpdatedAtMs ? "scheduled LAN refresh" : "legacy token metadata",
+            ...remotePairingAuditFieldsForPairing(entry),
+          });
+        }
 
         const bridgePubHex = bytesToHex(bridgeKeypair.pub);
         const bridgeFingerprint = fingerprintIdentity(bridgeKeypair.pub);
@@ -15397,6 +15592,8 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           relayUrl,
           label: entry.label,
           addedAtMs: entry.addedAtMs,
+          relayTokenUpdatedAtMs: entry.relayTokenUpdatedAtMs ?? null,
+          relayTokenRotated: existing ? autoRotateToken : false,
         });
       }
 
@@ -21070,6 +21267,7 @@ async function main() {
           relayUrl: config.remotePairingRelayUrl || undefined,
           requestListener: approvalServer.requestHandler,
           logger: console,
+          auditEventSink: recordRemotePairingAudit,
         });
         const status = runtime.remotePairingHandle.getStatus();
         if (status.enabled) {

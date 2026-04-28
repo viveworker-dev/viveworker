@@ -1,5 +1,5 @@
-const CACHE_NAME = "viveworker-v120";
-const APP_BUILD_ID = "20260428-client-update-copy";
+const CACHE_NAME = "viveworker-v127";
+const APP_BUILD_ID = "20260428-remote-token-refresh";
 const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
 const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
