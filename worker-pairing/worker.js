@@ -7,6 +7,8 @@
  *
  * Routes:
  *   GET  /v1/pairing/:pairingId/ws?role=phone|bridge&token=... → DO WS upgrade
+ *   GET  /stats/remote                                 → private operator stats
+ *   GET  /stats/remote/public                          → coarse public stats
  *   GET  /healthz                                      → 200 "ok"
  *   GET  /                                             → human-readable banner
  *
@@ -17,6 +19,7 @@
  */
 
 export { PairingChannel } from "./pairing-do.js";
+export { RemoteRelayAnalytics } from "./analytics-do.js";
 
 const PAIRING_ID_RE = /^[a-zA-Z0-9_-]{8,64}$/;
 const RELAY_TOKEN_RE = /^v1\.[A-Za-z0-9_-]{32}\.[a-z0-9]{1,13}$/u;
@@ -55,6 +58,8 @@ export default {
    * @param {Request} request
    * @param {{
    *   PAIRING_CHANNEL: DurableObjectNamespace,
+   *   RELAY_ANALYTICS?: DurableObjectNamespace,
+   *   STATS_ADMIN_TOKEN?: string,
    *   INVALID_TOKEN_RL?: { limit: (opts: { key: string }) => Promise<{ success: boolean }> },
    *   WS_UPGRADE_RL?:    { limit: (opts: { key: string }) => Promise<{ success: boolean }> },
    * }} env
@@ -68,6 +73,20 @@ export default {
         status: 200,
         headers: { "content-type": "text/plain", "cache-control": "no-store" },
       });
+    }
+
+    if (url.pathname === "/stats/remote/public" && request.method === "GET") {
+      return fetchRelayStats(env, request, { public: true });
+    }
+
+    if (url.pathname === "/stats/remote" && request.method === "GET") {
+      if (!isAuthorizedStatsRequest(env, request)) {
+        return new Response("not found", {
+          status: 404,
+          headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+        });
+      }
+      return fetchRelayStats(env, request);
     }
 
     if (url.pathname === "/" && request.method === "GET") {
@@ -99,11 +118,23 @@ export default {
         // its bucket the way the old in-memory Map allowed.
         const rl = await safeRateLimit(env.INVALID_TOKEN_RL, cfIp);
         if (rl && !rl.success) {
+          waitUntil(ctx, recordRelayMetric(env, {
+            type: "invalid_token_rate_limited",
+            role,
+            pairingId,
+            outcome: "rate_limited",
+          }));
           return new Response("too many invalid relay tokens", {
             status: 429,
             headers: { "retry-after": "60" },
           });
         }
+        waitUntil(ctx, recordRelayMetric(env, {
+          type: "invalid_token",
+          role,
+          pairingId,
+          outcome: "failure",
+        }));
         return new Response("invalid relay token", { status: 401 });
       }
 
@@ -114,6 +145,12 @@ export default {
       const upgradeRl = await safeRateLimit(env.WS_UPGRADE_RL, `${pairingId}:${cfIp}`);
       if (upgradeRl && !upgradeRl.success) {
         console.log(`[relay-ws-rate-limit] pairing=${shortPairing(pairingId)} role=${role}`);
+        waitUntil(ctx, recordRelayMetric(env, {
+          type: "ws_upgrade_rate_limited",
+          role,
+          pairingId,
+          outcome: "rate_limited",
+        }));
         return new Response("too many ws upgrade attempts", {
           status: 429,
           headers: { "retry-after": "60" },
@@ -126,12 +163,78 @@ export default {
       const id = env.PAIRING_CHANNEL.idFromName(await relayChannelName(pairingId, relayToken));
       const stub = env.PAIRING_CHANNEL.get(id);
       console.log(`[relay-ws-upgrade] pairing=${shortPairing(pairingId)} role=${role}`);
+      waitUntil(ctx, recordRelayMetric(env, {
+        type: "ws_upgrade",
+        role,
+        pairingId,
+        outcome: "success",
+      }));
       return stub.fetch(request);
     }
 
     return new Response("not found", { status: 404 });
   },
 };
+
+function fetchRelayStats(env, request, options = {}) {
+  if (!env.RELAY_ANALYTICS) {
+    return new Response(JSON.stringify({ error: "remote analytics not configured" }), {
+      status: 501,
+      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
+  const url = new URL(request.url);
+  const qs = url.search || "";
+  const statsPath = options.public ? "/v1/stats/public" : "/v1/stats";
+  const stub = env.RELAY_ANALYTICS.get(env.RELAY_ANALYTICS.idFromName("global-v1"));
+  return stub.fetch(`https://relay-analytics.local${statsPath}${qs}`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+  });
+}
+
+function isAuthorizedStatsRequest(env, request) {
+  const expected = String(env?.STATS_ADMIN_TOKEN || "").trim();
+  if (!expected) return false;
+  const auth = request.headers.get("authorization") || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const headerToken = request.headers.get("x-viveworker-stats-token") || "";
+  return safeEqualString(bearer, expected) || safeEqualString(headerToken, expected);
+}
+
+function safeEqualString(left, right) {
+  const a = String(left || "");
+  const b = String(right || "");
+  if (!a || !b) return false;
+  let diff = a.length ^ b.length;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+export async function recordRelayMetric(env, event) {
+  try {
+    if (!env?.RELAY_ANALYTICS) return;
+    const stub = env.RELAY_ANALYTICS.get(env.RELAY_ANALYTICS.idFromName("global-v1"));
+    await stub.fetch("https://relay-analytics.local/v1/event", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ atMs: Date.now(), ...event }),
+    });
+  } catch {
+    // Observability must never break relay traffic.
+  }
+}
+
+function waitUntil(ctx, promise) {
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(promise);
+    return;
+  }
+  if (promise && typeof promise.catch === "function") promise.catch(() => {});
+}
 
 async function verifyRelayToken(pairingId, relayToken) {
   if (!PAIRING_ID_RE.test(pairingId)) return false;

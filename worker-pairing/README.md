@@ -45,6 +45,8 @@ inspects `payload`.
 | Route | Purpose |
 |-------|---------|
 | `GET /v1/pairing/:pairingId/ws?role=phone\|bridge&token=...` | WS upgrade → DO |
+| `GET /stats/remote` | private operator relay counters for `viveworker stats` (`Authorization: Bearer <STATS_ADMIN_TOKEN>`) |
+| `GET /stats/remote/public` | coarse, delayed public adoption counters |
 | `GET /healthz` | health probe |
 | `GET /` | human-readable banner |
 
@@ -92,17 +94,39 @@ mean a fresh session.
 - `wrangler.toml` — Worker name, DO binding, SQLite DO migration.
 - `worker.js` — entry: route validation + `idFromName` → DO stub forward.
 - `pairing-do.js` — `PairingChannel` class with the full routing/buffer logic.
+- `analytics-do.js` — aggregate server-side counters for connection health and adoption.
 
 The DO imports the canonical envelope module via relative path
 (`../scripts/lib/remote-pairing/envelope.mjs`) so PC bridge, PWA, and
 Worker are all guaranteed to see the same wire format. Wrangler/esbuild
 bundles the import at deploy time.
 
+## Analytics
+
+`/stats/remote` exposes private aggregate server-side counters used by
+operators via `viveworker stats`: WS upgrades, phone/bridge connection
+counts, relay success, reconnects, invalid-token attempts, rate-limit hits,
+resume outcomes, and close codes. The route requires
+`Authorization: Bearer <STATS_ADMIN_TOKEN>` and returns `404` when the token
+is missing or invalid.
+
+`/stats/remote/public` exposes only coarse, delayed adoption counters. It
+does not publish invalid-token counters, rate-limit counters, close codes,
+protocol errors, or low-volume daily rows.
+
+The analytics DO stores only daily counters plus a non-reversible hash of
+the random `pairingId` for unique-pairing estimates. It never stores
+prompt/reply text, file contents, file paths, command text, relay tokens,
+public keys, request bodies, or IP addresses.
+
 ## Testing
 
 ```bash
 # Unit tests — routing state machine against mocked CF runtime (15 tests)
 node --test scripts/test/remote-pairing-do.test.mjs
+
+# Remote relay aggregate counters
+node --test scripts/test/remote-pairing-analytics-do.test.mjs
 
 # Envelope wire format (18 tests, shared with bridge + PWA)
 node --test scripts/test/remote-pairing-envelope.test.mjs

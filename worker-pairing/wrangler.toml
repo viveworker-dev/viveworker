@@ -21,12 +21,28 @@ routes = [
 name = "PAIRING_CHANNEL"
 class_name = "PairingChannel"
 
-# SQLite-backed DO is the recommended default for new projects. We don't
-# persist anything to it in Phase 1 (in-memory replay buffer only) but the
-# binding is future-proofed.
+[[durable_objects.bindings]]
+name = "RELAY_ANALYTICS"
+class_name = "RemoteRelayAnalytics"
+
+# Optional secret:
+#   STATS_ADMIN_TOKEN
+#
+# When set via `wrangler secret put STATS_ADMIN_TOKEN`, `/stats/remote`
+# exposes private operator counters to requests with
+# `Authorization: Bearer <token>`. Without it, only `/stats/remote/public`
+# is available.
+
+# SQLite-backed DO is the recommended default for new projects. PairingChannel
+# keeps transport state in memory; RemoteRelayAnalytics persists only aggregate
+# daily counters.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PairingChannel"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RemoteRelayAnalytics"]
 
 # Cloudflare-native Rate Limit bindings. These replace the per-isolate
 # in-memory token-bucket Map that lived in module scope; that Map gave each

@@ -7,7 +7,8 @@
  *   1. npm — public api.npmjs.org (download counts, latest version)
  *   2. A2A relay — /stats/global (public) + /stats/<userId> (auth)
  *   3. Share worker — /api/list (file count, quota usage)
- *   4. Local Moltbook data — ~/.viveworker/moltbook-{inbox,verify-history,scout-state}
+ *   4. Remote relay — /stats/remote (server-side aggregate counters)
+ *   5. Local Moltbook data — ~/.viveworker/moltbook-{inbox,verify-history,scout-state}
  *
  * Each section fetches independently and renders even when its peers fail
  * (so a down share-worker doesn't hide the npm section, etc.).
@@ -28,8 +29,11 @@ import os from "node:os";
 import path from "node:path";
 
 const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
+const ADMIN_ENV_FILE = path.join(os.homedir(), ".viveworker", "admin.env");
+const CONFIG_ENV_FILE = path.join(os.homedir(), ".viveworker", "config.env");
 const DEFAULT_A2A_RELAY_URL = "https://a2a.viveworker.com";
 const DEFAULT_SHARE_URL = "https://share.viveworker.com";
+const DEFAULT_PAIRING_RELAY_URL = "https://pairing.viveworker.com";
 const DEFAULT_NPM_PKG = "viveworker";
 const MOLTBOOK_INBOX_DIR = path.join(os.homedir(), ".viveworker", "moltbook-inbox");
 const MOLTBOOK_VERIFY_HISTORY = path.join(os.homedir(), ".viveworker", "moltbook-verify-history.jsonl");
@@ -57,10 +61,11 @@ export async function runStatsCli(args) {
 
   // Fetch all sections in parallel; each section swallows its own errors so a
   // single failing endpoint doesn't blank out the rest of the dashboard.
-  const [npm, a2a, share, moltbook] = await Promise.all([
+  const [npm, a2a, share, remote, moltbook] = await Promise.all([
     fetchNpm(pkgName).catch((err) => ({ error: err.message })),
     fetchA2A(creds).catch((err) => ({ error: err.message })),
     fetchShare(creds).catch((err) => ({ error: err.message })),
+    fetchRemoteRelay().catch((err) => ({ error: err.message })),
     fetchMoltbookLocal().catch((err) => ({ error: err.message })),
   ]);
 
@@ -71,7 +76,7 @@ export async function runStatsCli(args) {
   };
 
   if (flags.json) {
-    console.log(JSON.stringify({ snapshot, npm, a2a, share, moltbook }, null, 2));
+    console.log(JSON.stringify({ snapshot, npm, a2a, share, remote, moltbook }, null, 2));
     return;
   }
 
@@ -79,6 +84,7 @@ export async function runStatsCli(args) {
   printNpm(npm);
   printA2A(a2a);
   printShare(share);
+  printRemoteRelay(remote);
   printMoltbook(moltbook);
 }
 
@@ -90,6 +96,7 @@ function printHelp() {
   console.log("  - npm downloads (last 7d / prev 7d)");
   console.log("  - A2A relay stats (global + your user)");
   console.log("  - Share worker file count + quota");
+  console.log("  - Remote relay aggregate connection counters");
   console.log("  - Moltbook inbox / verify history / scout activity (local)");
   console.log("");
   console.log("Credentials for the A2A and share sections come from ~/.viveworker/a2a.env.");
@@ -241,9 +248,13 @@ async function fetchShare(creds) {
     return { skipped: "credentials missing" };
   }
   const shareUrl = creds.shareUrl || DEFAULT_SHARE_URL;
+  const headers = { "x-a2a-user": creds.userId, "x-a2a-key": creds.apiKey };
   const body = await fetchJsonWithTimeout(`${shareUrl}/api/list`, {
-    headers: { "x-a2a-user": creds.userId, "x-a2a-key": creds.apiKey },
+    headers,
   });
+  const metrics = await fetchJsonWithTimeout(`${shareUrl}/api/metrics`, {
+    headers,
+  }).catch((err) => ({ error: err.message }));
   const items = Array.isArray(body?.items) ? body.items : [];
   return {
     shareUrl,
@@ -251,6 +262,7 @@ async function fetchShare(creds) {
     quota: body?.quota || null,
     withPassword: items.filter((i) => i.hasPassword).length,
     withPrice:    items.filter((i) => i.price).length,
+    metrics,
   };
 }
 
@@ -276,6 +288,82 @@ function printShare(share) {
   if (share.withPassword || share.withPrice) {
     console.log(`  gated             ${share.withPassword} password, ${share.withPrice} paid`);
   }
+  if (share.metrics?.last7d && !share.metrics.error) {
+    const m = share.metrics.last7d;
+    console.log(`  x402 last 7d      paid uploads ${m.upload_paid || 0}, 402s ${m["402_served"] || 0}, paid views ${m.paid_view || 0}`);
+  } else if (share.metrics?.error) {
+    console.log(`  metrics           ${share.metrics.error}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Remote relay
+// ---------------------------------------------------------------------------
+
+async function fetchRemoteRelay() {
+  const relayUrl = normalizeHttpRelayUrl(process.env.VIVEWORKER_PAIRING_RELAY_URL || DEFAULT_PAIRING_RELAY_URL);
+  const adminToken = await loadRemoteStatsAdminToken();
+  if (adminToken) {
+    const body = await fetchJsonWithTimeout(`${relayUrl}/stats/remote?days=30`, {
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    return { relayUrl, access: "private", ...body };
+  }
+  const body = await fetchJsonWithTimeout(`${relayUrl}/stats/remote/public?days=30`);
+  return { relayUrl, access: "public", ...body };
+}
+
+function printRemoteRelay(remote) {
+  console.log("\n\x1b[1m📡 remote relay\x1b[0m");
+  if (remote.error) {
+    console.log(`  error: ${remote.error}`);
+    return;
+  }
+
+  if (remote.public) {
+    console.log(`  endpoint          ${remote.relayUrl}`);
+    console.log(`  access            public coarse stats (set STATS_ADMIN_TOKEN for private ops counters)`);
+    console.log(`  updated through   ${remote.updatedThroughDate || "n/a"}  (delayed by at least one complete UTC day)`);
+    console.log(`  active pairings   7d ${remote.last7d?.estimatedActivePairings ?? "?"}  30d ${remote.last30d?.estimatedActivePairings ?? "?"}`);
+    console.log(`  remote connects   7d ${remote.last7d?.remoteConnections ?? "?"}  30d ${remote.last30d?.remoteConnections ?? "?"}`);
+    if (remote.last30d?.successRatePct != null) {
+      console.log(`  success rate      30d ${remote.last30d.successRatePct}%`);
+    }
+    console.log(`  privacy           coarse delayed counters only; no content, tokens, keys, IPs, commands, or file paths`);
+    return;
+  }
+
+  const today = remote.today || {};
+  const last7d = remote.last7d || {};
+  const last30d = remote.last30d || {};
+  const t = today.counters || {};
+  const w = last7d.counters || {};
+  const m = last30d.counters || {};
+
+  console.log(`  endpoint          ${remote.relayUrl}`);
+  console.log(`  access            private operator stats`);
+  console.log(`  unique pairings   today ${padNum(today.uniquePairings)}  7d ${padNum(last7d.uniquePairings)}  30d ${padNum(last30d.uniquePairings)}`);
+  console.log(`  ws upgrades       today ${padNum(t.ws_upgrade)}  7d ${padNum(w.ws_upgrade)}  30d ${padNum(m.ws_upgrade)}`);
+  console.log(`  relay successes   today ${padNum(t.relay_success)}  7d ${padNum(w.relay_success)}  30d ${padNum(m.relay_success)}`);
+  console.log(`  reconnects        today ${padNum(t.same_role_replace)}  7d ${padNum(w.same_role_replace)}  30d ${padNum(m.same_role_replace)}`);
+  const invalid7d = (Number(w.invalid_token) || 0) + (Number(w.invalid_token_rate_limited) || 0);
+  const rate7d = (Number(w.ws_upgrade_rate_limited) || 0) + (Number(w.invalid_token_rate_limited) || 0);
+  console.log(`  abuse signals     invalid tokens ${padNum(invalid7d)} / 7d, rate-limited ${padNum(rate7d)} / 7d`);
+
+  const closes = Object.entries(last7d.closeCodes || {})
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 4)
+    .map(([code, count]) => `${code}:${count}`)
+    .join(", ");
+  if (closes) console.log(`  close codes 7d    ${closes}`);
+  console.log(`  privacy           server-side aggregate counters only; no content, tokens, keys, IPs, commands, or file paths`);
+}
+
+function normalizeHttpRelayUrl(value) {
+  const raw = String(value || DEFAULT_PAIRING_RELAY_URL).trim().replace(/\/$/u, "");
+  if (raw.startsWith("wss://")) return `https://${raw.slice("wss://".length)}`;
+  if (raw.startsWith("ws://")) return `http://${raw.slice("ws://".length)}`;
+  return raw || DEFAULT_PAIRING_RELAY_URL;
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +569,29 @@ async function loadCredentialsOrNull() {
   return { apiKey, userId, relayUrl, shareUrl };
 }
 
+async function loadRemoteStatsAdminToken() {
+  const direct =
+    process.env.STATS_ADMIN_TOKEN ||
+    process.env.VIVEWORKER_STATS_ADMIN_TOKEN ||
+    process.env.VIVEWORKER_REMOTE_STATS_ADMIN_TOKEN ||
+    "";
+  if (direct) return direct;
+
+  for (const file of [ADMIN_ENV_FILE, CONFIG_ENV_FILE]) {
+    try {
+      const text = await fs.readFile(file, "utf8");
+      const token =
+        envValue(text, "STATS_ADMIN_TOKEN") ||
+        envValue(text, "VIVEWORKER_STATS_ADMIN_TOKEN") ||
+        envValue(text, "VIVEWORKER_REMOTE_STATS_ADMIN_TOKEN");
+      if (token) return token;
+    } catch {
+      // Missing local admin config is expected for normal users.
+    }
+  }
+  return "";
+}
+
 function envValue(text, key) {
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -553,6 +664,10 @@ function formatDelta(deltaPct) {
   if (deltaPct == null) return "delta n/a";
   const sign = deltaPct >= 0 ? "+" : "";
   return `${sign}${deltaPct.toFixed(1)}%`;
+}
+
+function padNum(value) {
+  return String(Number(value) || 0).padStart(6);
 }
 
 function dateOnly(iso) {

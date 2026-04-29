@@ -151,6 +151,8 @@ Use these commands most often:
   install the Moltbook watcher and auto-scout after base setup
 - `npx viveworker enable scout`
   tune, reinstall, or uninstall the Moltbook auto-scout job
+- `npx viveworker stats`
+  show server-side adoption signals for npm, A2A, File Share, Remote connection, and local Moltbook state
 - `npx viveworker start`
   start `viveworker` again using the saved config
 - `npx viveworker stop`
@@ -500,6 +502,8 @@ If you can map your tool onto one of those paths, you probably do not need a bra
 - Remote connection uses a relay only for rendezvous/transport; paired-device traffic is end-to-end encrypted to your bridge
 - relay tokens can be rotated manually and are refreshed automatically during LAN enrollment after the rotation window
 - remote connection activity is recorded locally in `~/.viveworker/remote-pairing-audit.jsonl`
+- public relay analytics expose only coarse, delayed adoption counters; detailed relay health and abuse counters require an operator admin token
+- relay analytics never store prompts, replies, file contents, file paths, command text, relay tokens, public keys, or IP addresses
 - if you lose a paired device, revoke it from `Settings > Devices`
 - use `pair` only when you want to add another trusted device
 - A2A relay authentication: external agents must provide a valid API key (`X-A2A-Key` header), and registration requires GitHub OAuth

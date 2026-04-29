@@ -232,6 +232,25 @@ export class PairingChannel {
       ` outbox=${existingOutbox.length}` +
       ` lastSent=${existingLastSent}`,
     );
+    emitRelayMetric(this.env, {
+      type: "do_accept",
+      role,
+      outcome: "success",
+    });
+    if (replacing) {
+      emitRelayMetric(this.env, {
+        type: "same_role_replace",
+        role,
+        outcome: "success",
+      });
+    }
+    if (other?.socket && isOpen(other.socket)) {
+      emitRelayMetric(this.env, {
+        type: "relay_success",
+        role,
+        outcome: "success",
+      });
+    }
 
     // Note: replay/drain on attach used to live here. It's now driven
     // exclusively by the RESUME_REQ path — every reconnecting transport
@@ -433,6 +452,12 @@ export class PairingChannel {
     const peer = this.peers.get(role);
     if (peer && peer.socket === ws) {
       console.log(`[relay-do-close] pairing=${pairingOf(ws)} role=${role} code=${code} reason=${String(reason || "").slice(0, 48)}`);
+      emitRelayMetric(this.env, {
+        type: "close",
+        role,
+        code,
+        outcome: wasClean ? "success" : "failure",
+      });
       peer.socket = null;
       // Keep the outbox so a quick reconnect can RESUME from here.
     }
@@ -456,6 +481,11 @@ export class PairingChannel {
     const role = roleOf(ws) || "unknown";
     if (peer.coldWake) {
       console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=HIBERNATED cold=1`);
+      emitRelayMetric(this.env, {
+        type: "resume_fail",
+        role,
+        outcome: "failure",
+      });
       sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       peer.coldWake = false;
       return;
@@ -472,6 +502,11 @@ export class PairingChannel {
     // keep shipping ciphertext encrypted with the dead session's keys).
     if (lastSeenSeq === 0 && peer.lastSent > 0) {
       console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=STATE_LOSS`);
+      emitRelayMetric(this.env, {
+        type: "resume_fail",
+        role,
+        outcome: "failure",
+      });
       sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       return;
     }
@@ -484,6 +519,11 @@ export class PairingChannel {
     // session start where both sides are at 0.
     if (lastSeenSeq >= otherLastSent) {
       console.log(`[relay-do-resume-ok] pairing=${pairingOf(ws)} role=${role} currentSeq=${otherLastSent} replay=0`);
+      emitRelayMetric(this.env, {
+        type: "resume_ok",
+        role,
+        outcome: "success",
+      });
       trySend(ws, encodeResumeOk(otherLastSent));
       return;
     }
@@ -493,6 +533,11 @@ export class PairingChannel {
       // is empty. Either we hibernated (lost the buffer), or peer's
       // counter is desynced. Either way, force a re-handshake.
       console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=EMPTY_BUFFER`);
+      emitRelayMetric(this.env, {
+        type: "resume_fail",
+        role,
+        outcome: "failure",
+      });
       sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_HIBERNATED);
       return;
     }
@@ -502,6 +547,11 @@ export class PairingChannel {
     if (lastSeenSeq + 1 < earliestBuffered) {
       // Gap: we'd skip frames the peer hasn't seen. Force re-handshake.
       console.log(`[relay-do-resume-fail] pairing=${pairingOf(ws)} role=${role} reason=BUFFER_EXPIRED`);
+      emitRelayMetric(this.env, {
+        type: "resume_fail",
+        role,
+        outcome: "failure",
+      });
       sendResumeFailAndMaybeDrainFreshHandshake(ws, peer, other, RESUME_FAIL_BUFFER_EXPIRED);
       return;
     }
@@ -516,6 +566,11 @@ export class PairingChannel {
       }
     }
     console.log(`[relay-do-resume-ok] pairing=${pairingOf(ws)} role=${role} currentSeq=${otherLastSent} replay=${replayed}`);
+    emitRelayMetric(this.env, {
+      type: "resume_ok",
+      role,
+      outcome: "success",
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -523,6 +578,12 @@ export class PairingChannel {
   // -------------------------------------------------------------------------
 
   _closeWithError(ws, code, reason) {
+    emitRelayMetric(this.env, {
+      type: "protocol_error",
+      role: roleOf(ws),
+      code,
+      outcome: "failure",
+    });
     try {
       ws.close(code, reason.slice(0, 120)); // CF caps reason length
     } catch {
@@ -776,5 +837,20 @@ function trimOutbox(outbox) {
   while (totalBytes > MAX_BUFFERED_BYTES && outbox.length > 0) {
     const dropped = outbox.shift();
     totalBytes -= dropped.wire?.length ?? 0;
+  }
+}
+
+function emitRelayMetric(env, event) {
+  try {
+    if (!env?.RELAY_ANALYTICS) return;
+    const stub = env.RELAY_ANALYTICS.get(env.RELAY_ANALYTICS.idFromName("global-v1"));
+    const result = stub.fetch("https://relay-analytics.local/v1/event", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ atMs: Date.now(), ...event }),
+    });
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  } catch {
+    // Metrics are intentionally best-effort.
   }
 }
