@@ -153,6 +153,12 @@ Use these commands most often:
   tune, reinstall, or uninstall the Moltbook auto-scout job
 - `npx viveworker stats`
   show server-side adoption signals for npm, A2A, File Share, Remote connection, and local Moltbook state
+- `npx viveworker mcp`
+  start the stdio MCP server for MCP-compatible AI tools
+- `npx viveworker mcp config`
+  print a Claude Desktop / Cursor / Codex MCP config snippet
+- `npx viveworker enable mcp --target claude|cursor|codex|all`
+  install the MCP config entry after showing the exact change
 - `npx viveworker start`
   start `viveworker` again using the saved config
 - `npx viveworker stop`
@@ -174,6 +180,51 @@ Useful options:
 `pair` reissues only the short-lived pairing code and pairing URL.
 It does not change the main app URL, port, session secret, TLS, or Web Push settings.
 Use it only when you want to add another trusted device or browser.
+
+## MCP Integration
+
+`viveworker` can run as a local stdio MCP server, so MCP-compatible tools can use the same mobile control plane.
+
+Install it into a supported client:
+
+```bash
+npx viveworker enable mcp --target claude
+npx viveworker enable mcp --target cursor
+npx viveworker enable mcp --target codex
+```
+
+Use `--target all` to update every detected client, `--dry-run` to preview without writing, and `--yes` for non-interactive installs.
+
+If you prefer manual setup, add this to an MCP client:
+
+```json
+{
+  "mcpServers": {
+    "viveworker": {
+      "command": "npx",
+      "args": ["viveworker", "mcp"]
+    }
+  }
+}
+```
+
+Available tools:
+
+- `viveworker_status` checks bridge, pairing, Remote connection, A2A, File Share, and Moltbook status
+- `viveworker_notify` sends an informational phone notification and timeline entry
+- `viveworker_ask` asks a question on the paired phone and waits for the answer
+- `viveworker_request_approval` asks the phone to approve or reject a proposed action
+- `viveworker_share_file` uploads a workspace file to File Share after phone approval
+- `viveworker_thread_share` shares context into another Codex / Claude / inbox thread
+- `viveworker_send_a2a_task` sends a task to a registered A2A target after phone approval
+
+Security defaults:
+
+- MCP is stdio-only in this release; there is no HTTP MCP server
+- file sharing is limited to the current workspace and refuses `.env`, credential directories, private keys, and secret-looking paths
+- File Share and A2A task sending require phone approval
+- MCP tool calls are recorded locally with `provider: "mcp"`
+- prompts, message bodies, file contents, file paths, command text, tokens, public keys, and IP addresses are not sent to central analytics
 
 ## File Share
 

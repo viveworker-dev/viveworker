@@ -53,6 +53,7 @@
     "scripts/a2a-relay-client.mjs",
     "scripts/share-cli.mjs",
     "scripts/stats-cli.mjs",
+    "scripts/mcp-server.mjs",
     "scripts/lib",
     "web",
     "README.md",

@@ -5,10 +5,10 @@ import {
   savePairingState as saveRemotePairingState,
   clearPairingState as clearRemotePairingState,
 } from "./remote-pairing/pairing-state.js";
-import { getRoutingTelemetry, routedFetch } from "./remote-pairing/api-router.js?v=20260428-remote-token-refresh";
+const APP_BUILD_ID = "__VIVEWORKER_APP_BUILD_ID__";
+const { getRoutingTelemetry, routedFetch } = await import(`./remote-pairing/api-router.js?v=${encodeURIComponent(APP_BUILD_ID)}`);
 
 const DESKTOP_BREAKPOINT = 980;
-const APP_BUILD_ID = "20260428-remote-token-refresh";
 const INSTALL_BANNER_DISMISS_KEY = "viveworker-install-banner-dismissed-v2";
 const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
@@ -1425,6 +1425,7 @@ function normalizeProviderClient(value) {
   if (normalized === "moltbook") return "moltbook";
   if (normalized === "a2a") return "a2a";
   if (normalized === "viveworker") return "viveworker";
+  if (normalized === "mcp") return "mcp";
   return "codex";
 }
 
@@ -1434,6 +1435,7 @@ function providerDisplayName(provider) {
   if (p === "moltbook") return "Moltbook";
   if (p === "a2a") return "A2A";
   if (p === "viveworker") return L("common.appName");
+  if (p === "mcp") return "MCP";
   return L("common.codex");
 }
 

@@ -75,6 +75,17 @@ if (rawArgs[0] === "stats") {
   }
 }
 
+if (rawArgs[0] === "mcp") {
+  const { runMcpCli } = await import("./mcp-server.mjs");
+  try {
+    await runMcpCli(rawArgs.slice(1));
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+  }
+}
+
 const cli = parseArgs(rawArgs);
 
 try {
@@ -388,7 +399,7 @@ async function runPair(cliOptions) {
 async function runEnable(cliOptions) {
   const target = String(cliOptions.enableTarget || "").trim().toLowerCase();
   if (!target) {
-    throw new Error("Usage: viveworker enable <claude|a2a|moltbook|scout> [...]");
+    throw new Error("Usage: viveworker enable <claude|a2a|moltbook|scout|mcp> [...]");
   }
 
   switch (target) {
@@ -406,8 +417,245 @@ async function runEnable(cliOptions) {
     case "scout":
       await runEnableScout(cliOptions);
       return;
+    case "mcp":
+      await runEnableMcp(cliOptions);
+      return;
     default:
       throw new Error(`Unknown feature: ${target}`);
+  }
+}
+
+async function runEnableMcp(cliOptions) {
+  const target = normalizeMcpInstallTarget(cliOptions.mcpTarget || "all");
+  const allTargets = target === "all" ? ["claude", "cursor", "codex"] : [target];
+  const entries = [];
+  const config = mcpServerConfigSnippet();
+
+  for (const item of allTargets) {
+    const entry = await prepareMcpConfigChange(item, config, { explicit: target !== "all" });
+    if (entry) entries.push(entry);
+  }
+
+  if (entries.length === 0) {
+    console.log("");
+    console.log("No supported MCP client config was found.");
+    console.log("Run `npx viveworker mcp config` to print a manual config snippet.");
+    return;
+  }
+
+  console.log("");
+  console.log("viveworker MCP setup");
+  console.log("");
+  console.log("The following MCP client config changes will be applied:");
+  for (const entry of entries) {
+    console.log(`- ${entry.label}: ${entry.status} ${entry.path}`);
+  }
+  console.log("");
+  console.log("MCP server entry:");
+  console.log(JSON.stringify({ mcpServers: { viveworker: config } }, null, 2));
+
+  if (cliOptions.mcpDryRun) {
+    console.log("");
+    console.log("Dry run only. No files were changed.");
+    return;
+  }
+
+  const changedEntries = entries.filter((entry) => entry.changed);
+  if (changedEntries.length === 0) {
+    console.log("");
+    console.log("MCP config is already up to date.");
+    return;
+  }
+
+  if (!cliOptions.yes) {
+    const confirmed = await confirmCli("Write these MCP config changes? [y/N] ");
+    if (!confirmed) {
+      console.log("Cancelled.");
+      return;
+    }
+  }
+
+  for (const entry of changedEntries) {
+    await fs.mkdir(path.dirname(entry.path), { recursive: true });
+    await fs.writeFile(entry.path, entry.nextText, entry.mode || "utf8");
+  }
+
+  console.log("");
+  console.log("MCP config updated.");
+  console.log("Restart the target app so it reloads the MCP server list.");
+}
+
+function normalizeMcpInstallTarget(value) {
+  const target = String(value || "all").trim().toLowerCase();
+  if (["claude", "cursor", "codex", "all"].includes(target)) {
+    return target;
+  }
+  throw new Error("Use --target claude, --target cursor, --target codex, or --target all.");
+}
+
+function mcpServerConfigSnippet() {
+  return {
+    command: "npx",
+    args: ["viveworker", "mcp"],
+  };
+}
+
+async function prepareMcpConfigChange(target, serverConfig, { explicit = false } = {}) {
+  const descriptor = mcpConfigDescriptor(target);
+  if (!descriptor) {
+    return null;
+  }
+  if (!explicit && !(await fileExists(descriptor.parentDir))) {
+    return null;
+  }
+  const currentText = await readOptionalText(descriptor.path);
+  const result = descriptor.kind === "toml"
+    ? upsertCodexMcpConfig(currentText, serverConfig)
+    : upsertJsonMcpConfig(currentText, serverConfig);
+  return {
+    target,
+    label: descriptor.label,
+    path: descriptor.path,
+    status: result.changed
+      ? (currentText.trim() ? "update" : "create")
+      : "unchanged",
+    changed: result.changed,
+    nextText: result.text,
+  };
+}
+
+function mcpConfigDescriptor(target) {
+  if (target === "claude") {
+    const override = process.env.VIVEWORKER_MCP_CLAUDE_CONFIG_FILE || "";
+    const defaultPath = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+    const configPath = resolvePath(override || defaultPath);
+    return {
+      kind: "json",
+      label: "Claude Desktop",
+      path: configPath,
+      parentDir: path.dirname(configPath),
+    };
+  }
+  if (target === "cursor") {
+    const override = process.env.VIVEWORKER_MCP_CURSOR_CONFIG_FILE || "";
+    const defaultPath = path.join(os.homedir(), ".cursor", "mcp.json");
+    const configPath = resolvePath(override || defaultPath);
+    return {
+      kind: "json",
+      label: "Cursor",
+      path: configPath,
+      parentDir: path.dirname(configPath),
+    };
+  }
+  if (target === "codex") {
+    const override = process.env.VIVEWORKER_MCP_CODEX_CONFIG_FILE || "";
+    const defaultPath = path.join(os.homedir(), ".codex", "config.toml");
+    const configPath = resolvePath(override || defaultPath);
+    return {
+      kind: "toml",
+      label: "Codex",
+      path: configPath,
+      parentDir: path.dirname(configPath),
+    };
+  }
+  return null;
+}
+
+function upsertJsonMcpConfig(currentText, serverConfig) {
+  let data = {};
+  if (currentText.trim()) {
+    try {
+      data = JSON.parse(currentText);
+    } catch (error) {
+      throw new Error(`Unable to parse existing MCP JSON config: ${error.message}`);
+    }
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    data = {};
+  }
+  const previous = JSON.stringify(data);
+  const mcpServers = data.mcpServers && typeof data.mcpServers === "object" && !Array.isArray(data.mcpServers)
+    ? data.mcpServers
+    : {};
+  data.mcpServers = {
+    ...mcpServers,
+    viveworker: serverConfig,
+  };
+  const text = `${JSON.stringify(data, null, 2)}\n`;
+  return {
+    changed: JSON.stringify(data) !== previous,
+    text,
+  };
+}
+
+function upsertCodexMcpConfig(currentText, serverConfig) {
+  const block = [
+    "[mcp_servers.viveworker]",
+    `command = ${tomlString(serverConfig.command)}`,
+    `args = [${serverConfig.args.map((arg) => tomlString(arg)).join(", ")}]`,
+    "",
+  ].join("\n");
+  const withoutExisting = removeTomlTable(currentText, "mcp_servers.viveworker").replace(/\s+$/u, "");
+  const text = `${withoutExisting ? `${withoutExisting}\n\n` : ""}${block}`;
+  return {
+    changed: normalizeConfigText(text) !== normalizeConfigText(currentText),
+    text,
+  };
+}
+
+function removeTomlTable(text, tableName) {
+  const lines = String(text || "").split(/\r?\n/u);
+  const out = [];
+  let skipping = false;
+  const header = `[${tableName}]`;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === header) {
+      skipping = true;
+      continue;
+    }
+    if (skipping && /^\[[^\]]+\]\s*$/u.test(trimmed)) {
+      skipping = false;
+    }
+    if (!skipping) {
+      out.push(line);
+    }
+  }
+  return out.join("\n");
+}
+
+function tomlString(value) {
+  return JSON.stringify(String(value || ""));
+}
+
+function normalizeConfigText(value) {
+  return String(value || "").replace(/\r\n/gu, "\n").trim();
+}
+
+async function readOptionalText(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return "";
+    }
+    throw error;
+  }
+}
+
+async function confirmCli(prompt) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("Refusing to write MCP config without an interactive terminal. Re-run with --yes or --dry-run.");
+  }
+  const rl = createReadlineInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const answer = await rl.question(prompt);
+    return /^y(es)?$/iu.test(String(answer || "").trim());
+  } finally {
+    rl.close();
   }
 }
 
@@ -1397,6 +1645,9 @@ function parseArgs(argv) {
     autoScoutHarness: "auto",
     autoScoutSubmolts: "",
     autoScoutMaxDaily: 0,
+    mcpTarget: "",
+    mcpDryRun: false,
+    yes: false,
   };
 
   if (argv[0] && !argv[0].startsWith("-")) {
@@ -1552,6 +1803,13 @@ function parseArgs(argv) {
     } else if (arg === "--auto-scout-max-daily") {
       parsed.autoScoutMaxDaily = Number(next) || 0;
       index += 1;
+    } else if (arg === "--target") {
+      parsed.mcpTarget = next;
+      index += 1;
+    } else if (arg === "--dry-run") {
+      parsed.mcpDryRun = true;
+    } else if (arg === "--yes" || arg === "-y") {
+      parsed.yes = true;
     } else if (arg === "--help" || arg === "-h") {
       parsed.command = "help";
     } else {
@@ -1579,6 +1837,8 @@ ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.status")}
   ${t(locale, "cli.help.doctor")}
   ${t(locale, "cli.help.update")}
+  mcp           Start the stdio MCP server
+  mcp config    Print MCP client config snippets
 
 ${t(locale, "cli.help.commonOptions")}
   --port <n>
@@ -1607,6 +1867,7 @@ ${t(locale, "cli.help.featureOptions")}
   ${t(locale, "cli.help.enableA2a")}
   ${t(locale, "cli.help.enableMoltbook")}
   ${t(locale, "cli.help.enableScout")}
+  enable mcp --target <claude|cursor|codex|all> [--dry-run|--yes]
   ${t(locale, "cli.help.doctorFix")}
 `);
 }

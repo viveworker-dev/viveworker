@@ -16,6 +16,7 @@ import zlib from "node:zlib";
 import webPush from "web-push";
 import * as hazbaseAuth from "@hazbase/auth";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
+import { APP_BUILD_ID as WEB_APP_BUILD_ID } from "../web/build-id.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
@@ -48,8 +49,8 @@ const listSupportedPayments = typeof hazbaseAuth.listSupportedPayments === "func
   ? hazbaseAuth.listSupportedPayments.bind(hazbaseAuth)
   : async () => ({ networks: [], defaultNetwork: "base-sepolia" });
 const appPackageVersion = readPackageVersion();
-const WEB_APP_BUILD_ID = "20260428-remote-token-refresh";
 const WEB_APP_SCRIPT_URL = `/app.js?v=${WEB_APP_BUILD_ID}`;
+const WEB_APP_BUILD_ID_PLACEHOLDER = "__VIVEWORKER_APP_BUILD_ID__";
 const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
@@ -2839,6 +2840,7 @@ function normalizeProvider(value) {
   if (normalized === "moltbook") return "moltbook";
   if (normalized === "a2a") return "a2a";
   if (normalized === "viveworker") return "viveworker";
+  if (normalized === "mcp") return "mcp";
   return "codex";
 }
 
@@ -2848,6 +2850,7 @@ function providerDisplayName(locale, provider) {
   if (p === "moltbook") return "Moltbook";
   if (p === "a2a") return "A2A";
   if (p === "viveworker") return t(locale, "common.appName");
+  if (p === "mcp") return "MCP";
   return t(locale, "common.codex");
 }
 
@@ -2896,7 +2899,7 @@ function normalizeHistoryItem(raw) {
   const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
   const rawThreadLabel = cleanText(raw.threadLabel ?? "");
   const historyProvider = normalizeProvider(raw.provider);
-  const skipHistoryThreadLabelRewrite = historyProvider === "moltbook" || historyProvider === "a2a" || historyProvider === "viveworker"
+  const skipHistoryThreadLabelRewrite = historyProvider === "moltbook" || historyProvider === "a2a" || historyProvider === "viveworker" || historyProvider === "mcp"
     || kind === "moltbook_reply" || kind === "moltbook_draft" || kind === "a2a_task" || kind === "a2a_task_result" || kind === "thread_share";
   const threadLabel = skipHistoryThreadLabelRewrite
     ? rawThreadLabel
@@ -3183,7 +3186,7 @@ function normalizeTimelineEntry(raw) {
     (kind === "file_event" ? "" : cleanText(raw.title ?? "")) ||
     "";
   const rawProvider = normalizeProvider(raw.provider);
-  const skipThreadLabelRewrite = rawProvider === "moltbook" || rawProvider === "a2a" || rawProvider === "viveworker"
+  const skipThreadLabelRewrite = rawProvider === "moltbook" || rawProvider === "a2a" || rawProvider === "viveworker" || rawProvider === "mcp"
     || kind === "moltbook_reply" || kind === "moltbook_draft" || kind === "a2a_task" || kind === "a2a_task_result" || kind === "thread_share";
   const threadLabel =
     skipThreadLabelRewrite
@@ -10644,6 +10647,273 @@ function buildPushStatusResponse(config, state, session) {
   };
 }
 
+async function buildMcpStatusResponse(config, runtime, state) {
+  const remote = getRemotePairingStatus(runtime);
+  let remotePairings = 0;
+  try {
+    remotePairings = (await loadPairings()).length;
+  } catch {
+    remotePairings = 0;
+  }
+  const now = Date.now();
+  const pairedDevices = isPlainObject(state.pairedDevices) ? state.pairedDevices : {};
+  const trustedDevices = Object.values(pairedDevices).filter((raw) => {
+    const record = normalizeDeviceTrustRecord(raw, { trustTtlMs: config.deviceTrustTtlMs, now });
+    return record && !record.revokedAtMs && Number(record.trustedUntilMs) > now;
+  }).length;
+  const a2aRelay = getRelayStatus();
+  return {
+    ok: true,
+    bridge: {
+      running: true,
+      publicBaseUrl: config.nativeApprovalPublicBaseUrl,
+      locale: config.defaultLocale,
+      codexConnected: Boolean(runtime.ipcClient?.clientId),
+    },
+    pairing: {
+      trustedDevices,
+      webPushEnabled: Boolean(config.webPushEnabled),
+      pushSubscriptions: listPushSubscriptions(state).length,
+    },
+    remote: {
+      enabled: Boolean(remote.enabled),
+      relayUrl: remote.relayUrl || config.remotePairingRelayUrl || "",
+      identityFingerprint: remote.identityFingerprint || null,
+      pairings: remotePairings,
+      sessions: Array.isArray(remote.sessions)
+        ? remote.sessions.map((session) => ({
+            state: cleanText(session?.state || ""),
+            lastRoute: cleanText(session?.lastRoute || ""),
+            connected: cleanText(session?.state || "") === "connected",
+            phoneFingerprint: cleanText(session?.phoneFingerprint || ""),
+            lastSeenAtMs: Number(session?.lastSeenAtMs) || 0,
+          }))
+        : [],
+    },
+    a2a: {
+      enabled: Boolean(config.a2aApiKey),
+      relayEnabled: Boolean(config.a2aRelayUrl && config.a2aRelayUserId),
+      relayConnected: Boolean(a2aRelay.polling && a2aRelay.lastPollOk),
+      userIdConfigured: Boolean(config.a2aRelayUserId),
+    },
+    share: {
+      enabled: Boolean(config.a2aRelayUserId && config.a2aApiKey),
+      shareUrl: config.a2aShareUrl || "",
+    },
+    moltbook: {
+      enabled: Boolean(config.moltbookApiKey),
+    },
+  };
+}
+
+function mcpTimeoutMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 600_000;
+  return Math.max(10_000, Math.min(900_000, Math.floor(n)));
+}
+
+function mcpText(value, maxChars = 50_000) {
+  const text = String(value ?? "");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n\n[truncated by viveworker MCP]` : text;
+}
+
+function normalizeMcpStringArray(value, maxItems = 20) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => cleanText(item ?? ""))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function normalizeMcpQuestionOptions(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((option, index) => {
+      if (typeof option === "string") {
+        const label = cleanText(option);
+        return label ? { label } : null;
+      }
+      if (!isPlainObject(option)) return null;
+      const label = cleanText(option.label ?? option.title ?? `Option ${index + 1}`);
+      if (!label) return null;
+      const description = cleanText(option.description ?? option.detail ?? "");
+      return { label, ...(description ? { description } : {}) };
+    })
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+function normalizeMcpApprovalKind(value) {
+  const normalized = cleanText(value || "mcp").toLowerCase();
+  if (!/^[a-z0-9_-]{1,40}$/u.test(normalized)) {
+    return "mcp";
+  }
+  // Keep MCP in the normal approval lane. These kinds have provider-specific
+  // UI/actions elsewhere and should not be spoofable from a generic MCP client.
+  if (normalized === "payment" || normalized === "hazbase_wallet_payment" || normalized === "plan" || normalized === "question") {
+    return "mcp";
+  }
+  return normalized;
+}
+
+function createMcpPendingApproval(body, kind) {
+  const token = crypto.randomBytes(18).toString("hex");
+  const requestId = cleanText(body.requestId || crypto.randomUUID());
+  const title = cleanText(body.title || (kind === "question" ? "MCP question" : "MCP approval"));
+  const messageText = kind === "question"
+    ? mcpText(body.question || body.message || "")
+    : mcpText(body.messageText || body.message || "");
+  const requestKey = `mcp:${requestId}`;
+  const approval = {
+    token,
+    requestKey,
+    conversationId: "mcp",
+    requestId,
+    ownerClientId: null,
+    kind,
+    threadLabel: title || "MCP",
+    title,
+    messageText,
+    fileRefs: normalizeMcpStringArray(body.fileRefs),
+    previousFileRefs: [],
+    diffText: kind === "question" ? "" : mcpText(body.diffText || "", 100_000),
+    diffAvailable: kind !== "question" && Boolean(body.diffText),
+    diffSource: kind === "question" ? "" : "mcp",
+    diffAddedLines: 0,
+    diffRemovedLines: 0,
+    cwd: "",
+    workspaceRoot: "",
+    createdAtMs: Date.now(),
+    resolved: false,
+    resolving: false,
+    resolveMcpWaiter: null,
+    provider: "mcp",
+    planText: "",
+    questions: [],
+    notifyOnly: false,
+    readOnly: false,
+  };
+  if (kind === "question") {
+    approval.questions = [
+      {
+        question: mcpText(body.question || body.message || "", 2000),
+        options: normalizeMcpQuestionOptions(body.options),
+        multiSelect: body.multiSelect === true,
+      },
+    ];
+  }
+  return approval;
+}
+
+async function waitForMcpApprovalResult(runtime, approval, timeoutMs) {
+  const waitMs = mcpTimeoutMs(timeoutMs);
+  const result = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve({ approved: false, decision: "timeout" });
+    }, waitMs);
+    approval.resolveMcpWaiter = (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+  });
+  if (!approval.resolved) {
+    approval.resolved = true;
+    approval.resolving = false;
+    runtime.nativeApprovalsByToken.delete(approval.token);
+    runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+  }
+  return result;
+}
+
+async function handleMcpProviderEvent({ config, runtime, state, body, res }) {
+  const eventType = cleanText(body.eventType || "");
+  if (eventType === "status") {
+    return writeJson(res, 200, await buildMcpStatusResponse(config, runtime, state));
+  }
+
+  if (eventType === "notify") {
+    const title = cleanText(body.title || "MCP");
+    const messageText = mcpText(body.message || body.messageText || "");
+    if (!messageText) {
+      return writeJson(res, 400, { error: "missing-message" });
+    }
+    const stableId = `mcp_notify:${historyToken(`${title}:${messageText}:${Date.now()}`)}`;
+    const token = historyToken(stableId);
+    const entry = {
+      stableId,
+      token,
+      kind: "assistant_commentary",
+      threadId: "mcp",
+      threadLabel: cleanText(body.threadLabel || "MCP"),
+      title,
+      summary: formatNotificationBody(messageText, 160) || messageText,
+      messageText,
+      createdAtMs: Date.now(),
+      readOnly: true,
+      provider: "mcp",
+    };
+    const timelineChanged = recordTimelineEntry({ config, runtime, state, entry });
+    const historyChanged = recordHistoryItem({ config, runtime, state, item: entry });
+    const pushChanged = await deliverWebPushItem({
+      config,
+      state,
+      kind: "assistant_commentary",
+      tab: "timeline",
+      token,
+      stableId,
+      title,
+      body: messageText,
+    }).catch((error) => {
+      console.error(`[mcp-notify-push] ${error.message}`);
+      return false;
+    });
+    if (timelineChanged || historyChanged || pushChanged) {
+      await saveState(config.stateFile, state);
+    }
+    return writeJson(res, 200, { ok: true, token });
+  }
+
+  if (eventType === "approval_request" || eventType === "choice_request") {
+    const kind = eventType === "choice_request" ? "question" : normalizeMcpApprovalKind(body.approvalKind);
+    if (kind !== "question" && !mcpText(body.message || body.messageText || "")) {
+      return writeJson(res, 400, { error: "missing-message" });
+    }
+    if (kind === "question" && !mcpText(body.question || body.message || "")) {
+      return writeJson(res, 400, { error: "missing-question" });
+    }
+    const approval = createMcpPendingApproval(body, kind);
+    runtime.nativeApprovalsByToken.set(approval.token, approval);
+    runtime.nativeApprovalsByRequestKey.set(approval.requestKey, approval);
+    deliverWebPushItem({
+      config,
+      state,
+      kind: "approval",
+      tab: "inbox",
+      subtab: "pending",
+      token: approval.token,
+      stableId: pendingApprovalStableId(approval),
+      title: approval.title || "MCP",
+      body: approval.messageText,
+      buildLocalizedContent: () => ({
+        title: approval.title || "MCP",
+        body: approval.messageText,
+      }),
+    }).catch((error) => {
+      console.error(`[mcp-approval-push] ${approval.requestKey} | ${error.message}`);
+    });
+    const result = await waitForMcpApprovalResult(runtime, approval, body.timeoutMs);
+    return writeJson(res, 200, {
+      ok: true,
+      approved: result?.approved === true || result?.decision === "accept",
+      decision: result?.decision || (result?.approved ? "accept" : "reject"),
+      ...(result?.answerText ? { answerText: result.answerText } : {}),
+      ...(Array.isArray(result?.answers) ? { answers: result.answers } : {}),
+    });
+  }
+
+  return writeJson(res, 400, { error: "unsupported-mcp-event" });
+}
+
 function requestUserAgent(req) {
   return cleanText(req.headers?.["user-agent"] ?? "");
 }
@@ -13380,7 +13650,12 @@ async function autoApproveTrustedWrite({
 }
 
 async function handleNativeApprovalDecision({ config, runtime, state, approval, decision }) {
-  if (approval.resolveClaudeWaiter) {
+  if (approval.resolveMcpWaiter) {
+    approval.resolveMcpWaiter({
+      approved: decision === "accept",
+      decision,
+    });
+  } else if (approval.resolveClaudeWaiter) {
     if (approval.provider === "claude" && approval.kind === "plan") {
       // ExitPlanMode cannot be truly auto-approved via permissionDecision: "allow"
       // (Claude still shows the native PC plan dialog). Instead, deny the tool
@@ -13751,13 +14026,32 @@ const GZIPPABLE_EXTENSIONS = new Set([
 ]);
 const MIN_GZIP_BYTES = 512;
 
+function renderWebAssetBuffer(filePath, raw) {
+  const basename = path.basename(filePath);
+  if (basename !== "index.html" && basename !== "sw.js" && basename !== "app.js") {
+    return raw;
+  }
+
+  const text = raw.toString("utf8");
+  if (!text.includes(WEB_APP_BUILD_ID_PLACEHOLDER)) {
+    return raw;
+  }
+
+  return Buffer.from(text.replaceAll(WEB_APP_BUILD_ID_PLACEHOLDER, WEB_APP_BUILD_ID), "utf8");
+}
+
 async function loadWebAssetEntry(filePath) {
   const stat = await fs.stat(filePath);
   const cached = WEB_ASSET_CACHE.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+  if (
+    cached &&
+    cached.mtimeMs === stat.mtimeMs &&
+    cached.sourceSize === stat.size &&
+    cached.buildId === WEB_APP_BUILD_ID
+  ) {
     return cached;
   }
-  const raw = await fs.readFile(filePath);
+  const raw = renderWebAssetBuffer(filePath, await fs.readFile(filePath));
   const extension = path.extname(filePath).toLowerCase();
   let gzip = null;
   if (GZIPPABLE_EXTENSIONS.has(extension) && raw.length >= MIN_GZIP_BYTES) {
@@ -13771,7 +14065,8 @@ async function loadWebAssetEntry(filePath) {
     raw,
     gzip,
     mtimeMs: stat.mtimeMs,
-    size: stat.size,
+    sourceSize: stat.size,
+    buildId: WEB_APP_BUILD_ID,
     contentType: contentTypeForFile(filePath),
   };
   WEB_ASSET_CACHE.set(filePath, entry);
@@ -14173,6 +14468,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
       if (
         url.pathname === "/app.js" ||
         url.pathname === "/app.css" ||
+        url.pathname === "/build-id.js" ||
         url.pathname === "/i18n.js" ||
         url.pathname === "/hazbase-passkey.js" ||
         url.pathname === "/sw.js" ||
@@ -15748,7 +16044,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
               messageText: content,
               createdAtMs: share.createdAtMs,
               readOnly: false,
-              provider: "viveworker",
+              provider: sourceTool === "mcp" ? "mcp" : "viveworker",
             },
           });
           await saveState(config.stateFile, state);
@@ -16250,6 +16546,22 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           return writeJson(res, 408, { approved: false, decision, error: "payment-approval-timeout" });
         }
         return writeJson(res, 403, { approved: false, decision: "decline", error: "payment-approval-declined" });
+      }
+
+      if (url.pathname === "/api/providers/mcp/events" && req.method === "POST") {
+        const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
+        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+          return writeJson(res, 401, { error: "unauthorized" });
+        }
+
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch {
+          return writeJson(res, 400, { error: "invalid-json-body" });
+        }
+
+        return handleMcpProviderEvent({ config, runtime, state, body, res });
       }
 
       if (url.pathname === "/api/providers/claude/events" && req.method === "POST") {
@@ -17127,7 +17439,14 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
         approval.resolving = true;
         try {
-          if (approval.resolveClaudeWaiter) {
+          if (approval.resolveMcpWaiter) {
+            approval.resolveMcpWaiter({
+              approved: true,
+              decision: "answered",
+              answers,
+              answerText: reasonText,
+            });
+          } else if (approval.resolveClaudeWaiter) {
             approval.resolveClaudeWaiter({
               permissionDecision: "deny",
               permissionDecisionReason: reasonText,
@@ -17163,8 +17482,10 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           if (stateChanged) {
             await saveState(config.stateFile, state);
           }
-          console.log(`[claude-question-answer] ${approval.requestKey}`);
-          activateClaudeDesktopIfMac(req);
+          console.log(`[${approval.provider === "mcp" ? "mcp" : "claude"}-question-answer] ${approval.requestKey}`);
+          if (approval.provider === "claude") {
+            activateClaudeDesktopIfMac(req);
+          }
           return writeJson(res, 200, { ok: true });
         } catch (error) {
           approval.resolving = false;
