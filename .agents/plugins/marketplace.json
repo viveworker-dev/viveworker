@@ -1,0 +1,20 @@
+{
+  "name": "viveworker",
+  "interface": {
+    "displayName": "viveworker"
+  },
+  "plugins": [
+    {
+      "name": "viveworker-control-plane",
+      "source": {
+        "source": "local",
+        "path": "./plugins/viveworker-control-plane"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

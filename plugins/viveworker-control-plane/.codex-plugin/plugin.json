@@ -1,0 +1,47 @@
+{
+  "name": "viveworker-control-plane",
+  "version": "0.8.0",
+  "description": "Mobile control plane for Codex agents using viveworker MCP.",
+  "author": {
+    "name": "Yuta Hoshino",
+    "email": "hoshino.lireneo@gmail.com",
+    "url": "https://viveworker.com/"
+  },
+  "homepage": "https://viveworker.com/",
+  "repository": "https://github.com/viveworker-dev/viveworker",
+  "license": "MIT",
+  "keywords": [
+    "viveworker",
+    "mcp",
+    "codex",
+    "mobile",
+    "approvals",
+    "thread-sharing",
+    "file-share",
+    "a2a"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "viveworker Control Plane",
+    "shortDescription": "Ask, approve, share, and delegate from your phone.",
+    "longDescription": "Connect Codex to viveworker's mobile control plane. Agents can ask questions on your phone, request approvals, share deliverables, hand off thread context, and delegate A2A tasks without turning MCP into a shell executor.",
+    "developerName": "Yuta Hoshino",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "MCP",
+      "Mobile approvals",
+      "File sharing",
+      "Thread sharing",
+      "A2A delegation"
+    ],
+    "websiteURL": "https://viveworker.com/",
+    "defaultPrompt": [
+      "Ask me on my phone before the next risky step.",
+      "Share this result with my Codex thread.",
+      "Upload this report with viveworker File Share."
+    ],
+    "brandColor": "#64D99A"
+  }
+}

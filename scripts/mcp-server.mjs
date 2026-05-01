@@ -700,6 +700,9 @@ function printConfigSnippets() {
   console.log("  npx viveworker enable mcp --target cursor");
   console.log("  npx viveworker enable mcp --target codex");
   console.log("");
+  console.log("Claude Code:");
+  console.log("  claude mcp add --scope user viveworker -- npx viveworker mcp");
+  console.log("");
   console.log("Claude Desktop / Cursor / Codex MCP config:");
   console.log(JSON.stringify(snippet, null, 2));
 }

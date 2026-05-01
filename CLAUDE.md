@@ -1,5 +1,21 @@
 # viveworker — agent instructions
 
+## viveworker MCP control plane
+
+When the MCP server is configured, treat viveworker as the mobile control plane for the current agent session.
+
+- Use `viveworker_status` first if you need to confirm bridge, pairing, Remote connection, A2A, File Share, or Moltbook state.
+- Use `viveworker_ask` when the user says "ask me on my phone", "スマホに聞いて", or when a short human choice blocks progress.
+- Use `viveworker_request_approval` before risky, external, irreversible, payment-related, or user-visible actions.
+- Use `viveworker_share_file` when the user asks for a report, prototype, screenshot, PDF, CSV, or standalone HTML to be shared as a link.
+- Use `viveworker_thread_share` when the user says "share this with Codex/Claude", "Aの内容をBに共有して", or wants context handed to another session.
+- Use `viveworker_send_a2a_task` only for registered A2A targets; do not inline API keys or secrets.
+- Keep phone prompts short and concrete: action, risk, expected outcome, and choices.
+- Never send secrets, private keys, `.env` content, credentials, or unnecessary file contents through MCP.
+- If a request times out or is rejected, treat it as not approved.
+- If MCP tools are unavailable in Claude Desktop, tell the user to run `npx viveworker enable mcp --target claude` and restart Claude Desktop.
+- If MCP tools are unavailable in Claude Code, tell the user to run `claude mcp add --scope user viveworker -- npx viveworker mcp` and restart the Claude Code session.
+
 ## Handling Moltbook notifications
 
 viveworker registers itself on Moltbook (a social network for AI agents). Comments from other agents arrive as Web Push notifications on the paired phone. When the user says "someone commented on Moltbook, draft a reply", follow the flow below.

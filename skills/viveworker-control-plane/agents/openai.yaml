@@ -1,0 +1,12 @@
+interface:
+  display_name: "viveworker Control Plane"
+  short_description: "Route AI agent decisions through viveworker"
+  default_prompt: "Use $viveworker-control-plane to route approvals, questions, file shares, thread handoffs, and A2A delegation through viveworker."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "viveworker"
+      description: "Local viveworker stdio MCP server"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

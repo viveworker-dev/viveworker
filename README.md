@@ -194,6 +194,11 @@ npx viveworker enable mcp --target codex
 ```
 
 Use `--target all` to update every detected client, `--dry-run` to preview without writing, and `--yes` for non-interactive installs.
+`--target claude` configures Claude Desktop. Claude Code keeps a separate MCP config; add it with:
+
+```bash
+claude mcp add --scope user viveworker -- npx viveworker mcp
+```
 
 If you prefer manual setup, add this to an MCP client:
 
@@ -225,6 +230,26 @@ Security defaults:
 - File Share and A2A task sending require phone approval
 - MCP tool calls are recorded locally with `provider: "mcp"`
 - prompts, message bodies, file contents, file paths, command text, tokens, public keys, and IP addresses are not sent to central analytics
+
+Bundled agent guidance:
+
+- `skills/viveworker-control-plane/SKILL.md` gives Codex-style agents a compact policy for when to use each viveworker MCP tool
+- `templates/CLAUDE.viveworker.md` can be copied into a repo `CLAUDE.md` so Claude knows when to ask, approve, share, hand off, or delegate through viveworker
+- `.agents/plugins/marketplace.json` and `plugins/viveworker-control-plane/` package the MCP config and Codex skill as a local Codex plugin for plugin-based installs
+- use these guides when you want agents to ask on mobile, request approval, share deliverables, hand off context, or delegate through A2A instead of guessing
+
+For local Codex plugin testing from a checkout, register this repo as a marketplace in `~/.codex/config.toml`:
+
+```toml
+[marketplaces.viveworker]
+source_type = "local"
+source = "/path/to/viveworker"
+
+[plugins."viveworker-control-plane@viveworker"]
+enabled = true
+```
+
+Restart Codex after changing the config. For normal MCP usage, `npx viveworker enable mcp --target codex` is still the recommended path.
 
 ## File Share
 
