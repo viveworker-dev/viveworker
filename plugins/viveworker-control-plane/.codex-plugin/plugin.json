@@ -1,10 +1,10 @@
 {
   "name": "viveworker-control-plane",
   "version": "0.8.0",
-  "description": "Mobile control plane for Codex agents using viveworker MCP.",
+  "description": "Run AI agent work from your phone.",
   "author": {
-    "name": "Yuta Hoshino",
-    "email": "hoshino.lireneo@gmail.com",
+    "name": "viveworker team",
+    "email": "hello@viveworker.com",
     "url": "https://viveworker.com/"
   },
   "homepage": "https://viveworker.com/",
@@ -23,10 +23,10 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "viveworker Control Plane",
-    "shortDescription": "Ask, approve, share, and delegate from your phone.",
-    "longDescription": "Connect Codex to viveworker's mobile control plane. Agents can ask questions on your phone, request approvals, share deliverables, hand off thread context, and delegate A2A tasks without turning MCP into a shell executor.",
-    "developerName": "Yuta Hoshino",
+    "displayName": "viveworker",
+    "shortDescription": "Control Codex, Claude, and agent tasks from your phone.",
+    "longDescription": "Pair your phone with viveworker to control Codex, Claude, File Share, Thread Share, A2A tasks, and social posting workflows like Moltbook. Approve actions, answer questions, receive updates, share deliverables, delegate work, and keep agent work moving without being tied to your computer.",
+    "developerName": "viveworker team",
     "category": "Productivity",
     "capabilities": [
       "Interactive",
@@ -38,9 +38,9 @@
     ],
     "websiteURL": "https://viveworker.com/",
     "defaultPrompt": [
-      "Ask me on my phone before the next risky step.",
-      "Share this result with my Codex thread.",
-      "Upload this report with viveworker File Share."
+      "Set up viveworker and pair my phone.",
+      "Ask me on my phone before risky actions.",
+      "Share this result with another agent."
     ],
     "brandColor": "#64D99A"
   }

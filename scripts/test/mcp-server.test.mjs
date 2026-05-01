@@ -181,6 +181,7 @@ test("MCP prompts and unknown tools", async () => {
     const prompts = await mcp.request("prompts/list");
     const names = prompts.result.prompts.map((prompt) => prompt.name);
     assert.ok(names.includes("use_viveworker_control_plane"));
+    assert.ok(names.includes("setup_viveworker"));
     assert.ok(names.includes("delegate_with_a2a"));
 
     const prompt = await mcp.request("prompts/get", { name: "share_deliverable" });

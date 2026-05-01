@@ -19,6 +19,19 @@ npx viveworker enable mcp --target codex
 
 Then they should restart Codex.
 
+## First-run onboarding
+
+Use this flow when the user says "set up viveworker", "pair my phone", "viveworker を初期設定して", or "viveworker を使えるようにして".
+
+1. Try `viveworker_status` if MCP tools are available.
+2. If the bridge is missing or setup is incomplete, ask for confirmation before running or recommending `npx viveworker setup`.
+3. Do not silently run setup. It can install local certificates, write config, register launchd services, and update agent hooks.
+4. If setup exists but no phone is trusted, guide the user to run `npx viveworker pair` and open the pairing URL on the phone.
+5. Ask the user to allow notifications from the Home Screen app.
+6. Re-check with `viveworker_status`.
+7. Send a smoke notification with `viveworker_notify`.
+8. Summarize what is ready and what remains optional, such as Remote connection, File Share, A2A, or Moltbook.
+
 ## Tool policy
 
 - Use `viveworker_ask` for a short user decision that blocks progress.

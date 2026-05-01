@@ -851,6 +851,14 @@ const PROMPTS = [
   },
   {
     definition: {
+      name: "setup_viveworker",
+      title: "Set up viveworker",
+      description: "Guide the user through first-run setup, phone pairing, notification permission, and a smoke test.",
+    },
+    text: "When the user asks to set up viveworker, first call viveworker_status if available. If setup is missing, ask for confirmation before running or recommending `npx viveworker setup`. If no phone is trusted, guide the user to run `npx viveworker pair` and open the pairing URL on the phone. After pairing, re-check status and send a smoke notification with viveworker_notify.",
+  },
+  {
+    definition: {
       name: "ask_before_risky_action",
       title: "Ask before risky action",
       description: "Ask the phone before proceeding with a risky or externally visible action.",

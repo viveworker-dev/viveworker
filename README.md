@@ -223,6 +223,8 @@ Available tools:
 - `viveworker_thread_share` shares context into another Codex / Claude / inbox thread
 - `viveworker_send_a2a_task` sends a task to a registered A2A target after phone approval
 
+Available prompts include setup guidance, control-plane usage, risky-action approval, File Share deliverables, and A2A delegation.
+
 Security defaults:
 
 - MCP is stdio-only in this release; there is no HTTP MCP server
@@ -236,7 +238,7 @@ Bundled agent guidance:
 - `skills/viveworker-control-plane/SKILL.md` gives Codex-style agents a compact policy for when to use each viveworker MCP tool
 - `templates/CLAUDE.viveworker.md` can be copied into a repo `CLAUDE.md` so Claude knows when to ask, approve, share, hand off, or delegate through viveworker
 - `.agents/plugins/marketplace.json` and `plugins/viveworker-control-plane/` package the MCP config and Codex skill as a local Codex plugin for plugin-based installs
-- use these guides when you want agents to ask on mobile, request approval, share deliverables, hand off context, or delegate through A2A instead of guessing
+- use these guides when you want agents to guide first-run setup, ask on mobile, request approval, share deliverables, hand off context, or delegate through A2A instead of guessing
 
 For local Codex plugin testing from a checkout, register this repo as a marketplace in `~/.codex/config.toml`:
 

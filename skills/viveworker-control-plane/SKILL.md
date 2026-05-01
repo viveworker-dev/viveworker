@@ -13,6 +13,24 @@ Use viveworker as the mobile control surface around agent work. Keep normal loca
 - If viveworker MCP is unavailable, do not pretend the action happened. Tell the user to run `npx viveworker enable mcp --target codex` or add the config from `npx viveworker mcp config`.
 - Do not use viveworker for every routine local read/edit. Use it when a human decision, mobile notification, external handoff, or durable record is useful.
 
+## First-Run Onboarding
+
+Use this flow when the user asks to set up viveworker, pair a phone, install the control plane, or "make viveworker work here".
+
+1. Check whether MCP tools are available.
+   - If available, call `viveworker_status` first and use the result to decide what is missing.
+   - If unavailable, explain that the MCP entry is not loaded yet and guide the user through `npx viveworker enable mcp --target codex`, then ask them to restart Codex.
+2. If the bridge is not running or no local setup exists, ask for confirmation before running or recommending `npx viveworker setup`.
+   - Do not auto-run setup silently. It can install local certificates, write config, register launchd services, and change agent hooks.
+   - If the user explicitly asks you to execute setup, use the normal shell tool with clear confirmation, not MCP.
+3. If setup exists but no phone is trusted, guide the user to run `npx viveworker pair` and open the pairing URL on the phone.
+4. Ask the user to allow notifications from the Home Screen app when prompted.
+5. Re-check with `viveworker_status`.
+6. Send a final smoke notification with `viveworker_notify`.
+7. Summarize what is ready: bridge, pairing, notifications, Remote connection, File Share, A2A, and Moltbook where applicable.
+
+Keep onboarding calm and step-by-step. Do not make the user debug config files unless the status output points there.
+
 ## Tool Selection
 
 - Use `viveworker_notify` for informational milestones that should appear on the phone or timeline, such as "build finished", "review ready", or "agent is blocked".
