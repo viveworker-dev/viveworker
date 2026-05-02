@@ -1896,6 +1896,47 @@ async function revokeTrustedDevice(deviceId) {
   await renderShell();
 }
 
+/**
+ * `renderShell()` rebuilds the entire `#app` subtree by reassigning
+ * `innerHTML`, which destroys every <pre> element in the DOM — including
+ * any horizontal scroll position the user dragged into a wide code block.
+ * On a polling interval, that means a long line of code keeps snapping
+ * back to the start while the reader is mid-line.
+ *
+ * `snapshotCodeBlockScrolls()` records each `.markdown pre`'s scrollLeft
+ * keyed by its trimmed textContent (so the key survives a fresh render
+ * regardless of position in the DOM tree). `restoreCodeBlockScrolls()`
+ * walks the new DOM and restores any scrollLeft we still have a key for.
+ *
+ * Content-keyed matching is intentional: if the underlying code text
+ * changes mid-scroll, the new <pre> is logically different and we let it
+ * start at scrollLeft=0 rather than landing the reader somewhere unrelated.
+ */
+function snapshotCodeBlockScrolls() {
+  if (typeof document === "undefined") return null;
+  const blocks = document.querySelectorAll(".markdown pre");
+  if (blocks.length === 0) return null;
+  const map = new Map();
+  for (const pre of blocks) {
+    const key = pre.textContent ? pre.textContent.trim() : "";
+    if (!key) continue;
+    if (pre.scrollLeft === 0 && pre.scrollTop === 0) continue;
+    map.set(key, { scrollLeft: pre.scrollLeft, scrollTop: pre.scrollTop });
+  }
+  return map.size > 0 ? map : null;
+}
+
+function restoreCodeBlockScrolls(snapshot) {
+  if (!snapshot || typeof document === "undefined") return;
+  for (const pre of document.querySelectorAll(".markdown pre")) {
+    const key = pre.textContent ? pre.textContent.trim() : "";
+    const saved = key ? snapshot.get(key) : null;
+    if (!saved) continue;
+    if (saved.scrollLeft) pre.scrollLeft = saved.scrollLeft;
+    if (saved.scrollTop) pre.scrollTop = saved.scrollTop;
+  }
+}
+
 async function renderShell() {
   syncVisualViewportMetrics();
   const desktop = isDesktopLayout();
@@ -1915,6 +1956,8 @@ async function renderShell() {
   ]
     .filter(Boolean)
     .join(" ");
+
+  const codeBlockScrollSnapshot = snapshotCodeBlockScrolls();
 
   app.innerHTML = `
     <div class="${shellClassName}">
@@ -1941,6 +1984,10 @@ async function renderShell() {
   applyPendingListScrollRestore();
   applyPendingSettingsSubpageScrollReset();
   applyPendingSettingsScrollRestore();
+  // Reapply any horizontal scroll the user dragged into a code block before
+  // this re-render. Done after the imperative scroll resets above so they
+  // can't fight each other.
+  restoreCodeBlockScrolls(codeBlockScrollSnapshot);
   requestAnimationFrame(dismissBootSplash);
 }
 

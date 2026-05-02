@@ -42,6 +42,8 @@
       "Ask me on my phone before risky actions.",
       "Share this result with another agent."
     ],
-    "brandColor": "#64D99A"
+    "brandColor": "#64D99A",
+    "composerIcon": "./assets/viveworker-logo-v2.png",
+    "logo": "./assets/viveworker-logo-v2.png"
   }
 }

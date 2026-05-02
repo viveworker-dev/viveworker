@@ -170,13 +170,123 @@ function renderBlockquote(lines) {
 
 function renderCodeBlock(lines) {
   const [fence, ...rest] = lines;
+  // parseBlocks pushes the closing fence onto the block before breaking out
+  // of the loop, so `rest` ends with that closing line whenever the fence is
+  // properly closed. Strip it so the rendered <pre><code>...</code></pre>
+  // doesn't show the literal "```" as the last line of the code body.
+  const body = [...rest];
+  if (body.length > 0 && /^```\s*$/u.test(body[body.length - 1])) {
+    body.pop();
+  }
   const language = fence.replace(/^```/u, "").trim();
   const className = language ? ` class="language-${escapeHtml(language)}"` : "";
-  return `<pre><code${className}>${escapeHtml(rest.join("\n"))}</code></pre>`;
+  return `<pre><code${className}>${escapeHtml(body.join("\n"))}</code></pre>`;
 }
 
 function renderParagraph(lines) {
   return `<p>${lines.map((line) => renderInline(line.trim())).join("<br>")}</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// Pipe-style markdown tables
+// ---------------------------------------------------------------------------
+//
+//     | header 1 | header 2 |
+//     |----------|---------:|
+//     | cell     | 42       |
+//
+// Detection requires both a header row (single line starting AND ending with
+// `|`) and a separator row immediately below it whose cells are
+// `:?-{2,}:?` (with optional alignment markers). Anything else falls through
+// to the paragraph fallback so a stray `| not a table |` line still
+// renders as plain text.
+//
+// Cells go through `renderInline` so they pick up the existing escape /
+// inline-formatting pipeline; we never inject raw HTML.
+
+function isTableRowLine(line) {
+  if (typeof line !== "string") return false;
+  const trimmed = line.trim();
+  return trimmed.length >= 2 && trimmed.startsWith("|") && trimmed.endsWith("|");
+}
+
+function splitTableCells(line) {
+  // Strip the leading + trailing pipes; honour `\|` as an escaped literal.
+  const trimmed = line.trim().replace(/^\|/u, "").replace(/\|$/u, "");
+  const cells = [];
+  let current = "";
+  let i = 0;
+  while (i < trimmed.length) {
+    if (trimmed[i] === "\\" && trimmed[i + 1] === "|") {
+      current += "|";
+      i += 2;
+      continue;
+    }
+    if (trimmed[i] === "|") {
+      cells.push(current);
+      current = "";
+      i += 1;
+      continue;
+    }
+    current += trimmed[i];
+    i += 1;
+  }
+  cells.push(current);
+  return cells.map((cell) => cell.trim());
+}
+
+function isTableSeparatorLine(line) {
+  if (!isTableRowLine(line)) return false;
+  const cells = splitTableCells(line);
+  if (cells.length === 0) return false;
+  return cells.every((cell) => /^:?-{2,}:?$/u.test(cell));
+}
+
+function parseTableAlignments(separatorLine) {
+  return splitTableCells(separatorLine).map((cell) => {
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return "";
+  });
+}
+
+function renderTableCell(cell, align, tag) {
+  const styleAttr = align ? ` style="text-align:${align}"` : "";
+  return `<${tag}${styleAttr}>${renderInline(cell)}</${tag}>`;
+}
+
+function renderTable(headerLine, separatorLine, dataLines) {
+  const alignments = parseTableAlignments(separatorLine);
+  const headerCells = splitTableCells(headerLine);
+  // Pad alignments out to header width so any data row that's wider still
+  // gets a sensible alignment default.
+  while (alignments.length < headerCells.length) alignments.push("");
+
+  const headerHtml = headerCells
+    .map((cell, i) => renderTableCell(cell, alignments[i] || "", "th"))
+    .join("");
+  const bodyHtml = dataLines
+    .map((row) => {
+      const cells = splitTableCells(row);
+      const cellsHtml = cells
+        .map((cell, i) => renderTableCell(cell, alignments[i] || "", "td"))
+        .join("");
+      return `<tr>${cellsHtml}</tr>`;
+    })
+    .join("");
+
+  return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+}
+
+function looksLikeTableStart(lines, index) {
+  return (
+    isTableRowLine(lines[index]) &&
+    index + 1 < lines.length &&
+    isTableSeparatorLine(lines[index + 1])
+  );
 }
 
 function parseBlocks(markdown) {
@@ -241,6 +351,19 @@ function parseBlocks(markdown) {
       continue;
     }
 
+    if (looksLikeTableStart(lines, index)) {
+      const headerLine = lines[index];
+      const separatorLine = lines[index + 1];
+      const dataLines = [];
+      index += 2;
+      while (index < lines.length && isTableRowLine(lines[index])) {
+        dataLines.push(lines[index]);
+        index += 1;
+      }
+      blocks.push(renderTable(headerLine, separatorLine, dataLines));
+      continue;
+    }
+
     const block = [];
     while (index < lines.length) {
       const current = lines[index];
@@ -248,6 +371,10 @@ function parseBlocks(markdown) {
         break;
       }
       if (isUnorderedList(current) || isOrderedList(current) || /^(?:---|\*\*\*|___)\s*$/u.test(current)) {
+        break;
+      }
+      if (looksLikeTableStart(lines, index)) {
+        // Don't swallow a table-start row into the previous paragraph.
         break;
       }
       block.push(current);

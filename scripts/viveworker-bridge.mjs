@@ -4357,7 +4357,10 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
         if (block?.type === "text" && block.text) text += block.text;
       }
     }
-    text = cleanText(text);
+    // Preserve paragraph structure for the renderer — `cleanText` collapses
+    // every \s+ (newlines included) into a single space, which would flatten
+    // markdown tables / code fences / lists into a single illegible line.
+    text = normalizeLongText(text);
     if (!text) continue;
     if (type === "user" && record.entrypoint === "sdk-cli") {
       const derivedThreadLabel = deriveClaudeSdkCliThreadLabel(text, threadId);
@@ -20430,16 +20433,20 @@ function extractRolloutMessageText(content) {
   if (!Array.isArray(content)) {
     return "";
   }
-  return cleanText(
-    content
-      .map((entry) =>
-        isPlainObject(entry) && (entry.type === "input_text" || entry.type === "output_text")
-          ? normalizeTimelineMessageText(entry.text ?? "")
-          : ""
-      )
-      .filter(Boolean)
-      .join("\n")
-  );
+  // The per-entry text is already passed through `normalizeTimelineMessageText`
+  // (which preserves newlines for the markdown renderer). The final wrap used
+  // to be `cleanText`, which collapses every \s+ — newlines included — into
+  // a single space, flattening tables / code fences / lists into one
+  // illegible line. Use a plain trim instead so the structure survives.
+  return content
+    .map((entry) =>
+      isPlainObject(entry) && (entry.type === "input_text" || entry.type === "output_text")
+        ? normalizeTimelineMessageText(entry.text ?? "")
+        : ""
+    )
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 function extractTitleOnlyJsonTitleFromRolloutContent(content) {

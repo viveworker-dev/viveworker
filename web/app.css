@@ -77,6 +77,20 @@ code {
   background: rgba(156, 181, 197, 0.12);
 }
 
+/*
+ * Reset the inline-`<code>` look when the element is wrapped by `<pre>`.
+ * Without this, a multi-line code block ends up with the per-`<code>`
+ * padding + rounded background applied to each visual line individually
+ * (the inline element is line-broken and the browser paints the background
+ * once per line), which made fenced code blocks look like a stack of
+ * inline code spans on the phone PWA.
+ */
+pre code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
 #app {
   width: 100vw;
   max-width: 100vw;
@@ -2904,6 +2918,41 @@ code {
   max-width: 100%;
   display: block;
   overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.4rem 0 0.6rem;
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.detail-body.markdown table thead {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.detail-body.markdown table th,
+.detail-body.markdown table td {
+  border: 1px solid rgba(156, 181, 197, 0.16);
+  padding: 0.42rem 0.62rem;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.detail-body.markdown table th {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.detail-body.markdown table td {
+  color: var(--muted);
+}
+
+.detail-body.markdown table th code,
+.detail-body.markdown table td code {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.05rem 0.32rem;
+  border-radius: 6px;
+  font-size: 0.86em;
 }
 
 .detail-card {
