@@ -92,6 +92,37 @@ test("records aggregate counters without exposing pairing hashes", async () => {
   assert.deepEqual(stats.privacy.neverStored.includes("relayToken"), true);
 });
 
+test("weighted sampled events increment counters by count", async () => {
+  const analytics = makeDo();
+  const atMs = Date.now();
+  const expectedDate = new Date(atMs).toISOString().slice(0, 10);
+
+  await postEvent(analytics, {
+    type: "ws_upgrade",
+    role: "phone",
+    pairingId: "476b8996-27f2-4627-81f1-48635ddfe081",
+    atMs,
+    count: 20,
+  });
+  await postEvent(analytics, {
+    type: "close",
+    role: "phone",
+    code: 1006,
+    atMs,
+    count: 20,
+  });
+
+  const stats = await getStats(analytics);
+  const day = stats.daily.find((entry) => entry.date === expectedDate);
+  assert.ok(day, "expected daily row");
+  assert.equal(day.counters.events, 40);
+  assert.equal(day.counters.ws_upgrade, 20);
+  assert.equal(day.counters.close, 20);
+  assert.equal(day.byRole.phone.ws_upgrade, 20);
+  assert.equal(day.closeCodes["1006"], 20);
+  assert.equal(day.uniquePairings, 1);
+});
+
 test("rejects unknown events and never stores raw tokens or IP fields", async () => {
   const analytics = makeDo();
   const res = await analytics.fetch(new Request("https://analytics.local/v1/event", {

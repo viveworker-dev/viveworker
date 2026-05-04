@@ -99,6 +99,9 @@ const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
  */
 const DEFAULT_LAN_TIMEOUT_MS = 2_500;
 const DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
+const RELAY_FAILURE_WINDOW_MS = 60_000;
+const RELAY_FAILURE_THRESHOLD = 6;
+const RELAY_CIRCUIT_BREAKER_MS = 60_000;
 const PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
 const PAIRING_STATE_SCHEMA_VERSION = 2;
 const PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
@@ -128,6 +131,12 @@ let _lastPairingStateStatus = null;
 
 /** Last transport route that completed successfully. */
 let _lastSuccessfulRoute = null;
+
+/** Recent relay-level failures used to avoid burning relay/DO quota in loops. */
+let _relayFailureAtMs = [];
+
+/** If > now, relay attempts are intentionally skipped. */
+let _relayCircuitOpenUntilMs = 0;
 
 function newTelemetry() {
   return {
@@ -405,6 +414,51 @@ function resetRelayClientForRetry() {
   _wakeUnbind = null;
 }
 
+function closeRelayClient(_reason = "closed") {
+  if (_client) {
+    _telemetry.clientResets++;
+    try { _client.close(); } catch { /* ignore */ }
+  }
+  _client = null;
+  _clientPairingKey = null;
+  if (_wakeUnbind) {
+    try { _wakeUnbind(); } catch { /* ignore */ }
+  }
+  _wakeUnbind = null;
+}
+
+function relayCircuitDelayMs(opts = {}) {
+  return Math.max(0, _relayCircuitOpenUntilMs - nowMs(opts));
+}
+
+function relayCircuitError(opts = {}) {
+  const delayMs = relayCircuitDelayMs(opts);
+  const err = new Error(`remote relay temporarily cooled down (${Math.ceil(delayMs / 1000)}s)`);
+  err.name = "RemoteRelayCircuitOpenError";
+  err.code = "remote-relay-circuit-open";
+  err.retryAfterMs = delayMs;
+  return err;
+}
+
+function recordRelayFailure(err, opts = {}) {
+  const now = nowMs(opts);
+  _relayFailureAtMs = _relayFailureAtMs.filter((at) => now - at <= RELAY_FAILURE_WINDOW_MS);
+  _relayFailureAtMs.push(now);
+  if (_relayFailureAtMs.length < RELAY_FAILURE_THRESHOLD) return;
+  _relayCircuitOpenUntilMs = Math.max(_relayCircuitOpenUntilMs, now + RELAY_CIRCUIT_BREAKER_MS);
+  _relayFailureAtMs = [];
+  closeRelayClient("relay circuit open");
+  emitRoutingStatus("remote-cooled-down", opts, {
+    reason: err?.message || String(err || "relay failure"),
+    retryAfterMs: RELAY_CIRCUIT_BREAKER_MS,
+  });
+}
+
+function resetRelayFailureCircuit() {
+  _relayFailureAtMs = [];
+  _relayCircuitOpenUntilMs = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Response adapter — RpcResponse → minimal Fetch-Response shape
 // ---------------------------------------------------------------------------
@@ -501,6 +555,9 @@ async function attemptLanFetch(url, init, opts) {
       : await fetchPromise;
     _telemetry.lanOk++;
     _lastSuccessfulRoute = "lan";
+    _stickyRelayUntilMs = 0;
+    resetRelayFailureCircuit();
+    closeRelayClient("lan connected");
     emitRoutingStatus("lan-connected", opts, { url: String(url || "") });
     return { ok: true, response };
   } catch (err) {
@@ -693,6 +750,9 @@ async function encodeFormDataForRelay(formData, signal) {
 
 async function attemptRelayFetch(url, init, opts) {
   emitRoutingStatus("remote-connecting", opts, { url: String(url || "") });
+  if (relayCircuitDelayMs(opts) > 0) {
+    return { ok: false, err: relayCircuitError(opts) };
+  }
   const client = await getOrInitClient(opts);
   if (!client) {
     return { ok: false, err: relayClientUnavailableError(_lastPairingStateStatus) };
@@ -737,6 +797,7 @@ async function attemptRelayFetch(url, init, opts) {
     });
     _telemetry.relayOk++;
     _lastSuccessfulRoute = "relay";
+    resetRelayFailureCircuit();
     emitRoutingStatus("remote-connected", opts, { url: String(url || "") });
     return { ok: true, response: adaptRpcResponse(rpcRes) };
   } catch (err) {
@@ -747,6 +808,7 @@ async function attemptRelayFetch(url, init, opts) {
     }
     _telemetry.relayFail++;
     _telemetry.lastRelayFailAt = nowMs(opts);
+    recordRelayFailure(err, opts);
     emitRoutingStatus("remote-failed", opts, {
       url: String(url || ""),
       reason: err?.message || String(err),
@@ -858,6 +920,7 @@ export function __getTelemetry() {
     lastRoute: _lastSuccessfulRoute,
     hasClient: Boolean(_client),
     clientPairingKey: _clientPairingKey,
+    relayCircuitOpenUntilMs: _relayCircuitOpenUntilMs,
   };
 }
 
@@ -883,6 +946,8 @@ export function __resetForTest() {
   _telemetry = newTelemetry();
   _lastPairingStateStatus = null;
   _lastSuccessfulRoute = null;
+  _relayFailureAtMs = [];
+  _relayCircuitOpenUntilMs = 0;
 }
 
 // Test-visible constants for tests that want to assert behavior at the

@@ -73,6 +73,8 @@ const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
  * out via BUFFER_TTL_MS) and gets resumed via RESUME_REQ if needed.
  */
 const MAX_DRAIN_BYTES = 4 * 1024 * 1024;
+const DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE = 20;
+const RELAY_ANALYTICS_FULL_FIDELITY_EVENTS = new Set(["token_rotation"]);
 
 /**
  * Wire size of a Noise IK msg1 with an empty application payload:
@@ -843,14 +845,27 @@ function trimOutbox(outbox) {
 function emitRelayMetric(env, event) {
   try {
     if (!env?.RELAY_ANALYTICS) return;
+    const sampleWeight = relayMetricSampleWeight(env, event);
+    if (sampleWeight > 1 && Math.random() >= 1 / sampleWeight) return;
     const stub = env.RELAY_ANALYTICS.get(env.RELAY_ANALYTICS.idFromName("global-v1"));
     const result = stub.fetch("https://relay-analytics.local/v1/event", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ atMs: Date.now(), ...event }),
+      body: JSON.stringify({ atMs: Date.now(), ...event, count: sampleWeight }),
     });
     if (result && typeof result.catch === "function") result.catch(() => {});
   } catch {
     // Metrics are intentionally best-effort.
   }
+}
+
+function relayMetricSampleWeight(env, event) {
+  if (RELAY_ANALYTICS_FULL_FIDELITY_EVENTS.has(String(event?.type || ""))) {
+    return 1;
+  }
+  const configured = Number(env?.RELAY_ANALYTICS_SAMPLE_RATE);
+  if (Number.isFinite(configured) && configured >= 1) {
+    return Math.max(1, Math.min(10_000, Math.floor(configured)));
+  }
+  return DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE;
 }

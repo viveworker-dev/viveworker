@@ -110,6 +110,11 @@ resume outcomes, and close codes. The route requires
 `Authorization: Bearer <STATS_ADMIN_TOKEN>` and returns `404` when the token
 is missing or invalid.
 
+High-volume relay events are sampled before they hit the analytics Durable
+Object, then expanded with a `count` weight. This keeps stats useful for
+trend monitoring without letting a reconnect loop burn the DO request quota.
+Raw per-event logs are intentionally not retained.
+
 `/stats/remote/public` exposes only coarse, delayed adoption counters. It
 does not publish invalid-token counters, rate-limit counters, close codes,
 protocol errors, or low-volume daily rows.

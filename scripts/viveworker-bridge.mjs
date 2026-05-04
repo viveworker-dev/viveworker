@@ -13272,9 +13272,12 @@ function buildAmbientSuggestionsDetail(entry, locale) {
 
 function buildTimelineFileEventDetail(entry, locale) {
   const fileEventType = normalizeTimelineFileEventType(entry?.fileEventType ?? "");
+  const commandText = ["read", "search"].includes(fileEventType)
+    ? firstMarkdownCodeFenceText(entry?.messageText ?? "")
+    : "";
   const detailText = [
     fileEventDetailCopy(locale, fileEventType, entry?.provider),
-    normalizeTimelineMessageText(entry?.messageText ?? "", locale),
+    commandText ? "" : normalizeTimelineMessageText(entry?.messageText ?? "", locale),
   ].filter(Boolean).join("\n\n");
   return {
     kind: "file_event",
@@ -13287,6 +13290,7 @@ function buildTimelineFileEventDetail(entry, locale) {
     messageHtml: renderMessageHtml(detailText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousFileRefs: normalizeTimelineFileRefs(entry.previousFileRefs ?? []),
+    ...(commandText ? { commandText } : {}),
     diffAvailable: Boolean(entry.diffAvailable),
     diffText: normalizeTimelineDiffText(entry.diffText ?? ""),
     diffSource: normalizeTimelineDiffSource(entry.diffSource ?? ""),

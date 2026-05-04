@@ -27,6 +27,12 @@ const RELAY_TOKEN_POW_BITS = 16;
 const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
 const RELAY_CHANNEL_DOMAIN = "viveworker-remote-pairing-relay-channel";
 const VALID_ROLES = new Set(["phone", "bridge"]);
+const DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE = 20;
+const RELAY_ANALYTICS_FULL_FIDELITY_EVENTS = new Set(["token_rotation"]);
+const LOCAL_WS_UPGRADE_WINDOW_MS = 60_000;
+const LOCAL_WS_UPGRADE_COOLDOWN_MS = 60_000;
+const LOCAL_WS_UPGRADE_MAX_PER_WINDOW = 20;
+const LOCAL_WS_UPGRADE_BUCKETS = new Map();
 
 const BANNER_HTML = `<!doctype html>
 <html lang="en">
@@ -157,6 +163,22 @@ export default {
         });
       }
 
+      const localCooldownMs = checkLocalWsUpgradeBudget(pairingId, role);
+      if (localCooldownMs > 0) {
+        const retryAfter = String(Math.max(1, Math.ceil(localCooldownMs / 1000)));
+        console.log(`[relay-ws-local-cooldown] pairing=${shortPairing(pairingId)} role=${role} retryAfter=${retryAfter}s`);
+        waitUntil(ctx, recordRelayMetric(env, {
+          type: "ws_upgrade_local_cooldown",
+          role,
+          pairingId,
+          outcome: "rate_limited",
+        }));
+        return new Response("relay reconnect cooled down", {
+          status: 429,
+          headers: { "retry-after": retryAfter },
+        });
+      }
+
       // Forward to the DO instance keyed by pairingId + token. A leaked
       // pairingId alone cannot reach or replace the real sockets, and random
       // bot traffic must pay the token proof-of-work before allocating a DO.
@@ -217,14 +239,67 @@ function safeEqualString(left, right) {
 export async function recordRelayMetric(env, event) {
   try {
     if (!env?.RELAY_ANALYTICS) return;
+    const sampleWeight = relayMetricSampleWeight(env, event);
+    if (sampleWeight > 1 && Math.random() >= 1 / sampleWeight) return;
     const stub = env.RELAY_ANALYTICS.get(env.RELAY_ANALYTICS.idFromName("global-v1"));
     await stub.fetch("https://relay-analytics.local/v1/event", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ atMs: Date.now(), ...event }),
+      body: JSON.stringify({ atMs: Date.now(), ...event, count: sampleWeight }),
     });
   } catch {
     // Observability must never break relay traffic.
+  }
+}
+
+function relayMetricSampleWeight(env, event) {
+  if (RELAY_ANALYTICS_FULL_FIDELITY_EVENTS.has(String(event?.type || ""))) {
+    return 1;
+  }
+  const configured = Number(env?.RELAY_ANALYTICS_SAMPLE_RATE);
+  if (Number.isFinite(configured) && configured >= 1) {
+    return Math.max(1, Math.min(10_000, Math.floor(configured)));
+  }
+  return DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE;
+}
+
+function checkLocalWsUpgradeBudget(pairingId, role) {
+  const now = Date.now();
+  const key = `${pairingId}:${role}`;
+  pruneLocalWsUpgradeBuckets(now);
+  const bucket = LOCAL_WS_UPGRADE_BUCKETS.get(key) || {
+    windowStartMs: now,
+    count: 0,
+    cooldownUntilMs: 0,
+  };
+  if (bucket.cooldownUntilMs > now) {
+    LOCAL_WS_UPGRADE_BUCKETS.set(key, bucket);
+    return bucket.cooldownUntilMs - now;
+  }
+  if (now - bucket.windowStartMs >= LOCAL_WS_UPGRADE_WINDOW_MS) {
+    bucket.windowStartMs = now;
+    bucket.count = 0;
+    bucket.cooldownUntilMs = 0;
+  }
+  bucket.count += 1;
+  if (bucket.count > LOCAL_WS_UPGRADE_MAX_PER_WINDOW) {
+    bucket.cooldownUntilMs = now + LOCAL_WS_UPGRADE_COOLDOWN_MS;
+    LOCAL_WS_UPGRADE_BUCKETS.set(key, bucket);
+    return LOCAL_WS_UPGRADE_COOLDOWN_MS;
+  }
+  LOCAL_WS_UPGRADE_BUCKETS.set(key, bucket);
+  return 0;
+}
+
+function pruneLocalWsUpgradeBuckets(now) {
+  if (LOCAL_WS_UPGRADE_BUCKETS.size < 512) return;
+  for (const [key, bucket] of LOCAL_WS_UPGRADE_BUCKETS) {
+    if (
+      bucket.cooldownUntilMs <= now &&
+      now - bucket.windowStartMs > LOCAL_WS_UPGRADE_WINDOW_MS * 2
+    ) {
+      LOCAL_WS_UPGRADE_BUCKETS.delete(key);
+    }
   }
 }
 

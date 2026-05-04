@@ -19,8 +19,12 @@ test("timeline supports read/search file events and separate command events", ()
   assert.match(appSource, /case "commands":\s*return kind === "command_event";/);
   assert.match(appSource, /<pre class="timeline-entry__command"><code>/);
   assert.match(appSource, /function timelineCommandEventCommand/);
+  assert.match(appSource, /function timelineToolEventCommand/);
+  assert.match(appSource, /\["read",\s*"search"\]\.includes\(normalizeClientText\(item\?\.fileEventType \|\| ""\)\)/);
   assert.match(appSource, /function renderCommandEventDetail/);
   assert.match(appSource, /<pre class="detail-command-block"><code>/);
+  assert.match(bridgeSource, /const commandText = \["read",\s*"search"\]\.includes\(fileEventType\)/);
+  assert.match(bridgeSource, /\.\.\.\(commandText \? \{ commandText \} : \{\}\)/);
 });
 
 test("Codex exec_command calls become timeline operation events", () => {

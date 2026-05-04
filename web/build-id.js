@@ -1,1 +1,1 @@
-export const APP_BUILD_ID = "20260504-command-event-detail-v1";
+export const APP_BUILD_ID = "20260505-command-event-fast-approval-v1";

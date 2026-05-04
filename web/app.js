@@ -3782,7 +3782,7 @@ function renderTimelineEntry(entry, { desktop }) {
   const statusLabel = timelineEntryStatusLabel(item, isMessageLike);
   const fileEventFileSummary = isFileEvent ? timelineFileEventFileSummary(item) : "";
   const fileEventDiffStatsHtml = isFileEvent ? renderDiffEntryStatsHtml(item) : "";
-  const commandEventCommand = isCommandEvent ? timelineCommandEventCommand(item) : "";
+  const toolEventCommand = timelineToolEventCommand(item);
 
   return `
     <button
@@ -3805,7 +3805,7 @@ function renderTimelineEntry(entry, { desktop }) {
       ${threadLabel ? `<p class="timeline-entry__thread">${escapeHtml(threadLabel)}</p>` : ""}
       <div class="timeline-entry__body">
         <p class="timeline-entry__title">${escapeHtml(primaryText)}</p>
-        ${commandEventCommand ? `<pre class="timeline-entry__command"><code>${escapeHtml(commandEventCommand)}</code></pre>` : ""}
+        ${toolEventCommand ? `<pre class="timeline-entry__command"><code>${escapeHtml(toolEventCommand)}</code></pre>` : ""}
         ${secondaryText ? `<p class="timeline-entry__summary">${escapeHtml(secondaryText)}</p>` : ""}
         ${
           isFileEvent && fileEventFileSummary
@@ -4053,6 +4053,23 @@ function timelineGeneratedTitlePrefixes() {
 
 function timelineCommandEventCommand(item) {
   return truncateUiText(firstMarkdownCodeFence(item?.messageText || "") || item?.summary || item?.title || "", 220);
+}
+
+function shouldRenderFileEventCommand(item) {
+  if (item?.kind !== "file_event") {
+    return false;
+  }
+  return ["read", "search"].includes(normalizeClientText(item?.fileEventType || ""));
+}
+
+function timelineToolEventCommand(item) {
+  if (item?.kind === "command_event") {
+    return timelineCommandEventCommand(item);
+  }
+  if (!shouldRenderFileEventCommand(item)) {
+    return "";
+  }
+  return truncateUiText(firstMarkdownCodeFence(item?.messageText || "") || item?.commandText || "", 220);
 }
 
 function fileEventDisplayLabel(fileEventType) {
@@ -7015,10 +7032,10 @@ function renderAmbientSuggestionsSection(detail, options = {}) {
 }
 
 function renderCommandEventDetail(detail, options = {}) {
-  if (detail?.kind !== "command_event") {
+  if (detail?.kind !== "command_event" && !shouldRenderFileEventCommand(detail)) {
     return "";
   }
-  const commandText = normalizeClientText(detail?.commandText || "");
+  const commandText = normalizeClientText(detail?.commandText || "") || firstMarkdownCodeFence(detail?.messageText || "");
   if (!commandText) {
     return "";
   }
@@ -8776,7 +8793,8 @@ function bindShellInteractions() {
           delete postBody.hazbaseReauth;
         }
         await apiPost(actionUrl, postBody);
-        if (keepDetailOpen && activeItem?.kind === "approval") {
+        if (activeItem?.kind === "approval") {
+          state.pendingActionUrls.delete(actionUrl);
           pinActionOutcomeDetail(
             activeItem,
             buildActionOutcomeDetail({
@@ -8785,6 +8803,13 @@ function bindShellInteractions() {
               message: approvalOutcomeMessage(actionUrl, activeItem?.provider),
             })
           );
+          await renderShell();
+          void refreshAuthenticatedState()
+            .then(() => renderShell())
+            .catch((error) => {
+              console.debug?.("[approval-action-refresh-failed]", error?.message || String(error));
+            });
+          return;
         }
         await refreshAuthenticatedState();
         if (!keepDetailOpen && !isDesktopLayout()) {

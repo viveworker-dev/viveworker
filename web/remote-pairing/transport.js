@@ -84,6 +84,10 @@ const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
 const MAX_PRE_CONNECT_BACKOFF_MS = 4_000;
 const RELAY_RESET_RECONNECT_MS = 250;
+const DEFAULT_FAILURE_WINDOW_MS = 60_000;
+const DEFAULT_FAILURE_THRESHOLD = 4;
+const DEFAULT_CIRCUIT_BREAKER_MS = 60_000;
+const DEFAULT_MAX_CIRCUIT_BREAKER_MS = 10 * 60_000;
 const DEFAULT_PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 
 // CloseEvent codes we emit. 1000 is normal; 4xxx is application-defined.
@@ -113,6 +117,10 @@ const CLOSE_RELAY_RESET_SESSION = 4004;
  * @property {number} [pingIntervalMs]
  * @property {number[]} [backoffMs]
  * @property {number} [handshakeTimeoutMs]
+ * @property {number} [failureWindowMs]
+ * @property {number} [failureThreshold]
+ * @property {number} [circuitBreakerMs]
+ * @property {number} [maxCircuitBreakerMs]
  * @property {typeof WebSocket} [WebSocketImpl]     injectable for Node-side tests
  * @property {{debug?: Function, warn?: Function}} [logger]
  */
@@ -154,6 +162,10 @@ export class RemotePairingTransport {
     this._backoffMs = (opts.backoffMs ?? DEFAULT_BACKOFF_MS).slice();
     if (this._backoffMs.length === 0) this._backoffMs = [1_000];
     this._handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this._failureWindowMs = opts.failureWindowMs ?? DEFAULT_FAILURE_WINDOW_MS;
+    this._failureThreshold = opts.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
+    this._circuitBreakerMs = opts.circuitBreakerMs ?? DEFAULT_CIRCUIT_BREAKER_MS;
+    this._maxCircuitBreakerMs = opts.maxCircuitBreakerMs ?? DEFAULT_MAX_CIRCUIT_BREAKER_MS;
 
     this._WebSocketImpl = opts.WebSocketImpl ?? globalThis.WebSocket;
     if (typeof this._WebSocketImpl !== "function") {
@@ -188,6 +200,12 @@ export class RemotePairingTransport {
     this._pingTimer = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     this._handshakeTimer = null;
+    /** @type {number[]} recent reconnect-triggering failures. */
+    this._recentFailureAtMs = [];
+    /** If > Date.now(), reconnect attempts are intentionally delayed. */
+    this._circuitOpenUntilMs = 0;
+    /** Consecutive circuit openings, used to lengthen persistent outages. */
+    this._circuitOpenCount = 0;
 
     // ---- crypto state (persists across reconnects until RESUME_FAIL) ----
     /** @type {import("../remote-pairing.bundle.js").NoiseSession | null} */
@@ -320,6 +338,12 @@ export class RemotePairingTransport {
 
   _open() {
     this._cancelReconnectTimer();
+    const circuitDelay = this._circuitDelayMs();
+    if (circuitDelay > 0) {
+      this._log.warn?.(`relay reconnect circuit open for ${circuitDelay}ms`);
+      this._scheduleReconnect();
+      return;
+    }
     this._setState(STATE.OPENING);
 
     const url =
@@ -484,6 +508,12 @@ export class RemotePairingTransport {
 
     this._log.debug?.(`ws closed code=${evt?.code} reason=${evt?.reason}`);
     this._setState(STATE.DISCONNECTED, { code: evt?.code, reason: evt?.reason });
+    if (Number(evt?.code) !== CLOSE_NORMAL) {
+      this._recordReconnectFailure({
+        code: Number(evt?.code) || 0,
+        reason: String(evt?.reason || ""),
+      });
+    }
     if (isRelayReset) {
       this._scheduleRelayResetReconnect();
     } else {
@@ -619,9 +649,10 @@ export class RemotePairingTransport {
     const idx = Math.min(this._reconnectAttempt, this._backoffMs.length - 1);
     const waitingForFirstConnect = this._connectPromise != null && this._session == null;
     const rawDelay = this._backoffMs[idx];
-    const delay = waitingForFirstConnect
+    const backoffDelay = waitingForFirstConnect
       ? Math.min(rawDelay, MAX_PRE_CONNECT_BACKOFF_MS)
       : rawDelay;
+    const delay = Math.max(backoffDelay, this._circuitDelayMs());
     this._reconnectAttempt += 1;
     this._log.debug?.(`reconnect in ${delay}ms (attempt ${this._reconnectAttempt})`);
     this._reconnectTimer = setTimeout(() => {
@@ -636,7 +667,7 @@ export class RemotePairingTransport {
     // rendezvous again. Treat it as a protocol reset, not a network failure,
     // so app boot does not sit behind the exponential backoff ladder.
     this._reconnectAttempt = 0;
-    const delay = RELAY_RESET_RECONNECT_MS;
+    const delay = Math.max(RELAY_RESET_RECONNECT_MS, this._circuitDelayMs());
     this._log.debug?.(`reconnect in ${delay}ms (relay reset)`);
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
@@ -713,6 +744,9 @@ export class RemotePairingTransport {
     this._state = newState;
     if (newState === STATE.CONNECTED) {
       this._reconnectAttempt = 0;
+      this._recentFailureAtMs = [];
+      this._circuitOpenUntilMs = 0;
+      this._circuitOpenCount = 0;
     }
     try {
       this._onStateChange(newState, prev, info);
@@ -729,6 +763,10 @@ export class RemotePairingTransport {
   }
 
   _fail(err) {
+    this._recordReconnectFailure({
+      code: CLOSE_FATAL,
+      reason: err?.message || "fatal-error",
+    });
     this._setState(STATE.FAILED, { error: err });
     this._stopPing();
     this._stopHandshakeTimer();
@@ -747,6 +785,33 @@ export class RemotePairingTransport {
   _dropNoiseState() {
     this._session = null;
     this._handshake = null;
+  }
+
+  _recordReconnectFailure(info = {}) {
+    const now = Date.now();
+    const windowMs = Math.max(1_000, Number(this._failureWindowMs) || DEFAULT_FAILURE_WINDOW_MS);
+    this._recentFailureAtMs = this._recentFailureAtMs.filter((at) => now - at <= windowMs);
+    this._recentFailureAtMs.push(now);
+    const threshold = Math.max(2, Math.floor(Number(this._failureThreshold) || DEFAULT_FAILURE_THRESHOLD));
+    if (this._recentFailureAtMs.length < threshold) return;
+
+    const baseCooldownMs = Math.max(1_000, Number(this._circuitBreakerMs) || DEFAULT_CIRCUIT_BREAKER_MS);
+    const maxCooldownMs = Math.max(baseCooldownMs, Number(this._maxCircuitBreakerMs) || DEFAULT_MAX_CIRCUIT_BREAKER_MS);
+    const multiplier = Math.min(16, 2 ** this._circuitOpenCount);
+    const cooldownMs = Math.min(maxCooldownMs, baseCooldownMs * multiplier);
+    this._circuitOpenCount += 1;
+    this._circuitOpenUntilMs = Math.max(this._circuitOpenUntilMs, now + cooldownMs);
+    this._recentFailureAtMs = [];
+    this._dropNoiseState();
+    this._log.warn?.(
+      `relay reconnect circuit opened for ${cooldownMs}ms` +
+      `${info?.code ? ` after close=${info.code}` : ""}` +
+      `${info?.reason ? ` (${String(info.reason).slice(0, 64)})` : ""}`,
+    );
+  }
+
+  _circuitDelayMs() {
+    return Math.max(0, this._circuitOpenUntilMs - Date.now());
   }
 }
 

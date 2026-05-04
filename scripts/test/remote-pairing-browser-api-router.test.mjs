@@ -484,6 +484,8 @@ test("interactive GET can re-probe LAN inside sticky relay window", async () => 
   assert.equal(fetchCalls.length, 2, "LAN should be re-probed for interactive detail fetches");
   assert.equal(rpcCalls.fetch.length, 1, "relay should be skipped when the LAN probe succeeds");
   assert.equal(__getTelemetry().stickyRelayUntilMs, 0);
+  assert.equal(__getTelemetry().hasClient, false, "LAN recovery should close the relay client");
+  assert.equal(rpcCalls.close, 1);
 });
 
 const STICKY_HALF_MS = Math.floor(__STICKY_RELAY_MS / 2);
@@ -545,6 +547,36 @@ test("inside sticky window, if relay also fails, LAN is tried as a tiebreaker", 
   assert.equal(rpcCalls.fetch.length, 2);
   assert.equal(fetchCalls.length, 2);
   assert.deepEqual(await res.json(), { tiebreaker: "lan" });
+});
+
+test("repeated relay failures open a local circuit and skip extra relay calls", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("Failed to fetch") },
+  ]);
+  const relayErr = new Error("relay down");
+  const { opts, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => { throw relayErr; },
+    }),
+  });
+
+  for (let i = 0; i < 6; i++) {
+    await assert.rejects(
+      routedFetch(`/api/fail-${i}`, {}, { ...opts, preferRelayError: true }),
+      (err) => err === relayErr,
+    );
+  }
+
+  const before = rpcCalls.fetch.length;
+  assert.ok(__getTelemetry().relayCircuitOpenUntilMs > opts.now());
+  assert.equal(__getTelemetry().hasClient, false);
+
+  await assert.rejects(
+    routedFetch("/api/fail-circuit", {}, { ...opts, preferRelayError: true }),
+    (err) => err?.code === "remote-relay-circuit-open",
+  );
+  assert.equal(rpcCalls.fetch.length, before, "open circuit should not call relay fetch");
 });
 
 // ---------------------------------------------------------------------------

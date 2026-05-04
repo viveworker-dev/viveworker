@@ -13,6 +13,7 @@ const MAX_DAILY_ROWS = 30;
 
 const EVENT_TYPES = new Set([
   "ws_upgrade",
+  "ws_upgrade_local_cooldown",
   "ws_upgrade_rate_limited",
   "invalid_token",
   "invalid_token_rate_limited",
@@ -155,6 +156,7 @@ async function normalizeEvent(raw) {
   const event = {
     type,
     atMs: Number.isFinite(Number(raw?.atMs)) ? Number(raw.atMs) : Date.now(),
+    count: clampNumber(raw?.count, 1, 1, 10_000),
   };
 
   const role = String(raw?.role || "");
@@ -192,15 +194,16 @@ function normalizeDay(value, date) {
 
 function applyEvent(day, event) {
   day.updatedAtMs = Math.max(day.updatedAtMs || 0, event.atMs);
-  increment(day.counters, "events");
-  increment(day.counters, event.type);
+  const count = Math.max(1, Math.floor(Number(event.count) || 1));
+  increment(day.counters, "events", count);
+  increment(day.counters, event.type, count);
 
   if (event.role) {
-    increment(day.byRole[event.role], "events");
-    increment(day.byRole[event.role], event.type);
+    increment(day.byRole[event.role], "events", count);
+    increment(day.byRole[event.role], event.type, count);
   }
   if (event.code) {
-    increment(day.closeCodes, event.code);
+    increment(day.closeCodes, event.code, count);
   }
   if (event.pairingHash) {
     day.pairingHashes[event.pairingHash] = 1;
@@ -266,8 +269,8 @@ function mergeCounts(target, source) {
   }
 }
 
-function increment(obj, key) {
-  obj[key] = (Number(obj[key]) || 0) + 1;
+function increment(obj, key, count = 1) {
+  obj[key] = (Number(obj[key]) || 0) + count;
 }
 
 async function maybePruneOldDays(storage, nowMs) {
