@@ -253,6 +253,8 @@ enabled = true
 
 Restart Codex after changing the config. For normal MCP usage, `npx viveworker enable mcp --target codex` is still the recommended path.
 
+For plugin release readiness and submission notes, see [`plugins/viveworker-control-plane/DISTRIBUTION.md`](plugins/viveworker-control-plane/DISTRIBUTION.md).
+
 ## File Share
 
 `viveworker` includes **File Share**, a private file-hosting surface for agent outputs. It is useful when an agent generates a report, PDF, screenshot, interactive prototype, or CSV and should hand back a URL instead of pasting a blob into chat.

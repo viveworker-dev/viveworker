@@ -237,6 +237,16 @@ export async function executeA2ATask(task, config, runtime, state, { recordTimel
         stableId: `a2a_task_result:${task.id}`,
         title: `A2A ${icon}: ${instruction.slice(0, 60)}`,
         body: resultBody || instruction.slice(0, 160),
+        buildLocalizedContent: ({ locale }) => {
+          const lang = locale?.startsWith("ja") ? "ja" : "en";
+          const instructionSnippet = instruction.slice(0, 60);
+          return {
+            title: isCompleted
+              ? (lang === "ja" ? `A2A 完了: ${instructionSnippet}` : `A2A completed: ${instructionSnippet}`)
+              : (lang === "ja" ? `A2A 失敗: ${instructionSnippet}` : `A2A failed: ${instructionSnippet}`),
+            body: resultBody || instruction.slice(0, 160),
+          };
+        },
       });
     } catch (error) {
       console.error(`[a2a-exec-push] ${error.message}`);

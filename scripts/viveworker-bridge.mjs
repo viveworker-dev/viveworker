@@ -672,6 +672,118 @@ function formatLocalizedTitle(locale, baseKeyOrTitle, threadLabel) {
   return formatTitle(baseTitle, threadLabel);
 }
 
+function localizedThreadSharePushContent(locale, { sourceLabel = "", sourceTool = "", targetLabel = "", targetTool = "", body = "" } = {}) {
+  const source = cleanText(sourceLabel || sourceTool || "agent");
+  const target = cleanText(targetLabel || targetTool || "target");
+  return {
+    title: t(locale, "server.push.threadShare.title", { source, target }),
+    body: pushBodySnippet(body),
+  };
+}
+
+function localizedThreadShareFallbackPushContent(locale, target) {
+  const normalizedTarget = cleanText(target || "");
+  return {
+    title: t(locale, "server.push.threadShareFallback.title"),
+    body: t(locale, "server.push.threadShareFallback.body", { target: normalizedTarget }),
+  };
+}
+
+function localizedMcpNotifyTitle(locale, title) {
+  const normalizedTitle = cleanText(title || "");
+  if (!normalizedTitle || normalizedTitle === "MCP") {
+    return t(locale, "server.push.mcpNotify.title");
+  }
+  return normalizedTitle;
+}
+
+function localizedMcpApprovalPushContent(locale, approval) {
+  const kind = cleanText(approval?.kind || "mcp");
+  const title = cleanText(approval?.title || "");
+  const body = cleanText(approval?.messageText || "");
+  if (kind === "question") {
+    return {
+      title: t(locale, "server.push.mcpQuestion.title"),
+      body: pushBodySnippet(body),
+    };
+  }
+  if (kind === "file_share") {
+    const filePath = compactPath(normalizeTimelineFileRefs(approval?.fileRefs ?? [])[0] || t(locale, "common.fileEvent"));
+    const sizeMatch = body.match(/^\s*Size:\s*([^\n]+)$/imu);
+    return {
+      title: t(locale, "server.push.mcpShareFile.title"),
+      body: t(locale, "server.push.mcpShareFile.body", {
+        path: filePath,
+        size: cleanText(sizeMatch?.[1] || ""),
+      }),
+    };
+  }
+  if (kind === "a2a_task") {
+    const target = cleanText(title.match(/^Send A2A task to\s+(.+)$/iu)?.[1] || "A2A target");
+    return {
+      title: t(locale, "server.push.mcpA2aTask.title", { target }),
+      body: t(locale, "server.push.mcpA2aTask.body", { target }),
+    };
+  }
+  if (!title || title === "MCP approval") {
+    return {
+      title: t(locale, "server.push.mcpApproval.title"),
+      body: pushBodySnippet(body),
+    };
+  }
+  return { title, body: pushBodySnippet(body) };
+}
+
+function localizedPaymentApprovalPushContent(locale, approval) {
+  const payment = isPlainObject(approval?.rawParams) ? approval.rawParams : {};
+  const amount = cleanText(payment.amountUsdc || payment.amountAtomic || "");
+  const network = cleanText(payment.network || "");
+  const resource = cleanText(payment.resource || payment.url || "");
+  const titleKey = cleanText(approval?.kind || "") === "hazbase_wallet_payment"
+    ? "server.push.hazbasePayment.title"
+    : "server.push.paymentApproval.title";
+  return {
+    title: t(locale, titleKey, { amount }),
+    body: t(locale, "server.push.paymentApproval.body", { amount, network, resource }),
+  };
+}
+
+function localizedMoltbookReplyPushContent(locale, item) {
+  const title = cleanText(item?.title || "");
+  return {
+    title: !title || title === "Moltbook reply" ? t(locale, "server.push.moltbookReply.title") : title,
+    body: cleanText(item?.summary || "") || t(locale, "server.push.moltbookReply.body"),
+  };
+}
+
+function localizedMoltbookDraftPushTitle(locale, { draftType = "", postTitle = "", slot = "" } = {}) {
+  const normalizedPostTitle = cleanText(postTitle || "");
+  if (draftType !== "original_post") {
+    return t(locale, "server.push.moltbookDraft.replyTitle", { postTitle: normalizedPostTitle });
+  }
+  switch (cleanText(slot || "")) {
+    case "morning":
+      return t(locale, "server.push.moltbookDraft.originalMorning");
+    case "noon":
+      return t(locale, "server.push.moltbookDraft.originalNoon");
+    case "evening":
+      return t(locale, "server.push.moltbookDraft.originalEvening");
+    default:
+      return normalizedPostTitle || t(locale, "server.push.moltbookDraft.originalTitle");
+  }
+}
+
+function localizedMoltbookPostedBody(locale, draft, finalTitle) {
+  if (cleanText(draft?.draftType || "") === "original_post") {
+    return t(locale, "server.push.moltbookDraft.postedOriginalBody", { title: cleanText(finalTitle || draft?.postTitle || "") });
+  }
+  return t(locale, "server.push.moltbookDraft.postedReplyBody", { postTitle: cleanText(draft?.postTitle || "") });
+}
+
+function pushBodySnippet(value, maxChars = 160) {
+  return truncate(singleLine(value || ""), maxChars);
+}
+
 function notificationIconPrefix(kind) {
   switch (kind) {
     case "approval":
@@ -6335,7 +6447,7 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
         body: approval.messageText,
         buildLocalizedContent: ({ locale }) => ({
           title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
-          body: approval.messageText,
+          body: formatNativeApprovalMessage(approval.kind, approval.rawParams, locale),
         }),
       }) || stateChanged;
   }
@@ -6671,7 +6783,11 @@ async function syncGenericUserInputRequests({
               userInputRequest.supported ? "server.title.choice" : "server.title.choiceReadOnly",
               userInputRequest.threadLabel
             ),
-            body: userInputRequest.notificationText || userInputRequest.messageText,
+            body: buildUserInputNotificationText(
+              userInputRequest.questions,
+              userInputRequest.supported,
+              locale
+            ),
           }),
         }) || stateChanged;
     }
@@ -10866,6 +10982,10 @@ async function handleMcpProviderEvent({ config, runtime, state, body, res }) {
       stableId,
       title,
       body: messageText,
+      buildLocalizedContent: ({ locale }) => ({
+        title: localizedMcpNotifyTitle(locale, title),
+        body: pushBodySnippet(messageText),
+      }),
     }).catch((error) => {
       console.error(`[mcp-notify-push] ${error.message}`);
       return false;
@@ -10897,10 +11017,7 @@ async function handleMcpProviderEvent({ config, runtime, state, body, res }) {
       stableId: pendingApprovalStableId(approval),
       title: approval.title || "MCP",
       body: approval.messageText,
-      buildLocalizedContent: () => ({
-        title: approval.title || "MCP",
-        body: approval.messageText,
-      }),
+      buildLocalizedContent: ({ locale }) => localizedMcpApprovalPushContent(locale, approval),
     }).catch((error) => {
       console.error(`[mcp-approval-push] ${approval.requestKey} | ${error.message}`);
     });
@@ -11263,6 +11380,17 @@ function historyItemByToken(runtime, kind, token) {
   return runtime.recentHistoryItems.find(
     (item) => item.kind === kind && item.token === token
   ) ?? null;
+}
+
+function approvalDecisionFromHistoryItem(item) {
+  const outcome = cleanText(item?.outcome || "");
+  if (outcome === "approved") {
+    return "accept";
+  }
+  if (outcome === "rejected") {
+    return "decline";
+  }
+  return "";
 }
 
 function listLatestPersistedUserInputRequests({ config, runtime, state }) {
@@ -12338,6 +12466,48 @@ function findNewerThreadMessageAfterCompletion(runtime, completionItem) {
     .sort((left, right) => Number(right?.createdAtMs ?? 0) - Number(left?.createdAtMs ?? 0))[0] || null;
 }
 
+function normalizeCompletionReplyComparisonText(value) {
+  return normalizeLongText(value).replace(/\s+/gu, " ").trim();
+}
+
+function isMatchingCompletionReplyTimelineMessage(entry, messageText, expectedImageCount = 0) {
+  if (cleanText(entry?.kind || "") !== "user_message") {
+    return false;
+  }
+  const expectedText = normalizeCompletionReplyComparisonText(messageText);
+  const actualText = normalizeCompletionReplyComparisonText(entry?.messageText || entry?.summary || entry?.title || "");
+  if (!expectedText || actualText !== expectedText) {
+    return false;
+  }
+  const entryImageCount = normalizeTimelineImagePaths(entry?.imagePaths || []).length;
+  return expectedImageCount <= 0 || entryImageCount === expectedImageCount;
+}
+
+function findMatchingCompletionReplyAfterCompletion(runtime, completionItem, messageText, expectedImageCount = 0) {
+  const itemKind = cleanText(completionItem?.kind || "");
+  if (!runtime || !REPLYABLE_HISTORY_KINDS.has(itemKind)) {
+    return null;
+  }
+
+  const threadId = historyItemThreadId(completionItem);
+  const completionCreatedAtMs = Number(completionItem?.createdAtMs) || 0;
+  if (!threadId || !completionCreatedAtMs) {
+    return null;
+  }
+
+  return runtime.recentTimelineEntries
+    .filter((entry) => {
+      if (cleanText(entry?.threadId || "") !== threadId) {
+        return false;
+      }
+      if (Number(entry?.createdAtMs) <= completionCreatedAtMs) {
+        return false;
+      }
+      return isMatchingCompletionReplyTimelineMessage(entry, messageText, expectedImageCount);
+    })
+    .sort((left, right) => Number(right?.createdAtMs ?? 0) - Number(left?.createdAtMs ?? 0))[0] || null;
+}
+
 function buildHistoryDetail(item, locale, runtime = null) {
   const threadId = historyItemThreadId(item);
   const replyEnabled =
@@ -12849,6 +13019,20 @@ async function handleCompletionReply({
   if (!conversationId) {
     throw new Error("completion-reply-unavailable");
   }
+
+  const alreadyAcceptedReply = findMatchingCompletionReplyAfterCompletion(
+    runtime,
+    completionItem,
+    messageText,
+    normalizedLocalImagePaths.length
+  );
+  if (alreadyAcceptedReply && !force) {
+    console.log(
+      `[completion-reply] idempotent token=${cleanText(completionItem?.token || "") || "unknown"} thread=${conversationId} timeline=${cleanText(alreadyAcceptedReply.stableId || alreadyAcceptedReply.token || "") || "unknown"}`
+    );
+    return { alreadyAccepted: true };
+  }
+
   // For assistant_final, check against timeline entries (avoids maxHistoryItems eviction).
   // For legacy completion, check against history items.
   const itemKind = cleanText(completionItem?.kind || "");
@@ -12952,7 +13136,7 @@ async function handleCompletionReply({
         `[completion-reply] success candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
       );
       await finalizeReplyAccepted();
-      return;
+      return { alreadyAccepted: false };
     } catch (error) {
       if (isStartTurnAckTimeout(error)) {
         // Codex can create the turn but fail to send the bridge an ACK before
@@ -12962,7 +13146,7 @@ async function handleCompletionReply({
           `[completion-reply] accepted candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(error)}`
         );
         await finalizeReplyAccepted();
-        return;
+        return { alreadyAccepted: false, ackTimeout: true };
       }
       lastError = error;
       console.log(
@@ -14168,7 +14352,7 @@ function buildWebAppHtml({ pairToken }) {
     <link rel="manifest" href="${escapeHtml(manifestHref)}">
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/viveworker-icon-192.png">
-    <link rel="stylesheet" href="/app.css">
+    <link rel="stylesheet" href="/app.css?v=${escapeHtml(WEB_APP_BUILD_ID)}">
     <style>
       .boot-splash {
         position: fixed;
@@ -16064,6 +16248,13 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             stableId: `thread_share:${shareId}`,
             title: `Thread Share: ${sourceLabel || sourceTool || "agent"} → ${targetLabel || targetTool}`,
             body: String(content).slice(0, 160),
+            buildLocalizedContent: ({ locale }) => localizedThreadSharePushContent(locale, {
+              sourceLabel,
+              sourceTool,
+              targetLabel,
+              targetTool,
+              body: content,
+            }),
           });
         } catch (error) {
           console.error(`[thread-share-push] ${error.message}`);
@@ -16163,6 +16354,10 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
                   stableId: `thread_share_fallback:${share.shareId}`,
                   title: "Thread Share: target unreachable",
                   body: `Codex thread "${share.targetLabel || share.targetConversationId.slice(0, 8)}" is not connected. Content saved to inbox.`,
+                  buildLocalizedContent: ({ locale }) => localizedThreadShareFallbackPushContent(
+                    locale,
+                    share.targetLabel || share.targetConversationId.slice(0, 8)
+                  ),
                 });
               } catch (error) {
                 console.error(`[thread-share-fallback-push] ${error.message}`);
@@ -16424,7 +16619,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           stableId: pendingApprovalStableId(approval),
           title: approval.title,
           body: approval.messageText,
-          buildLocalizedContent: () => ({ title: approval.title, body: approval.messageText }),
+          buildLocalizedContent: ({ locale }) => localizedPaymentApprovalPushContent(locale, approval),
         }).catch((error) => {
           console.error(`[hazbase-wallet-payment-push] ${approval.requestKey} | ${error.message}`);
         });
@@ -16514,10 +16709,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           stableId: pendingApprovalStableId(approval),
           title: approval.title,
           body: approval.messageText,
-          buildLocalizedContent: () => ({
-            title: approval.title,
-            body: approval.messageText,
-          }),
+          buildLocalizedContent: ({ locale }) => localizedPaymentApprovalPushContent(locale, approval),
         }).catch((error) => {
           console.error(`[payment-approval-push] ${approval.requestKey} | ${error.message}`);
         });
@@ -16809,7 +17001,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           body: approval.messageText,
           buildLocalizedContent: ({ locale }) => ({
             title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
-            body: approval.messageText,
+            body: formatNativeApprovalMessage(approval.kind, approval.rawParams, locale),
           }),
         }).catch(() => {});
 
@@ -16938,6 +17130,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             stableId: `moltbook_reply:${item.sourceId}`,
             title: item.title,
             body: item.summary,
+            buildLocalizedContent: ({ locale }) => localizedMoltbookReplyPushContent(locale, item),
           });
         } catch (error) {
           console.error(`[moltbook-push-error] ${error.message}`);
@@ -17097,20 +17290,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           console.error(`[moltbook-draft-timeline-save] ${error.message}`);
         }
         try {
-          const pushTitle = (() => {
-            if (draftType !== "original_post") {
-              return postTitle ? `draft → ${postTitle}` : "Moltbook draft";
-            }
-            const greetings = {
-              morning: { en: "Good morning! Share yesterday's highlights?", ja: "おはようございます！昨日の成果をシェアしませんか？" },
-              noon: { en: "Nice progress! Ready to share your morning work?", ja: "午前中お疲れ様でした！進捗をシェアしませんか？" },
-              evening: { en: "Great work today! Let's share what you built.", ja: "今日もお疲れ様でした！成果をシェアしませんか？" },
-            };
-            const locale = config.locale || "en";
-            const lang = locale.startsWith("ja") ? "ja" : "en";
-            const g = greetings[slot];
-            return g ? g[lang] : (postTitle || "Moltbook new post");
-          })();
+          const pushTitle = localizedMoltbookDraftPushTitle(config.defaultLocale, { draftType, postTitle, slot });
           await deliverWebPushItem({
             config,
             state,
@@ -17121,6 +17301,10 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             stableId: `moltbook_draft:${sourceId}`,
             title: pushTitle,
             body: draftType === "original_post" ? (postTitle || String(draftText).slice(0, 160)) : String(draftText).slice(0, 160),
+            buildLocalizedContent: ({ locale }) => ({
+              title: localizedMoltbookDraftPushTitle(locale, { draftType, postTitle, slot }),
+              body: draftType === "original_post" ? (postTitle || pushBodySnippet(draftText)) : pushBodySnippet(draftText),
+            }),
           });
         } catch (error) {
           console.error(`[moltbook-draft-push-error] ${error.message}`);
@@ -17218,6 +17402,10 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
                   stableId: `moltbook_draft_failed:${draft.sourceId}`,
                   title: "Draft post failed",
                   body: String(postError.message || "").slice(0, 160),
+                  buildLocalizedContent: ({ locale }) => ({
+                    title: t(locale, "server.push.moltbookDraft.failedTitle"),
+                    body: pushBodySnippet(postError.message || ""),
+                  }),
                 });
               } catch { /* ignore push error */ }
             }
@@ -17327,7 +17515,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           const payload = contentType.includes("multipart/form-data")
             ? await stageCompletionReplyImages(config, req)
             : await parseJsonBody(req);
-          await handleCompletionReply({
+          const replyResult = await handleCompletionReply({
             config,
             runtime,
             state,
@@ -17341,6 +17529,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             ok: true,
             planMode: payload?.planMode === true,
             imageCount: Array.isArray(payload?.localImagePaths) ? payload.localImagePaths.length : 0,
+            alreadyAccepted: replyResult?.alreadyAccepted === true,
           });
         } catch (error) {
           if (error.message === "completion-reply-empty") {
@@ -17381,6 +17570,20 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         const decision = apiApprovalDecisionMatch[2];
         const approval = runtime.nativeApprovalsByToken.get(token);
         if (!approval) {
+          const historicalDecision = approvalDecisionFromHistoryItem(historyItemByToken(runtime, "approval", token));
+          if (historicalDecision) {
+            if (historicalDecision === decision) {
+              return writeJson(res, 200, {
+                ok: true,
+                decision,
+                alreadyHandled: true,
+              });
+            }
+            return writeJson(res, 409, {
+              error: "approval-already-handled",
+              decision: historicalDecision,
+            });
+          }
           return writeJson(res, 404, { error: "approval-not-found" });
         }
         if (approval.resolved || approval.resolving) {
@@ -19381,6 +19584,10 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
       stableId: `moltbook_draft_posted:${draft.sourceId}`,
       title: "Moltbook posted",
       body: truncate(singleLine(pushTitle), 160),
+      buildLocalizedContent: ({ locale }) => ({
+        title: t(locale, "server.push.moltbookDraft.postedTitle"),
+        body: localizedMoltbookPostedBody(locale, draft, finalTitle),
+      }),
     });
   } catch { /* ignore push error */ }
 

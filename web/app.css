@@ -1068,6 +1068,48 @@ pre code {
   word-break: break-all;
 }
 
+.settings-external-link {
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.32rem;
+  color: rgba(121, 196, 255, 0.9);
+  text-decoration: none;
+}
+
+.settings-external-link:hover,
+.settings-external-link:focus-visible {
+  color: rgba(176, 222, 255, 0.98);
+  text-decoration: none;
+}
+
+.settings-external-link:focus-visible {
+  outline: 1px solid rgba(121, 196, 255, 0.42);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.settings-external-link__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-external-link__icon {
+  width: 0.86rem;
+  height: 0.86rem;
+  flex: 0 0 auto;
+  opacity: 0.72;
+}
+
+.settings-external-link__icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .settings-row__chevron {
   width: 0.95rem;
   height: 0.95rem;
@@ -2934,8 +2976,17 @@ pre code {
   padding: 0.42rem 0.62rem;
   text-align: left;
   vertical-align: top;
+  /* Wrap plain text at natural boundaries, but only break long unbreakable
+   * runs as a last resort (instead of every column being forced narrow by
+   * the previous `word-break: break-word`). The table itself already has
+   * `overflow-x: auto`, so any cell that legitimately needs more width
+   * triggers horizontal scroll on the whole table. */
   white-space: normal;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: anywhere;
+  /* Keep cells from collapsing to a single character per line under the
+   * pressure of a wide inline `<code>` element. */
+  min-width: 4rem;
 }
 
 .detail-body.markdown table th {
@@ -2953,6 +3004,11 @@ pre code {
   padding: 0.05rem 0.32rem;
   border-radius: 6px;
   font-size: 0.86em;
+  /* Inline code never breaks mid-token — keeps `npx viveworker enable mcp …`
+   * legible on one line and lets the surrounding cell widen the table.
+   * The phone reader gets horizontal scroll instead of the previous
+   * char-per-line stack. */
+  white-space: nowrap;
 }
 
 .detail-card {

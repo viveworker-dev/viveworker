@@ -1912,28 +1912,36 @@ async function revokeTrustedDevice(deviceId) {
  * changes mid-scroll, the new <pre> is logically different and we let it
  * start at scrollLeft=0 rather than landing the reader somewhere unrelated.
  */
+// Markdown blocks the user can scroll horizontally — we preserve their
+// position across innerHTML rebuilds. <pre> for fenced code; <table> for
+// pipe-style markdown tables that exceed the viewport width.
+const MARKDOWN_SCROLL_SELECTORS = ".markdown pre, .markdown table";
+
 function snapshotCodeBlockScrolls() {
   if (typeof document === "undefined") return null;
-  const blocks = document.querySelectorAll(".markdown pre");
+  const blocks = document.querySelectorAll(MARKDOWN_SCROLL_SELECTORS);
   if (blocks.length === 0) return null;
   const map = new Map();
-  for (const pre of blocks) {
-    const key = pre.textContent ? pre.textContent.trim() : "";
+  for (const el of blocks) {
+    const key = el.textContent ? el.textContent.trim() : "";
     if (!key) continue;
-    if (pre.scrollLeft === 0 && pre.scrollTop === 0) continue;
-    map.set(key, { scrollLeft: pre.scrollLeft, scrollTop: pre.scrollTop });
+    if (el.scrollLeft === 0 && el.scrollTop === 0) continue;
+    map.set(`${el.tagName}:${key}`, {
+      scrollLeft: el.scrollLeft,
+      scrollTop: el.scrollTop,
+    });
   }
   return map.size > 0 ? map : null;
 }
 
 function restoreCodeBlockScrolls(snapshot) {
   if (!snapshot || typeof document === "undefined") return;
-  for (const pre of document.querySelectorAll(".markdown pre")) {
-    const key = pre.textContent ? pre.textContent.trim() : "";
-    const saved = key ? snapshot.get(key) : null;
+  for (const el of document.querySelectorAll(MARKDOWN_SCROLL_SELECTORS)) {
+    const key = el.textContent ? el.textContent.trim() : "";
+    const saved = key ? snapshot.get(`${el.tagName}:${key}`) : null;
     if (!saved) continue;
-    if (saved.scrollLeft) pre.scrollLeft = saved.scrollLeft;
-    if (saved.scrollTop) pre.scrollTop = saved.scrollTop;
+    if (saved.scrollLeft) el.scrollLeft = saved.scrollLeft;
+    if (saved.scrollTop) el.scrollTop = saved.scrollTop;
   }
 }
 
@@ -2267,6 +2275,25 @@ function normalizeCompletionReplyWarning(value) {
     summary,
     kind,
   };
+}
+
+function normalizeCompletionReplyCompareText(value) {
+  return normalizeClientText(value)
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function completionReplyWarningMatchesSentText(error, text, attachmentCount = 0) {
+  if (error?.errorKey !== "completion-reply-thread-advanced") {
+    return false;
+  }
+  if (attachmentCount > 0) {
+    return false;
+  }
+  const warning = normalizeCompletionReplyWarning(error?.payload?.warning);
+  const warningText = normalizeCompletionReplyCompareText(warning?.summary || "");
+  const sentText = normalizeCompletionReplyCompareText(text);
+  return Boolean(warningText && sentText && warningText === sentText);
 }
 
 function normalizeCompletionReplyAttachments(values) {
@@ -5222,6 +5249,15 @@ function renderSettingsAutoPilotSuggestion({ lane, count }) {
   `;
 }
 
+function renderSettingsExternalLink({ href, label }) {
+  return `
+    <a class="settings-external-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;justify-content:flex-end;gap:.32rem;text-decoration:none;color:#8fd7ff;max-width:100%;">
+      <span class="settings-external-link__label">${escapeHtml(label)}</span>
+      <span class="settings-external-link__icon" aria-hidden="true" style="display:inline-flex;width:.86rem;height:.86rem;flex:0 0 auto;">${renderIcon("external-link")}</span>
+    </a>
+  `.trim();
+}
+
 function renderSettingsMoltbookPage(context) {
   const scout = context.moltbookScout;
   if (!scout?.enabled) {
@@ -5236,10 +5272,16 @@ function renderSettingsMoltbookPage(context) {
     renderSettingsInfoRow(L("settings.row.moltbookBatchTopScore"), String(scout.batch.topScore)),
     renderSettingsInfoRow(L("settings.row.moltbookBatchRemaining"), `${Math.floor(scout.batch.remainingSeconds / 60)}:${String(scout.batch.remainingSeconds % 60).padStart(2, "0")}`),
   ] : [];
-  const accountRow = scout.account?.name && scout.account?.profileUrl
+  const accountProfileLink = scout.account?.name && scout.account?.profileUrl
+    ? renderSettingsExternalLink({
+        href: scout.account.profileUrl,
+        label: scout.account.name,
+      })
+    : "";
+  const accountRow = accountProfileLink
     ? renderSettingsInfoRow(
         L("settings.row.moltbookAccount"),
-        `<a href="${escapeHtml(scout.account.profileUrl)}" target="_blank" rel="noopener">${escapeHtml(scout.account.name)}</a>`,
+        accountProfileLink,
         { rawValue: true }
       )
     : null;
@@ -5310,7 +5352,10 @@ function renderSettingsA2aRelayPage(context) {
       ? L("settings.a2aRelay.status.polling")
       : L("settings.a2aRelay.status.disconnected");
   const profileUrl = `${relay.relayUrl}/u/${relay.userId}`;
-  const userIdLink = `<a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener">${escapeHtml(relay.userId)}</a>`;
+  const userIdLink = renderSettingsExternalLink({
+    href: profileUrl,
+    label: relay.userId,
+  });
   const relayHost = (() => { try { return new URL(relay.relayUrl).host; } catch { return relay.relayUrl; } })();
   const publicChecked = relay.acceptPublicTasks === true;
 
@@ -8141,6 +8186,14 @@ function bindShellInteractions() {
         if (error?.errorKey === "hazbase-session-expired") {
           await fetchHazbaseStatus();
         }
+        if (activeItem?.kind === "approval" && isAlreadyHandledApprovalError(error)) {
+          const recovered = await recoverHandledApprovalDetail(activeItem);
+          if (recovered) {
+            pinActionOutcomeDetail(activeItem, recovered);
+            await renderShell();
+            return;
+          }
+        }
         if (approvalFinalized) {
           await refreshAuthenticatedState();
           if (keepDetailOpen && activeItem?.kind === "approval") {
@@ -9240,6 +9293,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
           requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
         }
         const replyKind = replyForm.dataset.replyKind || "completion";
+        const sentNotice = L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault", { provider: providerDisplayName(replyProvider) });
         await apiPost(`/api/items/${encodeURIComponent(replyKind)}/${encodeURIComponent(token)}/reply`, requestBody);
         setCompletionReplyDraft(token, {
           text: "",
@@ -9248,7 +9302,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
           mode: draft.mode,
           sending: false,
           error: "",
-          notice: L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault", { provider: providerDisplayName(replyProvider) }),
+          notice: sentNotice,
           warning: null,
           confirmOverride: false,
           collapsedAfterSend: true,
@@ -9256,6 +9310,23 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         await refreshAuthenticatedState();
       } catch (error) {
         if (error.errorKey === "completion-reply-thread-advanced") {
+          if (completionReplyWarningMatchesSentText(error, text, attachments.length)) {
+            setCompletionReplyDraft(token, {
+              text: "",
+              sentText: text,
+              attachments: [],
+              mode: draft.mode,
+              sending: false,
+              error: "",
+              notice: L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault", { provider: providerDisplayName(replyProvider) }),
+              warning: null,
+              confirmOverride: false,
+              collapsedAfterSend: true,
+            });
+            await refreshAuthenticatedState();
+            await renderShell();
+            return;
+          }
           setCompletionReplyDraft(token, {
             text,
             sentText: "",
@@ -10009,6 +10080,22 @@ function hasDetailOverride(itemRef = state.currentItem) {
   return Boolean(state.detailOverride && isSameItemRef(state.detailOverride, itemRef));
 }
 
+function isAlreadyHandledApprovalError(error) {
+  return error?.errorKey === "approval-not-found" || error?.errorKey === "approval-already-handled";
+}
+
+async function recoverHandledApprovalDetail(itemRef) {
+  try {
+    await refreshAuthenticatedState();
+    const detail = await hydrateDetailImages(
+      await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`)
+    );
+    return detail?.kind === "approval" && detail.readOnly === true ? detail : null;
+  } catch {
+    return null;
+  }
+}
+
 function shouldPreserveCurrentItem(itemRef = state.currentItem) {
   return Boolean(itemRef && (hasLaunchItemIntent(itemRef) || hasDetailOverride(itemRef)));
 }
@@ -10076,6 +10163,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="12" width="14" height="7" rx="2"/><path d="M9 19h6"/><path d="M12 12v7"/><path d="M8.2 8.8a5.4 5.4 0 0 1 7.6 0"/><path d="M10.2 6.3a8.2 8.2 0 0 1 3.6 0"/><path d="M11.2 9.8a1.2 1.2 0 0 1 1.6 0"/></svg>`;
     case "link":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 13.6 8.3 15.7a3 3 0 0 1-4.2-4.2l2.8-2.8a3 3 0 0 1 4.2 0"/><path d="m13.6 10.4 2.1-2.1a3 3 0 1 1 4.2 4.2l-2.8 2.8a3 3 0 0 1-4.2 0"/><path d="m9.5 14.5 5-5"/></svg>`;
+    case "external-link":
+      return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10 6H6.8A2.8 2.8 0 0 0 4 8.8v8.4A2.8 2.8 0 0 0 6.8 20h8.4a2.8 2.8 0 0 0 2.8-2.8V14"/><path d="M14 4h6v6"/><path d="m12.5 11.5 7-7"/></svg>`;
     case "clip":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 12.5 5.9-5.9a3 3 0 1 1 4.2 4.2l-7.7 7.7a5 5 0 1 1-7.1-7.1l8.1-8.1"/></svg>`;
     case "moltbook-draft":

@@ -1,6 +1,7 @@
 const APP_BUILD_ID = "__VIVEWORKER_APP_BUILD_ID__";
 const CACHE_NAME = `viveworker-${APP_BUILD_ID}`;
 const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
+const APP_STYLE_URL = `/app.css?v=${APP_BUILD_ID}`;
 const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
@@ -14,7 +15,7 @@ const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
 const APP_ASSETS = [
   "/app",
   APP_SCRIPT_URL,
-  "/app.css",
+  APP_STYLE_URL,
   "/app.js",
   "/i18n.js",
   "/icons/viveworker-v-pulse.svg",
@@ -31,10 +32,12 @@ const APP_ROUTES = new Set(["/", "/app", "/app/"]);
 const CACHED_PATHS = new Set(APP_ASSETS.map((asset) => new URL(asset, self.location.origin).pathname));
 const VERSIONED_CACHE_PATHS = new Set([
   "/app.js",
+  "/app.css",
   "/remote-pairing/api-router.js",
 ]);
 const NETWORK_FIRST_PATHS = new Set([
   "/app.js",
+  "/app.css",
   "/remote-pairing/api-router.js",
 ]);
 const APP_NAVIGATION_NETWORK_TIMEOUT_MS = 1800;
@@ -49,7 +52,7 @@ const APP_SHELL_FALLBACK_HTML = `<!doctype html>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/viveworker-icon-192.png">
-    <link rel="stylesheet" href="/app.css">
+    <link rel="stylesheet" href="${APP_STYLE_URL}">
     <style>
       html, body { min-height: 100%; margin: 0; background: #081015; color: #f5fbff; }
       .boot-splash { position: fixed; inset: 0; display: grid; place-items: center; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; background: radial-gradient(circle at 50% 18%, rgba(47, 143, 103, 0.22), transparent 30%), linear-gradient(180deg, #081015 0%, #091015 100%); }
@@ -150,14 +153,14 @@ self.addEventListener("push", (event) => {
   } catch {
     payload = {
       title: "viveworker",
-      body: event.data ? event.data.text() : "A new Codex item is available.",
+      body: event.data ? event.data.text() : fallbackNotificationBody(),
       data: { url: "/app" },
     };
   }
 
   const title = payload.title || "viveworker";
   const options = {
-    body: payload.body || "A new Codex item is available.",
+    body: payload.body || fallbackNotificationBody(),
     tag: payload.tag || "",
     data: payload.data || { url: "/app" },
   };
@@ -174,6 +177,13 @@ self.addEventListener("push", (event) => {
     }
   })());
 });
+
+function fallbackNotificationBody() {
+  const language = String(self.navigator?.language || "").toLowerCase();
+  return language.startsWith("ja")
+    ? "viveworker を開いて確認してください。"
+    : "Open viveworker for details.";
+}
 
 self.addEventListener("notificationclick", (event) => {
   event.preventDefault?.();
