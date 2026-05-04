@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs, readFileSync } from "node:fs";
 import { upsertEnvText } from "./lib/pairing.mjs";
+import { normalizeViveworkerTaskMetadata } from "./a2a-handler.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -248,6 +249,8 @@ async function ingestRelayTask({ relayTask, config, runtime, state, helpers }) {
   const token = historyToken(`a2a_task:${relayTask.id}`);
   const instruction = cleanText(relayTask.instruction || "");
   const now = Date.now();
+  const relayMetadata = relayTask.metadata || relayTask.messages?.[0]?.metadata || {};
+  const viveworker = normalizeViveworkerTaskMetadata(relayMetadata);
 
   const task = {
     id: relayTask.id,
@@ -258,6 +261,8 @@ async function ingestRelayTask({ relayTask, config, runtime, state, helpers }) {
     messages: relayTask.messages || [],
     artifacts: [],
     instruction,
+    metadata: relayMetadata,
+    viveworker,
     callerInfo: relayTask.callerInfo || {},
     createdAtMs: relayTask.createdAtMs || now,
     updatedAtMs: now,
@@ -289,6 +294,7 @@ async function ingestRelayTask({ relayTask, config, runtime, state, helpers }) {
         title: `A2A: ${instruction.slice(0, 80)}`,
         summary: instruction.slice(0, 160),
         messageText: instruction,
+        viveworker,
         createdAtMs: relayTask.createdAtMs || now,
         readOnly: false,
         provider: "a2a",

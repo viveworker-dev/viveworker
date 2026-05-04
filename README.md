@@ -465,6 +465,63 @@ npx viveworker enable a2a --user-id <desired-id> \
 
 The bridge detects the new credentials within 30 seconds and auto-connects.
 
+### A2A Pro + x402 test flow
+
+Experimental paid deliverables can be tested by adding viveworker metadata to an incoming A2A task.
+The task still requires phone approval, executes locally, uploads the result to File Share with an x402 payment gate, and returns only the unlock URL to the requester.
+
+On the receiving side, set defaults if you do not want every caller to provide payment metadata:
+
+```bash
+A2A_PRO_MODEL=gpt-5.5
+A2A_PRO_PRICE=1.00
+A2A_PRO_PAY_TO=0x1111111111111111111111111111111111111111
+A2A_PRO_EXPIRES_DAYS=7
+```
+
+Only set `A2A_PRO_MODEL` / `requestedModel` to a model name supported by the local Codex or Claude CLI you will use for execution.
+
+Example requester payload:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "research-1",
+  "method": "message/send",
+  "params": {
+    "message": {
+      "role": "user",
+      "parts": [
+        {
+          "type": "text",
+          "text": "Research the current state of agent-to-agent paid deliverables and return a concise brief."
+        }
+      ],
+      "metadata": {
+        "viveworker": {
+          "mode": "x402-pro",
+          "requestedTier": "pro",
+          "requestedModel": "gpt-5.5",
+          "deliverableType": "research brief",
+          "payment": {
+            "price": "1.00",
+            "payTo": "0x1111111111111111111111111111111111111111"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+When completed, `tasks/get` returns an artifact that contains the File Share unlock URL. The requester can inspect the x402 requirement with:
+
+```bash
+npx viveworker share pay <unlock-url> --dry-run
+```
+
+Then they can unlock with their configured buyer wallet, for example `VIVEWORKER_BUYER_PRIVATE_KEY=0x... npx viveworker share pay <unlock-url> --output ./deliverable.html`.
+
 ### Key commands
 
 - `npx viveworker enable a2a --user-id <id>` — register with the relay via GitHub OAuth

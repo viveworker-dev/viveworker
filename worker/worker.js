@@ -903,6 +903,7 @@ async function handleMessageSend(env, request, userRecord, userId, rpcId, params
     messages: [message],
     artifacts: [],
     instruction,
+    metadata: message.metadata || params.metadata || {},
     callerInfo: {
       ip: request.headers.get("cf-connecting-ip") || "",
       userAgent: request.headers.get("user-agent") || "",

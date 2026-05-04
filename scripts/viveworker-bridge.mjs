@@ -14083,6 +14083,8 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
       provider: "a2a",
       instruction,
       messageText: responseText,
+      viveworker: task?.viveworker || entry?.viveworker || {},
+      paidDeliverable: task?.paidDeliverable || entry?.paidDeliverable || null,
       taskId: task?.id || "",
       taskStatus: task?.status || entry?.taskStatus || (kind === "a2a_task_result" ? "completed" : "submitted"),
       callerInfo: task?.callerInfo || {},
@@ -14734,7 +14736,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
         if (action === "approve") {
           // Resolve which executor to use.
           const available = runtime.a2aAvailableExecutors || { codex: false, claude: false };
-          const preference = requestedExecutor || state.a2aExecutorPreference || "ask";
+          const preference = requestedExecutor || task.viveworker?.requestedExecutor || state.a2aExecutorPreference || "ask";
           let executor;
           if (preference === "codex" && available.codex) executor = "codex";
           else if (preference === "claude" && available.claude) executor = "claude";
@@ -19613,6 +19615,10 @@ function buildConfig(cli) {
     a2aRelayUserId: cleanText(process.env.A2A_RELAY_USER_ID || ""),
     a2aRelaySecret: cleanText(process.env.A2A_RELAY_SECRET || ""),
     a2aRelayRegisterSecret: cleanText(process.env.A2A_RELAY_REGISTER_SECRET || ""),
+    a2aProModel: cleanText(process.env.A2A_PRO_MODEL || ""),
+    a2aProPrice: cleanText(process.env.A2A_PRO_PRICE || ""),
+    a2aProPayTo: cleanText(process.env.A2A_PRO_PAY_TO || ""),
+    a2aProExpiresDays: cleanText(process.env.A2A_PRO_EXPIRES_DAYS || "7"),
     // Remote-pairing relay (PWA off-LAN). Off by default — bridges that
     // never leave the trusted LAN don't need to open an outbound connection
     // to the relay. Toggle with REMOTE_PAIRING_ENABLED=true in

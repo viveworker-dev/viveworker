@@ -158,6 +158,90 @@ function extractTextFromParts(parts) {
     .trim();
 }
 
+function isPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function cleanMetadataText(value, maxLength = 500) {
+  return String(value ?? "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+const PRICE_REGEX = /^\d+(\.\d{1,6})?$/u;
+const ETH_ADDR_REGEX = /^0x[0-9a-fA-F]{40}$/u;
+
+function normalizeRequestedExecutor(value) {
+  const normalized = cleanMetadataText(value, 30).toLowerCase();
+  return normalized === "codex" || normalized === "claude" || normalized === "auto" ? normalized : "";
+}
+
+function normalizeRequestedTier(value) {
+  const normalized = cleanMetadataText(value, 50).toLowerCase();
+  if (normalized === "pro" || normalized === "pro-assisted" || normalized === "premium") {
+    return "pro";
+  }
+  if (normalized === "standard" || normalized === "free") {
+    return "standard";
+  }
+  return normalized || "";
+}
+
+function normalizePaymentSpec(source) {
+  const payment = isPlainObject(source?.payment) ? source.payment : source;
+  const price = cleanMetadataText(payment?.price ?? payment?.amount ?? payment?.amountUsdc ?? "", 30);
+  const payTo = cleanMetadataText(payment?.payTo ?? payment?.pay_to ?? payment?.recipient ?? "", 80);
+  if (!price && !payTo) {
+    return null;
+  }
+  if (!PRICE_REGEX.test(price) || !ETH_ADDR_REGEX.test(payTo)) {
+    return {
+      enabled: false,
+      invalid: true,
+      reason: "invalid-price-or-pay-to",
+      price,
+      payTo,
+    };
+  }
+  return {
+    enabled: true,
+    price,
+    payTo: payTo.toLowerCase(),
+    mode: cleanMetadataText(payment?.mode || source?.settlement || "x402", 40).toLowerCase() || "x402",
+  };
+}
+
+export function normalizeViveworkerTaskMetadata(metadata = {}) {
+  const root = isPlainObject(metadata) ? metadata : {};
+  const source = isPlainObject(root.viveworker) ? root.viveworker : root;
+  const mode = cleanMetadataText(source.mode || source.flow || "", 80).toLowerCase();
+  const requestedTier = normalizeRequestedTier(source.requestedTier || source.tier || source.qualityTier || source.modelTier);
+  const requestedExecutor = normalizeRequestedExecutor(source.requestedExecutor || source.executor);
+  const requestedModel = cleanMetadataText(source.requestedModel || source.model || "", 80);
+  const deliverableType = cleanMetadataText(source.deliverableType || source.deliverable || "research brief", 120);
+  const payment = normalizePaymentSpec(source);
+  const paidDeliverable =
+    mode === "x402-pro" ||
+    mode === "pay-per-unlock" ||
+    mode === "paid-unlock" ||
+    Boolean(payment);
+
+  if (!mode && !requestedTier && !requestedExecutor && !requestedModel && !paidDeliverable) {
+    return {};
+  }
+
+  return {
+    mode: mode || (paidDeliverable ? "x402-pro" : ""),
+    requestedTier,
+    requestedExecutor,
+    requestedModel,
+    deliverableType,
+    paidDeliverable,
+    payment,
+  };
+}
+
 function buildTaskResponse(task) {
   return {
     id: task.id,
@@ -269,6 +353,7 @@ async function handleMessageSend({
   const contextId = params.contextId || taskId();
   const token = historyToken(`a2a_task:${id}`);
   const now = Date.now();
+  const viveworker = normalizeViveworkerTaskMetadata(message.metadata || params.metadata || {});
 
   const task = {
     id,
@@ -279,6 +364,8 @@ async function handleMessageSend({
     messages: [message],
     artifacts: [],
     instruction,
+    metadata: message.metadata || params.metadata || {},
+    viveworker,
     callerInfo: {
       ip: req.socket?.remoteAddress || "",
       userAgent: req.headers["user-agent"] || "",
@@ -311,6 +398,7 @@ async function handleMessageSend({
         summary: cleanText(instruction).slice(0, 160),
         instruction,
         messageText: instruction,
+        viveworker,
         createdAtMs: now,
         readOnly: false,
         provider: "a2a",

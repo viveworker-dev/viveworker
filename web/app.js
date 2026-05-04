@@ -7088,6 +7088,29 @@ function renderA2ATaskDetail(detail, options = {}) {
   const statusBadge = !enabled && detail.kind === "a2a_task_result"
     ? `<span class="eyebrow-pill eyebrow-pill--subtle">${escapeHtml(L(statusKey))}</span>`
     : "";
+  const viveworkerTask = detail.viveworker || {};
+  const payment = viveworkerTask.payment || {};
+  const priceLabel = payment.price
+    ? `${payment.price} USDC`
+    : detail.paidDeliverable?.price
+      ? `${detail.paidDeliverable.price} USDC`
+      : "";
+  const paidDeliverableBlock = viveworkerTask.paidDeliverable || detail.paidDeliverable
+    ? `
+      <div class="reply-composer__context">
+        <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("a2a.task.paidDeliverable"))}</span>
+        <div class="reply-composer__context-body">
+          ${viveworkerTask.requestedTier ? `<p><strong>${escapeHtml(L("a2a.task.requestedTier"))}</strong>: ${escapeHtml(viveworkerTask.requestedTier)}</p>` : ""}
+          ${viveworkerTask.requestedExecutor ? `<p><strong>${escapeHtml(L("a2a.task.requestedExecutor"))}</strong>: ${escapeHtml(viveworkerTask.requestedExecutor)}</p>` : ""}
+          ${viveworkerTask.requestedModel ? `<p><strong>${escapeHtml(L("a2a.task.requestedModel"))}</strong>: ${escapeHtml(viveworkerTask.requestedModel)}</p>` : ""}
+          ${viveworkerTask.deliverableType ? `<p><strong>${escapeHtml(L("a2a.task.deliverableType"))}</strong>: ${escapeHtml(viveworkerTask.deliverableType)}</p>` : ""}
+          ${priceLabel ? `<p><strong>${escapeHtml(L("a2a.task.price"))}</strong>: ${escapeHtml(priceLabel)}</p>` : ""}
+          ${payment.payTo ? `<p><strong>${escapeHtml(L("a2a.task.payTo"))}</strong>: <code>${escapeHtml(payment.payTo)}</code></p>` : ""}
+          ${detail.paidDeliverable?.url ? `<p><strong>${escapeHtml(L("a2a.task.unlockUrl"))}</strong>: <a href="${escapeHtml(detail.paidDeliverable.url)}" target="_blank" rel="noopener">${escapeHtml(detail.paidDeliverable.url)}</a></p>` : ""}
+        </div>
+      </div>
+    `
+    : "";
 
   // Show executor selector when "ask" mode is active and both CLIs are available.
   const executors = state.session?.a2aExecutors || { codex: false, claude: false };
@@ -7129,6 +7152,7 @@ function renderA2ATaskDetail(detail, options = {}) {
           <span class="eyebrow-pill eyebrow-pill--quiet">${escapeHtml(L("a2a.task.eyebrow"))}</span>
           ${statusBadge}
           ${callerLine}
+          ${paidDeliverableBlock}
           <p class="muted reply-composer__description">${enabled ? escapeHtml(L("a2a.task.editHint")) : ""}</p>
         </div>
         <div class="reply-composer__instruction">
