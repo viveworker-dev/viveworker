@@ -1,1 +1,1 @@
-export const APP_BUILD_ID = "20260504-reply-idempotent";
+export const APP_BUILD_ID = "20260504-command-event-detail-v1";

@@ -456,6 +456,36 @@ test("after LAN fails, next call skips LAN entirely (sticky relay)", async () =>
   assert.equal(rpcCalls.fetch[1].path, "/api/second");
 });
 
+test("interactive GET can re-probe LAN inside sticky relay window", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("Failed to fetch") },
+    { mode: "ok", status: 200, body: '{"recovered":"lan"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls, clock } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async (req) => makeRpcResponse({
+        status: 200,
+        body: JSON.stringify({ via: "relay", path: req.path }),
+      }),
+    }),
+  });
+
+  await routedFetch("/api/first", {}, opts);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(rpcCalls.fetch.length, 1);
+
+  clock.advance(STICKY_HALF_MS);
+  const res = await routedFetch("/api/items/assistant_final/token", {}, {
+    ...opts,
+    probeLanWhileSticky: true,
+  });
+  assert.deepEqual(await res.json(), { recovered: "lan" });
+  assert.equal(fetchCalls.length, 2, "LAN should be re-probed for interactive detail fetches");
+  assert.equal(rpcCalls.fetch.length, 1, "relay should be skipped when the LAN probe succeeds");
+  assert.equal(__getTelemetry().stickyRelayUntilMs, 0);
+});
+
 const STICKY_HALF_MS = Math.floor(__STICKY_RELAY_MS / 2);
 
 test("after sticky window expires, LAN is re-probed", async () => {

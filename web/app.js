@@ -17,6 +17,7 @@ const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "c
 const EXTERNAL_TARGET_TABS = new Set(["inbox", "timeline", "diff"]);
 const EXTERNAL_TARGET_INBOX_SUBTABS = new Set(["pending", "completed"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
+const SCROLLABLE_CONTENT_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
@@ -37,7 +38,40 @@ const BOOT_SPLASH_STAGE = Object.freeze({
   establishing: 2,
   loading: 3,
 });
+const DETAIL_FETCH_TIMEOUT_MS = 12_000;
+const DETAIL_REFRESH_FALLBACK_TIMEOUT_MS = 2_500;
+const DETAIL_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
+const COMPLETION_REPLY_SEND_TIMEOUT_MS = 22_000;
+const COMPLETION_REPLY_OPTIMISTIC_SENT_MS = 1_600;
+const TIMELINE_REFRESH_TIMEOUT_MS = 8_000;
+const TIMELINE_POLL_TIMEOUT_MS = 4_500;
+const FAST_POLL_STEP_TIMEOUT_MS = 4_500;
+const TIMELINE_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
+const CLIENT_EVENT_REPORT_TIMEOUT_MS = 1_800;
+const TIMELINE_LIVE_REFRESH_TIMEOUT_MS = 2_000;
+const TIMELINE_LIVE_RETRY_MS = 5_000;
 const timelineImageObjectUrlCache = new Map();
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+async function runFastPollStep(label, fn, timeoutMs = FAST_POLL_STEP_TIMEOUT_MS) {
+  try {
+    await Promise.race([
+      Promise.resolve().then(fn),
+      wait(timeoutMs).then(() => {
+        const error = new Error(`${label}-poll-timeout`);
+        error.code = "poll-timeout";
+        throw error;
+      }),
+    ]);
+    return { label, ok: true };
+  } catch (error) {
+    console.warn(`[poll:${label}]`, error?.message || error);
+    return { label, ok: false };
+  }
+}
 
 const state = {
   session: null,
@@ -73,6 +107,7 @@ const state = {
   listScrollState: null,
   pendingListScrollRestore: false,
   threadFilterInteractionUntilMs: 0,
+  scrollableContentInteractionUntilMs: 0,
   diffThreadExpandedFiles: {},
   detailDiffExpanded: {},
   choiceLocalDrafts: {},
@@ -156,7 +191,16 @@ const state = {
 };
 
 let detailLoadSequence = 0;
+let timelineHydrationSequence = 0;
+let authenticatedPollInFlight = false;
 let hazbasePasskeyModulePromise = null;
+let lastTimelineRenderReportKey = "";
+let timelineLiveStream = null;
+let timelineLiveStreamRetryTimer = 0;
+let timelineLiveRefreshInFlight = false;
+let timelineLiveRefreshPending = false;
+let lastTimelineLiveRevision = 0;
+const reportedTimelineRenderTokens = new Set();
 
 async function loadHazbasePasskeyModule() {
   if (!hazbasePasskeyModulePromise) {
@@ -675,6 +719,8 @@ async function boot() {
     .then(async () => {
       if (!shouldDeferRenderForActiveInteraction()) {
         await renderShell();
+      } else {
+        renderDeferredInteractionShellUpdates();
       }
     })
     .catch(() => {});
@@ -686,55 +732,78 @@ async function boot() {
     .then(async () => {
       if (!shouldDeferRenderForActiveInteraction()) {
         await renderShell();
+      } else {
+        renderDeferredInteractionShellUpdates();
       }
     })
     .catch(() => {});
   syncDetectedLocalePreference().catch(() => {});
 
   setInterval(async () => {
-    if (!state.session?.authenticated) {
+    if (!state.session?.authenticated || authenticatedPollInFlight) {
       return;
     }
-    const consumedNotificationIntent = await consumePendingNotificationIntent();
-    if (consumedNotificationIntent) {
-      return;
-    }
-    // Split the poll tick into a fast local fan-out and a slow background
-    // fan-out. The fast calls are all in-memory bridge lookups (inbox,
-    // timeline, devices, push status, relay status) and typically resolve in
-    // under ~100 ms over localhost; rendering immediately after them keeps
-    // new user_message entries reaching the timeline within one scan tick.
-    // The slow calls — /api/inbox/diff (git subprocesses), moltbook scout
-    // status (cross-origin to moltbook.com on cache miss), and especially
-    // /api/share/status (10 s upstream timeout to share.viveworker.com) —
-    // used to gate the render on every poll, so a single share-worker
-    // cache miss stalled timeline updates for up to 10 seconds. Now they
-    // run in the background and trigger a second render when they resolve.
-    await Promise.all([
-      refreshInbox(),
-      refreshTimeline(),
-      refreshDevices(),
-      refreshPushStatus(),
-      fetchA2aRelayStatus(),
-    ]);
-    ensureCurrentSelection();
-    maybeAutoFocusClaudePending();
-    if (!shouldDeferRenderForActiveInteraction()) {
-      await renderShell();
-    }
+    authenticatedPollInFlight = true;
+    try {
+      const consumedNotificationIntent = await consumePendingNotificationIntent();
+      if (consumedNotificationIntent) {
+        return;
+      }
+      // Keep timeline freshness independent from secondary status probes.
+      // Remote relay reconnects can make one small API call wait for a full
+      // transport timeout; the timeline should still render on the next tick.
+      await Promise.all([
+        runFastPollStep(
+          "timeline",
+          () => refreshTimeline({ timeoutMs: TIMELINE_POLL_TIMEOUT_MS }),
+          TIMELINE_POLL_TIMEOUT_MS + 500,
+        ),
+        runFastPollStep(
+          "inbox",
+          () => refreshInbox({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+          FAST_POLL_STEP_TIMEOUT_MS + 500,
+        ),
+        runFastPollStep(
+          "devices",
+          () => refreshDevices({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+          FAST_POLL_STEP_TIMEOUT_MS + 500,
+        ),
+        runFastPollStep(
+          "push",
+          () => refreshPushStatus({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+          FAST_POLL_STEP_TIMEOUT_MS + 500,
+        ),
+        runFastPollStep(
+          "a2a-relay",
+          () => fetchA2aRelayStatus({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+          FAST_POLL_STEP_TIMEOUT_MS + 500,
+        ),
+      ]);
+      ensureCurrentSelection();
+      maybeAutoFocusClaudePending();
+      if (!shouldDeferRenderForActiveInteraction()) {
+        await renderShell();
+      } else {
+        renderDeferredInteractionShellUpdates();
+      }
 
-    Promise.allSettled([
-      refreshInboxDiff(),
-      fetchMoltbookScoutStatus(),
-      fetchA2aShareStatus(),
-      fetchRemotePairingStatus(),
-    ])
-      .then(async () => {
-        if (!shouldDeferRenderForActiveInteraction()) {
-          await renderShell();
-        }
-      })
-      .catch(() => {});
+      Promise.allSettled([
+        refreshInboxDiff(),
+        fetchMoltbookScoutStatus(),
+        fetchA2aShareStatus(),
+        fetchRemotePairingStatus(),
+      ])
+        .then(async () => {
+          if (!shouldDeferRenderForActiveInteraction()) {
+            await renderShell();
+          } else {
+            renderDeferredInteractionShellUpdates();
+          }
+        })
+        .catch(() => {});
+    } finally {
+      authenticatedPollInFlight = false;
+    }
   }, 3000);
 }
 
@@ -883,7 +952,11 @@ async function refreshAuthenticatedState() {
 // moltbook/a2a worker calls — the a2a share worker has a 10s timeout) and
 // runs in the background after the shell renders.
 async function refreshAuthenticatedStateLocal() {
-  await Promise.all([refreshInbox(), refreshTimeline(), refreshDevices()]);
+  await Promise.all([
+    refreshInbox({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+    refreshTimeline({ timeoutMs: TIMELINE_POLL_TIMEOUT_MS }),
+    refreshDevices({ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS }),
+  ]);
   ensureCurrentSelection();
 }
 
@@ -939,9 +1012,7 @@ async function refreshBootstrap() {
   syncCompletedThreadFilter();
   syncInboxSubtab();
 
-  state.timeline = await hydrateTimelinePayloadImages(bootstrap?.timeline || null);
-  syncTimelineThreadFilter();
-  syncTimelineKindFilter();
+  setTimelinePayload(bootstrap?.timeline || null, { hydrateImages: true, renderOnHydrate: false });
 
   const devicesPayload = bootstrap?.devices;
   state.devices = Array.isArray(devicesPayload?.devices) ? devicesPayload.devices : [];
@@ -1048,7 +1119,7 @@ function detectBrowserLocale() {
   return normalizeLocale(navigator.language || "") || DEFAULT_LOCALE;
 }
 
-async function refreshPushStatus() {
+async function refreshPushStatus(opts = {}) {
   const client = await getClientPushState();
   const { clientSubscription, ...clientStatus } = client;
   if (!state.session?.authenticated) {
@@ -1064,7 +1135,7 @@ async function refreshPushStatus() {
   }
 
   try {
-    let server = await apiGet("/api/push/status");
+    let server = await apiGet("/api/push/status", opts);
     if (
       server?.enabled === true &&
       server?.subscribed !== true &&
@@ -1076,8 +1147,8 @@ async function refreshPushStatus() {
           subscription: clientSubscription,
           userAgent: navigator.userAgent,
           standalone: isStandaloneMode(),
-        });
-        server = await apiGet("/api/push/status");
+        }, opts);
+        server = await apiGet("/api/push/status", opts);
       } catch {
         // Best effort: if the browser still has a local subscription, the
         // status row can reflect that while the enable action repairs it.
@@ -1114,13 +1185,13 @@ async function fetchMoltbookScoutStatus() {
   }
 }
 
-async function fetchA2aRelayStatus() {
+async function fetchA2aRelayStatus(opts = {}) {
   if (!state.session?.a2aRelayEnabled) {
     state.a2aRelayStatus = null;
     return;
   }
   try {
-    state.a2aRelayStatus = await apiGet("/api/a2a/relay-status");
+    state.a2aRelayStatus = await apiGet("/api/a2a/relay-status", opts);
   } catch {
     state.a2aRelayStatus = null;
   }
@@ -1204,8 +1275,8 @@ async function getClientPushState() {
   };
 }
 
-async function refreshInbox() {
-  const fast = await apiGet("/api/inbox");
+async function refreshInbox(opts = {}) {
+  const fast = await apiGet("/api/inbox", opts);
   // `/api/inbox` now returns only `{ pending, completed }`. The `diff`
   // half lives at `/api/inbox/diff` because it spawns `git` subprocesses
   // server-side and was blocking first paint of the completed/pending
@@ -1240,13 +1311,309 @@ async function refreshInboxDiff() {
   }
 }
 
-async function refreshTimeline() {
-  state.timeline = await hydrateTimelinePayloadImages(await apiGet("/api/timeline"));
-  syncTimelineThreadFilter();
-  syncTimelineKindFilter();
+async function refreshTimeline(opts = {}) {
+  const requestOpts = {
+    timeoutMs: TIMELINE_REFRESH_TIMEOUT_MS,
+    probeLanWhileSticky: true,
+    stickyLanProbeTimeoutMs: TIMELINE_STICKY_LAN_PROBE_TIMEOUT_MS,
+    ...opts,
+  };
+  setTimelinePayload(await apiGet("/api/timeline", requestOpts), { hydrateImages: true });
 }
 
-async function refreshDevices() {
+async function refreshTimelineDirectLan(opts = {}) {
+  setTimelinePayload(await apiGetDirectLan("/api/timeline", opts), { hydrateImages: true });
+}
+
+function closeTimelineLiveStream() {
+  if (timelineLiveStream) {
+    try {
+      timelineLiveStream.close();
+    } catch {}
+  }
+  timelineLiveStream = null;
+  if (timelineLiveStreamRetryTimer) {
+    clearTimeout(timelineLiveStreamRetryTimer);
+    timelineLiveStreamRetryTimer = 0;
+  }
+}
+
+function shouldUseTimelineLiveStream() {
+  if (!state.session?.authenticated || typeof EventSource !== "function") {
+    return false;
+  }
+  const telemetry = getRoutingTelemetry() || {};
+  return telemetry.lastRoute === "lan";
+}
+
+function scheduleTimelineLiveStreamRetry() {
+  if (timelineLiveStreamRetryTimer || !state.session?.authenticated) {
+    return;
+  }
+  timelineLiveStreamRetryTimer = setTimeout(() => {
+    timelineLiveStreamRetryTimer = 0;
+    syncTimelineLiveStream();
+  }, TIMELINE_LIVE_RETRY_MS);
+}
+
+function syncTimelineLiveStream() {
+  if (!state.session?.authenticated) {
+    closeTimelineLiveStream();
+    return;
+  }
+  if (timelineLiveStream) {
+    return;
+  }
+  if (!shouldUseTimelineLiveStream()) {
+    return;
+  }
+  try {
+    const stream = new EventSource("/api/timeline/stream");
+    timelineLiveStream = stream;
+    stream.addEventListener("hello", (event) => {
+      const data = parseTimelineLiveEvent(event);
+      lastTimelineLiveRevision = Math.max(lastTimelineLiveRevision, Number(data?.revision) || 0);
+    });
+    stream.addEventListener("timeline:update", (event) => {
+      const data = parseTimelineLiveEvent(event);
+      handleTimelineLiveUpdate(data).catch((err) => {
+        console.warn("[timeline-live]", err?.message || err);
+      });
+    });
+    stream.addEventListener("heartbeat", (event) => {
+      const data = parseTimelineLiveEvent(event);
+      lastTimelineLiveRevision = Math.max(lastTimelineLiveRevision, Number(data?.revision) || 0);
+    });
+    stream.onerror = () => {
+      if (timelineLiveStream === stream) {
+        closeTimelineLiveStream();
+        scheduleTimelineLiveStreamRetry();
+      }
+    };
+  } catch (err) {
+    console.warn("[timeline-live]", err?.message || err);
+    closeTimelineLiveStream();
+    scheduleTimelineLiveStreamRetry();
+  }
+}
+
+function parseTimelineLiveEvent(event) {
+  try {
+    return JSON.parse(event?.data || "{}");
+  } catch {
+    return null;
+  }
+}
+
+async function handleTimelineLiveUpdate(data) {
+  const revision = Number(data?.revision) || 0;
+  if (revision && revision <= lastTimelineLiveRevision) {
+    return;
+  }
+  lastTimelineLiveRevision = Math.max(lastTimelineLiveRevision, revision);
+  if (timelineLiveRefreshInFlight) {
+    timelineLiveRefreshPending = true;
+    return;
+  }
+  timelineLiveRefreshInFlight = true;
+  try {
+    do {
+      timelineLiveRefreshPending = false;
+      try {
+        await refreshTimelineDirectLan({ timeoutMs: TIMELINE_LIVE_REFRESH_TIMEOUT_MS });
+      } catch {
+        await refreshTimeline({
+          timeoutMs: TIMELINE_LIVE_REFRESH_TIMEOUT_MS,
+          probeLanWhileSticky: true,
+          stickyLanProbeTimeoutMs: TIMELINE_STICKY_LAN_PROBE_TIMEOUT_MS,
+        });
+      }
+      renderAfterBackgroundDataRefresh();
+    } while (timelineLiveRefreshPending);
+  } finally {
+    timelineLiveRefreshInFlight = false;
+  }
+}
+
+function setTimelinePayload(payload, options = {}) {
+  const requestId = ++timelineHydrationSequence;
+  const normalizedPayload = payload && typeof payload === "object" ? payload : null;
+  state.timeline = normalizedPayload;
+  syncTimelineThreadFilter();
+  syncTimelineKindFilter();
+  syncTimelineLiveStream();
+
+  if (options.hydrateImages !== true || !timelinePayloadHasImages(normalizedPayload)) {
+    return;
+  }
+
+  hydrateTimelinePayloadImages(normalizedPayload)
+    .then((hydrated) => {
+      if (requestId !== timelineHydrationSequence || !hydrated) {
+        return;
+      }
+      state.timeline = hydrated;
+      syncTimelineThreadFilter();
+      syncTimelineKindFilter();
+      if (options.renderOnHydrate === false || !state.session?.authenticated) {
+        return;
+      }
+      renderAfterBackgroundDataRefresh();
+    })
+    .catch(() => {});
+}
+
+function latestTimelineEntryForClientEvent() {
+  const entries = Array.isArray(state.timeline?.entries) ? state.timeline.entries : [];
+  return entries.length > 0 ? entries[0] : null;
+}
+
+function newlyRenderedTimelineTokensForClientEvent(visible) {
+  if (!visible) {
+    return [];
+  }
+  const entries = Array.isArray(state.timeline?.entries) ? state.timeline.entries : [];
+  const rendered = [];
+  for (const entry of entries.slice(0, 20)) {
+    const token = normalizeClientText(entry?.token || entry?.createdAtMs || "");
+    const kind = normalizeClientText(entry?.kind || "");
+    if (!token || !kind || reportedTimelineRenderTokens.has(token)) {
+      continue;
+    }
+    reportedTimelineRenderTokens.add(token);
+    rendered.push({
+      token,
+      kind,
+      createdAtMs: Number(entry?.createdAtMs) || 0,
+    });
+    if (rendered.length >= 5) {
+      break;
+    }
+  }
+  if (reportedTimelineRenderTokens.size > 500) {
+    const keep = new Set(entries.slice(0, 250).map((entry) => normalizeClientText(entry?.token || entry?.createdAtMs || "")).filter(Boolean));
+    for (const token of reportedTimelineRenderTokens) {
+      if (!keep.has(token)) {
+        reportedTimelineRenderTokens.delete(token);
+      }
+    }
+  }
+  return rendered;
+}
+
+function reportTimelineRendered(reason = "render") {
+  if (!state.session?.authenticated) {
+    return;
+  }
+  const latest = latestTimelineEntryForClientEvent();
+  if (!latest) {
+    return;
+  }
+  const latestToken = normalizeClientText(latest.token || latest.createdAtMs || "");
+  const latestKind = normalizeClientText(latest.kind || "");
+  if (!latestToken || !latestKind) {
+    return;
+  }
+  const desktop = isDesktopLayout();
+  const visible = state.currentTab === "timeline" && (desktop || !state.detailOpen);
+  const telemetry = getRoutingTelemetry() || {};
+  const route = normalizeClientText(telemetry.lastRoute || "unknown");
+  const renderedTokens = newlyRenderedTimelineTokensForClientEvent(visible);
+  const reportKey = [
+    latestKind,
+    latestToken,
+    state.currentTab,
+    visible ? "visible" : "hidden",
+    route,
+    renderedTokens.map((item) => item.token).join(","),
+  ].join(":");
+  if (lastTimelineRenderReportKey === reportKey) {
+    return;
+  }
+  lastTimelineRenderReportKey = reportKey;
+
+  const send = () => {
+    const latestNow = latestTimelineEntryForClientEvent();
+    if (!latestNow) {
+      return;
+    }
+    const telemetryNow = getRoutingTelemetry() || telemetry;
+    apiPost(
+      "/api/client-events",
+      {
+        type: "timeline-render",
+        reason,
+        latestToken: normalizeClientText(latestNow.token || latestNow.createdAtMs || ""),
+        latestKind: normalizeClientText(latestNow.kind || ""),
+        latestCreatedAtMs: Number(latestNow.createdAtMs) || 0,
+        renderedTokens,
+        entryCount: Array.isArray(state.timeline?.entries) ? state.timeline.entries.length : 0,
+        currentTab: state.currentTab,
+        visible,
+        route: normalizeClientText(telemetryNow.lastRoute || route || "unknown"),
+        clientAtMs: Date.now(),
+        appBuildId: APP_BUILD_ID,
+      },
+      {
+        timeoutMs: CLIENT_EVENT_REPORT_TIMEOUT_MS,
+        probeLanWhileSticky: false,
+        suppressRoutingStatus: true,
+      },
+    ).catch(() => {});
+  };
+
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(send);
+  } else {
+    queueMicrotask(send);
+  }
+}
+
+function timelinePayloadHasImages(payload) {
+  const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+  return entries.some((entry) => Array.isArray(entry?.imageUrls) && entry.imageUrls.length > 0);
+}
+
+function renderAfterBackgroundDataRefresh() {
+  ensureCurrentSelection();
+  if (shouldDeferRenderForActiveInteraction()) {
+    if (renderDeferredInteractionShellUpdates()) {
+      reportTimelineRendered("deferred-refresh");
+    }
+    return;
+  }
+  renderCurrentSurface();
+}
+
+async function refreshPrimaryTabData(tab = state.currentTab) {
+  if (tab === "inbox") {
+    await refreshInbox();
+    return;
+  }
+  if (tab === "timeline") {
+    await refreshTimeline();
+    return;
+  }
+  if (tab === "diff") {
+    await refreshInboxDiff();
+  }
+}
+
+function refreshPrimaryTabAfterNavigation(tab = state.currentTab) {
+  if (!state.session?.authenticated || tab === "settings") {
+    return;
+  }
+  refreshPrimaryTabData(tab)
+    .then(() => {
+      if (state.currentTab !== tab || state.currentTab === "settings") {
+        return;
+      }
+      renderAfterBackgroundDataRefresh();
+    })
+    .catch(() => {});
+}
+
+async function refreshDevices(opts = {}) {
   if (!state.session?.authenticated) {
     state.devices = [];
     state.deviceError = "";
@@ -1254,7 +1621,7 @@ async function refreshDevices() {
   }
 
   try {
-    const payload = await apiGet("/api/devices");
+    const payload = await apiGet("/api/devices", opts);
     state.devices = Array.isArray(payload?.devices) ? payload.devices : [];
     state.deviceError = "";
   } catch (error) {
@@ -1532,6 +1899,7 @@ function timelineKindFilterOptions() {
     { id: "messages", label: L("timeline.kindFilter.messages"), icon: "timeline" },
     { id: "suggestions", label: L("timeline.kindFilter.suggestions"), icon: "suggestions" },
     { id: "files", label: L("timeline.kindFilter.files"), icon: "file-event" },
+    { id: "commands", label: L("timeline.kindFilter.commands"), icon: "command" },
     { id: "approvals", label: L("timeline.kindFilter.approvals"), icon: "approval" },
     { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
     { id: "choices", label: L("timeline.kindFilter.choices"), icon: "choice" },
@@ -1569,6 +1937,8 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
       return kind === "ambient_suggestions";
     case "files":
       return kind === "file_event";
+    case "commands":
+      return kind === "command_event";
     case "approvals":
       return kind === "approval";
     case "plans":
@@ -1847,6 +2217,7 @@ async function logout({ revokeCurrentDeviceTrust = false } = {}) {
 }
 
 function resetAuthenticatedState() {
+  closeTimelineLiveStream();
   state.session = null;
   state.inbox = null;
   // Reset the diff-loaded flag so the next sign-in shows the skeleton
@@ -1903,23 +2274,25 @@ async function revokeTrustedDevice(deviceId) {
  * On a polling interval, that means a long line of code keeps snapping
  * back to the start while the reader is mid-line.
  *
- * `snapshotCodeBlockScrolls()` records each `.markdown pre`'s scrollLeft
+ * `snapshotScrollableContentScrolls()` records each scrollable code/diff
+ * block's scrollLeft
  * keyed by its trimmed textContent (so the key survives a fresh render
- * regardless of position in the DOM tree). `restoreCodeBlockScrolls()`
+ * regardless of position in the DOM tree). `restoreScrollableContentScrolls()`
  * walks the new DOM and restores any scrollLeft we still have a key for.
  *
  * Content-keyed matching is intentional: if the underlying code text
  * changes mid-scroll, the new <pre> is logically different and we let it
  * start at scrollLeft=0 rather than landing the reader somewhere unrelated.
  */
-// Markdown blocks the user can scroll horizontally — we preserve their
-// position across innerHTML rebuilds. <pre> for fenced code; <table> for
-// pipe-style markdown tables that exceed the viewport width.
-const MARKDOWN_SCROLL_SELECTORS = ".markdown pre, .markdown table";
+// Blocks the user can scroll horizontally — we preserve their position
+// across innerHTML rebuilds and defer background renders while the user is
+// actively scrolling/selecting them. <pre> for fenced code; <table> for
+// pipe-style markdown tables; `.detail-diff-viewer` for file diffs.
+const SCROLLABLE_CONTENT_SELECTORS = ".markdown pre, .markdown table, .detail-diff-viewer";
 
-function snapshotCodeBlockScrolls() {
+function snapshotScrollableContentScrolls() {
   if (typeof document === "undefined") return null;
-  const blocks = document.querySelectorAll(MARKDOWN_SCROLL_SELECTORS);
+  const blocks = document.querySelectorAll(SCROLLABLE_CONTENT_SELECTORS);
   if (blocks.length === 0) return null;
   const map = new Map();
   for (const el of blocks) {
@@ -1934,9 +2307,9 @@ function snapshotCodeBlockScrolls() {
   return map.size > 0 ? map : null;
 }
 
-function restoreCodeBlockScrolls(snapshot) {
+function restoreScrollableContentScrolls(snapshot) {
   if (!snapshot || typeof document === "undefined") return;
-  for (const el of document.querySelectorAll(MARKDOWN_SCROLL_SELECTORS)) {
+  for (const el of document.querySelectorAll(SCROLLABLE_CONTENT_SELECTORS)) {
     const key = el.textContent ? el.textContent.trim() : "";
     const saved = key ? snapshot.get(`${el.tagName}:${key}`) : null;
     if (!saved) continue;
@@ -1965,7 +2338,7 @@ async function renderShell() {
     .filter(Boolean)
     .join(" ");
 
-  const codeBlockScrollSnapshot = snapshotCodeBlockScrolls();
+  const scrollableContentSnapshot = snapshotScrollableContentScrolls();
 
   app.innerHTML = `
     <div class="${shellClassName}">
@@ -1995,8 +2368,9 @@ async function renderShell() {
   // Reapply any horizontal scroll the user dragged into a code block before
   // this re-render. Done after the imperative scroll resets above so they
   // can't fight each other.
-  restoreCodeBlockScrolls(codeBlockScrollSnapshot);
+  restoreScrollableContentScrolls(scrollableContentSnapshot);
   requestAnimationFrame(dismissBootSplash);
+  reportTimelineRendered("shell");
 }
 
 function applyPendingDetailScrollReset() {
@@ -2045,6 +2419,53 @@ function applyPendingSettingsScrollRestore() {
   });
 }
 
+function renderDeferredInteractionShellUpdates() {
+  if (typeof document === "undefined") {
+    return false;
+  }
+  if (state.currentTab === "settings") {
+    return false;
+  }
+  const desktop = isDesktopLayout();
+  // On mobile detail screens the list is intentionally not mounted, so the
+  // latest state will appear as soon as the user backs out. On desktop the
+  // list and detail are side-by-side, so updating only the list keeps new
+  // timeline/inbox cards flowing without disturbing the detail pane.
+  if (!desktop && state.detailOpen) {
+    return false;
+  }
+  if (isListSurfaceInteractionActive()) {
+    return false;
+  }
+  const listSurface = document.querySelector("[data-list-surface]");
+  if (!listSurface) {
+    return false;
+  }
+  const scrollLeft = listSurface.scrollLeft;
+  const scrollTop = listSurface.scrollTop;
+  listSurface.innerHTML = renderListPanel({
+    tab: state.currentTab,
+    entries: listEntriesForTab(state.currentTab),
+    desktop,
+  });
+  listSurface.scrollLeft = scrollLeft;
+  listSurface.scrollTop = scrollTop;
+  bindPartialListSurfaceInteractions(listSurface);
+  reportTimelineRendered("deferred-list");
+  return true;
+}
+
+function isListSurfaceInteractionActive() {
+  if (state.threadFilterInteractionUntilMs > Date.now() || state.timelineKindFilterOpen) {
+    return true;
+  }
+  if (typeof document === "undefined" || typeof Element === "undefined") {
+    return false;
+  }
+  const activeElement = document.activeElement;
+  return activeElement instanceof Element && Boolean(activeElement.closest("[data-list-surface]"));
+}
+
 function currentViewportScrollY() {
   return window.scrollY || window.pageYOffset || document.documentElement?.scrollTop || 0;
 }
@@ -2057,9 +2478,38 @@ function clearThreadFilterInteraction() {
   state.threadFilterInteractionUntilMs = 0;
 }
 
+function markScrollableContentInteraction() {
+  state.scrollableContentInteractionUntilMs = Date.now() + SCROLLABLE_CONTENT_INTERACTION_DEFER_MS;
+}
+
+function selectionIntersectsScrollableContent() {
+  if (typeof document === "undefined" || typeof Element === "undefined") {
+    return false;
+  }
+  const selection = document.getSelection?.();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return false;
+  }
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    const node = range.commonAncestorContainer;
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (element?.closest?.(SCROLLABLE_CONTENT_SELECTORS)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function shouldDeferRenderForActiveInteraction() {
   const activeElement = document.activeElement;
   if (state.completionReplySheetToken) {
+    return true;
+  }
+  if (state.scrollableContentInteractionUntilMs > Date.now()) {
+    return true;
+  }
+  if (selectionIntersectsScrollableContent()) {
     return true;
   }
   if (
@@ -2501,9 +2951,15 @@ async function fetchCurrentDetailForItem(itemRef = state.currentItem) {
   if (hasDetailOverride(itemRef)) {
     return state.detailOverride.detail;
   }
+  const detailUrl = `/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`;
   try {
     const detail = await hydrateDetailImages(
-      await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`)
+      await apiGet(detailUrl, {
+        timeoutMs: DETAIL_FETCH_TIMEOUT_MS,
+        probeLanWhileSticky: true,
+        stickyLanProbeTimeoutMs: DETAIL_STICKY_LAN_PROBE_TIMEOUT_MS,
+        preferRelayError: true,
+      })
     );
     if (hasLaunchItemIntent(itemRef)) {
       state.launchItemIntent.status = "loaded";
@@ -2516,16 +2972,24 @@ async function fetchCurrentDetailForItem(itemRef = state.currentItem) {
       renderPair();
       return null;
     }
-    await refreshInbox();
+    await Promise.race([
+      refreshInbox(),
+      wait(DETAIL_REFRESH_FALLBACK_TIMEOUT_MS),
+    ]).catch(() => {});
     try {
       const detail = await hydrateDetailImages(
-        await apiGet(`/api/items/${encodeURIComponent(itemRef.kind)}/${encodeURIComponent(itemRef.token)}`)
+        await apiGet(detailUrl, {
+          timeoutMs: DETAIL_FETCH_TIMEOUT_MS,
+          probeLanWhileSticky: true,
+          stickyLanProbeTimeoutMs: DETAIL_STICKY_LAN_PROBE_TIMEOUT_MS,
+          preferRelayError: true,
+        })
       );
       if (hasLaunchItemIntent(itemRef)) {
         state.launchItemIntent.status = "loaded";
       }
       return detail;
-    } catch {
+    } catch (retryError) {
       if (hasLaunchItemIntent(itemRef)) {
         clearChoiceLocalDraftForItem(itemRef);
         const fallbackDetail = buildLaunchItemFallbackDetail(itemRef);
@@ -2540,7 +3004,7 @@ async function fetchCurrentDetailForItem(itemRef = state.currentItem) {
       if (!state.currentItem) {
         return null;
       }
-      return null;
+      return buildDetailLoadErrorDetail(itemRef, retryError || error);
     }
   }
 }
@@ -2555,6 +3019,7 @@ function queueCurrentDetailLoad(itemRef = state.currentItem) {
 
   const requestedItem = { ...itemRef };
   const requestId = ++detailLoadSequence;
+  const hadRenderableDetailAtStart = Boolean(renderableCurrentDetail(requestedItem));
   state.currentDetailLoading = true;
   state.detailLoadingItem = requestedItem;
 
@@ -2581,6 +3046,16 @@ function queueCurrentDetailLoad(itemRef = state.currentItem) {
       }
       state.currentDetailLoading = false;
       state.detailLoadingItem = null;
+      const completedInitialDetailLoad =
+        !hadRenderableDetailAtStart &&
+        Boolean(state.currentDetail) &&
+        isSameItemRef(state.currentDetail, requestedItem) &&
+        Boolean(state.currentItem) &&
+        isSameItemRef(state.currentItem, requestedItem);
+      if (shouldDeferRenderForActiveInteraction() && !completedInitialDetailLoad) {
+        renderDeferredInteractionShellUpdates();
+        return;
+      }
       renderCurrentSurface();
     });
 }
@@ -2596,6 +3071,31 @@ function buildLaunchItemFallbackDetail(itemRef) {
     messageHtml: `<p>${escapeHtml(body)}</p><p>${escapeHtml(L("server.page.notFoundHint"))}</p>`,
     readOnly: true,
     actions: [],
+  };
+}
+
+function buildDetailLoadErrorDetail(itemRef, error) {
+  const snapshot = buildDetailLoadingSnapshot(itemRef) || {};
+  const entry = selectedEntryForItem(itemRef);
+  const item = entry?.item || {};
+  const fallbackText = normalizeClientText(item.messageText || item.summary || item.title || "");
+  const messageParts = [
+    fallbackText ? `<p>${escapeHtml(fallbackText)}</p>` : "",
+  ].filter(Boolean);
+  return {
+    kind: itemRef.kind,
+    token: itemRef.token,
+    title: item.title || snapshot.title || kindMeta(itemRef.kind).label,
+    threadId: item.threadId || "",
+    threadLabel: item.threadLabel || snapshot.threadLabel || "",
+    summary: item.summary || fallbackText || "",
+    messageHtml: messageParts.join(""),
+    provider: item.provider || normalizeProviderClient(item.provider) || "",
+    createdAtMs: Number(item.createdAtMs || snapshot.createdAtMs) || Date.now(),
+    readOnly: true,
+    actions: [],
+    loadError: true,
+    loadErrorMessage: normalizeClientText(error?.message || String(error || "")),
   };
 }
 
@@ -2663,7 +3163,7 @@ function renderDesktopWorkspace(detail) {
     (state.currentDetailLoading || !renderableCurrentDetail());
   return `
     <section class="desktop-workspace">
-      <aside class="surface surface--list">
+      <aside class="surface surface--list" data-list-surface>
         ${renderListPanel({
           tab: state.currentTab,
           entries,
@@ -2691,7 +3191,7 @@ function renderMobileWorkspace(detail) {
   }
 
   return `
-    <section class="screen-block">
+    <section class="screen-block" data-list-surface>
       ${renderListPanel({
         tab: state.currentTab,
         entries: listEntriesForTab(state.currentTab),
@@ -3272,15 +3772,17 @@ function renderTimelineEntry(entry, { desktop }) {
   const isMoltbookOrA2A = item.kind === "moltbook_reply" || item.kind === "moltbook_draft" || item.kind === "a2a_task" || item.kind === "a2a_task_result" || item.kind === "thread_share";
   const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || isMoltbookOrA2A;
   const isFileEvent = item.kind === "file_event";
+  const isCommandEvent = item.kind === "command_event";
   const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
   const fileRefs = normalizeClientFileRefs(item.fileRefs);
-  const primaryText = timelineEntryPrimaryText(item, entry.status, { isMessageLike, isFileEvent });
-  const secondaryText = timelineEntrySecondaryText(item, entry.status, primaryText, { isMessageLike, isFileEvent });
+  const primaryText = timelineEntryPrimaryText(item, entry.status, { isMessageLike, isFileEvent, isCommandEvent });
+  const secondaryText = timelineEntrySecondaryText(item, entry.status, primaryText, { isMessageLike, isFileEvent, isCommandEvent });
   const threadLabel = timelineEntryThreadLabel(item, isMessageLike);
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
   const statusLabel = timelineEntryStatusLabel(item, isMessageLike);
   const fileEventFileSummary = isFileEvent ? timelineFileEventFileSummary(item) : "";
   const fileEventDiffStatsHtml = isFileEvent ? renderDiffEntryStatsHtml(item) : "";
+  const commandEventCommand = isCommandEvent ? timelineCommandEventCommand(item) : "";
 
   return `
     <button
@@ -3303,6 +3805,7 @@ function renderTimelineEntry(entry, { desktop }) {
       ${threadLabel ? `<p class="timeline-entry__thread">${escapeHtml(threadLabel)}</p>` : ""}
       <div class="timeline-entry__body">
         <p class="timeline-entry__title">${escapeHtml(primaryText)}</p>
+        ${commandEventCommand ? `<pre class="timeline-entry__command"><code>${escapeHtml(commandEventCommand)}</code></pre>` : ""}
         ${secondaryText ? `<p class="timeline-entry__summary">${escapeHtml(secondaryText)}</p>` : ""}
         ${
           isFileEvent && fileEventFileSummary
@@ -3352,7 +3855,7 @@ function renderDiffEntry(entry) {
 }
 
 function timelineEntryStatusLabel(item, isMessageLike) {
-  if (isMessageLike || item?.kind === "file_event") {
+  if (isMessageLike || item?.kind === "file_event" || item?.kind === "command_event") {
     return "";
   }
 
@@ -3435,7 +3938,7 @@ function timelineEntryThreadLabel(item, isMessage) {
   return threadLabel || "";
 }
 
-function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileEvent = false } = {}) {
+function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileEvent = false, isCommandEvent = false } = {}) {
   if (item?.kind === "ambient_suggestions") {
     return item.summary || fallbackSummaryForKind(item.kind, status, item.provider);
   }
@@ -3448,10 +3951,14 @@ function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileE
     return fileEventTimelineCountLabel(item) || fallbackSummaryForKind(item.kind, status, item.provider);
   }
 
+  if (isCommandEvent) {
+    return L("common.commandEvent");
+  }
+
   return timelineDisplayTitleWithoutThread(item, { allowFallbackSummary: true }) || L("common.untitledItem");
 }
 
-function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike = false, isFileEvent = false } = {}) {
+function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike = false, isFileEvent = false, isCommandEvent = false } = {}) {
   if (item?.kind === "ambient_suggestions") {
     return "";
   }
@@ -3466,6 +3973,10 @@ function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike =
   }
 
   if (isFileEvent) {
+    return "";
+  }
+
+  if (isCommandEvent) {
     return "";
   }
 
@@ -3518,6 +4029,7 @@ function timelineGeneratedTitlePrefixes() {
     kindMeta("assistant_commentary").label,
     kindMeta("assistant_final").label,
     L("common.fileEvent"),
+    L("common.commandEvent"),
     "Approval",
     "Plan",
     "Choice",
@@ -3526,6 +4038,7 @@ function timelineGeneratedTitlePrefixes() {
     "Commentary",
     "Final answer",
     "Files",
+    "Command",
     "承認",
     "プラン",
     "選択",
@@ -3534,13 +4047,22 @@ function timelineGeneratedTitlePrefixes() {
     "途中経過",
     "最終回答",
     "ファイル",
+    "コマンド",
   ];
+}
+
+function timelineCommandEventCommand(item) {
+  return truncateUiText(firstMarkdownCodeFence(item?.messageText || "") || item?.summary || item?.title || "", 220);
 }
 
 function fileEventDisplayLabel(fileEventType) {
   switch (normalizeClientText(fileEventType || "")) {
     case "read":
       return L("fileEvent.read");
+    case "search":
+      return L("fileEvent.search");
+    case "command":
+      return L("fileEvent.command");
     case "write":
       return L("fileEvent.write");
     case "create":
@@ -3563,6 +4085,10 @@ function fileEventTimelineCountLabel(item) {
   switch (fileEventType) {
     case "read":
       return L("fileEvent.timeline.read", { count });
+    case "search":
+      return L("fileEvent.timeline.search", { count });
+    case "command":
+      return L("fileEvent.timeline.command", { count });
     case "write":
       return L("fileEvent.timeline.write", { count });
     case "create":
@@ -3611,7 +4137,7 @@ function diffThreadFilesSummary(item) {
     .map((entry) => fileChangeEntryLabel(entry))
     .filter(Boolean);
   if (labels.length === 0) {
-    return "";
+    return truncateUiText(firstMarkdownCodeFence(item?.messageText || "") || item?.summary || "");
   }
   const visibleLabels = labels.slice(0, 3);
   const hiddenCount = labels.length - visibleLabels.length;
@@ -6380,6 +6906,7 @@ function renderStandardDetailDesktop(detail) {
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
       <h2 class="detail-title detail-title--desktop">${renderDetailTitle(detail)}</h2>
+      ${renderDetailLoadErrorNotice(detail)}
       ${detail.readOnly || detail.kind === "approval" || detail.kind === "moltbook_draft" || detail.kind === "moltbook_reply" || detail.kind === "thread_share" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderAutoPilotManualReview(detail)}
@@ -6400,6 +6927,7 @@ function renderStandardDetailDesktop(detail) {
             </section>
           `
       }
+      ${renderCommandEventDetail(detail)}
       ${renderClaudePlanSection(detail)}
       ${renderClaudeQuestionSection(detail)}
       ${renderDetailImageGallery(detail)}
@@ -6422,6 +6950,7 @@ function renderStandardDetailMobile(detail) {
       <div class="detail-shell detail-shell--mobile">
         <div class="mobile-detail-scroll mobile-detail-scroll--detail">
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
+          ${renderDetailLoadErrorNotice(detail, { mobile: true })}
           ${renderPreviousContextCard(detail, { mobile: true })}
           ${renderAutoPilotManualReview(detail, { mobile: true })}
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
@@ -6442,6 +6971,7 @@ function renderStandardDetailMobile(detail) {
                 </section>
               `
           }
+          ${renderCommandEventDetail(detail, { mobile: true })}
           ${renderClaudePlanSection(detail, { mobile: true })}
           ${renderClaudeQuestionSection(detail, { mobile: true })}
           ${renderDetailImageGallery(detail, { mobile: true })}
@@ -6484,6 +7014,46 @@ function renderAmbientSuggestionsSection(detail, options = {}) {
   `;
 }
 
+function renderCommandEventDetail(detail, options = {}) {
+  if (detail?.kind !== "command_event") {
+    return "";
+  }
+  const commandText = normalizeClientText(detail?.commandText || "");
+  if (!commandText) {
+    return "";
+  }
+  return `
+    <section class="detail-card detail-card--command ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-files-card__header">
+        <span class="detail-files-card__icon" aria-hidden="true">${renderIcon("command")}</span>
+        <span>${escapeHtml(L("common.commandEvent"))}</span>
+      </div>
+      <pre class="detail-command-block"><code>${escapeHtml(commandText)}</code></pre>
+    </section>
+  `;
+}
+
+function renderDetailLoadErrorNotice(detail, options = {}) {
+  if (detail?.loadError !== true) {
+    return "";
+  }
+  const errorText = normalizeClientText(detail.loadErrorMessage || "");
+  return `
+    <section class="detail-card detail-card--body ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-body markdown">
+        <p><strong>${escapeHtml(L("detail.loadFailedTitle"))}</strong></p>
+        <p>${escapeHtml(L("detail.loadFailedCopy"))}</p>
+        ${errorText ? `<p class="muted">${escapeHtml(errorText)}</p>` : ""}
+      </div>
+      <div class="actions actions--stack">
+        <button class="secondary secondary--wide" type="button" data-detail-retry>
+          ${escapeHtml(L("detail.loadRetry"))}
+        </button>
+      </div>
+    </section>
+  `;
+}
+
 function renderAmbientSuggestionCard(detail, suggestion, index) {
   const copyKey = ambientSuggestionCopyKey(detail?.token || "", suggestion?.id || "", index);
   const copyStatus = state.ambientSuggestionCopyState?.key === copyKey
@@ -6516,7 +7086,7 @@ function renderAmbientSuggestionCard(detail, suggestion, index) {
 }
 
 function renderDetailPlainIntro(detail, options = {}) {
-  if (!["approval", "diff_thread", "file_event"].includes(detail?.kind || "")) {
+  if (!["approval", "diff_thread", "file_event", "command_event"].includes(detail?.kind || "")) {
     return "";
   }
   const ak = normalizeClientText(detail?.approvalKind || "");
@@ -7863,6 +8433,8 @@ function renderTabButtons({ buttonClass, withIcons }) {
 }
 
 function bindShellInteractions() {
+  bindScrollableContentRenderDeferral();
+
   for (const button of document.querySelectorAll("[data-tab]")) {
     button.addEventListener("click", async () => {
       await switchTab(button.dataset.tab);
@@ -8108,14 +8680,31 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-detail-retry]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!state.currentItem) {
+        return;
+      }
+      state.currentDetail = null;
+      state.currentDetailLoading = false;
+      state.detailLoadingItem = null;
+      queueCurrentDetailLoad(state.currentItem);
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-back-to-list]")) {
     button.addEventListener("click", async () => {
+      const nextTab = state.currentTab;
       clearChoiceLocalDraftForItem(state.currentItem);
       state.detailOpen = false;
       state.pendingListScrollRestore = !isDesktopLayout() && Boolean(state.listScrollState);
       clearPinnedDetailState();
       syncCurrentItemUrl(null);
       await renderShell();
+      refreshPrimaryTabAfterNavigation(nextTab);
     });
   }
 
@@ -9292,9 +9881,43 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         for (const attachment of attachments) {
           requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
         }
-        const replyKind = replyForm.dataset.replyKind || "completion";
         const sentNotice = L(draft.mode === "plan" ? "reply.notice.sentPlan" : "reply.notice.sentDefault", { provider: providerDisplayName(replyProvider) });
-        await apiPost(`/api/items/${encodeURIComponent(replyKind)}/${encodeURIComponent(token)}/reply`, requestBody);
+        const renderOptimisticSent = () => {
+          const currentDraft = getCompletionReplyDraft(token);
+          if (!currentDraft.sending || currentDraft.text !== text) {
+            return;
+          }
+          setCompletionReplyDraft(token, {
+            text: "",
+            sentText: text,
+            attachments: currentDraft.attachments,
+            mode: draft.mode,
+            sending: false,
+            error: "",
+            notice: sentNotice,
+            warning: null,
+            confirmOverride: false,
+            collapsedAfterSend: true,
+          });
+          renderShell().catch((renderError) => {
+            console.warn("[completion-reply-optimistic-render]", renderError?.message || renderError);
+          });
+        };
+        const optimisticSentTimer = setTimeout(renderOptimisticSent, COMPLETION_REPLY_OPTIMISTIC_SENT_MS);
+        let replyResult = null;
+        try {
+          const replyKind = replyForm.dataset.replyKind || "completion";
+          replyResult = await apiPost(
+            `/api/items/${encodeURIComponent(replyKind)}/${encodeURIComponent(token)}/reply`,
+            requestBody,
+            {
+              timeoutMs: COMPLETION_REPLY_SEND_TIMEOUT_MS,
+              preferRelayError: true,
+            },
+          );
+        } finally {
+          clearTimeout(optimisticSentTimer);
+        }
         setCompletionReplyDraft(token, {
           text: "",
           sentText: text,
@@ -9307,8 +9930,26 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
           confirmOverride: false,
           collapsedAfterSend: true,
         });
-        await refreshAuthenticatedState();
+        if (replyResult?.ackTimeout === true) {
+          console.info("[completion-reply] accepted after slow Codex ACK");
+        }
+        await renderShell();
+        refreshAuthenticatedState()
+          .then(renderShell)
+          .catch((refreshError) => console.warn("[completion-reply-refresh]", refreshError?.message || refreshError));
+        return;
       } catch (error) {
+        const optimisticDraft = getCompletionReplyDraft(token);
+        if (
+          error.errorKey === "request-timeout" &&
+          optimisticDraft.collapsedAfterSend &&
+          optimisticDraft.sentText === text
+        ) {
+          refreshAuthenticatedState()
+            .then(renderShell)
+            .catch((refreshError) => console.warn("[completion-reply-refresh]", refreshError?.message || refreshError));
+          return;
+        }
         if (error.errorKey === "completion-reply-thread-advanced") {
           if (completionReplyWarningMatchesSentText(error, text, attachments.length)) {
             setCompletionReplyDraft(token, {
@@ -9323,8 +9964,10 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
               confirmOverride: false,
               collapsedAfterSend: true,
             });
-            await refreshAuthenticatedState();
             await renderShell();
+            refreshAuthenticatedState()
+              .then(renderShell)
+              .catch((refreshError) => console.warn("[completion-reply-refresh]", refreshError?.message || refreshError));
             return;
           }
           setCompletionReplyDraft(token, {
@@ -9530,6 +10173,143 @@ function bindSharedUi(renderFn) {
   }
 }
 
+function bindScrollableContentRenderDeferral() {
+  const mark = () => {
+    markScrollableContentInteraction();
+  };
+  for (const el of document.querySelectorAll(SCROLLABLE_CONTENT_SELECTORS)) {
+    el.addEventListener("scroll", mark, { passive: true });
+    el.addEventListener("wheel", mark, { passive: true });
+    el.addEventListener("touchstart", mark, { passive: true });
+    el.addEventListener("touchmove", mark, { passive: true });
+    el.addEventListener("pointerdown", mark);
+    el.addEventListener("copy", mark);
+  }
+}
+
+function bindPartialListSurfaceInteractions(listSurface) {
+  if (!listSurface || listSurface.dataset.partialListInteractionsBound === "true") {
+    return;
+  }
+  listSurface.dataset.partialListInteractionsBound = "true";
+
+  const targetElement = (event) => {
+    const target = event.target;
+    return target instanceof Element ? target : target?.parentElement || null;
+  };
+  const threadSelectSelector = "[data-timeline-thread-select], [data-diff-thread-select], [data-completed-thread-select]";
+
+  listSurface.addEventListener("pointerdown", (event) => {
+    if (targetElement(event)?.closest(threadSelectSelector)) {
+      markThreadFilterInteraction();
+    }
+  });
+  listSurface.addEventListener("focusin", (event) => {
+    if (targetElement(event)?.closest(threadSelectSelector)) {
+      markThreadFilterInteraction();
+    }
+  });
+  listSurface.addEventListener("focusout", (event) => {
+    if (targetElement(event)?.closest(threadSelectSelector)) {
+      clearThreadFilterInteraction();
+    }
+  });
+
+  listSurface.addEventListener("change", async (event) => {
+    const target = targetElement(event);
+    const timelineSelect = target?.closest("[data-timeline-thread-select]");
+    const diffSelect = target?.closest("[data-diff-thread-select]");
+    const completedSelect = target?.closest("[data-completed-thread-select]");
+    if (!timelineSelect && !diffSelect && !completedSelect) {
+      return;
+    }
+    clearThreadFilterInteraction();
+    if (timelineSelect) {
+      state.timelineThreadFilter = timelineSelect.value || "all";
+      state.timelineKindFilterOpen = false;
+    } else if (diffSelect) {
+      state.diffThreadFilter = diffSelect.value || "all";
+    } else if (completedSelect) {
+      state.completedThreadFilter = completedSelect.value || "all";
+    }
+    alignCurrentItemToVisibleEntries();
+    await renderShell();
+  });
+
+  listSurface.addEventListener("click", async (event) => {
+    const target = targetElement(event);
+    const threadSelect = target?.closest(threadSelectSelector);
+    if (threadSelect) {
+      markThreadFilterInteraction();
+      return;
+    }
+
+    const providerButton = target?.closest("[data-provider-filter]");
+    if (providerButton) {
+      event.preventDefault();
+      const next = providerButton.dataset.providerFilter || "all";
+      if (state.providerFilter === next) {
+        return;
+      }
+      state.providerFilter = next;
+      state.timelineThreadFilter = "all";
+      state.timelineKindFilter = "all";
+      state.timelineKindFilterOpen = false;
+      state.completedThreadFilter = "all";
+      state.diffThreadFilter = "all";
+      alignCurrentItemToVisibleEntries();
+      await renderShell();
+      return;
+    }
+
+    const kindToggle = target?.closest("[data-timeline-kind-filter-toggle]");
+    if (kindToggle) {
+      event.preventDefault();
+      markThreadFilterInteraction();
+      state.timelineKindFilterOpen = !state.timelineKindFilterOpen;
+      await renderShell();
+      return;
+    }
+
+    const kindOption = target?.closest("[data-timeline-kind-filter-option]");
+    if (kindOption) {
+      event.preventDefault();
+      clearThreadFilterInteraction();
+      state.timelineKindFilter = kindOption.dataset.timelineKindFilterOption || "all";
+      state.timelineKindFilterOpen = false;
+      alignCurrentItemToVisibleEntries();
+      await renderShell();
+      return;
+    }
+
+    const subtabButton = target?.closest("[data-inbox-subtab]");
+    if (subtabButton) {
+      const nextSubtab = subtabButton.dataset.inboxSubtab === "completed" ? "completed" : "pending";
+      if (nextSubtab === state.inboxSubtab) {
+        return;
+      }
+      state.inboxSubtab = nextSubtab;
+      if (isDesktopLayout()) {
+        alignCurrentItemToVisibleEntries();
+        syncCurrentItemUrl(state.currentItem);
+      }
+      await renderShell();
+      return;
+    }
+
+    const itemButton = target?.closest("[data-open-item-kind][data-open-item-token]");
+    if (itemButton) {
+      openItem({
+        kind: itemButton.dataset.openItemKind,
+        token: itemButton.dataset.openItemToken,
+        sourceTab: itemButton.dataset.sourceTab,
+        sourceSubtab: itemButton.dataset.sourceSubtab,
+      });
+      await renderShell();
+    }
+  });
+}
+
 function openSettingsSubpage(page) {
   if (!page) {
     return;
@@ -9571,6 +10351,7 @@ async function switchTab(tab) {
     syncCurrentItemUrl(state.currentItem);
   }
   await renderShell();
+  refreshPrimaryTabAfterNavigation(tab);
   if (tab === "settings") {
     void fetchHazbaseStatus()
       .then(() => {
@@ -9767,6 +10548,8 @@ function kindMeta(kind, item) {
       return { label: L("common.diff"), tone: "neutral", icon: "diff" };
     case "file_event":
       return { label: L("common.fileEvent"), tone: "neutral", icon: "file-event" };
+    case "command_event":
+      return { label: L("common.commandEvent"), tone: "neutral", icon: "command" };
     case "moltbook_reply":
       return { label: L("common.moltbookReply"), tone: "neutral", icon: "moltbook-comment" };
     case "moltbook_draft":
@@ -9798,6 +10581,9 @@ function itemIntentText(kind, status = "pending", provider) {
   }
   if (kind === "file_event") {
     return L("intent.fileEvent");
+  }
+  if (kind === "command_event") {
+    return L("intent.commandEvent");
   }
   if (kind === "ambient_suggestions") {
     return L("intent.ambientSuggestions");
@@ -9834,6 +10620,9 @@ function detailIntentText(detail) {
     return itemIntentText(detail.kind, "diff", provider);
   }
   if (detail.kind === "file_event") {
+    return itemIntentText(detail.kind, "timeline", provider);
+  }
+  if (detail.kind === "command_event") {
     return itemIntentText(detail.kind, "timeline", provider);
   }
   if (detail.kind === "ambient_suggestions") {
@@ -9909,6 +10698,8 @@ function fallbackSummaryForKind(kind, status, provider) {
       return L("summary.diffThread");
     case "file_event":
       return L("summary.fileEvent", vars);
+    case "command_event":
+      return L("summary.commandEvent", vars);
     case "ambient_suggestions":
       return L("summary.ambientSuggestions", { count: 0, firstTitle: "", more: 0 });
     case "user_message":
@@ -10131,6 +10922,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4.5" width="14" height="15" rx="2.5"/><path d="M8.5 9h7"/><path d="M8.5 12h7"/><path d="M8.5 15h4.5"/></svg>`;
     case "file-event":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3.8h5.9l4.3 4.3v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-12.3a2 2 0 0 1 2-2Z"/><path d="M13.9 3.8v4.3h4.3"/><path d="M9.2 13.1h5.6"/><path d="M9.2 16.2h4"/></svg>`;
+    case "command":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4.2" y="5" width="15.6" height="14" rx="2.6"/><path d="m7.8 10 2.4 2-2.4 2"/><path d="M12.2 14h4"/></svg>`;
     case "diff":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 5.5v13"/><path d="M4.8 8.2 7.5 5.5 10.2 8.2"/><path d="M16.5 18.5v-13"/><path d="m13.8 15.8 2.7 2.7 2.7-2.7"/><path d="M11.8 7.5h1.2"/><path d="M11 12h2.8"/><path d="M11.8 16.5h1.2"/></svg>`;
     case "pending":
@@ -10435,32 +11228,107 @@ function pruneTimelineImageObjectUrlCache() {
   }
 }
 
+function withRequestTimeout(init, opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs) || 0;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || typeof AbortController === "undefined") {
+    return { init, cleanup: () => {} };
+  }
+  if (init.signal?.aborted) {
+    return { init, cleanup: () => {} };
+  }
+  const controller = new AbortController();
+  let timer = null;
+  const externalAbortHandler = init.signal
+    ? () => controller.abort(init.signal.reason)
+    : null;
+  if (init.signal && externalAbortHandler) {
+    init.signal.addEventListener("abort", externalAbortHandler, { once: true });
+  }
+  timer = setTimeout(() => {
+    const error = new Error("request-timeout");
+    error.name = "AbortError";
+    controller.abort(error);
+  }, timeoutMs);
+  return {
+    init: { ...init, signal: controller.signal },
+    cleanup: () => {
+      if (timer) clearTimeout(timer);
+      if (init.signal && externalAbortHandler) {
+        init.signal.removeEventListener("abort", externalAbortHandler);
+      }
+    },
+  };
+}
+
+function normalizeRequestError(error, opts = {}) {
+  if (error?.name === "AbortError" && Number(opts.timeoutMs) > 0) {
+    const timeoutError = new Error(L("error.requestTimedOut"));
+    timeoutError.code = 0;
+    timeoutError.status = 0;
+    timeoutError.errorKey = "request-timeout";
+    return timeoutError;
+  }
+  return error;
+}
+
 async function apiGet(url, opts = {}) {
   // routedFetch tries LAN first, then falls back to the relay tunnel when
   // the phone is off-LAN. Returns a fetch-Response-compatible object so the
   // rest of this function is identical to a plain `fetch()` call.
-  const response = await routedFetch(url, {
+  const timed = withRequestTimeout({
     credentials: "same-origin",
     headers: {
       Accept: "application/json",
     },
   }, opts);
-  if (!response.ok) {
-    const errorInfo = await readError(response);
-    const error = new Error(errorInfo.message);
-    error.code = response.status;
-    error.status = response.status;
-    error.errorKey = errorInfo.errorKey || "";
-    throw error;
+  try {
+    const response = await routedFetch(url, timed.init, opts);
+    if (!response.ok) {
+      const errorInfo = await readError(response);
+      const error = new Error(errorInfo.message);
+      error.code = response.status;
+      error.status = response.status;
+      error.errorKey = errorInfo.errorKey || "";
+      throw error;
+    }
+    return await response.json();
+  } catch (error) {
+    throw normalizeRequestError(error, opts);
+  } finally {
+    timed.cleanup();
   }
-  return response.json();
 }
 
-async function apiPost(url, body) {
+async function apiGetDirectLan(url, opts = {}) {
+  const timed = withRequestTimeout({
+    credentials: "same-origin",
+    headers: {
+      Accept: "application/json",
+    },
+  }, opts);
+  try {
+    const response = await fetch(url, timed.init);
+    if (!response.ok) {
+      const errorInfo = await readError(response);
+      const error = new Error(errorInfo.message);
+      error.code = response.status;
+      error.status = response.status;
+      error.errorKey = errorInfo.errorKey || "";
+      throw error;
+    }
+    return await response.json();
+  } catch (error) {
+    throw normalizeRequestError(error, opts);
+  } finally {
+    timed.cleanup();
+  }
+}
+
+async function apiPost(url, body, opts = {}) {
   const isFormDataBody = typeof FormData !== "undefined" && body instanceof FormData;
   // Keep native FormData for LAN; routedFetch serializes it to multipart
   // bytes only when the request has to travel through the remote relay.
-  const response = await routedFetch(url, {
+  const timed = withRequestTimeout({
     method: "POST",
     credentials: "same-origin",
     headers: isFormDataBody
@@ -10472,17 +11340,24 @@ async function apiPost(url, body) {
           Accept: "application/json",
         },
     body: isFormDataBody ? body : JSON.stringify(body || {}),
-  });
-  if (!response.ok) {
-    const errorInfo = await readError(response);
-    const error = new Error(errorInfo.message);
-    error.code = response.status;
-    error.status = response.status;
-    error.errorKey = errorInfo.errorKey || "";
-    error.payload = errorInfo.payload ?? null;
-    throw error;
+  }, opts);
+  try {
+    const response = await routedFetch(url, timed.init, opts);
+    if (!response.ok) {
+      const errorInfo = await readError(response);
+      const error = new Error(errorInfo.message);
+      error.code = response.status;
+      error.status = response.status;
+      error.errorKey = errorInfo.errorKey || "";
+      error.payload = errorInfo.payload ?? null;
+      throw error;
+    }
+    return await response.json();
+  } catch (error) {
+    throw normalizeRequestError(error, opts);
+  } finally {
+    timed.cleanup();
   }
-  return response.json();
 }
 
 async function readError(response) {
@@ -10510,6 +11385,7 @@ function localizeApiError(value) {
     "device-not-found": "error.deviceNotFound",
     "web-push-disabled": "error.webPushDisabled",
     "push-subscription-expired": "error.pushSubscriptionExpired",
+    "request-timeout": "error.requestTimedOut",
     "item-not-found": "error.itemNotFound",
     "completion-reply-unavailable": "error.completionReplyUnavailable",
     "completion-reply-thread-advanced": "error.completionReplyThreadAdvanced",
