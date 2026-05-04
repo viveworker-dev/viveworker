@@ -98,6 +98,7 @@ const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
  * LAN is the fast path, and slow/unreachable LAN should become relay.
  */
 const DEFAULT_LAN_TIMEOUT_MS = 2_500;
+const DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
 const PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
 const PAIRING_STATE_SCHEMA_VERSION = 2;
 const PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
@@ -524,6 +525,18 @@ async function attemptLanFetch(url, init, opts) {
   }
 }
 
+async function attemptStickyLanProbe(url, init, opts) {
+  const probeTimeoutMs = opts.stickyLanProbeTimeoutMs ?? DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS;
+  const lan = await attemptLanFetch(url, init, {
+    ...opts,
+    lanTimeoutMs: probeTimeoutMs,
+  });
+  if (lan.ok) {
+    _stickyRelayUntilMs = 0;
+  }
+  return lan;
+}
+
 function abortError(signal) {
   if (signal?.reason instanceof Error) {
     const err = signal.reason;
@@ -783,6 +796,8 @@ function nowMs(opts) {
  *   onRouteStatus?: (event: { phase: string, atMs: number, url?: string, sticky?: boolean, reason?: string, state?: string, previousState?: string, code?: number, resumed?: boolean }) => void,
  *   suppressRoutingStatus?: boolean,
  *   preferRelayError?: boolean,
+ *   probeLanWhileSticky?: boolean,
+ *   stickyLanProbeTimeoutMs?: number,
  * }} [opts]
  * @returns {Promise<{
  *   ok: boolean,
@@ -798,6 +813,10 @@ export async function routedFetch(url, init = {}, opts = {}) {
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
+    if (opts.probeLanWhileSticky === true) {
+      const lan = await attemptStickyLanProbe(url, init, opts);
+      if (lan.ok) return lan.response;
+    }
     emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: true });
     const r = await attemptRelayFetch(url, init, opts);
     if (r.ok) return r.response;

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { promises as fs, readFileSync, createReadStream } from "node:fs";
+import { promises as fs, readFileSync, createReadStream, watch as watchFs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -55,7 +55,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
+const timelineKinds = new Set([...timelineMessageKinds, "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "command_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -64,7 +64,9 @@ const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const REMOTE_PAIRING_RELAY_TOKEN_ROTATION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_COMPLETION_REPLY_ACK_TIMEOUT_MS = 1200;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
+const COMPLETION_PUSH_CONTENT_DEDUPE_WINDOW_MS = 2 * 60 * 1000;
 const HAZBASE_METADATA_TIMEOUT_MS = 1500;
 const NPM_VERSION_CHECK_TIMEOUT_MS = 2500;
 const NPM_VERSION_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -270,6 +272,15 @@ const runtime = {
   recentHistoryItems: [],
   recentTimelineEntries: [],
   recentCodeEvents: [],
+  timelineBus: null,
+  timelineRevision: 0,
+  timelineLiveWatchers: [],
+  timelineLiveScanTimer: null,
+  timelineLiveScanInFlight: false,
+  timelineLiveScanReschedule: false,
+  timelineLiveScanReasons: new Set(),
+  timelineLiveClaudeFiles: new Set(),
+  timelineLiveRolloutFiles: new Set(),
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
   remotePairingHandle: null,
@@ -517,6 +528,8 @@ function kindTitle(locale, kind) {
       return t(locale, "server.title.complete");
     case "file_event":
       return t(locale, "common.fileEvent");
+    case "command_event":
+      return t(locale, "common.commandEvent");
     case "diff_thread":
       return t(locale, "common.diff");
     case "a2a_task":
@@ -816,13 +829,17 @@ function normalizeTimelineOutcome(value) {
 
 function normalizeTimelineFileEventType(value) {
   const normalized = cleanText(value || "").toLowerCase();
-  return ["read", "write", "create", "delete", "rename"].includes(normalized) ? normalized : "";
+  return ["read", "search", "command", "write", "create", "delete", "rename"].includes(normalized) ? normalized : "";
 }
 
 function fileEventTitle(locale, fileEventType) {
   switch (normalizeTimelineFileEventType(fileEventType)) {
     case "read":
       return t(locale, "fileEvent.read");
+    case "search":
+      return t(locale, "fileEvent.search");
+    case "command":
+      return t(locale, "fileEvent.command");
     case "write":
       return t(locale, "fileEvent.write");
     case "create":
@@ -841,6 +858,10 @@ function fileEventDetailCopy(locale, fileEventType, provider) {
   switch (normalizeTimelineFileEventType(fileEventType)) {
     case "read":
       return t(locale, "detail.fileEvent.read", vars);
+    case "search":
+      return t(locale, "detail.fileEvent.search", vars);
+    case "command":
+      return t(locale, "detail.fileEvent.command", vars);
     case "write":
       return t(locale, "detail.fileEvent.write", vars);
     case "create":
@@ -1548,6 +1569,87 @@ function extractCommandLineFromFunctionOutput(outputText) {
   return unwrapShellCommand(match?.[1] || "");
 }
 
+function parseToolArgumentsJson(value) {
+  if (isPlainObject(value)) {
+    return value;
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const parsed = safeJsonParse(value);
+  return isPlainObject(parsed) ? parsed : null;
+}
+
+function commandBaseName(command) {
+  const normalized = cleanText(command || "");
+  if (!normalized) {
+    return "";
+  }
+  return path.basename(normalized);
+}
+
+function classifyTimelineCommand(commandText) {
+  const normalizedCommand = unwrapShellCommand(commandText);
+  const tokens = tokenizeShellWords(normalizedCommand);
+  if (tokens.length === 0) {
+    return {
+      fileEventType: "command",
+      command: "",
+      commandText: normalizedCommand,
+      fileRefs: [],
+    };
+  }
+
+  const command = commandBaseName(tokens[0]);
+  const gitSubcommand = command === "git" ? cleanText(tokens[1] || "") : "";
+  let fileEventType = "command";
+  if (["rg", "grep", "ag", "ack", "fd", "find"].includes(command) || gitSubcommand === "grep") {
+    fileEventType = "search";
+  } else if (
+    ["cat", "sed", "nl", "head", "tail", "wc", "ls", "pwd", "less", "more"].includes(command) ||
+    (command === "git" && ["status", "diff", "show", "log", "ls-files", "branch"].includes(gitSubcommand))
+  ) {
+    fileEventType = "read";
+  }
+
+  return {
+    fileEventType,
+    command,
+    commandText: normalizedCommand,
+    fileRefs: extractReadFileRefsFromCommand(normalizedCommand),
+  };
+}
+
+function redactTimelineCommandText(commandText) {
+  return cleanText(commandText || "")
+    .replace(/((?:--)?(?:api[-_]?key|token|secret|password|credential)(?:=|\s+))(["']?)[^\s"']+\2/giu, "$1[redacted]")
+    .replace(/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=)(["']?)[^\s"']+\2/giu, "$1[redacted]");
+}
+
+function timelineCommandMessage(locale, { commandText = "", toolName = "", fileRefs = [] } = {}) {
+  const commandBlock = commandText
+    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${redactTimelineCommandText(commandText)}\n\`\`\``
+    : "";
+  const toolBlock = !commandBlock && toolName
+    ? `${t(locale, "server.message.toolLabel")}\n\`\`\`text\n${cleanText(toolName)}\n\`\`\``
+    : "";
+  const files = normalizeTimelineFileRefs(fileRefs);
+  const filesBlock = files.length
+    ? `${t(locale, "server.message.filesLabel")}\n\`\`\`text\n${files.join("\n")}\n\`\`\``
+    : "";
+  return [commandBlock || toolBlock, filesBlock].filter(Boolean).join("\n\n");
+}
+
+function timelineCommandSummary(commandText, fallback = "") {
+  const redacted = redactTimelineCommandText(commandText);
+  return truncate(singleLine(redacted || fallback || ""), 180);
+}
+
+function firstMarkdownCodeFenceText(text) {
+  const match = String(text || "").match(/```(?:\w+)?\n([\s\S]*?)\n```/u);
+  return cleanText(match?.[1] || "");
+}
+
 function extractReadFileRefsFromCommand(commandText) {
   const normalizedCommand = unwrapShellCommand(commandText);
   const tokens = tokenizeShellWords(normalizedCommand);
@@ -1774,6 +1876,36 @@ function rememberApplyPatchInput(fileState, payload, createdAtMs = Date.now()) {
     }
     fileState.applyPatchInputsByCallId.delete(oldestKey);
   }
+}
+
+function rememberToolEventInput(fileState, payload, createdAtMs = Date.now()) {
+  const callId = cleanText(payload?.call_id || payload?.callId || payload?.id || "");
+  if (!callId) {
+    return null;
+  }
+  if (!(fileState.toolEventInputsByCallId instanceof Map)) {
+    fileState.toolEventInputsByCallId = new Map();
+  }
+  const stored = {
+    callId,
+    name: cleanText(payload?.name || ""),
+    arguments: parseToolArgumentsJson(payload?.arguments),
+    createdAtMs: Number(createdAtMs) || Date.now(),
+  };
+  fileState.toolEventInputsByCallId.set(callId, stored);
+  while (fileState.toolEventInputsByCallId.size > 128) {
+    const oldestKey = fileState.toolEventInputsByCallId.keys().next().value;
+    fileState.toolEventInputsByCallId.delete(oldestKey);
+  }
+  return stored;
+}
+
+function findStoredToolEventInput(fileState, callId) {
+  const normalizedCallId = cleanText(callId || "");
+  if (!normalizedCallId || !(fileState?.toolEventInputsByCallId instanceof Map)) {
+    return null;
+  }
+  return fileState.toolEventInputsByCallId.get(normalizedCallId) || null;
 }
 
 async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath }) {
@@ -2180,6 +2312,7 @@ async function ensureRolloutFileState(runtime, threadId, rolloutFilePath) {
     threadId: cleanText(threadId || ""),
     cwd: await findRolloutThreadCwd(runtime, threadId || ""),
     applyPatchInputsByCallId: new Map(),
+    toolEventInputsByCallId: new Map(),
     startupCutoffMs: 0,
     skipPartialLine: false,
   };
@@ -3253,6 +3386,8 @@ function timelineKindSortPriority(kind) {
       return 60;
     case "ambient_suggestions":
       return 52;
+    case "command_event":
+      return 46;
     case "file_event":
       return 45;
     case "assistant_final":
@@ -3275,7 +3410,9 @@ function normalizeTimelineEntry(raw) {
   }
 
   const stableId = cleanText(raw.stableId ?? raw.id ?? "");
-  const kind = cleanText(raw.kind ?? "");
+  const rawKind = cleanText(raw.kind ?? "");
+  const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
+  const kind = rawKind === "file_event" && fileEventType === "command" ? "command_event" : rawKind;
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
   if (!stableId || !timelineKinds.has(kind)) {
     return null;
@@ -3284,7 +3421,6 @@ function normalizeTimelineEntry(raw) {
   const threadId = cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? "");
   const rawMessageText = raw.messageText ?? "";
   const messageText = normalizeTimelineMessageText(rawMessageText);
-  const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
   const diffText = normalizeTimelineDiffText(raw.diffText ?? "");
   const diffSource = normalizeTimelineDiffSource(raw.diffSource ?? "");
   const diffCounts = diffLineCounts(diffText);
@@ -3376,7 +3512,78 @@ function normalizeTimelineEntry(raw) {
   return shouldHideInternalTimelineItem(normalized) ? null : normalized;
 }
 
-function recordTimelineEntry({ config, runtime, state, entry }) {
+class TimelineBus {
+  constructor() {
+    this.clients = new Set();
+  }
+
+  addClient(client) {
+    this.clients.add(client);
+    return () => {
+      this.clients.delete(client);
+    };
+  }
+
+  emit(eventName, payload) {
+    for (const client of [...this.clients]) {
+      try {
+        client.send(eventName, payload);
+      } catch {
+        try {
+          client.close?.();
+        } catch {}
+        this.clients.delete(client);
+      }
+    }
+  }
+
+  closeAll() {
+    for (const client of [...this.clients]) {
+      try {
+        client.close?.();
+      } catch {}
+    }
+    this.clients.clear();
+  }
+}
+
+function ensureTimelineBus(runtime) {
+  if (!runtime.timelineBus) {
+    runtime.timelineBus = new TimelineBus();
+  }
+  return runtime.timelineBus;
+}
+
+function buildTimelineUpdatePayload({ runtime, entry, source = "unknown" }) {
+  runtime.timelineRevision = (Number(runtime.timelineRevision) || 0) + 1;
+  return {
+    revision: runtime.timelineRevision,
+    token: cleanText(entry?.token || historyToken(entry?.stableId || entry?.createdAtMs || "")).slice(0, 120),
+    stableId: cleanText(entry?.stableId || "").slice(0, 180),
+    kind: cleanText(entry?.kind || "").slice(0, 80),
+    provider: cleanText(entry?.provider || "").slice(0, 40),
+    threadId: cleanText(entry?.threadId || "").slice(0, 120),
+    createdAtMs: Number(entry?.createdAtMs) || 0,
+    source: cleanText(source || "unknown").slice(0, 80),
+    ingestAtMs: Date.now(),
+  };
+}
+
+function publishTimelineUpdate({ config, runtime, entry, source = "unknown" }) {
+  if (!config?.timelineLiveSync || !runtime || !entry) {
+    return;
+  }
+  const payload = buildTimelineUpdatePayload({ runtime, entry, source });
+  console.log(
+    `[timeline-ingest] at=${new Date(payload.ingestAtMs).toISOString()} ` +
+    `provider=${payload.provider || "unknown"} kind=${payload.kind || "unknown"} ` +
+    `token=${payload.token || "none"} createdAtMs=${payload.createdAtMs || 0} ` +
+    `source=${payload.source || "unknown"} revision=${payload.revision}`
+  );
+  ensureTimelineBus(runtime).emit("timeline:update", payload);
+}
+
+function recordTimelineEntry({ config, runtime, state, entry, source = "unknown" }) {
   const normalized = normalizeTimelineEntry(entry);
   if (!normalized) {
     return false;
@@ -3393,6 +3600,10 @@ function recordTimelineEntry({ config, runtime, state, entry }) {
   const changed = timelineProjectionChanged(nextItems, runtime.recentTimelineEntries, [
     "stableId",
     "title",
+    "summary",
+    "messageText",
+    "fileEventType",
+    "fileRefs",
     "createdAtMs",
     "diffAvailable",
     "diffSource",
@@ -3403,6 +3614,9 @@ function recordTimelineEntry({ config, runtime, state, entry }) {
   ]);
   runtime.recentTimelineEntries = nextItems;
   state.recentTimelineEntries = nextItems;
+  if (changed) {
+    publishTimelineUpdate({ config, runtime, entry: normalized, source });
+  }
   return changed;
 }
 
@@ -3521,6 +3735,18 @@ function historyItemFromEvent(event) {
     primaryLabel: "詳細",
     tone: "secondary",
   });
+}
+
+function completionPushContentDedupeId(event) {
+  if (!event || event.kind !== "task_complete") {
+    return "";
+  }
+  const threadId = cleanText(event.threadId ?? event.conversationId ?? "unknown") || "unknown";
+  const messageText = normalizeLongText(event.detailText || event.message || "");
+  if (!messageText) {
+    return "";
+  }
+  return `task_complete_content:${threadId}:${historyToken(messageText)}`;
 }
 
 function recordHistoryItem({ config, runtime, state, item }) {
@@ -3685,6 +3911,7 @@ function recordActionHistoryItem({
     runtime,
     state,
     entry: item,
+    source: "event",
   });
   return historyChanged || timelineChanged;
 }
@@ -3844,7 +4071,20 @@ function pushDeliveryKey(deviceId, stableId) {
   return `${cleanText(deviceId || "")}:${cleanText(stableId || "")}`;
 }
 
-async function deliverWebPushItem({ config, state, kind, token, stableId, title, body, tab = "", subtab = "", buildLocalizedContent = null }) {
+async function deliverWebPushItem({
+  config,
+  state,
+  kind,
+  token,
+  stableId,
+  title,
+  body,
+  tab = "",
+  subtab = "",
+  buildLocalizedContent = null,
+  dedupeId = "",
+  dedupeWindowMs = 0,
+}) {
   if (!config.webPushEnabled || config.dryRun) {
     return false;
   }
@@ -3861,8 +4101,18 @@ async function deliverWebPushItem({ config, state, kind, token, stableId, title,
   let changed = false;
 
   for (const subscription of subscriptions) {
-    const deliveryKey = pushDeliveryKey(subscription.deviceId, stableId);
-    if (state.pushDeliveries[deliveryKey]) {
+    const now = Date.now();
+    const stableDeliveryKey = pushDeliveryKey(subscription.deviceId, stableId);
+    const dedupeDeliveryKey = pushDeliveryKey(subscription.deviceId, dedupeId || stableId);
+    const stableDeliveredAt = Number(state.pushDeliveries[stableDeliveryKey]) || 0;
+    const dedupeDeliveredAt = Number(state.pushDeliveries[dedupeDeliveryKey]) || 0;
+    if (stableDeliveredAt) {
+      continue;
+    }
+    if (
+      dedupeDeliveredAt &&
+      (!dedupeWindowMs || now - dedupeDeliveredAt <= Math.max(0, Number(dedupeWindowMs) || 0))
+    ) {
       continue;
     }
 
@@ -3890,8 +4140,10 @@ async function deliverWebPushItem({ config, state, kind, token, stableId, title,
         },
         payload
       );
-      const now = Date.now();
-      state.pushDeliveries[deliveryKey] = now;
+      state.pushDeliveries[stableDeliveryKey] = now;
+      if (dedupeDeliveryKey !== stableDeliveryKey) {
+        state.pushDeliveries[dedupeDeliveryKey] = now;
+      }
       trimSeenEvents(state.pushDeliveries, config.maxSeenEvents * 4);
       const stored = normalizePushSubscriptionRecord(state.pushSubscriptions?.[subscription.id]);
       if (stored) {
@@ -4043,6 +4295,207 @@ async function scanOnce({ config, runtime, state }) {
   return dirty;
 }
 
+function isPathWithin(parentDir, candidatePath) {
+  const parent = path.resolve(parentDir || "");
+  const candidate = path.resolve(candidatePath || "");
+  if (!parent || !candidate) return false;
+  return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
+}
+
+function isClaudeTranscriptPath(config, filePath) {
+  return Boolean(
+    filePath &&
+    filePath.endsWith(".jsonl") &&
+    isPathWithin(config.claudeProjectsDir, filePath)
+  );
+}
+
+function isRolloutFilePath(filePath) {
+  const base = path.basename(filePath || "");
+  return base.startsWith("rollout-") && base.endsWith(".jsonl");
+}
+
+function watchedEventPath(root, filename) {
+  if (!filename) return root;
+  const text = Buffer.isBuffer(filename) ? filename.toString("utf8") : String(filename);
+  if (!text) return root;
+  return path.isAbsolute(text) ? text : path.join(root, text);
+}
+
+function addTimelineLiveWatcher({ runtime, label, targetPath, options = {}, onChange }) {
+  if (!targetPath) return;
+  try {
+    const watcher = watchFs(targetPath, options, (_eventType, filename) => {
+      onChange(watchedEventPath(targetPath, filename));
+    });
+    watcher.on?.("error", (err) => {
+      console.warn(`[timeline-live-watch-error] ${label} ${err?.message || err}`);
+    });
+    runtime.timelineLiveWatchers.push(watcher);
+    console.log(`[timeline-live-watch] ${label} ${targetPath}`);
+  } catch (err) {
+    console.warn(`[timeline-live-watch-skip] ${label} ${targetPath} ${err?.message || err}`);
+  }
+}
+
+function scheduleTimelineLiveScan({ config, runtime, state, reason = "unknown", filePath = "" }) {
+  if (!config.timelineLiveSync || runtime.stopping) {
+    return;
+  }
+  runtime.timelineLiveScanReasons.add(cleanText(reason || "unknown").slice(0, 80));
+  const normalizedPath = cleanText(filePath || "");
+  if (isClaudeTranscriptPath(config, normalizedPath)) {
+    runtime.timelineLiveClaudeFiles.add(normalizedPath);
+  } else if (isRolloutFilePath(normalizedPath)) {
+    runtime.timelineLiveRolloutFiles.add(normalizedPath);
+  }
+
+  if (runtime.timelineLiveScanTimer) {
+    return;
+  }
+  runtime.timelineLiveScanTimer = setTimeout(() => {
+    runtime.timelineLiveScanTimer = null;
+    runPendingTimelineLiveScan({ config, runtime, state }).catch((err) => {
+      console.warn(`[timeline-live-scan-error] ${err?.message || err}`);
+    });
+  }, Math.max(25, Number(config.timelineLiveDebounceMs) || 150));
+  runtime.timelineLiveScanTimer.unref?.();
+}
+
+async function runPendingTimelineLiveScan({ config, runtime, state }) {
+  if (runtime.timelineLiveScanInFlight) {
+    runtime.timelineLiveScanReschedule = true;
+    return;
+  }
+  runtime.timelineLiveScanInFlight = true;
+  const reasons = new Set(runtime.timelineLiveScanReasons);
+  const claudeFiles = [...runtime.timelineLiveClaudeFiles];
+  const rolloutFiles = [...runtime.timelineLiveRolloutFiles];
+  runtime.timelineLiveScanReasons.clear();
+  runtime.timelineLiveClaudeFiles.clear();
+  runtime.timelineLiveRolloutFiles.clear();
+
+  let dirty = false;
+  const now = Date.now();
+  try {
+    if (reasons.has("codex-home") || reasons.has("codex-history") || reasons.has("codex-logs")) {
+      if (!config.codexLogsDbFile) {
+        const latestLogsDbFile = await findLatestCodexLogsDbFile(config.codexHome);
+        if (latestLogsDbFile && latestLogsDbFile !== runtime.logsDbFile) {
+          runtime.logsDbFile = latestLogsDbFile;
+        }
+      }
+      dirty = (await processHistoryTimelineFile({ config, runtime, state, now })) || dirty;
+      if (config.notifyCompletions || config.webUiEnabled) {
+        dirty = (await processSqliteCompletionLog({ config, runtime, state, now })) || dirty;
+      }
+      if (config.webUiEnabled) {
+        dirty = (await processSqliteTimelineLog({ config, runtime, state, now })) || dirty;
+      }
+    }
+
+    for (const filePath of rolloutFiles.slice(0, 12)) {
+      if (!runtime.knownFiles.includes(filePath)) {
+        runtime.knownFiles.push(filePath);
+        runtime.knownFiles.sort();
+      }
+      dirty = (await processRolloutFile({ filePath, config, runtime, state, now })) || dirty;
+    }
+
+    let claudeTranscriptChanged = false;
+    let claudeTargets = claudeFiles;
+    if (reasons.has("claude-dir") && claudeTargets.length === 0) {
+      claudeTargets = await listClaudeTranscriptFiles(config.claudeProjectsDir, config.claudeTranscriptMaxAgeMs);
+    }
+    for (const filePath of claudeTargets.slice(0, 24)) {
+      if (!runtime.claudeKnownFiles.includes(filePath)) {
+        runtime.claudeKnownFiles.push(filePath);
+      }
+      const changed = await processClaudeTranscriptFile({ filePath, config, runtime, state, now });
+      claudeTranscriptChanged = claudeTranscriptChanged || changed;
+      dirty = dirty || changed;
+    }
+    if (claudeTranscriptChanged) {
+      dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
+    }
+
+    if (dirty) {
+      scheduleSaveState(config, state);
+    }
+  } finally {
+    runtime.timelineLiveScanInFlight = false;
+    if (runtime.timelineLiveScanReschedule || runtime.timelineLiveScanReasons.size > 0) {
+      runtime.timelineLiveScanReschedule = false;
+      scheduleTimelineLiveScan({ config, runtime, state, reason: "reschedule" });
+    }
+  }
+}
+
+function startTimelineLiveSync({ config, runtime, state }) {
+  if (config.dryRun || !config.webUiEnabled || !config.timelineLiveSync) {
+    return null;
+  }
+
+  addTimelineLiveWatcher({
+    runtime,
+    label: "codex-home",
+    targetPath: config.codexHome,
+    onChange: (filePath) => {
+      const base = path.basename(filePath || "");
+      if (filePath === config.historyFile || base === path.basename(config.historyFile || "")) {
+        scheduleTimelineLiveScan({ config, runtime, state, reason: "codex-history", filePath });
+        return;
+      }
+      if (/^logs(?:_\d+)?\.sqlite(?:-wal|-shm)?$/u.test(base)) {
+        scheduleTimelineLiveScan({ config, runtime, state, reason: "codex-logs", filePath });
+      }
+    },
+  });
+
+  addTimelineLiveWatcher({
+    runtime,
+    label: "codex-sessions",
+    targetPath: config.sessionsDir,
+    options: { recursive: true },
+    onChange: (filePath) => {
+      if (isRolloutFilePath(filePath)) {
+        scheduleTimelineLiveScan({ config, runtime, state, reason: "codex-rollout", filePath });
+      }
+    },
+  });
+
+  addTimelineLiveWatcher({
+    runtime,
+    label: "claude-projects",
+    targetPath: config.claudeProjectsDir,
+    options: { recursive: true },
+    onChange: (filePath) => {
+      scheduleTimelineLiveScan({
+        config,
+        runtime,
+        state,
+        reason: isClaudeTranscriptPath(config, filePath) ? "claude-file" : "claude-dir",
+        filePath,
+      });
+    },
+  });
+
+  return {
+    close() {
+      if (runtime.timelineLiveScanTimer) {
+        clearTimeout(runtime.timelineLiveScanTimer);
+        runtime.timelineLiveScanTimer = null;
+      }
+      for (const watcher of runtime.timelineLiveWatchers.splice(0)) {
+        try {
+          watcher.close();
+        } catch {}
+      }
+      runtime.timelineBus?.closeAll?.();
+    },
+  };
+}
+
 async function processRolloutFile({ filePath, config, runtime, state, now }) {
   let stat;
   try {
@@ -4066,6 +4519,7 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
       threadId: extractThreadIdFromRolloutPath(filePath),
       cwd: null,
       applyPatchInputsByCallId: new Map(),
+      toolEventInputsByCallId: new Map(),
       startupCutoffMs:
         typeof restoredOffset === "number" ? 0 : now - config.replaySeconds * 1000,
       skipPartialLine:
@@ -4143,6 +4597,7 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
             runtime,
             state,
             entry: timelineEntry,
+            source: "codex-rollout",
           }) || dirty;
       }
 
@@ -4160,6 +4615,7 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
             runtime,
             state,
             entry: fileTimelineEntry,
+            source: "codex-rollout",
           }) || dirty;
         dirty =
           recordCodeEvent({
@@ -4346,6 +4802,109 @@ async function listClaudeTranscriptFiles(claudeProjectsDir, maxAgeMs = 0) {
   }
 }
 
+function buildClaudeToolTimelineEntries({ content, threadId, threadLabel, uuid, createdAtMs, cwd }) {
+  if (!Array.isArray(content) || !threadId) {
+    return [];
+  }
+
+  const entries = [];
+  for (const block of content) {
+    if (!isPlainObject(block) || block.type !== "tool_use") {
+      continue;
+    }
+    const toolName = cleanText(block.name || "");
+    const input = isPlainObject(block.input) ? block.input : {};
+    const toolId = cleanText(block.id || block.tool_use_id || "") || historyToken(JSON.stringify(block));
+    const callId = `${uuid || createdAtMs}:${toolId}`;
+    const lowerToolName = toolName.toLowerCase();
+
+    if (lowerToolName === "bash") {
+      const commandText = cleanText(input.command || "");
+      if (!commandText) {
+        continue;
+      }
+      const classified = classifyTimelineCommand(commandText);
+      entries.push(
+        buildToolTimelineEntry({
+          provider: "claude",
+          threadId,
+          threadLabel,
+          callId,
+          createdAtMs,
+          fileEventType: classified.fileEventType,
+          commandText: classified.commandText || commandText,
+          fileRefs: classified.fileRefs,
+          cwd,
+        })
+      );
+      continue;
+    }
+
+    if (["write", "edit", "multiedit", "todowrite", "exitplanmode", "askuserquestion"].includes(lowerToolName)) {
+      continue;
+    }
+
+    if (lowerToolName === "read") {
+      const fileRefs = normalizeTimelineFileRefs([input.file_path || input.path || input.filePath].filter(Boolean));
+      entries.push(
+        buildToolTimelineEntry({
+          provider: "claude",
+          threadId,
+          threadLabel,
+          callId,
+          createdAtMs,
+          fileEventType: "read",
+          toolName,
+          summaryText: fileRefs[0] ? `${toolName}: ${fileRefs[0]}` : toolName,
+          fileRefs,
+          cwd,
+        })
+      );
+      continue;
+    }
+
+    if (["grep", "glob", "websearch", "webfetch"].includes(lowerToolName)) {
+      const query = cleanText(input.pattern || input.query || input.url || "");
+      const fileRefs = normalizeTimelineFileRefs([input.path || input.file_path || input.filePath].filter(Boolean));
+      entries.push(
+        buildToolTimelineEntry({
+          provider: "claude",
+          threadId,
+          threadLabel,
+          callId,
+          createdAtMs,
+          fileEventType: "search",
+          toolName,
+          summaryText: query ? `${toolName}: ${query}` : toolName,
+          fileRefs,
+          cwd,
+        })
+      );
+      continue;
+    }
+
+    if (lowerToolName === "ls") {
+      const fileRefs = normalizeTimelineFileRefs([input.path].filter(Boolean));
+      entries.push(
+        buildToolTimelineEntry({
+          provider: "claude",
+          threadId,
+          threadLabel,
+          callId,
+          createdAtMs,
+          fileEventType: "read",
+          toolName,
+          summaryText: fileRefs[0] ? `${toolName}: ${fileRefs[0]}` : toolName,
+          fileRefs,
+          cwd,
+        })
+      );
+    }
+  }
+
+  return entries.filter(Boolean);
+}
+
 async function processClaudeTranscriptFile({ filePath, config, runtime, state, now }) {
   let fileState = runtime.claudeFileStates.get(filePath);
   if (!fileState) {
@@ -4461,6 +5020,20 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
     const claudeTitle = threadId ? runtime.claudeSessionTitles.get(threadId) || "" : "";
     const threadLabel = claudeTitle || fileState.threadLabel || "";
 
+    if (type === "assistant" && Array.isArray(content)) {
+      const toolEntries = buildClaudeToolTimelineEntries({
+        content,
+        threadId,
+        threadLabel,
+        uuid,
+        createdAtMs,
+        cwd: fileState.cwd,
+      });
+      for (const toolEntry of toolEntries) {
+        dirty = recordTimelineEntry({ config, runtime, state, entry: toolEntry, source: "claude-tool" }) || dirty;
+      }
+    }
+
     let text = "";
     if (typeof content === "string") {
       text = content;
@@ -4516,7 +5089,7 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
       provider: "claude",
     });
     if (entry) {
-      dirty = recordTimelineEntry({ config, runtime, state, entry }) || dirty;
+      dirty = recordTimelineEntry({ config, runtime, state, entry, source: "claude-transcript" }) || dirty;
 
       // Also record Claude assistant_final as a history item for the completed list
       if (kind === "assistant_final") {
@@ -4825,6 +5398,7 @@ async function processSqliteTimelineLog({ config, runtime, state, now }) {
           runtime,
           state,
           entry,
+          source: "codex-sqlite",
         }) || dirty;
 
       // Also record Codex assistant_final as a history item so it appears
@@ -4976,6 +5550,7 @@ async function processHistoryTimelineFile({ config, runtime, state, now }) {
         runtime,
         state,
         entry,
+        source: "codex-history",
       }) || dirty;
   }
 
@@ -5150,6 +5725,7 @@ async function backfillRecentTimelineEntryDiffs({ config, runtime, state }) {
         threadId: cleanText(entry?.threadId || ""),
         cwd: await findRolloutThreadCwd(runtime, entry?.threadId || ""),
         applyPatchInputsByCallId: new Map(),
+        toolEventInputsByCallId: new Map(),
         startupCutoffMs: 0,
         skipPartialLine: false,
       };
@@ -5722,6 +6298,47 @@ function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
   });
 }
 
+function buildToolTimelineEntry({
+  provider,
+  threadId,
+  threadLabel,
+  callId,
+  createdAtMs,
+  fileEventType,
+  commandText = "",
+  toolName = "",
+  summaryText = "",
+  fileRefs = [],
+  cwd = "",
+}) {
+  const normalizedType = normalizeTimelineFileEventType(fileEventType) || "command";
+  const normalizedRefs = normalizeTimelineFileRefs(fileRefs);
+  const kind = normalizedType === "command" ? "command_event" : "file_event";
+  const stableKey = callId || historyToken(`${threadId}:${createdAtMs}:${normalizedType}:${commandText || toolName}:${normalizedRefs.join("|")}`);
+  const messageText = timelineCommandMessage(DEFAULT_LOCALE, {
+    commandText,
+    toolName,
+    fileRefs: normalizedRefs,
+  });
+  const summary = timelineCommandSummary(commandText, summaryText || toolName) || fileEventTitle(DEFAULT_LOCALE, normalizedType);
+  return normalizeTimelineEntry({
+    stableId: `${kind}:${normalizedType}:${threadId}:${stableKey}`,
+    token: historyToken(`${kind}:${normalizedType}:${threadId}:${stableKey}`),
+    kind,
+    fileEventType: normalizedType,
+    threadId,
+    threadLabel,
+    title: kind === "command_event" ? kindTitle(DEFAULT_LOCALE, "command_event") : fileEventTitle(DEFAULT_LOCALE, normalizedType),
+    summary,
+    messageText,
+    fileRefs: normalizedRefs,
+    createdAtMs,
+    cwd,
+    readOnly: true,
+    provider,
+  });
+}
+
 async function buildRolloutFileTimelineEntries({ config, record, fileState, runtime, rolloutFilePath = "" }) {
   if (!isPlainObject(record) || cleanText(record.type) !== "response_item") {
     return [];
@@ -5742,30 +6359,54 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
     cwd: fileState.cwd || "",
   });
 
+  if (payloadType === "function_call" && cleanText(payload?.name || "") === "exec_command") {
+    const stored = rememberToolEventInput(fileState, payload, createdAtMs);
+    const args = stored?.arguments || {};
+    const commandText = cleanText(args.cmd || args.command || "");
+    if (!commandText) {
+      return [];
+    }
+    const classified = classifyTimelineCommand(commandText);
+    return [
+      buildToolTimelineEntry({
+        provider: "codex",
+        threadId,
+        threadLabel,
+        callId,
+        createdAtMs,
+        fileEventType: classified.fileEventType,
+        commandText: classified.commandText || commandText,
+        fileRefs: classified.fileRefs,
+        cwd: cleanText(args.workdir || fileState.cwd || ""),
+      }),
+    ].filter(Boolean);
+  }
+
   if (payloadType === "custom_tool_call") {
     rememberApplyPatchInput(fileState, payload, createdAtMs);
     return [];
   }
 
   if (payloadType === "function_call_output") {
-    const commandText = extractCommandLineFromFunctionOutput(payload.output ?? "");
-    const fileRefs = extractReadFileRefsFromCommand(commandText);
-    if (fileRefs.length === 0) {
+    if (findStoredToolEventInput(fileState, callId)) {
       return [];
     }
+    const commandText = extractCommandLineFromFunctionOutput(payload.output ?? "");
+    if (!commandText) {
+      return [];
+    }
+    const classified = classifyTimelineCommand(commandText);
     return [
-      normalizeTimelineEntry({
-        stableId: `file_event:read:${threadId}:${callId || historyToken(`${threadId}:${createdAtMs}:${fileRefs.join("|")}`)}`,
-        token: historyToken(`file_event:read:${threadId}:${callId || createdAtMs}`),
-        kind: "file_event",
-        fileEventType: "read",
+      buildToolTimelineEntry({
+        provider: "codex",
         threadId,
         threadLabel,
-        title: fileEventTitle(DEFAULT_LOCALE, "read"),
-        summary: "",
-        fileRefs,
+        callId,
         createdAtMs,
-        readOnly: true,
+        fileEventType: classified.fileEventType,
+        commandText: classified.commandText || commandText,
+        fileRefs: classified.fileRefs,
+        cwd: fileState.cwd || "",
       }),
     ].filter(Boolean);
   }
@@ -5996,6 +6637,8 @@ async function processScannedEvent({ config, runtime, state, event }) {
         subtab: "completed",
         token: historyToken(event.id),
         stableId: event.id,
+        dedupeId: completionPushContentDedupeId(event),
+        dedupeWindowMs: COMPLETION_PUSH_CONTENT_DEDUPE_WINDOW_MS,
         title: event.title,
         body: event.detailText || event.message,
         buildLocalizedContent: ({ locale }) => ({
@@ -6214,6 +6857,8 @@ function buildRolloutEvent({ record, filePath, fileState, sessionIndex, config, 
       threadLabel: context.threadLabel,
       message,
       detailText,
+      threadId,
+      turnId,
       priority: config.completePriority,
       tags: config.completeTags,
       clickUrl: config.clickUrl,
@@ -8585,7 +9230,7 @@ class NativeIpcClient {
     );
   }
 
-  async startTurn(conversationId, turnStartParams, ownerClientId = null) {
+  async startTurn(conversationId, turnStartParams, ownerClientId = null, options = {}) {
     return this.sendThreadFollowerRequest(
       "thread-follower-start-turn",
       {
@@ -8593,11 +9238,12 @@ class NativeIpcClient {
         turnStartParams,
       },
       conversationId,
-      ownerClientId
+      ownerClientId,
+      options
     );
   }
 
-  async startTurnDirect(conversationId, turnStartParams, ownerClientId = null) {
+  async startTurnDirect(conversationId, turnStartParams, ownerClientId = null, options = {}) {
     const targetClientId =
       ownerClientId ??
       this.runtime.threadOwnerClientIds.get(conversationId) ??
@@ -8605,7 +9251,7 @@ class NativeIpcClient {
     return this.sendRequest(
       "turn/start",
       buildDirectTurnStartPayload(conversationId, turnStartParams),
-      { targetClientId }
+      { targetClientId, ...options }
     );
   }
 
@@ -8635,12 +9281,13 @@ class NativeIpcClient {
     );
   }
 
-  sendThreadFollowerRequest(method, params, conversationId, ownerClientId = null) {
+  sendThreadFollowerRequest(method, params, conversationId, ownerClientId = null, options = {}) {
     return this.sendRequest(method, params, {
       targetClientId:
         ownerClientId ??
         this.runtime.threadOwnerClientIds.get(conversationId) ??
         null,
+      ...options,
     });
   }
 
@@ -12625,6 +13272,10 @@ function buildAmbientSuggestionsDetail(entry, locale) {
 
 function buildTimelineFileEventDetail(entry, locale) {
   const fileEventType = normalizeTimelineFileEventType(entry?.fileEventType ?? "");
+  const detailText = [
+    fileEventDetailCopy(locale, fileEventType, entry?.provider),
+    normalizeTimelineMessageText(entry?.messageText ?? "", locale),
+  ].filter(Boolean).join("\n\n");
   return {
     kind: "file_event",
     token: entry.token,
@@ -12633,7 +13284,7 @@ function buildTimelineFileEventDetail(entry, locale) {
     threadLabel: entry.threadLabel || "",
     fileEventType,
     createdAtMs: Number(entry.createdAtMs) || 0,
-    messageHtml: renderMessageHtml(fileEventDetailCopy(locale, fileEventType, entry?.provider), `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    messageHtml: renderMessageHtml(detailText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousFileRefs: normalizeTimelineFileRefs(entry.previousFileRefs ?? []),
     diffAvailable: Boolean(entry.diffAvailable),
@@ -12641,6 +13292,25 @@ function buildTimelineFileEventDetail(entry, locale) {
     diffSource: normalizeTimelineDiffSource(entry.diffSource ?? ""),
     diffAddedLines: Math.max(0, Number(entry.diffAddedLines) || 0),
     diffRemovedLines: Math.max(0, Number(entry.diffRemovedLines) || 0),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function buildTimelineCommandEventDetail(entry, locale) {
+  const commandText = firstMarkdownCodeFenceText(entry?.messageText ?? "") || cleanText(entry?.summary || "");
+  const detailText = t(locale, "detail.commandEvent.copy", { provider: providerDisplayName(locale, entry?.provider) });
+  return {
+    kind: "command_event",
+    token: entry.token,
+    threadId: cleanText(entry.threadId || ""),
+    title: cleanText(entry.threadLabel || entry.title || "") || kindTitle(locale, "command_event"),
+    threadLabel: entry.threadLabel || "",
+    fileEventType: "command",
+    createdAtMs: Number(entry.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(detailText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    commandText,
+    fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     readOnly: true,
     actions: [],
   };
@@ -13019,6 +13689,11 @@ async function handleCompletionReply({
   if (!conversationId) {
     throw new Error("completion-reply-unavailable");
   }
+  console.log(
+    `[completion-reply] received at=${new Date().toISOString()} ` +
+    `token=${cleanText(completionItem?.token || "") || "unknown"} thread=${conversationId} ` +
+    `images=${normalizedLocalImagePaths.length} plan=${planMode ? 1 : 0} force=${force ? 1 : 0}`
+  );
 
   const alreadyAcceptedReply = findMatchingCompletionReplyAfterCompletion(
     runtime,
@@ -13123,17 +13798,19 @@ async function handleCompletionReply({
         await runtime.ipcClient.startTurnDirect(
           conversationId,
           candidate.turnStartParams,
-          ownerClientId
+          ownerClientId,
+          { timeoutMs: config.completionReplyAckTimeoutMs }
         );
       } else {
         await runtime.ipcClient.startTurn(
           conversationId,
           candidate.turnStartParams,
-          ownerClientId
+          ownerClientId,
+          { timeoutMs: config.completionReplyAckTimeoutMs }
         );
       }
       console.log(
-        `[completion-reply] success candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
+        `[completion-reply] success at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
       );
       await finalizeReplyAccepted();
       return { alreadyAccepted: false };
@@ -13143,7 +13820,7 @@ async function handleCompletionReply({
         // its internal follower timeout fires. Retrying risks duplicate user
         // turns, so treat this as accepted and let the timeline catch up.
         console.log(
-          `[completion-reply] accepted candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(error)}`
+          `[completion-reply] accepted at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(error)}`
         );
         await finalizeReplyAccepted();
         return { alreadyAccepted: false, ackTimeout: true };
@@ -13902,6 +14579,10 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
     const entry = timelineEntryByToken(runtime, token, kind);
     return entry ? buildTimelineFileEventDetail(entry, locale) : null;
   }
+  if (kind === "command_event") {
+    const entry = timelineEntryByToken(runtime, token, kind);
+    return entry ? buildTimelineCommandEventDetail(entry, locale) : null;
+  }
   if (kind === "ambient_suggestions") {
     const entry = timelineEntryByToken(runtime, token, kind);
     if (entry) {
@@ -14562,6 +15243,107 @@ function logRemotePairingBootTrace(body, session, req) {
   if (totalMs >= 5_000 || remoteRouteSeen) {
     console.log(`[remote-pairing-boot-detail] trace=${traceId} ${events.map(formatBootTraceEvent).join(" | ")}`);
   }
+}
+
+function logClientEvent(body, session, req) {
+  const type = cleanText(body?.type || "").slice(0, 80);
+  if (type !== "timeline-render") {
+    return;
+  }
+
+  const route = cleanText(body?.route || "").slice(0, 24) || "unknown";
+  const reason = cleanText(body?.reason || "").slice(0, 80) || "unknown";
+  const latestToken = cleanText(body?.latestToken || "").slice(0, 80) || "none";
+  const latestKind = cleanText(body?.latestKind || "").slice(0, 80) || "unknown";
+  const appBuildId = cleanText(body?.appBuildId || "").slice(0, 80) || "unknown";
+  const currentTab = cleanText(body?.currentTab || "").slice(0, 40) || "unknown";
+  const entryCount = Math.max(0, Math.min(10_000, Math.round(Number(body?.entryCount) || 0)));
+  const latestCreatedAtMs = Math.max(0, Math.min(9_999_999_999_999, Math.round(Number(body?.latestCreatedAtMs) || 0)));
+  const clientAtMs = Math.max(0, Math.min(9_999_999_999_999, Math.round(Number(body?.clientAtMs) || 0)));
+  const visible = body?.visible === true;
+  const renderedTokens = Array.isArray(body?.renderedTokens)
+    ? body.renderedTokens
+        .slice(0, 5)
+        .map((item) => {
+          const token = cleanText(item?.token || "").slice(0, 80);
+          const kind = cleanText(item?.kind || "").slice(0, 80);
+          const createdAtMs = Math.max(0, Math.min(9_999_999_999_999, Math.round(Number(item?.createdAtMs) || 0)));
+          return token && kind ? `${kind}:${token}:${createdAtMs}` : "";
+        })
+        .filter(Boolean)
+    : [];
+  const deviceId = cleanText(session?.deviceId || "").slice(0, 60) || "unknown";
+  const ua = requestUserAgent(req).slice(0, 90);
+
+  console.log(
+    `[client-event] timeline-render at=${new Date().toISOString()} device=${deviceId} ` +
+    `route=${route} visible=${visible ? 1 : 0} tab=${currentTab} reason=${reason} ` +
+    `latest=${latestKind}:${latestToken} latestCreatedAtMs=${latestCreatedAtMs} ` +
+    `clientAtMs=${clientAtMs} count=${entryCount} build=${appBuildId} ` +
+    `rendered=${renderedTokens.join(",") || "none"} ua=${JSON.stringify(ua)}`
+  );
+}
+
+function writeSseEvent(res, eventName, payload) {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function openTimelineStream({ config, runtime, req, res, session }) {
+  if (!config.timelineLiveSync) {
+    return writeJson(res, 404, { error: "timeline-live-sync-disabled" });
+  }
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  let closed = false;
+  const deviceId = cleanText(session?.deviceId || "").slice(0, 60) || "unknown";
+  const bus = ensureTimelineBus(runtime);
+  const client = {
+    send(eventName, payload) {
+      if (closed || res.destroyed || res.writableEnded) {
+        throw new Error("timeline-stream-closed");
+      }
+      writeSseEvent(res, eventName, payload);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      remove();
+      try {
+        res.end();
+      } catch {}
+    },
+  };
+  const remove = bus.addClient(client);
+  const heartbeat = setInterval(() => {
+    try {
+      client.send("heartbeat", {
+        atMs: Date.now(),
+        revision: Number(runtime.timelineRevision) || 0,
+      });
+    } catch {
+      client.close();
+    }
+  }, 20_000);
+  heartbeat.unref?.();
+
+  req.on("close", () => client.close());
+  req.on("aborted", () => client.close());
+  res.on("error", () => client.close());
+  client.send("hello", {
+    ok: true,
+    revision: Number(runtime.timelineRevision) || 0,
+    appBuildId: WEB_APP_BUILD_ID,
+    deviceId,
+    atMs: Date.now(),
+  });
+  console.log(`[timeline-stream] open device=${deviceId} clients=${bus.clients.size}`);
 }
 
 function recordRemotePairingAudit(event) {
@@ -15645,6 +16427,29 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         return writeJson(res, 200, { ok: true });
       }
 
+      // POST /api/client-events — local-only diagnostics from the PWA.
+      //
+      // The endpoint deliberately accepts only small sanitized metadata, not
+      // message text, commands, file paths, relay tokens, or public keys. It is
+      // used to correlate "bridge accepted" timings with "the PWA rendered the
+      // latest timeline item" timings while debugging LAN/remote freshness.
+      if (url.pathname === "/api/client-events" && req.method === "POST") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) return;
+        let body;
+        try {
+          body = await parseJsonBody(req);
+        } catch (err) {
+          return writeJson(res, 400, { error: "invalid-json-body", message: err.message });
+        }
+        try {
+          logClientEvent(body, session, req);
+        } catch (err) {
+          console.warn(`[client-event] failed to log event: ${err?.message}`);
+        }
+        return writeJson(res, 200, { ok: true });
+      }
+
       // POST /api/remote-pairing/toggle — flip on/off without restart.
       //
       // Body: { enabled: boolean }
@@ -16452,7 +17257,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           rangeDate = d.toISOString().slice(0, 10);
         }
 
-        const relevantKinds = new Set(["file_event", "completion", "plan_ready", "assistant_final"]);
+        const relevantKinds = new Set(["file_event", "command_event", "completion", "plan_ready", "assistant_final"]);
         const entries = (runtime.recentTimelineEntries || [])
           .filter((e) => e.createdAtMs >= rangeStart && e.createdAtMs < rangeEnd && relevantKinds.has(e.kind))
           .map((e) => ({
@@ -17449,6 +18254,14 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         return writeJson(res, 200, buildTimelineResponse(runtime, state, config, locale));
       }
 
+      if (url.pathname === "/api/timeline/stream" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        return openTimelineStream({ config, runtime, req, res, session });
+      }
+
       const apiTimelineImageMatch = url.pathname.match(/^\/api\/timeline\/([^/]+)\/images\/(\d+)$/u);
       if (apiTimelineImageMatch && req.method === "GET") {
         const token = decodeURIComponent(apiTimelineImageMatch[1]);
@@ -17532,6 +18345,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             planMode: payload?.planMode === true,
             imageCount: Array.isArray(payload?.localImagePaths) ? payload.localImagePaths.length : 0,
             alreadyAccepted: replyResult?.alreadyAccepted === true,
+            ackTimeout: replyResult?.ackTimeout === true,
           });
         } catch (error) {
           if (error.message === "completion-reply-empty") {
@@ -19652,6 +20466,8 @@ function buildConfig(cli) {
       process.env.TIMELINE_ATTACHMENTS_DIR || path.join(path.dirname(stateFile), "timeline-attachments")
     ),
     pollIntervalMs: numberEnv("POLL_INTERVAL_MS", 2500),
+    timelineLiveSync: boolEnv("TIMELINE_LIVE_SYNC", true),
+    timelineLiveDebounceMs: numberEnv("TIMELINE_LIVE_DEBOUNCE_MS", 75),
     replaySeconds: numberEnv("REPLAY_SECONDS", 300),
     sessionIndexRefreshMs: numberEnv("SESSION_INDEX_REFRESH_MS", 30000),
     directoryScanIntervalMs: numberEnv("DIRECTORY_SCAN_INTERVAL_MS", 30000),
@@ -19710,6 +20526,10 @@ function buildConfig(cli) {
     ipcSocketPath: resolvePath(process.env.CODEX_IPC_SOCKET_PATH || defaultIpcSocketPath()),
     ipcReconnectMs: numberEnv("IPC_RECONNECT_MS", 1500),
     ipcRequestTimeoutMs: numberEnv("IPC_REQUEST_TIMEOUT_MS", 12000),
+    completionReplyAckTimeoutMs: numberEnv(
+      "COMPLETION_REPLY_ACK_TIMEOUT_MS",
+      DEFAULT_COMPLETION_REPLY_ACK_TIMEOUT_MS
+    ),
     choicePageSize: numberEnv("CHOICE_PAGE_SIZE", 5),
     completionReplyImageMaxBytes: numberEnv(
       "COMPLETION_REPLY_IMAGE_MAX_BYTES",
@@ -21632,11 +22452,13 @@ async function main() {
       `notifyPlans=${config.notifyPlans}`,
       `nativeApprovalServer=${config.nativeApprovalPublicBaseUrl}`,
       `pollMs=${config.pollIntervalMs}`,
+      `timelineLive=${config.timelineLiveSync}`,
       `replaySeconds=${config.replaySeconds}`,
     ].join(" | ")
   );
 
   let approvalServer = null;
+  let timelineLiveHandle = null;
 
   process.on("SIGINT", handleSignal);
   process.on("SIGTERM", handleSignal);
@@ -21775,6 +22597,8 @@ async function main() {
       }
     }
 
+    timelineLiveHandle = startTimelineLiveSync({ config, runtime, state });
+
     // --- A2A Relay ---
     if (config.a2aRelayUrl && config.a2aRelayUserId) {
       config.a2aAcceptPublicTasks = state.a2aAcceptPublicTasks === true;
@@ -21906,6 +22730,13 @@ async function main() {
     }
   } finally {
     runtime.stopping = true;
+
+    if (timelineLiveHandle) {
+      try {
+        timelineLiveHandle.close();
+      } catch {}
+      timelineLiveHandle = null;
+    }
 
     stopRelayPolling();
 
