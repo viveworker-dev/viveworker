@@ -27,7 +27,7 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
 });
 
 test("build id marks the fast timeline sync bundle", () => {
-  assert.match(buildIdSource, /20260504-command-event-detail-v1/);
+  assert.match(buildIdSource, /20260506-live-activity-status-v1/);
 });
 
 test("timeline render is reported with sanitized client metadata", () => {

@@ -897,7 +897,7 @@ async function forceAppRefreshFromLan() {
       const keys = await caches.keys();
       await Promise.all(
         keys
-          .filter((key) => /^viveworker-v/.test(key))
+          .filter((key) => /^viveworker-/u.test(key))
           .map((key) => caches.delete(key))
       );
     }
@@ -1930,17 +1930,26 @@ function currentTimelineKindFilterOption() {
 
 function timelineEntryMatchesKindFilter(entry, filterId) {
   const kind = normalizeClientText(entry?.kind || entry?.item?.kind || "");
+  const fileEventType = normalizeClientText(entry?.fileEventType || entry?.item?.fileEventType || "");
+  const activityPhase = normalizeClientText(entry?.activityPhase || entry?.item?.activityPhase || "");
   switch (filterId) {
     case "messages":
-      return TIMELINE_MESSAGE_KINDS.has(kind);
+      return TIMELINE_MESSAGE_KINDS.has(kind) || (kind === "activity_status" && activityPhase === "thinking");
     case "suggestions":
       return kind === "ambient_suggestions";
     case "files":
-      return kind === "file_event";
+      return (
+        (kind === "file_event" && fileEventType !== "git") ||
+        (kind === "activity_status" && ["reading", "searching", "editing"].includes(activityPhase))
+      );
     case "commands":
-      return kind === "command_event";
+      return (
+        kind === "command_event" ||
+        (kind === "file_event" && fileEventType === "git") ||
+        (kind === "activity_status" && activityPhase === "running_command")
+      );
     case "approvals":
-      return kind === "approval";
+      return kind === "approval" || (kind === "activity_status" && activityPhase === "awaiting_approval");
     case "plans":
       return kind === "plan" || kind === "plan_ready";
     case "choices":
@@ -3773,6 +3782,7 @@ function renderTimelineEntry(entry, { desktop }) {
   const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || isMoltbookOrA2A;
   const isFileEvent = item.kind === "file_event";
   const isCommandEvent = item.kind === "command_event";
+  const isActivityStatus = item.kind === "activity_status";
   const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
   const fileRefs = normalizeClientFileRefs(item.fileRefs);
   const primaryText = timelineEntryPrimaryText(item, entry.status, { isMessageLike, isFileEvent, isCommandEvent });
@@ -3783,13 +3793,15 @@ function renderTimelineEntry(entry, { desktop }) {
   const fileEventFileSummary = isFileEvent ? timelineFileEventFileSummary(item) : "";
   const fileEventDiffStatsHtml = isFileEvent ? renderDiffEntryStatsHtml(item) : "";
   const toolEventCommand = timelineToolEventCommand(item);
+  const tagName = isActivityStatus ? "div" : "button";
+  const openAttrs = isActivityStatus
+    ? `role="status" aria-live="polite"`
+    : `data-open-item-kind="${escapeHtml(item.kind)}" data-open-item-token="${escapeHtml(item.token)}" data-source-tab="timeline"`;
 
   return `
-    <button
-      class="timeline-entry timeline-entry--${kindClassName} timeline-entry--kind-${kindNameClass} ${isMessageLike ? "timeline-entry--message" : "timeline-entry--operational"}"
-      data-open-item-kind="${escapeHtml(item.kind)}"
-      data-open-item-token="${escapeHtml(item.token)}"
-      data-source-tab="timeline"
+    <${tagName}
+      class="timeline-entry timeline-entry--${kindClassName} timeline-entry--kind-${kindNameClass} ${isMessageLike ? "timeline-entry--message" : "timeline-entry--operational"} ${isActivityStatus ? "timeline-entry--activity" : ""}"
+      ${openAttrs}
     >
       <div class="timeline-entry__meta">
         <span class="timeline-entry__kind">
@@ -3799,7 +3811,7 @@ function renderTimelineEntry(entry, { desktop }) {
         </span>
         <span class="timeline-entry__meta-right">
           <span class="timeline-entry__time">${escapeHtml(timestampLabel)}</span>
-          <span class="timeline-entry__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>
+          ${isActivityStatus ? `<span class="timeline-entry__activity-pulse" aria-hidden="true"></span>` : `<span class="timeline-entry__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>`}
         </span>
       </div>
       ${threadLabel ? `<p class="timeline-entry__thread">${escapeHtml(threadLabel)}</p>` : ""}
@@ -3821,7 +3833,7 @@ function renderTimelineEntry(entry, { desktop }) {
         ${isFileEvent ? "" : renderTimelineEntryFileStrip(fileRefs)}
       </div>
       ${statusLabel ? `<div class="timeline-entry__footer"><span class="timeline-entry__status">${escapeHtml(statusLabel)}</span></div>` : ""}
-    </button>
+    </${tagName}>
   `;
 }
 
@@ -4059,10 +4071,13 @@ function shouldRenderFileEventCommand(item) {
   if (item?.kind !== "file_event") {
     return false;
   }
-  return ["read", "search"].includes(normalizeClientText(item?.fileEventType || ""));
+  return ["read", "search", "git"].includes(normalizeClientText(item?.fileEventType || ""));
 }
 
 function timelineToolEventCommand(item) {
+  if (item?.kind === "activity_status") {
+    return truncateUiText(item?.commandText || "", 220);
+  }
   if (item?.kind === "command_event") {
     return timelineCommandEventCommand(item);
   }
@@ -4078,6 +4093,8 @@ function fileEventDisplayLabel(fileEventType) {
       return L("fileEvent.read");
     case "search":
       return L("fileEvent.search");
+    case "git":
+      return L("fileEvent.command");
     case "command":
       return L("fileEvent.command");
     case "write":
@@ -4095,15 +4112,24 @@ function fileEventDisplayLabel(fileEventType) {
 
 function fileEventTimelineCountLabel(item) {
   const fileEventType = normalizeClientText(item?.fileEventType || "");
-  const count = normalizeClientFileRefs(item?.fileRefs).length;
+  const fileRefs = normalizeClientFileRefs(item?.fileRefs);
+  const count = fileRefs.length;
   if (count <= 0) {
     return fileEventDisplayLabel(fileEventType) || L("common.fileEvent");
   }
   switch (fileEventType) {
     case "read":
+      if (count === 1) {
+        return L("fileEvent.read");
+      }
       return L("fileEvent.timeline.read", { count });
     case "search":
+      if (count === 1) {
+        return L("fileEvent.search");
+      }
       return L("fileEvent.timeline.search", { count });
+    case "git":
+      return L("fileEvent.timeline.command", { count });
     case "command":
       return L("fileEvent.timeline.command", { count });
     case "write":
@@ -5448,20 +5474,29 @@ function recentAutoPilotEntries(limit = 5) {
 }
 
 function isAutoPilotApprovalEntry(entry) {
+  const mode = normalizeClientText(entry?.autoPilotMode || "");
   const stableId = normalizeClientText(entry?.stableId || "");
   return (
     normalizeClientText(entry?.kind || "") === "approval" &&
     normalizeClientText(entry?.outcome || "") === "approved" &&
-    (stableId.endsWith(":autopilot") || stableId.includes(":autopilot-write"))
+    (mode === "read" || mode === "write" || stableId.endsWith(":autopilot") || stableId.includes(":autopilot-write"))
   );
 }
 
 function autoPilotEntryMode(item) {
+  const mode = normalizeClientText(item?.autoPilotMode || "");
+  if (mode === "read" || mode === "write") {
+    return mode;
+  }
   const stableId = normalizeClientText(item?.stableId || "");
   return stableId.includes(":autopilot-write") ? "write" : "read";
 }
 
 function autoPilotEntryWriteLane(item) {
+  const projected = normalizeClientText(item?.autoPilotWriteLane || "");
+  if (projected) {
+    return projected;
+  }
   const stableId = normalizeClientText(item?.stableId || "");
   const match = stableId.match(/:autopilot-write:([a-z_-]+)$/u);
   return normalizeClientText(match?.[1] || "");
@@ -8800,7 +8835,7 @@ function bindShellInteractions() {
             buildActionOutcomeDetail({
               kind: "approval",
               title: state.currentDetail?.title,
-              message: approvalOutcomeMessage(actionUrl, activeItem?.provider),
+              message: approvalOutcomeMessage(actionUrl, state.currentDetail?.provider || activeItem?.provider),
             })
           );
           await renderShell();
@@ -10582,6 +10617,8 @@ function kindMeta(kind, item) {
       return { label: L("common.assistantCommentary"), tone: "plan", icon: "assistant-commentary" };
     case "assistant_final":
       return { label: L("common.assistantFinal"), tone: "completion", icon: "assistant-final" };
+    case "activity_status":
+      return { label: L("server.title.activityStatus"), tone: "plan", icon: activityStatusIcon(item?.activityPhase) };
     case "ambient_suggestions":
       return { label: L("common.ambientSuggestions"), tone: "neutral", icon: "suggestions" };
     case "approval":
@@ -10596,6 +10633,9 @@ function kindMeta(kind, item) {
     case "diff_thread":
       return { label: L("common.diff"), tone: "neutral", icon: "diff" };
     case "file_event":
+      if (normalizeClientText(item?.fileEventType || "") === "git") {
+        return { label: L("common.commandEvent"), tone: "neutral", icon: "command" };
+      }
       return { label: L("common.fileEvent"), tone: "neutral", icon: "file-event" };
     case "command_event":
       return { label: L("common.commandEvent"), tone: "neutral", icon: "command" };
@@ -10613,6 +10653,24 @@ function kindMeta(kind, item) {
       return { label: L("common.a2aTaskResult"), tone: "completion", icon: "completion-item" };
     default:
       return { label: L("common.item"), tone: "neutral", icon: "item" };
+  }
+}
+
+function activityStatusIcon(phase) {
+  switch (normalizeClientText(phase || "")) {
+    case "reading":
+      return "file-event";
+    case "searching":
+      return "filter";
+    case "editing":
+      return "diff";
+    case "running_command":
+      return "command";
+    case "awaiting_approval":
+      return "approval";
+    case "thinking":
+    default:
+      return "pending";
   }
 }
 

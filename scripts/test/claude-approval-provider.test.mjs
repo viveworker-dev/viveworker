@@ -1,0 +1,27 @@
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import assert from "node:assert/strict";
+
+const bridgeSource = readFileSync(new URL("../viveworker-bridge.mjs", import.meta.url), "utf8");
+const appSource = readFileSync(new URL("../../web/app.js", import.meta.url), "utf8");
+
+test("Claude approvals carry raw params for Web Push body generation", () => {
+  assert.match(bridgeSource, /function claudeApprovalRawParams\(body, kind\)/);
+  assert.match(bridgeSource, /const rawParams = claudeApprovalRawParams\(body, approvalKind\);/);
+  assert.match(bridgeSource, /rawParams,/);
+  assert.match(bridgeSource, /formatNativeApprovalMessage\(approval\.kind, approval\.rawParams, locale\)/);
+  assert.match(bridgeSource, /const safeParams = isPlainObject\(params\) \? params : \{\};/);
+});
+
+test("Claude approval Web Push delivery is awaited and logged", () => {
+  assert.match(bridgeSource, /const pushChanged = await deliverWebPushItem\(\{/);
+  assert.match(bridgeSource, /await saveState\(config\.stateFile, state\);/);
+  assert.match(bridgeSource, /\[claude-approval-push\]/);
+});
+
+test("approval action outcome uses the loaded detail provider before falling back", () => {
+  assert.match(
+    appSource,
+    /approvalOutcomeMessage\(actionUrl, state\.currentDetail\?\.provider \|\| activeItem\?\.provider\)/
+  );
+});

@@ -13,12 +13,13 @@
  *   2. If LAN throws a `TypeError` (network failure, DNS, connect refused —
  *      i.e. the bridge isn't reachable), fall back to the relay's
  *      `RemotePairingRpcClient.fetch()`.
- *   3. After a LAN failure, enter a STICKY_RELAY_MS window where subsequent
- *      requests skip LAN and go straight to relay. Avoids paying the LAN
- *      timeout cost on every call after we've already learned LAN is dead.
- *   4. When the window expires, the next request re-probes LAN. If LAN is
- *      back, the sticky window is left dormant and we return to the happy
- *      path. If LAN is still dead, the window resets.
+ *   3. After a LAN failure, enter a sticky relay window where subsequent
+ *      requests skip LAN and go straight to relay. If LAN was healthy very
+ *      recently, keep that window short so one transient WiFi wobble doesn't
+ *      make an in-room phone behave like it is off-LAN for minutes.
+ *   4. While sticky relay is active, periodically run a tiny LAN probe. If
+ *      LAN is back, clear sticky state and close the relay client. If LAN is
+ *      still dead, the sticky window resets and relay stays the fast path.
  *   5. AbortError (caller cancelled) is never treated as a LAN failure —
  *      we re-throw immediately rather than waste a relay attempt.
  *
@@ -76,11 +77,9 @@ import { loadPairingState } from "./pairing-state.js";
 // ---------------------------------------------------------------------------
 
 /**
- * After a LAN failure we prefer relay for this long before re-probing LAN.
- * 5 minutes is a coarse pick: long enough that a phone that fell off LAN
- * (cellular handoff, WiFi drop) doesn't pay LAN connect timeouts on every
- * outbound call, short enough that "I just walked back into wifi range"
- * recovers without the user noticing.
+ * Hard upper bound after a LAN failure. We keep this for real off-LAN use so
+ * cellular/remote sessions do not pay LAN connect timeouts on every request.
+ * Recent successful LAN sessions use a much shorter transient window below.
  */
 const STICKY_RELAY_MS = 5 * 60 * 1000;
 
@@ -99,6 +98,13 @@ const DEFAULT_RELAY_TIMEOUT_MS = 60_000;
  */
 const DEFAULT_LAN_TIMEOUT_MS = 2_500;
 const DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
+// Recover quickly from accidentally sticky relay while still avoiding LAN
+// timeout spam during real off-LAN sessions.
+const AUTO_STICKY_LAN_PROBE_INTERVAL_MS = 8_000;
+const AUTO_STICKY_LAN_PROBE_TIMEOUT_MS = 900;
+const RECENT_LAN_OK_GRACE_MS = 60_000;
+const TRANSIENT_LAN_FAILURE_STICKY_MS = 8_000;
+const TRANSIENT_LAN_FAILURE_THRESHOLD = 2;
 const RELAY_FAILURE_WINDOW_MS = 60_000;
 const RELAY_FAILURE_THRESHOLD = 6;
 const RELAY_CIRCUIT_BREAKER_MS = 60_000;
@@ -131,6 +137,15 @@ let _lastPairingStateStatus = null;
 
 /** Last transport route that completed successfully. */
 let _lastSuccessfulRoute = null;
+
+/** Last time a LAN request completed successfully. */
+let _lastLanOkAtMs = 0;
+
+/** Last time we tried a LAN probe while sticky relay was active. */
+let _lastStickyLanProbeAtMs = 0;
+
+/** Consecutive LAN transport failures since the last LAN success. */
+let _consecutiveLanFailures = 0;
 
 /** Recent relay-level failures used to avoid burning relay/DO quota in loops. */
 let _relayFailureAtMs = [];
@@ -440,6 +455,29 @@ function relayCircuitError(opts = {}) {
   return err;
 }
 
+function shouldAutoProbeLanWhileSticky(now, opts = {}) {
+  if (opts.autoProbeLanWhileSticky === false) {
+    return false;
+  }
+  if (relayCircuitDelayMs(opts) > 0) {
+    return false;
+  }
+  return now - _lastStickyLanProbeAtMs >= AUTO_STICKY_LAN_PROBE_INTERVAL_MS;
+}
+
+function stickyLanProbeOpts(opts, autoProbe) {
+  if (!autoProbe) {
+    return opts;
+  }
+  if (opts.stickyLanProbeTimeoutMs != null) {
+    return opts;
+  }
+  return {
+    ...opts,
+    stickyLanProbeTimeoutMs: AUTO_STICKY_LAN_PROBE_TIMEOUT_MS,
+  };
+}
+
 function recordRelayFailure(err, opts = {}) {
   const now = nowMs(opts);
   _relayFailureAtMs = _relayFailureAtMs.filter((at) => now - at <= RELAY_FAILURE_WINDOW_MS);
@@ -554,8 +592,11 @@ async function attemptLanFetch(url, init, opts) {
       ? await Promise.race([fetchPromise, timeoutPromise])
       : await fetchPromise;
     _telemetry.lanOk++;
+    _lastLanOkAtMs = nowMs(opts);
+    _consecutiveLanFailures = 0;
     _lastSuccessfulRoute = "lan";
     _stickyRelayUntilMs = 0;
+    _lastStickyLanProbeAtMs = 0;
     resetRelayFailureCircuit();
     closeRelayClient("lan connected");
     emitRoutingStatus("lan-connected", opts, { url: String(url || "") });
@@ -566,12 +607,17 @@ async function attemptLanFetch(url, init, opts) {
       throw err;
     }
     const lanErr = didTimeout ? new TypeError("LAN fetch timed out") : err;
+    const failedAt = nowMs(opts);
     _telemetry.lanFail++;
-    _telemetry.lastLanFailAt = nowMs(opts);
-    _stickyRelayUntilMs = _telemetry.lastLanFailAt + STICKY_RELAY_MS;
+    _consecutiveLanFailures++;
+    _telemetry.lastLanFailAt = failedAt;
+    _lastStickyLanProbeAtMs = failedAt;
+    _stickyRelayUntilMs = failedAt + stickyRelayWindowAfterLanFailure(failedAt);
     emitRoutingStatus("lan-failed", opts, {
       url: String(url || ""),
       reason: lanErr?.message || String(lanErr),
+      consecutiveLanFailures: _consecutiveLanFailures,
+      stickyRelayMs: Math.max(0, _stickyRelayUntilMs - failedAt),
     });
     return { ok: false, err: lanErr };
   } finally {
@@ -582,8 +628,17 @@ async function attemptLanFetch(url, init, opts) {
   }
 }
 
+function stickyRelayWindowAfterLanFailure(now) {
+  const recentLanOk = _lastLanOkAtMs > 0 && now - _lastLanOkAtMs <= RECENT_LAN_OK_GRACE_MS;
+  if (recentLanOk && _consecutiveLanFailures <= TRANSIENT_LAN_FAILURE_THRESHOLD) {
+    return TRANSIENT_LAN_FAILURE_STICKY_MS;
+  }
+  return STICKY_RELAY_MS;
+}
+
 async function attemptStickyLanProbe(url, init, opts) {
   const probeTimeoutMs = opts.stickyLanProbeTimeoutMs ?? DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS;
+  _lastStickyLanProbeAtMs = nowMs(opts);
   const lan = await attemptLanFetch(url, init, {
     ...opts,
     lanTimeoutMs: probeTimeoutMs,
@@ -859,6 +914,7 @@ function nowMs(opts) {
  *   suppressRoutingStatus?: boolean,
  *   preferRelayError?: boolean,
  *   probeLanWhileSticky?: boolean,
+ *   autoProbeLanWhileSticky?: boolean,
  *   stickyLanProbeTimeoutMs?: number,
  * }} [opts]
  * @returns {Promise<{
@@ -875,8 +931,9 @@ export async function routedFetch(url, init = {}, opts = {}) {
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
-    if (opts.probeLanWhileSticky === true) {
-      const lan = await attemptStickyLanProbe(url, init, opts);
+    const autoProbe = shouldAutoProbeLanWhileSticky(t, opts);
+    if (opts.probeLanWhileSticky === true || autoProbe) {
+      const lan = await attemptStickyLanProbe(url, init, stickyLanProbeOpts(opts, autoProbe));
       if (lan.ok) return lan.response;
     }
     emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: true });
@@ -918,6 +975,9 @@ export function __getTelemetry() {
     ..._telemetry,
     stickyRelayUntilMs: _stickyRelayUntilMs,
     lastRoute: _lastSuccessfulRoute,
+    lastLanOkAtMs: _lastLanOkAtMs,
+    lastStickyLanProbeAtMs: _lastStickyLanProbeAtMs,
+    consecutiveLanFailures: _consecutiveLanFailures,
     hasClient: Boolean(_client),
     clientPairingKey: _clientPairingKey,
     relayCircuitOpenUntilMs: _relayCircuitOpenUntilMs,
@@ -946,6 +1006,9 @@ export function __resetForTest() {
   _telemetry = newTelemetry();
   _lastPairingStateStatus = null;
   _lastSuccessfulRoute = null;
+  _lastLanOkAtMs = 0;
+  _lastStickyLanProbeAtMs = 0;
+  _consecutiveLanFailures = 0;
   _relayFailureAtMs = [];
   _relayCircuitOpenUntilMs = 0;
 }
@@ -953,5 +1016,7 @@ export function __resetForTest() {
 // Test-visible constants for tests that want to assert behavior at the
 // sticky-window boundary without hard-coding 5 minutes in two places.
 export const __STICKY_RELAY_MS = STICKY_RELAY_MS;
+export const __AUTO_STICKY_LAN_PROBE_INTERVAL_MS = AUTO_STICKY_LAN_PROBE_INTERVAL_MS;
+export const __TRANSIENT_LAN_FAILURE_STICKY_MS = TRANSIENT_LAN_FAILURE_STICKY_MS;
 export const __DEFAULT_RELAY_TIMEOUT_MS = DEFAULT_RELAY_TIMEOUT_MS;
 export const __DEFAULT_LAN_TIMEOUT_MS = DEFAULT_LAN_TIMEOUT_MS;

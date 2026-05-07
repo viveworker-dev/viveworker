@@ -20,6 +20,8 @@ import {
   __getTelemetry,
   __resetForTest,
   __STICKY_RELAY_MS,
+  __AUTO_STICKY_LAN_PROBE_INTERVAL_MS,
+  __TRANSIENT_LAN_FAILURE_STICKY_MS,
 } from "../../web/remote-pairing/api-router.js";
 
 // ---------------------------------------------------------------------------
@@ -427,7 +429,7 @@ test("AbortError on relay re-throws (after LAN already failed)", async () => {
 // Sticky-relay window
 // ---------------------------------------------------------------------------
 
-test("after LAN fails, next call skips LAN entirely (sticky relay)", async () => {
+test("after LAN fails, immediate next call skips LAN (sticky relay)", async () => {
   const fetchPair = makeFakeFetch([
     { mode: "throw", err: new TypeError("Failed to fetch") },
     // Second call SHOULD NOT happen — assert by counting.
@@ -448,12 +450,60 @@ test("after LAN fails, next call skips LAN entirely (sticky relay)", async () =>
   assert.equal(fetchCalls.length, 1);
   assert.equal(rpcCalls.fetch.length, 1);
 
-  // Within the sticky window, we should NOT touch LAN again.
-  clock.advance(STICKY_HALF_MS);
+  // Immediately inside the sticky window, we should NOT touch LAN again.
+  clock.advance(Math.max(1, __AUTO_STICKY_LAN_PROBE_INTERVAL_MS - 1));
   await routedFetch("/api/second", {}, opts);
   assert.equal(fetchCalls.length, 1, "LAN should not be retried inside sticky window");
   assert.equal(rpcCalls.fetch.length, 2);
   assert.equal(rpcCalls.fetch[1].path, "/api/second");
+});
+
+test("sticky relay auto-probes LAN after a short cooldown", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("Failed to fetch") },
+    { mode: "ok", status: 200, body: '{"recovered":"lan"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls, clock } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async (req) => makeRpcResponse({
+        status: 200,
+        body: JSON.stringify({ via: "relay", path: req.path }),
+      }),
+    }),
+  });
+
+  await routedFetch("/api/first", {}, opts);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(rpcCalls.fetch.length, 1);
+
+  clock.advance(__AUTO_STICKY_LAN_PROBE_INTERVAL_MS + 1);
+  const res = await routedFetch("/api/second", {}, opts);
+  assert.deepEqual(await res.json(), { recovered: "lan" });
+  assert.equal(fetchCalls.length, 2, "LAN should be auto-probed while sticky relay is active");
+  assert.equal(rpcCalls.fetch.length, 1, "relay should be skipped when the auto-probe succeeds");
+  assert.equal(__getTelemetry().stickyRelayUntilMs, 0);
+});
+
+test("recent LAN success keeps sticky relay short for transient failures", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "ok", status: 200, body: '{"via":"lan"}' },
+    { mode: "throw", err: new TypeError("temporary LAN wobble") },
+  ]);
+  const { opts, clock } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay"}' }),
+    }),
+  });
+
+  await routedFetch("/api/lan", {}, opts);
+  await routedFetch("/api/wobble", {}, opts);
+
+  const tel = __getTelemetry();
+  assert.equal(tel.consecutiveLanFailures, 1);
+  assert.equal(tel.lastRoute, "relay");
+  assert.equal(tel.stickyRelayUntilMs - clock.now(), __TRANSIENT_LAN_FAILURE_STICKY_MS);
 });
 
 test("interactive GET can re-probe LAN inside sticky relay window", async () => {
@@ -541,7 +591,7 @@ test("inside sticky window, if relay also fails, LAN is tried as a tiebreaker", 
   await routedFetch("/api/first", {}, opts);
   assert.equal(fetchCalls.length, 1);
 
-  clock.advance(STICKY_HALF_MS);
+  clock.advance(Math.max(1, __AUTO_STICKY_LAN_PROBE_INTERVAL_MS - 1));
   const res = await routedFetch("/api/second", {}, opts);
   // Order: relay (fail) → LAN (succeed)
   assert.equal(rpcCalls.fetch.length, 2);

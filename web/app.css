@@ -2755,6 +2755,39 @@ pre code {
   color: rgba(236, 248, 255, 0.66);
 }
 
+.timeline-entry--activity {
+  cursor: default;
+  border-color: rgba(121, 196, 255, 0.18);
+  background:
+    linear-gradient(180deg, rgba(121, 196, 255, 0.11), rgba(20, 31, 40, 0.94)),
+    var(--card);
+}
+
+.timeline-entry__activity-pulse {
+  width: 0.58rem;
+  height: 0.58rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(121, 196, 255, 0.9);
+  box-shadow: 0 0 0 0 rgba(121, 196, 255, 0.26);
+  animation: timeline-activity-pulse 1.6s ease-out infinite;
+}
+
+@keyframes timeline-activity-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(121, 196, 255, 0.26);
+    opacity: 0.95;
+  }
+  70% {
+    box-shadow: 0 0 0 0.56rem rgba(121, 196, 255, 0);
+    opacity: 0.72;
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(121, 196, 255, 0);
+    opacity: 0.95;
+  }
+}
+
 .timeline-entry--message .timeline-entry__title {
   font-size: 1.03rem;
   line-height: 1.55;

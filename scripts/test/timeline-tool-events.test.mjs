@@ -7,7 +7,7 @@ const appSource = readFileSync(new URL("../../web/app.js", import.meta.url), "ut
 const i18nSource = readFileSync(new URL("../../web/i18n.js", import.meta.url), "utf8");
 
 test("timeline supports read/search file events and separate command events", () => {
-  assert.match(bridgeSource, /\["read",\s*"search",\s*"command",\s*"write",\s*"create",\s*"delete",\s*"rename"\]/);
+  assert.match(bridgeSource, /\["read",\s*"search",\s*"git",\s*"command",\s*"write",\s*"create",\s*"delete",\s*"rename"\]/);
   assert.match(bridgeSource, /"file_event",\s*"command_event"/);
   assert.match(bridgeSource, /const kind = normalizedType === "command" \? "command_event" : "file_event"/);
   assert.match(bridgeSource, /rawKind === "file_event" && fileEventType === "command" \? "command_event" : rawKind/);
@@ -15,16 +15,32 @@ test("timeline supports read/search file events and separate command events", ()
   assert.match(i18nSource, /"common\.commandEvent"/);
   assert.match(i18nSource, /"timeline\.kindFilter\.commands"/);
   assert.match(appSource, /case "search":\s*return L\("fileEvent\.search"\);/);
+  assert.match(appSource, /case "git":\s*return L\("fileEvent\.command"\);/);
   assert.match(appSource, /case "command_event":\s*return \{ label: L\("common\.commandEvent"\)/);
-  assert.match(appSource, /case "commands":\s*return kind === "command_event";/);
+  assert.match(appSource, /kind === "activity_status" && activityPhase === "running_command"/);
   assert.match(appSource, /<pre class="timeline-entry__command"><code>/);
   assert.match(appSource, /function timelineCommandEventCommand/);
   assert.match(appSource, /function timelineToolEventCommand/);
-  assert.match(appSource, /\["read",\s*"search"\]\.includes\(normalizeClientText\(item\?\.fileEventType \|\| ""\)\)/);
+  assert.match(appSource, /\["read",\s*"search",\s*"git"\]\.includes\(normalizeClientText\(item\?\.fileEventType \|\| ""\)\)/);
   assert.match(appSource, /function renderCommandEventDetail/);
   assert.match(appSource, /<pre class="detail-command-block"><code>/);
-  assert.match(bridgeSource, /const commandText = \["read",\s*"search"\]\.includes\(fileEventType\)/);
+  assert.match(bridgeSource, /const commandText = \["read",\s*"search",\s*"git"\]\.includes\(fileEventType\)/);
   assert.match(bridgeSource, /\.\.\.\(commandText \? \{ commandText \} : \{\}\)/);
+});
+
+test("timeline exposes live activity status as ephemeral cards", () => {
+  assert.match(bridgeSource, /"activity_status"/);
+  assert.match(bridgeSource, /activeTimelineActivitiesByKey: new Map\(\)/);
+  assert.match(bridgeSource, /function upsertTimelineActivity/);
+  assert.match(bridgeSource, /function clearTimelineActivity/);
+  assert.match(bridgeSource, /function buildActiveTimelineActivityEntries/);
+  assert.match(bridgeSource, /eventType === "PreToolUse"/);
+  assert.match(bridgeSource, /source: "codex-tool-start"/);
+  assert.match(appSource, /case "activity_status":\s*return \{ label: L\("server\.title\.activityStatus"\)/);
+  assert.match(appSource, /timeline-entry--activity/);
+  assert.match(appSource, /role="status" aria-live="polite"/);
+  assert.match(i18nSource, /"server\.activity\.thinking"/);
+  assert.match(i18nSource, /"server\.activity\.runningCommand"/);
 });
 
 test("Codex exec_command calls become timeline operation events", () => {
@@ -45,6 +61,12 @@ test("timeline operation details include command context but not command output"
   assert.match(bridgeSource, /function timelineCommandMessage/);
   assert.match(bridgeSource, /function firstMarkdownCodeFenceText/);
   assert.match(bridgeSource, /commandText,\s*fileRefs:/);
+  assert.doesNotMatch(bridgeSource, /fileEventType = "git";/);
+  assert.match(bridgeSource, /function readCommandPathArgs/);
+  assert.match(bridgeSource, /command === "head" \|\| command === "tail"/);
+  assert.match(appSource, /return L\("fileEvent\.read"\);/);
+  assert.doesNotMatch(i18nSource, /"fileEvent\.timeline\.readOne"/);
+  assert.doesNotMatch(i18nSource, /"fileEvent\.timeline\.searchOne"/);
   assert.match(bridgeSource, /redactTimelineCommandText/);
   assert.doesNotMatch(bridgeSource, /payload\.output[\s\S]{0,120}messageText/);
 });

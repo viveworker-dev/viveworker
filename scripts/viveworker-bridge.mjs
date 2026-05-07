@@ -55,7 +55,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "approval", "plan", "choice", "info", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "command_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
+const timelineKinds = new Set([...timelineMessageKinds, "activity_status", "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "command_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -70,6 +70,7 @@ const COMPLETION_PUSH_CONTENT_DEDUPE_WINDOW_MS = 2 * 60 * 1000;
 const HAZBASE_METADATA_TIMEOUT_MS = 1500;
 const NPM_VERSION_CHECK_TIMEOUT_MS = 2500;
 const NPM_VERSION_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const TIMELINE_ACTIVITY_TTL_MS = 2 * 60 * 1000;
 
 // Shared memo for buildDiffThreadGroups. Each call spawns 3 git subprocesses
 // per tracked repo (`git diff --name-status`, `git status --porcelain`,
@@ -272,6 +273,7 @@ const runtime = {
   recentHistoryItems: [],
   recentTimelineEntries: [],
   recentCodeEvents: [],
+  activeTimelineActivitiesByKey: new Map(),
   timelineBus: null,
   timelineRevision: 0,
   timelineLiveWatchers: [],
@@ -514,6 +516,8 @@ function kindTitle(locale, kind) {
       return t(locale, "server.title.assistantCommentary");
     case "assistant_final":
       return t(locale, "server.title.assistantFinal");
+    case "activity_status":
+      return t(locale, "server.title.activityStatus");
     case "ambient_suggestions":
       return t(locale, "server.title.ambientSuggestions");
     case "approval":
@@ -829,7 +833,7 @@ function normalizeTimelineOutcome(value) {
 
 function normalizeTimelineFileEventType(value) {
   const normalized = cleanText(value || "").toLowerCase();
-  return ["read", "search", "command", "write", "create", "delete", "rename"].includes(normalized) ? normalized : "";
+  return ["read", "search", "git", "command", "write", "create", "delete", "rename"].includes(normalized) ? normalized : "";
 }
 
 function fileEventTitle(locale, fileEventType) {
@@ -838,6 +842,8 @@ function fileEventTitle(locale, fileEventType) {
       return t(locale, "fileEvent.read");
     case "search":
       return t(locale, "fileEvent.search");
+    case "git":
+      return t(locale, "fileEvent.command");
     case "command":
       return t(locale, "fileEvent.command");
     case "write":
@@ -860,6 +866,8 @@ function fileEventDetailCopy(locale, fileEventType, provider) {
       return t(locale, "detail.fileEvent.read", vars);
     case "search":
       return t(locale, "detail.fileEvent.search", vars);
+    case "git":
+      return t(locale, "detail.fileEvent.command", vars);
     case "command":
       return t(locale, "detail.fileEvent.command", vars);
     case "write":
@@ -1531,7 +1539,7 @@ function evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot }) {
     return null;
   }
 
-  const command = cleanText(tokens[0]);
+  const command = commandBaseName(tokens[0]);
   if (!command || /^[A-Za-z_][A-Za-z0-9_]*=.*/u.test(command)) {
     return null;
   }
@@ -1606,8 +1614,7 @@ function classifyTimelineCommand(commandText) {
   if (["rg", "grep", "ag", "ack", "fd", "find"].includes(command) || gitSubcommand === "grep") {
     fileEventType = "search";
   } else if (
-    ["cat", "sed", "nl", "head", "tail", "wc", "ls", "pwd", "less", "more"].includes(command) ||
-    (command === "git" && ["status", "diff", "show", "log", "ls-files", "branch"].includes(gitSubcommand))
+    ["cat", "sed", "nl", "head", "tail", "wc", "ls", "pwd", "less", "more"].includes(command)
   ) {
     fileEventType = "read";
   }
@@ -1668,15 +1675,19 @@ function extractReadFileRefsFromCommand(commandText) {
     return [];
   }
 
-  if (command === "cat" || command === "nl") {
-    return normalizeTimelineFileRefs(tokens.slice(1).filter((token) => !String(token || "").startsWith("-")));
+  if (command === "cat" || command === "nl" || command === "wc" || command === "less" || command === "more" || command === "ls") {
+    return normalizeTimelineFileRefs(readCommandPathArgs(tokens));
+  }
+
+  if (command === "head" || command === "tail") {
+    return normalizeTimelineFileRefs(readCommandPathArgs(tokens, { valueOptions: new Set(["-n", "--lines", "-c", "--bytes"]) }));
   }
 
   if (command === "sed") {
     if (!tokens.includes("-n")) {
       return [];
     }
-    return normalizeTimelineFileRefs(tokens.slice(1).filter((token) => !String(token || "").startsWith("-")));
+    return normalizeTimelineFileRefs(sedCommandPathArgs(tokens));
   }
 
   if (command === "rg") {
@@ -1705,6 +1716,57 @@ function extractReadFileRefsFromCommand(commandText) {
   }
 
   return [];
+}
+
+function readCommandPathArgs(tokens, { valueOptions = new Set() } = {}) {
+  const args = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = cleanText(tokens[index] || "");
+    if (!token) {
+      continue;
+    }
+    if (token === "--") {
+      args.push(...tokens.slice(index + 1));
+      break;
+    }
+    if (token.startsWith("-")) {
+      const optionName = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+      if (valueOptions.has(optionName) && !token.includes("=")) {
+        index += 1;
+      }
+      continue;
+    }
+    args.push(token);
+  }
+  return args;
+}
+
+function sedCommandPathArgs(tokens) {
+  const args = [];
+  let scriptSeen = false;
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = cleanText(tokens[index] || "");
+    if (!token) {
+      continue;
+    }
+    if (token === "--") {
+      args.push(...tokens.slice(index + 1));
+      break;
+    }
+    if (token.startsWith("-")) {
+      if (token === "-e" || token === "-f") {
+        index += 1;
+        scriptSeen = true;
+      }
+      continue;
+    }
+    if (!scriptSeen) {
+      scriptSeen = true;
+      continue;
+    }
+    args.push(token);
+  }
+  return args;
 }
 
 function autoPilotApprovalMessage(locale, commandText) {
@@ -3377,6 +3439,8 @@ function migrateRecentCodeEventsState({ config, runtime, state }) {
 
 function timelineKindSortPriority(kind) {
   switch (cleanText(kind || "")) {
+    case "activity_status":
+      return 90;
     case "completion":
       return 70;
     case "approval":
@@ -3490,6 +3554,8 @@ function normalizeTimelineEntry(raw) {
     tone: cleanText(raw.tone ?? "") || "secondary",
     cwd: resolvePath(cleanText(raw.cwd || "")),
     provider: normalizeProvider(raw.provider),
+    ...(raw.activityPhase != null ? { activityPhase: cleanText(raw.activityPhase) } : {}),
+    ...(raw.commandText != null ? { commandText: cleanText(raw.commandText) } : {}),
     // Moltbook-specific fields — preserved for detail view fallback after
     // the in-memory draft/item expires.
     ...(raw.draftText != null ? { draftText: cleanText(raw.draftText) } : {}),
@@ -3581,6 +3647,229 @@ function publishTimelineUpdate({ config, runtime, entry, source = "unknown" }) {
     `source=${payload.source || "unknown"} revision=${payload.revision}`
   );
   ensureTimelineBus(runtime).emit("timeline:update", payload);
+}
+
+function timelineActivityKey(provider, threadId) {
+  const normalizedProvider = normalizeProvider(provider) || "codex";
+  const normalizedThreadId = cleanText(threadId || "");
+  if (!normalizedThreadId) {
+    return "";
+  }
+  return `${normalizedProvider}:${normalizedThreadId}`;
+}
+
+function timelineActivityTitle(locale, phase) {
+  switch (cleanText(phase || "")) {
+    case "thinking":
+      return t(locale, "server.activity.thinking");
+    case "reading":
+      return t(locale, "server.activity.reading");
+    case "searching":
+      return t(locale, "server.activity.searching");
+    case "editing":
+      return t(locale, "server.activity.editing");
+    case "running_command":
+      return t(locale, "server.activity.runningCommand");
+    case "awaiting_approval":
+      return t(locale, "server.activity.awaitingApproval");
+    default:
+      return t(locale, "server.activity.working");
+  }
+}
+
+function timelineActivitySummary(activity) {
+  const phase = cleanText(activity?.phase || "");
+  const refs = normalizeTimelineFileRefs(activity?.fileRefs || []);
+  if (refs.length === 1 && ["reading", "searching", "editing"].includes(phase)) {
+    return compactPath(refs[0]);
+  }
+  if (refs.length > 1 && ["reading", "searching", "editing"].includes(phase)) {
+    return `${refs.length} files`;
+  }
+  const commandText = cleanText(activity?.commandText || "");
+  if (commandText && phase !== "running_command") {
+    return timelineCommandSummary(commandText);
+  }
+  return cleanText(activity?.summary || "");
+}
+
+function buildTimelineActivityEntry(activity, locale = DEFAULT_LOCALE) {
+  if (!isPlainObject(activity)) {
+    return null;
+  }
+  const provider = normalizeProvider(activity.provider);
+  const threadId = cleanText(activity.threadId || "");
+  const key = cleanText(activity.key || timelineActivityKey(provider, threadId));
+  if (!key || !threadId) {
+    return null;
+  }
+  const phase = cleanText(activity.phase || "working");
+  const updatedAtMs = Number(activity.updatedAtMs) || Date.now();
+  return normalizeTimelineEntry({
+    stableId: `activity_status:${key}`,
+    token: historyToken(`activity_status:${key}`),
+    kind: "activity_status",
+    threadId,
+    threadLabel: cleanText(activity.threadLabel || ""),
+    title: timelineActivityTitle(locale, phase),
+    summary: timelineActivitySummary(activity),
+    messageText: cleanText(activity.commandText || activity.summary || ""),
+    fileRefs: normalizeTimelineFileRefs(activity.fileRefs || []),
+    commandText: cleanText(activity.commandText || ""),
+    activityPhase: phase,
+    createdAtMs: updatedAtMs,
+    cwd: cleanText(activity.cwd || ""),
+    readOnly: true,
+    provider,
+  });
+}
+
+function publishTimelineActivityUpdate({ config, runtime, activity, source = "activity-status" }) {
+  const entry = buildTimelineActivityEntry(activity, DEFAULT_LOCALE);
+  if (entry) {
+    publishTimelineUpdate({ config, runtime, entry, source });
+  }
+}
+
+function upsertTimelineActivity({
+  config,
+  runtime,
+  provider,
+  threadId,
+  threadLabel = "",
+  phase = "working",
+  summary = "",
+  commandText = "",
+  fileRefs = [],
+  cwd = "",
+  source = "activity-status",
+  atMs = Date.now(),
+}) {
+  if (!config?.webUiEnabled || !runtime) {
+    return false;
+  }
+  if (!(runtime.activeTimelineActivitiesByKey instanceof Map)) {
+    runtime.activeTimelineActivitiesByKey = new Map();
+  }
+  const normalizedProvider = normalizeProvider(provider) || "codex";
+  const normalizedThreadId = cleanText(threadId || "");
+  const key = timelineActivityKey(normalizedProvider, normalizedThreadId);
+  if (!key) {
+    return false;
+  }
+  const next = {
+    key,
+    provider: normalizedProvider,
+    threadId: normalizedThreadId,
+    threadLabel: cleanText(threadLabel || ""),
+    phase: cleanText(phase || "working"),
+    summary: cleanText(summary || ""),
+    commandText: cleanText(commandText || ""),
+    fileRefs: normalizeTimelineFileRefs(fileRefs),
+    cwd: cleanText(cwd || ""),
+    updatedAtMs: Number(atMs) || Date.now(),
+  };
+  const previous = runtime.activeTimelineActivitiesByKey.get(key);
+  const changed =
+    !previous ||
+    previous.phase !== next.phase ||
+    previous.summary !== next.summary ||
+    previous.commandText !== next.commandText ||
+    previous.threadLabel !== next.threadLabel ||
+    previous.cwd !== next.cwd ||
+    JSON.stringify(previous.fileRefs || []) !== JSON.stringify(next.fileRefs || []);
+  runtime.activeTimelineActivitiesByKey.set(key, next);
+  if (changed) {
+    publishTimelineActivityUpdate({ config, runtime, activity: next, source });
+  }
+  return changed;
+}
+
+function clearTimelineActivity({ config, runtime, provider, threadId, source = "activity-clear", atMs = Date.now() }) {
+  if (!runtime?.activeTimelineActivitiesByKey) {
+    return false;
+  }
+  const key = timelineActivityKey(provider, threadId);
+  if (!key || !runtime.activeTimelineActivitiesByKey.has(key)) {
+    return false;
+  }
+  const previous = runtime.activeTimelineActivitiesByKey.get(key);
+  runtime.activeTimelineActivitiesByKey.delete(key);
+  publishTimelineActivityUpdate({
+    config,
+    runtime,
+    activity: {
+      ...(isPlainObject(previous) ? previous : {}),
+      key,
+      provider: normalizeProvider(provider),
+      threadId: cleanText(threadId || ""),
+      phase: "working",
+      updatedAtMs: Number(atMs) || Date.now(),
+    },
+    source,
+  });
+  return true;
+}
+
+function timelineActivityFromCommand({ commandText, cwd = "" }) {
+  const classified = classifyTimelineCommand(commandText);
+  const fileEventType = cleanText(classified.fileEventType || "");
+  const phase = fileEventType === "read"
+    ? "reading"
+    : fileEventType === "search"
+      ? "searching"
+      : "running_command";
+  return {
+    phase,
+    commandText: classified.commandText || commandText,
+    fileRefs: classified.fileRefs || [],
+    cwd,
+  };
+}
+
+function timelineActivityFromClaudeTool(toolName, input = {}) {
+  const lowerToolName = cleanText(toolName || "").toLowerCase();
+  if (lowerToolName === "bash") {
+    return timelineActivityFromCommand({ commandText: cleanText(input.command || ""), cwd: cleanText(input.cwd || "") });
+  }
+  if (["read", "ls"].includes(lowerToolName)) {
+    return {
+      phase: "reading",
+      summary: cleanText(toolName || ""),
+      fileRefs: normalizeTimelineFileRefs([input.file_path || input.path || input.filePath].filter(Boolean)),
+    };
+  }
+  if (["grep", "glob", "websearch", "webfetch"].includes(lowerToolName)) {
+    return {
+      phase: "searching",
+      summary: cleanText(input.pattern || input.query || input.url || toolName || ""),
+      fileRefs: normalizeTimelineFileRefs([input.path || input.file_path || input.filePath].filter(Boolean)),
+    };
+  }
+  if (["write", "edit", "multiedit", "todowrite"].includes(lowerToolName)) {
+    return {
+      phase: "editing",
+      summary: cleanText(toolName || ""),
+      fileRefs: normalizeTimelineFileRefs([input.file_path || input.path || input.filePath].filter(Boolean)),
+    };
+  }
+  if (["askuserquestion", "exitplanmode"].includes(lowerToolName)) {
+    return { phase: "awaiting_approval", summary: cleanText(toolName || "") };
+  }
+  return { phase: "working", summary: cleanText(toolName || "") };
+}
+
+function timelineActivityFromClaudeContent(content) {
+  if (!Array.isArray(content)) {
+    return null;
+  }
+  for (const block of content) {
+    if (!isPlainObject(block) || block.type !== "tool_use") {
+      continue;
+    }
+    return timelineActivityFromClaudeTool(block.name || "", isPlainObject(block.input) ? block.input : {});
+  }
+  return null;
 }
 
 function recordTimelineEntry({ config, runtime, state, entry, source = "unknown" }) {
@@ -4599,6 +4888,17 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
             entry: timelineEntry,
             source: "codex-rollout",
           }) || dirty;
+        upsertTimelineActivity({
+          config,
+          runtime,
+          provider: "codex",
+          threadId: timelineEntry.threadId,
+          threadLabel: timelineEntry.threadLabel,
+          phase: "thinking",
+          cwd: fileState.cwd || "",
+          source: "codex-user-message",
+          atMs: Date.parse(record.timestamp ?? "") || Date.now(),
+        });
       }
 
       const fileTimelineEntries = await buildRolloutFileTimelineEntries({
@@ -5032,6 +5332,23 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
       for (const toolEntry of toolEntries) {
         dirty = recordTimelineEntry({ config, runtime, state, entry: toolEntry, source: "claude-tool" }) || dirty;
       }
+      const toolActivity = timelineActivityFromClaudeContent(content);
+      if (toolActivity) {
+        upsertTimelineActivity({
+          config,
+          runtime,
+          provider: "claude",
+          threadId,
+          threadLabel,
+          phase: toolActivity.phase,
+          summary: toolActivity.summary,
+          commandText: toolActivity.commandText,
+          fileRefs: toolActivity.fileRefs,
+          cwd: fileState.cwd,
+          source: "claude-tool-start",
+          atMs: createdAtMs,
+        });
+      }
     }
 
     let text = "";
@@ -5071,6 +5388,28 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
       : stopReason === "end_turn"
         ? "assistant_final"
         : "assistant_commentary";
+    if (kind === "user_message") {
+      upsertTimelineActivity({
+        config,
+        runtime,
+        provider: "claude",
+        threadId,
+        threadLabel,
+        phase: "thinking",
+        cwd: fileState.cwd,
+        source: "claude-user-message",
+        atMs: createdAtMs,
+      });
+    } else if (kind === "assistant_final") {
+      clearTimelineActivity({
+        config,
+        runtime,
+        provider: "claude",
+        threadId,
+        source: "claude-final",
+        atMs: createdAtMs,
+      });
+    }
     // Use kind-independent stableId so re-scans with corrected classification
     // replace old entries rather than creating duplicates.
     const stableId = `claude_msg:${threadId}:${uuid}`;
@@ -6367,6 +6706,20 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
       return [];
     }
     const classified = classifyTimelineCommand(commandText);
+    const activity = timelineActivityFromCommand({ commandText, cwd: cleanText(args.workdir || fileState.cwd || "") });
+    upsertTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId,
+      threadLabel,
+      phase: activity.phase,
+      commandText: activity.commandText,
+      fileRefs: activity.fileRefs,
+      cwd: activity.cwd,
+      source: "codex-tool-start",
+      atMs: createdAtMs,
+    });
     return [
       buildToolTimelineEntry({
         provider: "codex",
@@ -6384,11 +6737,34 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
 
   if (payloadType === "custom_tool_call") {
     rememberApplyPatchInput(fileState, payload, createdAtMs);
+    upsertTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId,
+      threadLabel,
+      phase: "editing",
+      summary: cleanText(payload?.name || "apply_patch"),
+      cwd: fileState.cwd || "",
+      source: "codex-tool-start",
+      atMs: createdAtMs,
+    });
     return [];
   }
 
   if (payloadType === "function_call_output") {
     if (findStoredToolEventInput(fileState, callId)) {
+      upsertTimelineActivity({
+        config,
+        runtime,
+        provider: "codex",
+        threadId,
+        threadLabel,
+        phase: "thinking",
+        cwd: fileState.cwd || "",
+        source: "codex-tool-output",
+        atMs: createdAtMs,
+      });
       return [];
     }
     const commandText = extractCommandLineFromFunctionOutput(payload.output ?? "");
@@ -6396,6 +6772,17 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
       return [];
     }
     const classified = classifyTimelineCommand(commandText);
+    upsertTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId,
+      threadLabel,
+      phase: "thinking",
+      cwd: fileState.cwd || "",
+      source: "codex-tool-output",
+      atMs: createdAtMs,
+    });
     return [
       buildToolTimelineEntry({
         provider: "codex",
@@ -6554,6 +6941,18 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
       fileState.applyPatchInputsByCallId.delete(callId);
     }
 
+    upsertTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId,
+      threadLabel,
+      phase: "thinking",
+      cwd: fileState.cwd || "",
+      source: "codex-tool-output",
+      atMs: createdAtMs,
+    });
+
     return entries.filter(Boolean);
   }
 
@@ -6610,8 +7009,24 @@ async function processScannedEvent({ config, runtime, state, event }) {
   let dirty = false;
 
   if (event.kind === "task_complete") {
+    clearTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId: event.threadId ?? event.conversationId ?? "",
+      source: "codex-task-complete",
+      atMs: event.timestampMs || Date.now(),
+    });
     attachCompletionDetails({ config, runtime, event });
   } else if (event.kind === "plan_ready") {
+    clearTimelineActivity({
+      config,
+      runtime,
+      provider: "codex",
+      threadId: event.threadId ?? event.conversationId ?? "",
+      source: "codex-plan-ready",
+      atMs: event.timestampMs || Date.now(),
+    });
     attachPlanDetails({ config, runtime, event });
   }
 
@@ -10170,9 +10585,10 @@ function formatNativeApprovalMessage(kind, params, locale = config?.defaultLocal
 }
 
 function formatCommandApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const safeParams = isPlainObject(params) ? params : {};
   const parts = [];
-  const reason = truncate(cleanText(params.reason ?? params.justification ?? ""), 220);
-  const command = truncate(cleanText(params.command ?? params.cmd ?? ""), 1200);
+  const reason = truncate(cleanText(safeParams.reason ?? safeParams.justification ?? ""), 220);
+  const command = truncate(cleanText(safeParams.command ?? safeParams.cmd ?? ""), 1200);
   if (reason) {
     parts.push(reason);
   } else {
@@ -10185,19 +10601,39 @@ function formatCommandApprovalMessage(params, locale = config?.defaultLocale || 
 }
 
 function formatFileApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const safeParams = isPlainObject(params) ? params : {};
   const parts = [];
-  const reason = truncate(cleanText(params.reason ?? ""), 220);
+  const reason = truncate(cleanText(safeParams.reason ?? ""), 220);
   if (reason) {
     parts.push(reason);
   } else {
     parts.push(t(locale, "server.message.fileApprovalNeeded"));
   }
-  if (params.grantRoot) {
-    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(params.grantRoot) }));
-  } else if (params.cwd) {
-    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(params.cwd) }));
+  if (safeParams.grantRoot) {
+    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(safeParams.grantRoot) }));
+  } else if (safeParams.cwd) {
+    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(safeParams.cwd) }));
   }
   return truncate(parts.join("\n"), 1024);
+}
+
+function claudeApprovalRawParams(body, kind) {
+  const toolInput = isPlainObject(body?.toolInput) ? cloneJson(body.toolInput) : {};
+  const rawParams = {
+    ...toolInput,
+    ...(body?.cwd ? { cwd: String(body.cwd) } : {}),
+  };
+  const messageText = cleanText(body?.messageText || "");
+  if (messageText && !cleanText(rawParams.reason ?? rawParams.justification ?? "")) {
+    rawParams.reason = messageText;
+  }
+  if (kind === "command" && !cleanText(rawParams.command ?? rawParams.cmd ?? "")) {
+    const commandText = cleanText(toolInput.command ?? toolInput.cmd ?? "");
+    if (commandText) {
+      rawParams.command = commandText;
+    }
+  }
+  return rawParams;
 }
 
 function extractApprovalFileRefs(params) {
@@ -12621,6 +13057,26 @@ function buildTimelineThreads(entries, config) {
     .slice(0, config.maxTimelineThreads);
 }
 
+function buildActiveTimelineActivityEntries(runtime, locale) {
+  if (!(runtime?.activeTimelineActivitiesByKey instanceof Map)) {
+    return [];
+  }
+  const now = Date.now();
+  const entries = [];
+  for (const [key, activity] of [...runtime.activeTimelineActivitiesByKey.entries()]) {
+    const updatedAtMs = Number(activity?.updatedAtMs) || 0;
+    if (!updatedAtMs || now - updatedAtMs > TIMELINE_ACTIVITY_TTL_MS) {
+      runtime.activeTimelineActivitiesByKey.delete(key);
+      continue;
+    }
+    const entry = buildTimelineActivityEntry(activity, locale);
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
 function buildTimelineResponse(runtime, state, config, locale) {
   const messageEntries = normalizeTimelineEntries(
     state.recentTimelineEntries ?? runtime.recentTimelineEntries,
@@ -12628,7 +13084,11 @@ function buildTimelineResponse(runtime, state, config, locale) {
   );
   runtime.recentTimelineEntries = messageEntries;
   const entries = normalizeTimelineEntries(
-    [...messageEntries, ...buildOperationalTimelineEntries(runtime, state, config, locale)],
+    [
+      ...buildActiveTimelineActivityEntries(runtime, locale),
+      ...messageEntries,
+      ...buildOperationalTimelineEntries(runtime, state, config, locale),
+    ],
     config.maxTimelineEntries
   ).map((entry) => ({
     kind: entry.kind,
@@ -12646,6 +13106,9 @@ function buildTimelineResponse(runtime, state, config, locale) {
     outcome: entry.outcome || "",
     createdAtMs: entry.createdAtMs,
     provider: normalizeProvider(entry.provider),
+    ...(entry.activityPhase != null ? { activityPhase: entry.activityPhase } : {}),
+    ...(entry.commandText != null ? { commandText: entry.commandText } : {}),
+    ...timelineAutoPilotProjection(entry),
     ...(entry.draftType != null ? { draftType: entry.draftType } : {}),
   }));
 
@@ -12653,6 +13116,24 @@ function buildTimelineResponse(runtime, state, config, locale) {
     threads: buildTimelineThreads(entries, config),
     entries,
   };
+}
+
+function timelineAutoPilotProjection(entry) {
+  if (cleanText(entry?.kind || "") !== "approval" || cleanText(entry?.outcome || "") !== "approved") {
+    return {};
+  }
+  const stableId = cleanText(entry?.stableId || "");
+  if (stableId.includes(":autopilot-write")) {
+    const lane = cleanText(stableId.match(/:autopilot-write:([a-z_-]+)$/u)?.[1] || "");
+    return {
+      autoPilotMode: "write",
+      ...(lane ? { autoPilotWriteLane: lane } : {}),
+    };
+  }
+  if (stableId.endsWith(":autopilot")) {
+    return { autoPilotMode: "read" };
+  }
+  return {};
 }
 
 function buildPendingApprovalDetail(runtime, state, approval, locale) {
@@ -13272,7 +13753,7 @@ function buildAmbientSuggestionsDetail(entry, locale) {
 
 function buildTimelineFileEventDetail(entry, locale) {
   const fileEventType = normalizeTimelineFileEventType(entry?.fileEventType ?? "");
-  const commandText = ["read", "search"].includes(fileEventType)
+  const commandText = ["read", "search", "git"].includes(fileEventType)
     ? firstMarkdownCodeFenceText(entry?.messageText ?? "")
     : "";
   const detailText = [
@@ -17592,6 +18073,13 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           const threadId = String(body.threadId || body.sessionId || "");
           console.log(`[claude-stop] threadId=${threadId} pendingTotal=${runtime.nativeApprovalsByToken.size}`);
           if (threadId) {
+            clearTimelineActivity({
+              config,
+              runtime,
+              provider: "claude",
+              threadId,
+              source: "claude-stop",
+            });
             const pending = [];
             for (const approval of runtime.nativeApprovalsByToken.values()) {
               if (!approval.resolved && approval.conversationId === threadId) {
@@ -17662,6 +18150,21 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           // for this session/tool as accepted (so iPhone moves it to completed).
           const threadId = String(body.threadId || body.sessionId || "");
           const toolName = String(body.toolName || "");
+          const eventCwd = String(body.cwd || "");
+          const threadLabel =
+            runtime.claudeSessionTitles.get(threadId) ||
+            (eventCwd ? path.basename(eventCwd) : "") ||
+            threadId.slice(0, 40);
+          upsertTimelineActivity({
+            config,
+            runtime,
+            provider: "claude",
+            threadId,
+            threadLabel,
+            phase: "thinking",
+            cwd: eventCwd,
+            source: "claude-post-tool",
+          });
           const fingerprint = claudeToolFingerprint(toolName, body.toolInput);
           console.log(`[claude-post-tool] threadId=${threadId} tool=${toolName} fp=${fingerprint.slice(0, 80)} pendingTotal=${runtime.nativeApprovalsByToken.size}`);
           const match = findClaudePendingApprovalForTool(runtime, threadId, toolName, fingerprint);
@@ -17697,6 +18200,31 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           }
         }
 
+        if (eventType === "PreToolUse") {
+          const threadId = String(body.threadId || body.sessionId || "");
+          const eventCwd = String(body.cwd || "");
+          const toolName = String(body.toolName || "");
+          const toolActivity = timelineActivityFromClaudeTool(toolName, isPlainObject(body.toolInput) ? body.toolInput : {});
+          const threadLabel =
+            runtime.claudeSessionTitles.get(threadId) ||
+            (eventCwd ? path.basename(eventCwd) : "") ||
+            threadId.slice(0, 40);
+          upsertTimelineActivity({
+            config,
+            runtime,
+            provider: "claude",
+            threadId,
+            threadLabel,
+            phase: toolActivity.phase,
+            summary: toolActivity.summary,
+            commandText: toolActivity.commandText,
+            fileRefs: toolActivity.fileRefs,
+            cwd: eventCwd,
+            source: "claude-pre-tool",
+          });
+          return writeJson(res, 200, {});
+        }
+
         if (eventType !== "approval_request") {
           // Non-approval events (Notification, Stop, etc.) — acknowledge immediately
           return writeJson(res, 200, {});
@@ -17708,6 +18236,8 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         const threadId = String(body.threadId || "");
         const requestId = String(body.requestId || crypto.randomUUID());
         const requestKey = `${threadId}:${requestId}`;
+        const approvalKind = String(body.approvalKind || "command");
+        const rawParams = claudeApprovalRawParams(body, approvalKind);
 
         const approval = {
           token,
@@ -17715,13 +18245,14 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           conversationId: threadId,
           requestId,
           ownerClientId: null,
-          kind: String(body.approvalKind || "command"),
+          kind: approvalKind,
           threadLabel:
             runtime.claudeSessionTitles.get(threadId) ||
             (body.cwd ? path.basename(String(body.cwd))  : "") ||
             String(body.threadId || "").slice(0, 40),
           title: config.approvalTitle,
           messageText: String(body.messageText || ""),
+          rawParams,
           fileRefs: Array.isArray(body.fileRefs) ? body.fileRefs : [],
           previousFileRefs: [],
           diffText: String(body.diffText || ""),
@@ -17743,6 +18274,20 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           notifyOnly: body.notifyOnly === true,
           readOnly: body.notifyOnly === true,
         };
+
+        upsertTimelineActivity({
+          config,
+          runtime,
+          provider: "claude",
+          threadId,
+          threadLabel: approval.threadLabel,
+          phase: "awaiting_approval",
+          summary: approval.messageText,
+          fileRefs: approval.fileRefs,
+          cwd: approval.cwd,
+          source: "claude-approval-request",
+          atMs: approval.createdAtMs,
+        });
 
         const claudeAutoPilotMatch =
           approval.kind === "command"
@@ -17800,21 +18345,28 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         runtime.nativeApprovalsByToken.set(token, approval);
         runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
 
-        deliverWebPushItem({
-          config,
-          state,
-          kind: "approval",
-          tab: "inbox",
-          subtab: "pending",
-          token: approval.token,
-          stableId: pendingApprovalStableId(approval),
-          title: approval.title,
-          body: approval.messageText,
-          buildLocalizedContent: ({ locale }) => ({
-            title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
-            body: formatNativeApprovalMessage(approval.kind, approval.rawParams, locale),
-          }),
-        }).catch(() => {});
+        try {
+          const pushChanged = await deliverWebPushItem({
+            config,
+            state,
+            kind: "approval",
+            tab: "inbox",
+            subtab: "pending",
+            token: approval.token,
+            stableId: pendingApprovalStableId(approval),
+            title: approval.title,
+            body: approval.messageText,
+            buildLocalizedContent: ({ locale }) => ({
+              title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+              body: formatNativeApprovalMessage(approval.kind, approval.rawParams, locale),
+            }),
+          });
+          if (pushChanged) {
+            await saveState(config.stateFile, state);
+          }
+        } catch (error) {
+          console.error(`[claude-approval-push] ${approval.requestKey} | ${error.message}`);
+        }
 
         // Notify-only path: phone gets a read-only entry + push, but the
         // hook does not block on a decision. The PostToolUse handler will
