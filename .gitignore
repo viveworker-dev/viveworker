@@ -16,6 +16,7 @@ node_modules/
 *.log
 .logs/
 docs/
+marketing/
 
 # Local databases and caches
 *.db

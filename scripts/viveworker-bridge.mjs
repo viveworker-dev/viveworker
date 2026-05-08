@@ -21,7 +21,7 @@ import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
-import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems } from "./moltbook-api.mjs";
+import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems, updateInboxStatus, getMoltbookReplyQuotaState } from "./moltbook-api.mjs";
 import { startRemotePairingRelay, DEFAULT_RELAY_URL } from "./lib/remote-pairing/orchestrator.mjs";
 import { restartRemotePairingRelay, persistRemotePairingEnv, getRemotePairingStatus } from "./lib/remote-pairing/control.mjs";
 import { appendRemotePairingAuditEvent, readRemotePairingAuditEvents } from "./lib/remote-pairing/audit.mjs";
@@ -266,6 +266,7 @@ const runtime = {
   completionDetailsByToken: new Map(),
   moltbookItemsByToken: new Map(),
   moltbookDraftsByToken: new Map(),
+  moltbookReplyQuotaQueue: Promise.resolve(),
   a2aTasksByToken: new Map(),
   threadSharesByToken: new Map(),
   threadRegistry: new Map(),
@@ -348,6 +349,58 @@ setInterval(async () => {
     }
   }
 }, 60_000).unref?.();
+
+async function withMoltbookReplyQuotaLock(fn) {
+  const previous = runtime.moltbookReplyQuotaQueue || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => { release = resolve; });
+  runtime.moltbookReplyQuotaQueue = previous.then(() => next, () => next);
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function reserveMoltbookReplyQuotaSlot(draft, maxDaily = 5) {
+  if (!draft || draft.draftType === "original_post") return { reserved: false };
+  return withMoltbookReplyQuotaLock(async () => {
+    const scoutState = rollScoutDayIfNeeded(await readScoutState());
+    if ((Number(scoutState.sentToday) || 0) >= maxDaily) {
+      return {
+        reserved: false,
+        quotaReached: true,
+        day: scoutState.day,
+        sentToday: Number(scoutState.sentToday) || 0,
+        maxDaily,
+      };
+    }
+    scoutState.sentToday = (Number(scoutState.sentToday) || 0) + 1;
+    markPostSeen(scoutState, draft.postId, "reserved");
+    await writeScoutState(scoutState);
+    draft.replyQuotaReserved = true;
+    draft.replyQuotaReservedDay = scoutState.day;
+    draft.replyQuotaReservedAtMs = Date.now();
+    return {
+      reserved: true,
+      day: scoutState.day,
+      sentToday: scoutState.sentToday,
+      maxDaily,
+    };
+  });
+}
+
+async function releaseMoltbookReplyQuotaSlot(draft) {
+  if (!draft?.replyQuotaReserved || draft.draftType === "original_post") return;
+  await withMoltbookReplyQuotaLock(async () => {
+    const scoutState = rollScoutDayIfNeeded(await readScoutState());
+    if (draft.replyQuotaReservedDay && scoutState.day !== draft.replyQuotaReservedDay) return;
+    scoutState.sentToday = Math.max(0, (Number(scoutState.sentToday) || 0) - 1);
+    await writeScoutState(scoutState);
+  });
+  draft.replyQuotaReserved = false;
+}
 const initialHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
 const initialTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
 const normalizedHistoryStateChanged =
@@ -18589,6 +18642,22 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         if (draftType === "reply" && !postId) {
           return writeJson(res, 400, { error: "missing-postId-for-reply" });
         }
+        if (draftType !== "original_post") {
+          const scoutState = rollScoutDayIfNeeded(await readScoutState());
+          const quota = await getMoltbookReplyQuotaState({ state: scoutState, maxDaily: 5 });
+          if (quota.quotaReached) {
+            await writeScoutState(scoutState);
+            return writeJson(res, 409, {
+              error: "moltbook-reply-quota-reached",
+              sentToday: quota.sentToday,
+              pendingToday: quota.pendingToday,
+              usedToday: quota.usedToday,
+              maxDaily: quota.maxDaily,
+              day: quota.day,
+            });
+          }
+          await writeScoutState(scoutState);
+        }
         const token = historyToken(`moltbook_draft:${sourceId}`);
         const postTitle = cleanText(body.postTitle || "");
         const postUrl = cleanText(body.postUrl || `https://www.moltbook.com/post/${postId}`);
@@ -18724,6 +18793,17 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         const action = String(body.action || "") === "approve" ? "approve" : "deny";
         const editedText = cleanText(body.editedText || "");
         const editedTitle = cleanText(body.editedTitle || "");
+        if (action === "approve" && draft.draftType !== "original_post") {
+          const quota = await reserveMoltbookReplyQuotaSlot(draft, 5);
+          if (quota.quotaReached) {
+            return writeJson(res, 409, {
+              error: "moltbook-reply-quota-reached",
+              sentToday: quota.sentToday,
+              maxDaily: quota.maxDaily,
+              day: quota.day,
+            });
+          }
+        }
         const decision = {
           action,
           text: action === "approve" ? editedText || draft.draftText : "",
@@ -18757,6 +18837,15 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
               await executeMoltbookDraftPost(draft, config, runtime, state);
             } catch (postError) {
               console.error(`[moltbook-draft-post-error] ${postError.message}`);
+              await releaseMoltbookReplyQuotaSlot(draft).catch((error) => console.error(`[moltbook-quota-release] ${error.message}`));
+              if (draft.parentCommentId) {
+                await updateInboxStatus(draft.parentCommentId, "pending", {
+                  source: "mobile-draft-approve",
+                  draftStatus: "failed",
+                  draftToken: draft.token,
+                  draftError: String(postError.message || "").slice(0, 500),
+                }).catch((error) => console.error(`[moltbook-inbox-post-failed] ${error.message}`));
+              }
               try {
                 await deliverWebPushItem({
                   config, state, kind: "moltbook_draft", token: draft.token,
@@ -18776,6 +18865,14 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
             setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120_000).unref?.();
           })();
         } else {
+          if (draft.parentCommentId) {
+            await updateInboxStatus(draft.parentCommentId, "skipped", {
+              source: "mobile-draft-deny",
+              draftStatus: "denied",
+              draftToken: draft.token,
+              skippedAt: new Date().toISOString(),
+            }).catch((error) => console.error(`[moltbook-inbox-denied] ${error.message}`));
+          }
           // Deny — clean up.
           await deleteDraft(token).catch(() => {});
           setTimeout(() => runtime.moltbookDraftsByToken.delete(token), 120_000).unref?.();
@@ -20858,9 +20955,21 @@ async function executeMoltbookDraftPost(draft, config, runtime, state) {
     createdPostId = draft.postId || null;
     createdCommentId = comment?.id || null;
     console.log(`[moltbook-draft-post] Posted reply (commentId=${comment?.id}) to post ${draft.postId}`);
+    if (draft.parentCommentId) {
+      await updateInboxStatus(draft.parentCommentId, "replied", {
+        source: "mobile-draft-approve",
+        replyText: finalText,
+        replyCommentId: createdCommentId || "",
+        replyVerification: verification || null,
+        draftStatus: "posted",
+        draftToken: draft.token,
+      }).catch((error) => console.error(`[moltbook-inbox-replied] ${error.message}`));
+    }
 
     const scoutState = rollScoutDayIfNeeded(await readScoutState());
-    scoutState.sentToday += 1;
+    if (!draft.replyQuotaReserved) {
+      scoutState.sentToday += 1;
+    }
     markPostSeen(scoutState, draft.postId, "published");
     // Append the reply to `recentComposeTitles` so it shows up in the
     // "最近の投稿" list with its reply badge. `recordComposeAttempt` knows

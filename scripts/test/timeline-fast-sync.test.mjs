@@ -26,8 +26,8 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
   assert.match(appSource, /stickyLanProbeTimeoutMs: TIMELINE_STICKY_LAN_PROBE_TIMEOUT_MS,/);
 });
 
-test("build id marks the fast timeline sync bundle", () => {
-  assert.match(buildIdSource, /20260506-live-activity-status-v1/);
+test("build id marks the current web bundle", () => {
+  assert.match(buildIdSource, /20260508-moltbook-quota-deny-i18n/);
 });
 
 test("timeline render is reported with sanitized client metadata", () => {

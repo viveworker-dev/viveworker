@@ -10,7 +10,7 @@
 # Environment:
 #   SCOUT_HARNESS   — "claude" or "codex" (default: auto-detect)
 #   SCOUT_FLAGS     — extra flags for scout (e.g. "--submolts builds,general --max-daily 5")
-#   SCOUT_TIMEOUT   — propose timeout in seconds (default: 900)
+#   SCOUT_TIMEOUT   — propose timeout in seconds (default: 86400 = 24h)
 #   SCOUT_DRAFT_TIMEOUT — LLM draft timeout in seconds (default: 120)
 #   SCOUT_WINDOW    — batch window in seconds (default: 1800 = 30 min)
 #   COMPOSE_MAX     — max original posts per day (default: 1)
@@ -27,7 +27,7 @@ NODE="$(command -v node)"
 VIVEWORKER="$SCRIPT_DIR/viveworker.mjs"
 PERSONA_FILE="$HOME/.viveworker/moltbook-persona.md"
 WINDOW_SEC="${SCOUT_WINDOW:-1800}"
-PROPOSE_TIMEOUT_SEC="${SCOUT_TIMEOUT:-900}"
+PROPOSE_TIMEOUT_SEC="${SCOUT_TIMEOUT:-86400}"
 DRAFT_TIMEOUT_SEC="${SCOUT_DRAFT_TIMEOUT:-120}"
 
 # Seconds until a given hour (local time). Used for compose slot timeouts.
@@ -105,6 +105,102 @@ read_field() {
 json_field() {
   echo "$1" | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).$2||'')}catch{}})"
 }
+
+# ═══════════════════════════════════════════════════════════════
+# Step -1: Draft a reply to an incoming comment first.
+#   Inbox replies continue an active conversation, so they take priority over
+#   original posts and discovery replies.  The CLI marks a successful proposal
+#   on the inbox item, which prevents duplicate drafts for the same comment.
+# ═══════════════════════════════════════════════════════════════
+INBOX_JSON=$("$NODE" "$VIVEWORKER" moltbook inbox-pick ${SCOUT_FLAGS:-} 2>/dev/null) || true
+INBOX_STATUS=$(json_field "$INBOX_JSON" "status")
+
+if [ "$INBOX_STATUS" = "candidate" ]; then
+  if [ -z "$HARNESS_BIN" ]; then
+    echo "[scout-auto] inbox: pending comment found, but no draft harness is available"
+  else
+    printf '%s' "$INBOX_JSON" > "$SCOUT_TMP"
+    INBOX_COMMENT_ID=$(read_field commentId)
+    INBOX_POST_ID=$(read_field postId)
+    INBOX_AUTHOR=$(read_field author)
+    INBOX_POST_TITLE=$(read_field postTitle)
+    INBOX_POST_AUTHOR=$(read_field postAuthor)
+    INBOX_POST_URL=$(read_field postUrl)
+    INBOX_POST_BODY=$(read_field postBody)
+    INBOX_COMMENT_TEXT=$(read_field commentText)
+
+    echo "[scout-auto] inbox: drafting reply to @$INBOX_AUTHOR on '$INBOX_POST_TITLE'"
+
+    INBOX_PROMPT="$(cat <<INBOX_PROMPT_EOF
+${PERSONA:+You are drafting a reply on behalf of the agent described below. Follow this persona precisely.
+-----8<----- persona -----8<-----
+$PERSONA
+-----8<----- end persona -----8<-----
+
+}Someone replied to your Moltbook post. You are continuing that conversation, not cold-starting a new outreach reply.
+
+Original post:
+Title: $INBOX_POST_TITLE
+Author: ${INBOX_POST_AUTHOR:-you}
+URL: $INBOX_POST_URL
+
+Post body:
+$INBOX_POST_BODY
+
+Incoming comment from @$INBOX_AUTHOR:
+$INBOX_COMMENT_TEXT
+
+Draft a natural reply in the persona voice. Keep it concise, specific to the comment, and conversational. Prefer ending with one concrete question only if it genuinely helps continue the thread.
+
+Output in this exact format — no markdown fences, no extra text:
+
+INTENT: (1-2 sentences in Japanese: why this reply angle fits the incoming comment and original post)
+---
+(your reply text here)
+INBOX_PROMPT_EOF
+    )"
+
+    INBOX_DRAFT_TEXT=""
+    if [ "$HARNESS" = "claude" ]; then
+      INBOX_DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$INBOX_PROMPT" --output-format text 2>/dev/null) || true
+    elif [ "$HARNESS" = "codex" ]; then
+      INBOX_DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec "$INBOX_PROMPT" 2>/dev/null) || true
+    fi
+
+    if [ -z "$INBOX_DRAFT_TEXT" ]; then
+      echo "[scout-auto] inbox: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
+    else
+      INBOX_INTENT=""
+      INBOX_REPLY_BODY=""
+      if echo "$INBOX_DRAFT_TEXT" | grep -q "^---$"; then
+        INBOX_INTENT=$(echo "$INBOX_DRAFT_TEXT" | sed -n '1,/^---$/p' | sed '/^---$/d' | sed 's/^INTENT: *//')
+        INBOX_REPLY_BODY=$(echo "$INBOX_DRAFT_TEXT" | sed '1,/^---$/d')
+      else
+        INBOX_REPLY_BODY="$INBOX_DRAFT_TEXT"
+        INBOX_INTENT="inbox: responding to @${INBOX_AUTHOR}'s comment"
+      fi
+      INBOX_INTENT=$(echo "$INBOX_INTENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      INBOX_REPLY_BODY=$(echo "$INBOX_REPLY_BODY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+      if [ -n "$INBOX_REPLY_BODY" ]; then
+        echo "[scout-auto] inbox: draft ready (${#INBOX_REPLY_BODY} chars), submitting propose"
+        "$NODE" "$VIVEWORKER" moltbook propose "$INBOX_POST_ID" \
+          --title "$INBOX_POST_TITLE" \
+          --post-author "$INBOX_POST_AUTHOR" \
+          --post-body "$INBOX_POST_BODY" \
+          --intent "$INBOX_INTENT" \
+          --text "$INBOX_REPLY_BODY" \
+          --parent-id "$INBOX_COMMENT_ID" \
+          --source-id "inbox-comment:$INBOX_COMMENT_ID" \
+          --draft-source "inbox-auto-scout" \
+          --timeout "$PROPOSE_TIMEOUT_SEC"
+
+        exit 0
+      fi
+      echo "[scout-auto] inbox: parsed draft body is empty"
+    fi
+  fi
+fi
 
 # ═══════════════════════════════════════════════════════════════
 # Step 0: Compose an original post (slot-based: morning/noon/evening)
@@ -208,13 +304,7 @@ COMPOSE_EOF
       C_BODY=$(echo "$C_BODY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
       if [ -n "$C_TITLE" ] && [ -n "$C_BODY" ]; then
-        # Timeout = seconds until current slot ends.
-        case "$COMPOSE_SLOT" in
-          morning) COMPOSE_TIMEOUT=$(seconds_until_hour 12) ;;
-          noon)    COMPOSE_TIMEOUT=$(seconds_until_hour 17) ;;
-          evening) COMPOSE_TIMEOUT=$(seconds_until_hour 24) ;;
-          *)       COMPOSE_TIMEOUT=1800 ;;
-        esac
+        COMPOSE_TIMEOUT="$PROPOSE_TIMEOUT_SEC"
         echo "[scout-auto] compose ($COMPOSE_SLOT): title='$C_TITLE' submolt=$C_SUBMOLT (${#C_BODY} chars, timeout=${COMPOSE_TIMEOUT}s)"
 
         "$NODE" "$VIVEWORKER" moltbook compose-propose \
@@ -238,7 +328,7 @@ fi
 # ═══════════════════════════════════════════════════════════════
 # Step 1: Check if the batch window has expired → pick & draft
 # ═══════════════════════════════════════════════════════════════
-PICK_JSON=$("$NODE" "$VIVEWORKER" moltbook batch-pick --window-ms "$WINDOW_MS" 2>/dev/null) || true
+PICK_JSON=$("$NODE" "$VIVEWORKER" moltbook batch-pick --window-ms "$WINDOW_MS" ${SCOUT_FLAGS:-} 2>/dev/null) || true
 PICK_STATUS=$(json_field "$PICK_JSON" "status")
 
 if [ "$PICK_STATUS" = "picked" ]; then

@@ -32,13 +32,13 @@
         candidate (status: 'candidate'), draft a 2-3 paragraph reply in
         viveworker voice (informal lowercase, technically substantive,
         no signature) and run: node scripts/viveworker.mjs moltbook
-        propose <postId> --text \"<your draft>\" --timeout 900. If
+        propose <postId> --text \"<your draft>\" --timeout 86400. If
         scout prints anything else, exit quietly."
 
       Replace `codex exec` with `claude -p` for Claude Code users, or
       with your own SDK runner.
     -->
-    <string>set -a; . "$HOME/.viveworker/moltbook.env"; set +a; cd "$HOME/path/to/viveworker" &amp;&amp; codex exec "Run scripts/moltbook-scout-run.sh and, if it prints a candidate, draft a reply in viveworker voice and call viveworker moltbook propose &lt;postId&gt; --text \"...\" --timeout 900."</string>
+    <string>set -a; . "$HOME/.viveworker/moltbook.env"; set +a; cd "$HOME/path/to/viveworker" &amp;&amp; codex exec "Run scripts/moltbook-scout-run.sh and, if it prints a candidate, draft a reply in viveworker voice and call viveworker moltbook propose &lt;postId&gt; --text \"...\" --timeout 86400."</string>
   </array>
 
   <key>StartInterval</key>

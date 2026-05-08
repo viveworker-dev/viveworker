@@ -177,11 +177,15 @@ export function defaultScoutState() {
   return { day: todayKey(), sentToday: 0, seenPostIds: {}, batch: null, lastComposeDay: "", composedToday: 0, composeSlotsAttempted: [], recentComposeTitles: [] };
 }
 
-export function todayKey() {
+export function todayKey(nowMs = Date.now()) {
+  return dayKeyForTimestamp(nowMs);
+}
+
+export function dayKeyForTimestamp(timestampMs = Date.now()) {
   // Use local timezone with AM 5:00 as the day boundary — hours before 5am
   // count as the previous day so late-night work doesn't consume the next
   // day's quota.
-  const d = new Date(Date.now() - 5 * 60 * 60 * 1000);
+  const d = new Date(Number(timestampMs || Date.now()) - 5 * 60 * 60 * 1000);
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
@@ -245,6 +249,178 @@ export async function listInboxItems(dir = DEFAULT_INBOX_DIR) {
   } catch {
     return [];
   }
+}
+
+function normalizedAuthorKey(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^@/u, "")
+    .toLowerCase();
+}
+
+export function isOwnMoltbookInboxItem(item, env = {}) {
+  const authorId = String(item?.authorId || item?.author_id || "");
+  const myAgentId = String(env.MOLTBOOK_AGENT_ID || "");
+  if (authorId && myAgentId && authorId === myAgentId) return true;
+
+  const authorName = normalizedAuthorKey(item?.authorName || item?.author || item?.username);
+  const myAgentName = normalizedAuthorKey(env.MOLTBOOK_AGENT_NAME || "");
+  return Boolean(authorName && (authorName === "viveworker" || (myAgentName && authorName === myAgentName)));
+}
+
+export function hasPendingMoltbookDraftForInboxItem(item) {
+  const draftStatus = String(item?.draftStatus || "").toLowerCase();
+  if (["failed", "expired", "missing", "stale"].includes(draftStatus)) return false;
+  if (draftStatus && draftStatus !== "none") return true;
+  return Boolean(item?.draftToken || item?.draftedAt || item?.draftSourceId);
+}
+
+export function isActiveMoltbookDraft(draft, nowMs = Date.now()) {
+  if (!draft || typeof draft !== "object" || draft.decision) return false;
+  const token = String(draft.token || "");
+  if (!token) return false;
+  const createdAtMs = Number(draft.createdAtMs) || 0;
+  if (!createdAtMs) return true;
+  const ttlMs = Math.max(60_000, Math.min(Number(draft.ttlMs) || 86_400_000, 86_400_000));
+  return nowMs - createdAtMs <= ttlMs;
+}
+
+export function countReservedMoltbookReplyDrafts(drafts, {
+  day = todayKey(),
+  nowMs = Date.now(),
+  excludeToken = "",
+} = {}) {
+  let count = 0;
+  for (const draft of Array.isArray(drafts) ? drafts : []) {
+    if (!isActiveMoltbookDraft(draft, nowMs)) continue;
+    if (String(draft.token || "") === String(excludeToken || "")) continue;
+    if (String(draft.draftType || "reply") !== "reply") continue;
+    const createdAtMs = Number(draft.createdAtMs) || nowMs;
+    if (dayKeyForTimestamp(createdAtMs) !== day) continue;
+    count += 1;
+  }
+  return count;
+}
+
+export async function getMoltbookReplyQuotaState({
+  state = null,
+  maxDaily = 5,
+  draftsDir = DEFAULT_DRAFTS_DIR,
+  nowMs = Date.now(),
+  excludeToken = "",
+} = {}) {
+  const scoutState = rollScoutDayIfNeeded(state || await readScoutState());
+  const pendingDrafts = await listPendingDrafts(draftsDir);
+  const pendingToday = countReservedMoltbookReplyDrafts(pendingDrafts, {
+    day: scoutState.day,
+    nowMs,
+    excludeToken,
+  });
+  const sentToday = Number(scoutState.sentToday) || 0;
+  const max = Math.max(0, Number(maxDaily) || 5);
+  const usedToday = sentToday + pendingToday;
+  return {
+    day: scoutState.day,
+    sentToday,
+    pendingToday,
+    usedToday,
+    maxDaily: max,
+    remaining: Math.max(0, max - usedToday),
+    quotaReached: usedToday >= max,
+  };
+}
+
+export async function reconcileInboxDraftMarkers(items, {
+  inboxDir = DEFAULT_INBOX_DIR,
+  draftsDir = DEFAULT_DRAFTS_DIR,
+  nowMs = Date.now(),
+} = {}) {
+  const pendingDrafts = await listPendingDrafts(draftsDir);
+  const activeTokens = new Set(
+    pendingDrafts
+      .filter((draft) => isActiveMoltbookDraft(draft, nowMs))
+      .map((draft) => String(draft.token || ""))
+      .filter(Boolean),
+  );
+  const reconciled = [];
+  let resetCount = 0;
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object") {
+      reconciled.push(item);
+      continue;
+    }
+    const status = String(item.status || "").toLowerCase();
+    const draftStatus = String(item.draftStatus || "").toLowerCase();
+    const draftToken = String(item.draftToken || "");
+    const shouldReset =
+      status === "pending"
+      && hasPendingMoltbookDraftForInboxItem(item)
+      && (draftStatus === "proposed" || Boolean(draftToken))
+      && (!draftToken || !activeTokens.has(draftToken));
+    if (!shouldReset) {
+      reconciled.push(item);
+      continue;
+    }
+    const updated = await updateInboxStatus(item.commentId, "pending", {
+      draftStatus: "expired",
+      draftToken: "",
+      draftSource: "",
+      draftSourceId: "",
+      draftError: "previous draft expired or is no longer available; eligible for reproposal",
+      draftExpiredAt: new Date(nowMs).toISOString(),
+    }, inboxDir);
+    reconciled.push(updated || {
+      ...item,
+      draftStatus: "expired",
+      draftToken: "",
+      draftSource: "",
+      draftSourceId: "",
+      draftError: "previous draft expired or is no longer available; eligible for reproposal",
+      draftExpiredAt: new Date(nowMs).toISOString(),
+    });
+    resetCount += 1;
+  }
+  return { items: reconciled, resetCount };
+}
+
+export function pickInboxReplyCandidate(items, env = {}) {
+  const skipReasons = {
+    malformed: 0,
+    notPending: 0,
+    selfAuthor: 0,
+    alreadyDrafted: 0,
+  };
+  const candidates = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object" || !item.commentId || !item.postId) {
+      skipReasons.malformed += 1;
+      continue;
+    }
+    if (String(item.status || "").toLowerCase() !== "pending") {
+      skipReasons.notPending += 1;
+      continue;
+    }
+    if (isOwnMoltbookInboxItem(item, env)) {
+      skipReasons.selfAuthor += 1;
+      continue;
+    }
+    if (hasPendingMoltbookDraftForInboxItem(item)) {
+      skipReasons.alreadyDrafted += 1;
+      continue;
+    }
+    candidates.push(item);
+  }
+  candidates.sort((a, b) => {
+    const bt = Number(Date.parse(b.createdAt || b.updatedAt || "")) || 0;
+    const at = Number(Date.parse(a.createdAt || a.updatedAt || "")) || 0;
+    return bt - at;
+  });
+  return {
+    status: candidates.length ? "candidate" : "empty",
+    item: candidates[0] || null,
+    skipReasons,
+    consideredCount: candidates.length,
+  };
 }
 
 // ---------- Draft persistence ----------

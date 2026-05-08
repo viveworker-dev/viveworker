@@ -33,6 +33,9 @@ import {
   recordComposeAttempt,
   solveVerificationPuzzle,
   solvePuzzleWithLLM,
+  pickInboxReplyCandidate,
+  reconcileInboxDraftMarkers,
+  getMoltbookReplyQuotaState,
 } from "./moltbook-api.mjs";
 
 function fail(message, code = 1) {
@@ -138,7 +141,7 @@ async function cmdThread(commentId) {
 }
 
 async function cmdReply(commentId, flags) {
-  if (!commentId) fail("usage: viveworker moltbook reply <commentId> --text \"...\"");
+  if (!commentId) fail("usage: viveworker moltbook reply <commentId> --text \"...\" [--top-level]");
   const text = typeof flags.text === "string" ? flags.text : "";
   if (!text.trim()) fail("--text is required and must be non-empty");
   let item = await readInboxItem(commentId);
@@ -159,10 +162,20 @@ async function cmdReply(commentId, flags) {
     };
     await writeInboxItem(item);
   }
+  // For "mention" notifications, the commentId is a synthetic notification
+  // ID — there's no real parent comment to thread under, and posting with
+  // parent_id=that value gets rejected as "Parent comment not found". Drop
+  // parent_id so the comment lands as a top-level reply on the post.
+  // Caller can also force this with --top-level for ad-hoc cases (e.g.,
+  // older inbox entries written before the watcher started recording kind).
+  const isTopLevel = flags["top-level"] === true || item.kind === "mention";
+  const body = isTopLevel
+    ? { content: text }
+    : { content: text, parent_id: commentId };
   const { mb, env } = await getClient();
   const result = await mb(`/posts/${item.postId}/comments`, {
     method: "POST",
-    body: JSON.stringify({ content: text, parent_id: commentId }),
+    body: JSON.stringify(body),
   });
   const verification = result?.comment?.verification || null;
   await resolveOnBridge(env, commentId);
@@ -272,6 +285,7 @@ async function cmdPoll() {
       commentId,
       postId,
       parentCommentId: String(n.comment?.parent_id || n.parent_id || ""),
+      authorId: String(author.id || author.agent_id || author.agentId || ""),
       authorName: author.username || author.name || "user",
       postTitle: n.post?.title || n.post_title || "",
       postUrl: `https://www.moltbook.com/post/${postId}`,
@@ -283,6 +297,71 @@ async function cmdPoll() {
     written += 1;
   }
   console.log(`added ${written} new item(s)`);
+}
+
+async function cmdInboxPick(flags) {
+  await ensureInboxDir();
+  const { mb, env } = await getClient();
+  const maxDaily = Number(flags["max-daily"]) || 5;
+  const state = rollScoutDayIfNeeded(await readScoutState());
+  const reconciled = await reconcileInboxDraftMarkers(await listInboxItems());
+  const quota = await getMoltbookReplyQuotaState({ state, maxDaily });
+  if (quota.quotaReached) {
+    await writeScoutState(state);
+    console.log(JSON.stringify({
+      status: "quota-reached",
+      sentToday: quota.sentToday,
+      pendingToday: quota.pendingToday,
+      usedToday: quota.usedToday,
+      maxDaily: quota.maxDaily,
+      day: quota.day,
+      recoveredDrafts: reconciled.resetCount,
+    }, null, 2));
+    return;
+  }
+  const picked = pickInboxReplyCandidate(reconciled.items, env);
+  if (!picked.item) {
+    console.log(JSON.stringify({
+      status: "empty",
+      skipReasons: picked.skipReasons,
+      recoveredDrafts: reconciled.resetCount,
+    }, null, 2));
+    return;
+  }
+
+  const item = picked.item;
+  let post = null;
+  if (!flags["no-fetch"]) {
+    try {
+      const data = await mb(`/posts/${item.postId}`);
+      post = data?.post || data || null;
+    } catch (error) {
+      console.error(`inbox-pick: could not fetch post ${item.postId}: ${error.message}`);
+    }
+  }
+
+  const postAuthor = post?.author || post?.user || {};
+  const output = {
+    status: "candidate",
+    commentId: String(item.commentId),
+    postId: String(item.postId),
+    parentCommentId: String(item.parentCommentId || ""),
+    author: item.authorName || "user",
+    authorId: item.authorId || "",
+    postTitle: item.postTitle || post?.title || "",
+    postUrl: item.postUrl || `https://www.moltbook.com/post/${item.postId}`,
+    postAuthor: postAuthor.username || postAuthor.name || "",
+    postBody: post?.content || post?.body || "",
+    commentText: item.contextText || "",
+    createdAt: item.createdAt || "",
+    consideredCount: picked.consideredCount,
+    skipReasons: picked.skipReasons,
+    recoveredDrafts: reconciled.resetCount,
+  };
+  const json = JSON.stringify(output, (_, v) =>
+    typeof v === "string" ? v.replace(/[\x00-\x1f]/g, (ch) => ch === "\n" || ch === "\t" ? ch : "") : v
+  , 2);
+  console.log(json);
 }
 
 // ---------------------------------------------------------------------------
@@ -311,10 +390,18 @@ async function cmdScout(flags) {
   const dryRun = Boolean(flags["dry-run"]);
 
   const state = rollScoutDayIfNeeded(await readScoutState());
-  if (state.sentToday >= maxDaily) {
+  const quota = await getMoltbookReplyQuotaState({ state, maxDaily });
+  if (quota.quotaReached) {
     console.log(
       JSON.stringify(
-        { status: "quota-reached", sentToday: state.sentToday, maxDaily, day: state.day },
+        {
+          status: "quota-reached",
+          sentToday: quota.sentToday,
+          pendingToday: quota.pendingToday,
+          usedToday: quota.usedToday,
+          maxDaily: quota.maxDaily,
+          day: quota.day,
+        },
         null,
         2
       )
@@ -495,6 +582,14 @@ async function cmdPropose(postId, flags) {
   const postAuthor = typeof flags["post-author"] === "string" ? flags["post-author"] : "";
   const intent = typeof flags.intent === "string" ? flags.intent : "";
   const postUrl = `https://www.moltbook.com/post/${postId}`;
+  const sourceId = typeof flags["source-id"] === "string" && flags["source-id"].trim()
+    ? flags["source-id"].trim()
+    : parentCommentId
+      ? `inbox-comment:${parentCommentId}`
+      : `draft:${postId}:${Date.now()}`;
+  const draftSource = typeof flags["draft-source"] === "string" && flags["draft-source"].trim()
+    ? flags["draft-source"].trim()
+    : (parentCommentId ? "inbox-auto-scout" : "auto-scout");
 
   const env = await loadMoltbookEnv();
   const base = (env.VIVEWORKER_BASE_URL || "https://127.0.0.1:8810").replace(/\/+$/u, "");
@@ -503,8 +598,6 @@ async function cmdPropose(postId, flags) {
 
   const prevTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-  const sourceId = `draft:${postId}:${Date.now()}`;
 
   // Submit draft to bridge. The bridge persists it to disk and handles posting
   // on approval — the CLI exits immediately (fire-and-forget).
@@ -537,6 +630,17 @@ async function cmdPropose(postId, flags) {
   }
   const token = submitRes?.token;
   if (!token) fail(`bridge did not return a token: ${JSON.stringify(submitRes)}`);
+  if (parentCommentId) {
+    await updateInboxStatus(parentCommentId, "pending", {
+      draftStatus: "proposed",
+      draftSource,
+      draftSourceId: sourceId,
+      draftToken: token,
+      draftedAt: new Date().toISOString(),
+      draftError: "",
+    }).catch(() => null);
+    await resolveOnBridge(env, parentCommentId);
+  }
 
   console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
   if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
@@ -603,7 +707,26 @@ async function cmdBatchAdd(flags) {
 
 async function cmdBatchPick(flags) {
   const windowMs = Number(flags["window-ms"]) || DEFAULT_BATCH_WINDOW_MS;
+  const maxDaily = Number(flags["max-daily"]) || 5;
   const state = rollScoutDayIfNeeded(await readScoutState());
+  const quota = await getMoltbookReplyQuotaState({ state, maxDaily });
+
+  if (quota.quotaReached) {
+    if (quota.sentToday >= quota.maxDaily) {
+      state.batch = null;
+    }
+    await writeScoutState(state);
+    console.log(JSON.stringify({
+      status: "quota-reached",
+      sentToday: quota.sentToday,
+      pendingToday: quota.pendingToday,
+      usedToday: quota.usedToday,
+      maxDaily: quota.maxDaily,
+      day: quota.day,
+      droppedBatch: quota.sentToday >= quota.maxDaily,
+    }, null, 2));
+    return;
+  }
 
   if (!state.batch || !state.batch.candidates?.length) {
     console.log(JSON.stringify({ status: "empty" }));
@@ -933,6 +1056,8 @@ export async function runMoltbookCli(argv) {
       return cmdPoll();
     case "reconcile":
       return cmdReconcile();
+    case "inbox-pick":
+      return cmdInboxPick(flags);
     case "scout":
       return cmdScout(flags);
     case "propose":
@@ -972,12 +1097,13 @@ Commands:
   mark-skip <commentId>                 Mark an item as skipped
   poll                                  Manual one-shot notification refresh
   reconcile                             Mark inbox items already replied to as resolved
+  inbox-pick [--no-fetch]               Pick one pending incoming comment for a reply draft
   scout [--max-daily N] [--submolts a,b] [--dry-run]
                                         Pick one feed candidate and print context
-  propose <postId> --text "..." [--timeout 900] [--parent-id <commentId>]
+  propose <postId> --text "..." [--timeout 86400] [--parent-id <commentId>] [--source-id <id>]
                                         Submit draft for phone approval, then post on approve
   compose [--max-daily N]               Check activity & return compose material (JSON)
-  compose-propose --title "..." --content "..." [--submolt general] [--timeout 900]
+  compose-propose --title "..." --content "..." [--submolt general] [--timeout 86400]
                                         Submit original post draft for phone approval, then publish
   persona init|edit|show                Manage ~/.viveworker/moltbook-persona.md (inlined into scout prompt)`);
       return;

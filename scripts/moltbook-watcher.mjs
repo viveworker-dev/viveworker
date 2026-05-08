@@ -185,6 +185,7 @@ async function pollOnce() {
       seen.add(commentId);
       const sourceId = `comment:${commentId}`;
       const author = n.actor || n.author || n.comment?.author || {};
+      const authorId = String(author.id || author.agent_id || author.agentId || "");
       let authorName = author.username || author.name || "";
       if (!authorName) {
         authorName = (await resolveAuthorName(postId, commentId, n.type || n.notificationType || "", postCommentCache, postCache)) || "user";
@@ -194,12 +195,21 @@ async function pollOnce() {
       const createdAtIso = n.created_at || n.createdAt || new Date().toISOString();
       const parentCommentId = String(n.comment?.parent_id || n.parent_id || "");
 
+      // "mention" notifications carry a synthetic commentId that doesn't
+      // exist in the moltbook comment table — replying with parent_id=that
+      // value 404s ("Parent comment not found"). Mark these so the CLI can
+      // skip parent_id and post a top-level comment on the post instead.
+      const notifType = String(n.type || n.kind || n.notificationType || "").toLowerCase();
+      const kind = notifType.includes("mention") ? "mention" : "reply";
+
       pending.set(sourceId, { commentId, postId });
 
       const inboxItem = {
         commentId,
         postId,
         parentCommentId,
+        kind,
+        authorId,
         authorName,
         postTitle,
         postUrl: `https://www.moltbook.com/post/${postId}`,

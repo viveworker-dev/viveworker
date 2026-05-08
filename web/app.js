@@ -7662,7 +7662,7 @@ function renderMoltbookDraftComposer(detail, options = {}) {
     ? `
       <div class="actions actions--stack${options.mobile ? " actions--sticky" : ""}">
         <button type="submit" data-action="approve" class="primary primary--wide">${escapeHtml(approveLabel)}</button>
-        <button type="submit" data-action="deny" class="danger danger--wide">Deny</button>
+        <button type="submit" data-action="deny" class="danger danger--wide">${escapeHtml(L("moltbook.draft.deny"))}</button>
       </div>
     `
     : `<p class="muted reply-composer__description">${escapeHtml(L("moltbook.draft.resolved"))}</p>`;
@@ -9747,7 +9747,9 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
         labelCache.set(btn, btn.innerHTML);
         btn.disabled = true;
         if (btn.dataset.action === submittedAction) {
-          btn.innerHTML = submittedAction === "approve" ? "送信中…" : "処理中…";
+          btn.innerHTML = submittedAction === "approve"
+            ? escapeHtml(L("moltbook.draft.submittingApprove"))
+            : escapeHtml(L("moltbook.draft.submittingDeny"));
           btn.classList.add("is-loading");
         } else {
           btn.classList.add("is-dimmed");
