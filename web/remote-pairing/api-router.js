@@ -102,9 +102,16 @@ const DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
 // timeout spam during real off-LAN sessions.
 const AUTO_STICKY_LAN_PROBE_INTERVAL_MS = 8_000;
 const AUTO_STICKY_LAN_PROBE_TIMEOUT_MS = 900;
+const LAN_REACHABILITY_PROBE_TIMEOUT_MS = 700;
+const LAN_REACHABILITY_PROBE_PATH = "/health";
 const RECENT_LAN_OK_GRACE_MS = 60_000;
 const TRANSIENT_LAN_FAILURE_STICKY_MS = 8_000;
 const TRANSIENT_LAN_FAILURE_THRESHOLD = 2;
+// If LAN was healthy moments ago, a single timed-out local request is more
+// likely a busy bridge/Safari wobble than a true off-LAN transition. Delay
+// relay fallback for the first few consecutive failures to avoid burning
+// Cloudflare Durable Object quota while the phone is still on trusted LAN.
+const RECENT_LAN_RELAY_SUPPRESSION_FAILURES = 2;
 const RELAY_FAILURE_WINDOW_MS = 60_000;
 const RELAY_FAILURE_THRESHOLD = 6;
 const RELAY_CIRCUIT_BREAKER_MS = 60_000;
@@ -157,8 +164,10 @@ function newTelemetry() {
   return {
     lanOk: 0,
     lanFail: 0,
+    lanReachableAfterFailure: 0,
     relayOk: 0,
     relayFail: 0,
+    relaySuppressed: 0,
     lastLanFailAt: 0,
     lastRelayFailAt: 0,
     clientResets: 0,
@@ -636,6 +645,60 @@ function stickyRelayWindowAfterLanFailure(now) {
   return STICKY_RELAY_MS;
 }
 
+function shouldDelayRelayAfterRecentLanFailure(now, opts = {}) {
+  if (opts.delayRelayAfterRecentLanFailure === false) {
+    return false;
+  }
+  if (_lastLanOkAtMs <= 0 || now - _lastLanOkAtMs > RECENT_LAN_OK_GRACE_MS) {
+    return false;
+  }
+  return _consecutiveLanFailures > 0 &&
+    _consecutiveLanFailures <= RECENT_LAN_RELAY_SUPPRESSION_FAILURES;
+}
+
+function suppressRelayAfterRecentLanFailure(url, err, opts = {}) {
+  _telemetry.relaySuppressed++;
+  emitRoutingStatus("remote-delayed", opts, {
+    url: String(url || ""),
+    reason: err?.message || String(err || "LAN failure"),
+    consecutiveLanFailures: _consecutiveLanFailures,
+    recentLanOkAtMs: _lastLanOkAtMs,
+  });
+}
+
+function shouldConfirmLanReachability(now, opts = {}) {
+  if (opts.confirmLanReachabilityBeforeRelay === false) {
+    return false;
+  }
+  return _lastLanOkAtMs > 0 && now - _lastLanOkAtMs <= RECENT_LAN_OK_GRACE_MS;
+}
+
+async function confirmLanUnavailableBeforeRelay(url, err, opts = {}) {
+  if (!shouldConfirmLanReachability(nowMs(opts), opts)) {
+    return false;
+  }
+  const path = urlToRelayPath(url);
+  if (path === LAN_REACHABILITY_PROBE_PATH) {
+    return false;
+  }
+
+  const probe = await attemptLanFetch(LAN_REACHABILITY_PROBE_PATH, {
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  }, {
+    ...opts,
+    lanTimeoutMs: opts.lanReachabilityProbeTimeoutMs ?? LAN_REACHABILITY_PROBE_TIMEOUT_MS,
+  });
+  if (!probe.ok) {
+    return false;
+  }
+
+  _telemetry.lanReachableAfterFailure++;
+  suppressRelayAfterRecentLanFailure(url, err, opts);
+  return true;
+}
+
 async function attemptStickyLanProbe(url, init, opts) {
   const probeTimeoutMs = opts.stickyLanProbeTimeoutMs ?? DEFAULT_STICKY_LAN_PROBE_TIMEOUT_MS;
   _lastStickyLanProbeAtMs = nowMs(opts);
@@ -915,7 +978,10 @@ function nowMs(opts) {
  *   preferRelayError?: boolean,
  *   probeLanWhileSticky?: boolean,
  *   autoProbeLanWhileSticky?: boolean,
+ *   delayRelayAfterRecentLanFailure?: boolean,
+ *   confirmLanReachabilityBeforeRelay?: boolean,
  *   stickyLanProbeTimeoutMs?: number,
+ *   lanReachabilityProbeTimeoutMs?: number,
  * }} [opts]
  * @returns {Promise<{
  *   ok: boolean,
@@ -931,10 +997,24 @@ export async function routedFetch(url, init = {}, opts = {}) {
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
+    if (shouldDelayRelayAfterRecentLanFailure(t, opts)) {
+      const lan = await attemptLanFetch(url, init, opts);
+      if (lan.ok) return lan.response;
+      if (shouldDelayRelayAfterRecentLanFailure(nowMs(opts), opts)) {
+        suppressRelayAfterRecentLanFailure(url, lan.err, opts);
+        throw lan.err;
+      }
+      if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+        throw lan.err;
+      }
+    }
     const autoProbe = shouldAutoProbeLanWhileSticky(t, opts);
     if (opts.probeLanWhileSticky === true || autoProbe) {
       const lan = await attemptStickyLanProbe(url, init, stickyLanProbeOpts(opts, autoProbe));
       if (lan.ok) return lan.response;
+      if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+        throw lan.err;
+      }
     }
     emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: true });
     const r = await attemptRelayFetch(url, init, opts);
@@ -954,6 +1034,13 @@ export async function routedFetch(url, init = {}, opts = {}) {
   // Happy path: LAN first.
   const lan = await attemptLanFetch(url, init, opts);
   if (lan.ok) return lan.response;
+  if (shouldDelayRelayAfterRecentLanFailure(nowMs(opts), opts)) {
+    suppressRelayAfterRecentLanFailure(url, lan.err, opts);
+    throw lan.err;
+  }
+  if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+    throw lan.err;
+  }
 
   // Try relay once before giving up.
   emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: false });
@@ -1020,3 +1107,4 @@ export const __AUTO_STICKY_LAN_PROBE_INTERVAL_MS = AUTO_STICKY_LAN_PROBE_INTERVA
 export const __TRANSIENT_LAN_FAILURE_STICKY_MS = TRANSIENT_LAN_FAILURE_STICKY_MS;
 export const __DEFAULT_RELAY_TIMEOUT_MS = DEFAULT_RELAY_TIMEOUT_MS;
 export const __DEFAULT_LAN_TIMEOUT_MS = DEFAULT_LAN_TIMEOUT_MS;
+export const __RECENT_LAN_RELAY_SUPPRESSION_FAILURES = RECENT_LAN_RELAY_SUPPRESSION_FAILURES;

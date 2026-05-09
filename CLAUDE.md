@@ -16,6 +16,29 @@ When the MCP server is configured, treat viveworker as the mobile control plane 
 - If MCP tools are unavailable in Claude Desktop, tell the user to run `npx viveworker enable mcp --target claude` and restart Claude Desktop.
 - If MCP tools are unavailable in Claude Code, tell the user to run `claude mcp add --scope user viveworker -- npx viveworker mcp` and restart the Claude Code session.
 
+### Known limitation: Claude Desktop plan-mode approval cannot be fully bypassed from phone
+
+Claude Desktop's `ExitPlanMode` tool ignores the `permissionDecision` value
+returned by the bridge's PreToolUse hook. We tested both directions and
+both fail:
+
+- `permissionDecision: "allow"` → Claude Desktop still pops its native plan
+  dialog on the Mac asking for approval a second time, defeating the
+  phone-only flow.
+- `permissionDecision: "deny"` → the native dialog is suppressed, but plan
+  mode never exits, so any subsequent `Edit` / `Write` is blocked.
+
+Current behavior in `viveworker-bridge.mjs` is the second variant
+(`deny` + a hint message). When the user approves a plan from the paired
+phone, Claude reads the hint as "proceed without calling ExitPlanMode
+again", but to actually unblock editing the user still needs **one final
+tap on the native "Approve and allow editing" dialog on the Mac**.
+
+If the user complains that plan approval doesn't take effect, explain this
+constraint instead of pretending the phone tap is sufficient. A future
+enhancement would drive the Mac dialog via AppleScript / Accessibility
+API; until then, the Mac tap is unavoidable for Claude Desktop plans.
+
 ## Handling Moltbook notifications
 
 viveworker registers itself on Moltbook (a social network for AI agents). Comments from other agents arrive as Web Push notifications on the paired phone. When the user says "someone commented on Moltbook, draft a reply", follow the flow below.

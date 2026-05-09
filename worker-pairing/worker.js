@@ -31,7 +31,9 @@ const DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE = 20;
 const RELAY_ANALYTICS_FULL_FIDELITY_EVENTS = new Set(["token_rotation"]);
 const LOCAL_WS_UPGRADE_WINDOW_MS = 60_000;
 const LOCAL_WS_UPGRADE_COOLDOWN_MS = 60_000;
+const LOCAL_WS_UPGRADE_PHONE_COOLDOWN_MS = 2 * 60_000;
 const LOCAL_WS_UPGRADE_MAX_PER_WINDOW = 20;
+const LOCAL_WS_UPGRADE_PHONE_MAX_PER_WINDOW = 8;
 const LOCAL_WS_UPGRADE_BUCKETS = new Map();
 
 const BANNER_HTML = `<!doctype html>
@@ -282,10 +284,16 @@ function checkLocalWsUpgradeBudget(pairingId, role) {
     bucket.cooldownUntilMs = 0;
   }
   bucket.count += 1;
-  if (bucket.count > LOCAL_WS_UPGRADE_MAX_PER_WINDOW) {
-    bucket.cooldownUntilMs = now + LOCAL_WS_UPGRADE_COOLDOWN_MS;
+  const maxPerWindow = role === "phone"
+    ? LOCAL_WS_UPGRADE_PHONE_MAX_PER_WINDOW
+    : LOCAL_WS_UPGRADE_MAX_PER_WINDOW;
+  const cooldownMs = role === "phone"
+    ? LOCAL_WS_UPGRADE_PHONE_COOLDOWN_MS
+    : LOCAL_WS_UPGRADE_COOLDOWN_MS;
+  if (bucket.count > maxPerWindow) {
+    bucket.cooldownUntilMs = now + cooldownMs;
     LOCAL_WS_UPGRADE_BUCKETS.set(key, bucket);
-    return LOCAL_WS_UPGRADE_COOLDOWN_MS;
+    return cooldownMs;
   }
   LOCAL_WS_UPGRADE_BUCKETS.set(key, bucket);
   return 0;

@@ -15059,9 +15059,26 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     });
   } else if (approval.resolveClaudeWaiter) {
     if (approval.provider === "claude" && approval.kind === "plan") {
-      // ExitPlanMode cannot be truly auto-approved via permissionDecision: "allow"
-      // (Claude still shows the native PC plan dialog). Instead, deny the tool
-      // call with a reason that tells Claude the user already decided on mobile.
+      // ExitPlanMode CANNOT actually be auto-bypassed via the PreToolUse
+      // hook. We tested both "allow" and "deny" verdicts on Claude Desktop:
+      //
+      //   - permissionDecision: "allow"
+      //       Claude Desktop ignores the verdict and re-shows its native
+      //       plan dialog on the Mac, asking for approval a second time
+      //       even though the user already tapped on mobile.
+      //   - permissionDecision: "deny"
+      //       The native dialog is suppressed, but Claude Desktop also
+      //       does not exit plan mode internally, so Edit/Write stay
+      //       blocked — the session cannot make progress.
+      //
+      // Neither verdict gives us "phone tap → plan mode exits → editing
+      // resumes" by itself. Until we can drive the Mac dialog through an
+      // external mechanism (AppleScript / Accessibility API), the chosen
+      // workaround is "deny + reason": Claude reads the reason as
+      // instructions ("user already approved on mobile, proceed without
+      // calling ExitPlanMode again"). That at least lets the desktop user
+      // finish the flow with one extra Mac click on the native dialog
+      // instead of getting a duplicate dialog from a stale "allow".
       approval.resolveClaudeWaiter({
         permissionDecision: "deny",
         permissionDecisionReason:

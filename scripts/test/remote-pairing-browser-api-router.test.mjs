@@ -22,6 +22,7 @@ import {
   __STICKY_RELAY_MS,
   __AUTO_STICKY_LAN_PROBE_INTERVAL_MS,
   __TRANSIENT_LAN_FAILURE_STICKY_MS,
+  __RECENT_LAN_RELAY_SUPPRESSION_FAILURES,
 } from "../../web/remote-pairing/api-router.js";
 
 // ---------------------------------------------------------------------------
@@ -485,12 +486,41 @@ test("sticky relay auto-probes LAN after a short cooldown", async () => {
   assert.equal(__getTelemetry().stickyRelayUntilMs, 0);
 });
 
-test("recent LAN success keeps sticky relay short for transient failures", async () => {
+test("recent LAN success delays relay for transient failures", async () => {
   const fetchPair = makeFakeFetch([
     { mode: "ok", status: 200, body: '{"via":"lan"}' },
     { mode: "throw", err: new TypeError("temporary LAN wobble") },
   ]);
-  const { opts, clock } = makeOpts({
+  const events = [];
+  const { opts, clock, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay"}' }),
+    }),
+  });
+  opts.onRouteStatus = (event) => events.push(event.phase);
+
+  await routedFetch("/api/lan", {}, opts);
+  await assert.rejects(routedFetch("/api/wobble", {}, opts), /temporary LAN wobble/);
+
+  const tel = __getTelemetry();
+  assert.equal(tel.consecutiveLanFailures, 1);
+  assert.equal(tel.lastRoute, "lan");
+  assert.equal(tel.relaySuppressed, 1);
+  assert.equal(rpcCalls.fetch.length, 0);
+  assert.ok(events.includes("remote-delayed"));
+  assert.equal(tel.stickyRelayUntilMs - clock.now(), __TRANSIENT_LAN_FAILURE_STICKY_MS);
+});
+
+test("repeated failures after recent LAN success eventually allow relay", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "ok", status: 200, body: '{"via":"lan"}' },
+    { mode: "throw", err: new TypeError("temporary LAN wobble 1") },
+    { mode: "throw", err: new TypeError("temporary LAN wobble 2") },
+    { mode: "throw", err: new TypeError("left LAN") },
+    { mode: "throw", err: new TypeError("health also unreachable") },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
     fetchPair,
     rpcPair: makeFakeRpcClientCtor({
       fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay"}' }),
@@ -498,12 +528,45 @@ test("recent LAN success keeps sticky relay short for transient failures", async
   });
 
   await routedFetch("/api/lan", {}, opts);
-  await routedFetch("/api/wobble", {}, opts);
+  for (let i = 0; i < __RECENT_LAN_RELAY_SUPPRESSION_FAILURES; i++) {
+    await assert.rejects(routedFetch(`/api/wobble-${i}`, {}, opts), /temporary LAN wobble/);
+  }
+  const res = await routedFetch("/api/remote", {}, opts);
+  assert.deepEqual(await res.json(), { via: "relay" });
+  assert.equal(fetchCalls.length, 5);
+  assert.equal(rpcCalls.fetch.length, 1);
+  assert.equal(__getTelemetry().lastRoute, "relay");
+});
 
-  const tel = __getTelemetry();
-  assert.equal(tel.consecutiveLanFailures, 1);
-  assert.equal(tel.lastRoute, "relay");
-  assert.equal(tel.stickyRelayUntilMs - clock.now(), __TRANSIENT_LAN_FAILURE_STICKY_MS);
+test("LAN health success prevents relay after endpoint-specific failures", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "ok", status: 200, body: '{"via":"lan"}' },
+    { mode: "throw", err: new TypeError("temporary endpoint wobble 1") },
+    { mode: "throw", err: new TypeError("temporary endpoint wobble 2") },
+    { mode: "throw", err: new TypeError("endpoint is slow") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+  ]);
+  const events = [];
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"via":"relay"}' }),
+    }),
+  });
+  opts.onRouteStatus = (event) => events.push(event.phase);
+
+  await routedFetch("/api/lan", {}, opts);
+  for (let i = 0; i < __RECENT_LAN_RELAY_SUPPRESSION_FAILURES; i++) {
+    await assert.rejects(routedFetch(`/api/wobble-${i}`, {}, opts), /temporary endpoint wobble/);
+  }
+  await assert.rejects(routedFetch("/api/slow", {}, opts), /endpoint is slow/);
+
+  assert.equal(fetchCalls.length, 5);
+  assert.equal(fetchCalls.at(-1).url, "/health");
+  assert.equal(rpcCalls.fetch.length, 0);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+  assert.equal(__getTelemetry().lanReachableAfterFailure, 1);
+  assert.ok(events.includes("remote-delayed"));
 });
 
 test("interactive GET can re-probe LAN inside sticky relay window", async () => {
@@ -737,7 +800,11 @@ test("bindWakeEvents is called once at client construction time", async () => {
     }),
   });
   await routedFetch("/api/a", {}, opts);
-  await routedFetch("/api/b", {}, opts);
+  await routedFetch("/api/b", {}, {
+    ...opts,
+    delayRelayAfterRecentLanFailure: false,
+    confirmLanReachabilityBeforeRelay: false,
+  });
   assert.equal(wakeCalls.bound, 1);
   assert.equal(rpcCalls.constructed, 1);
 });
@@ -801,7 +868,11 @@ test("telemetry counts LAN successes and relay successes", async () => {
     }),
   });
   await routedFetch("/api/a", {}, opts);
-  await routedFetch("/api/b", {}, opts);
+  await routedFetch("/api/b", {}, {
+    ...opts,
+    delayRelayAfterRecentLanFailure: false,
+    confirmLanReachabilityBeforeRelay: false,
+  });
 
   const tel = __getTelemetry();
   assert.equal(tel.lanOk, 1);
