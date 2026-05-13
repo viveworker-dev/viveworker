@@ -88,6 +88,7 @@ const DEFAULT_FAILURE_WINDOW_MS = 60_000;
 const DEFAULT_FAILURE_THRESHOLD = 4;
 const DEFAULT_CIRCUIT_BREAKER_MS = 60_000;
 const DEFAULT_MAX_CIRCUIT_BREAKER_MS = 10 * 60_000;
+const DEFAULT_STABLE_CONNECTION_MS = 15_000;
 const DEFAULT_PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 
 // CloseEvent codes we emit. 1000 is normal; 4xxx is application-defined.
@@ -121,6 +122,7 @@ const CLOSE_RELAY_RESET_SESSION = 4004;
  * @property {number} [failureThreshold]
  * @property {number} [circuitBreakerMs]
  * @property {number} [maxCircuitBreakerMs]
+ * @property {number} [stableConnectionMs]
  * @property {typeof WebSocket} [WebSocketImpl]     injectable for Node-side tests
  * @property {{debug?: Function, warn?: Function}} [logger]
  */
@@ -166,6 +168,7 @@ export class RemotePairingTransport {
     this._failureThreshold = opts.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
     this._circuitBreakerMs = opts.circuitBreakerMs ?? DEFAULT_CIRCUIT_BREAKER_MS;
     this._maxCircuitBreakerMs = opts.maxCircuitBreakerMs ?? DEFAULT_MAX_CIRCUIT_BREAKER_MS;
+    this._stableConnectionMs = opts.stableConnectionMs ?? DEFAULT_STABLE_CONNECTION_MS;
 
     this._WebSocketImpl = opts.WebSocketImpl ?? globalThis.WebSocket;
     if (typeof this._WebSocketImpl !== "function") {
@@ -200,6 +203,8 @@ export class RemotePairingTransport {
     this._pingTimer = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     this._handshakeTimer = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    this._stableConnectionTimer = null;
     /** @type {number[]} recent reconnect-triggering failures. */
     this._recentFailureAtMs = [];
     /** If > Date.now(), reconnect attempts are intentionally delayed. */
@@ -317,6 +322,7 @@ export class RemotePairingTransport {
     this._closed = true;
     this._started = false;
     this._cancelReconnectTimer();
+    this._cancelStableConnectionTimer();
     this._stopPing();
     this._stopHandshakeTimer();
     if (this._ws) {
@@ -682,6 +688,24 @@ export class RemotePairingTransport {
     }
   }
 
+  _scheduleStableConnectionReset() {
+    const delay = Math.max(0, Number(this._stableConnectionMs) || 0);
+    this._stableConnectionTimer = setTimeout(() => {
+      this._stableConnectionTimer = null;
+      if (this._closed || this._state !== STATE.CONNECTED) return;
+      this._recentFailureAtMs = [];
+      this._circuitOpenUntilMs = 0;
+      this._circuitOpenCount = 0;
+    }, delay);
+  }
+
+  _cancelStableConnectionTimer() {
+    if (this._stableConnectionTimer != null) {
+      clearTimeout(this._stableConnectionTimer);
+      this._stableConnectionTimer = null;
+    }
+  }
+
   _startPing() {
     this._stopPing();
     this._pingTimer = setInterval(() => {
@@ -742,11 +766,10 @@ export class RemotePairingTransport {
     if (this._state === newState) return;
     const prev = this._state;
     this._state = newState;
+    this._cancelStableConnectionTimer();
     if (newState === STATE.CONNECTED) {
       this._reconnectAttempt = 0;
-      this._recentFailureAtMs = [];
-      this._circuitOpenUntilMs = 0;
-      this._circuitOpenCount = 0;
+      this._scheduleStableConnectionReset();
     }
     try {
       this._onStateChange(newState, prev, info);
@@ -771,6 +794,7 @@ export class RemotePairingTransport {
     this._stopPing();
     this._stopHandshakeTimer();
     this._cancelReconnectTimer();
+    this._cancelStableConnectionTimer();
     if (this._ws) {
       try { this._ws.close(CLOSE_FATAL, "fatal-error"); } catch {}
       this._ws = null;

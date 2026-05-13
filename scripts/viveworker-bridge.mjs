@@ -9631,6 +9631,15 @@ function isStartTurnAckTimeout(errorValue) {
     message === "turn/start-timeout";
 }
 
+function isIpcNoClientFoundError(errorValue) {
+  const message = normalizeIpcErrorMessage(errorValue).toLowerCase();
+  return message === "no-client-found" ||
+    message === "client-not-found" ||
+    message === "target-client-not-found" ||
+    message.includes("no client found") ||
+    message.includes("client not found");
+}
+
 function buildDefaultCollaborationMode(threadState) {
   // Fallback turns must leave Plan mode unless the caller explicitly opts in.
   return buildRequestedCollaborationMode(threadState, "default");
@@ -9749,14 +9758,36 @@ class NativeIpcClient {
     );
   }
 
-  sendThreadFollowerRequest(method, params, conversationId, ownerClientId = null, options = {}) {
-    return this.sendRequest(method, params, {
-      targetClientId:
-        ownerClientId ??
-        this.runtime.threadOwnerClientIds.get(conversationId) ??
-        null,
-      ...options,
-    });
+  async sendThreadFollowerRequest(method, params, conversationId, ownerClientId = null, options = {}) {
+    const targetClientId =
+      ownerClientId ??
+      this.runtime.threadOwnerClientIds.get(conversationId) ??
+      null;
+
+    try {
+      return await this.sendRequest(method, params, {
+        targetClientId,
+        ...options,
+      });
+    } catch (error) {
+      if (!targetClientId || !isIpcNoClientFoundError(error)) {
+        throw error;
+      }
+
+      const mappedOwner = this.runtime.threadOwnerClientIds.get(conversationId) ?? null;
+      if (mappedOwner === targetClientId) {
+        this.runtime.threadOwnerClientIds.delete(conversationId);
+      }
+      console.warn(
+        `[ipc] stale owner client for thread=${cleanText(conversationId || "") || "unknown"} ` +
+        `target=${cleanText(targetClientId || "") || "unknown"} method=${cleanText(method || "") || "unknown"}; retrying without target`
+      );
+
+      return this.sendRequest(method, params, {
+        ...options,
+        targetClientId: null,
+      });
+    }
   }
 
   sendRequest(method, params, options = {}) {
@@ -19040,6 +19071,9 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
           }
           if (error.message === "codex-ipc-not-connected") {
             return writeJson(res, 503, { error: error.message });
+          }
+          if (isIpcNoClientFoundError(error)) {
+            return writeJson(res, 503, { error: "codex-client-not-found" });
           }
           return writeJson(res, 500, { error: error.message });
         }

@@ -35,11 +35,32 @@ test("completion reply treats slow Codex ACK as fast accepted delivery", async (
   );
 });
 
+test("completion reply retries without stale Codex owner client", async () => {
+  const bridge = await readBridge();
+
+  assert.match(
+    bridge,
+    /function isIpcNoClientFoundError\(errorValue\)/u,
+    "Bridge should classify Codex no-client-found as a recoverable stale owner error"
+  );
+  assert.match(
+    bridge,
+    /async sendThreadFollowerRequest\([\s\S]*?targetClientId[\s\S]*?catch \(error\)[\s\S]*?isIpcNoClientFoundError\(error\)[\s\S]*?threadOwnerClientIds\.delete\(conversationId\)[\s\S]*?retrying without target[\s\S]*?targetClientId: null/u,
+    "Thread-follower requests should clear stale ownerClientId and retry without a target"
+  );
+  assert.match(
+    bridge,
+    /isIpcNoClientFoundError\(error\)[\s\S]*?writeJson\(res,\s*503,\s*\{\s*error:\s*"codex-client-not-found"\s*\}\)/u,
+    "If the retry still fails, the API should return a stable localized error key"
+  );
+});
+
 test("completion reply UI does not stay stuck on sending when the response is slow", async () => {
   const app = await readApp();
 
   assert.match(app, /const COMPLETION_REPLY_OPTIMISTIC_SENT_MS = 1_600;/u);
   assert.match(app, /const optimisticSentTimer = setTimeout\(renderOptimisticSent, COMPLETION_REPLY_OPTIMISTIC_SENT_MS\);/u);
   assert.match(app, /clearTimeout\(optimisticSentTimer\);/u);
-  assert.match(app, /error\.errorKey === "request-timeout"[\s\S]*optimisticDraft\.collapsedAfterSend/u);
+  assert.match(app, /function isCompletionReplyLateNetworkResult\(error\)[\s\S]*error\?\.errorKey === "request-timeout"[\s\S]*LAN_FETCH_TIMEOUT_MESSAGE/u);
+  assert.match(app, /isCompletionReplyLateNetworkResult\(error\)[\s\S]*optimisticDraft\.collapsedAfterSend/u);
 });

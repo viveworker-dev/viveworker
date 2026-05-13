@@ -43,6 +43,7 @@ const DETAIL_REFRESH_FALLBACK_TIMEOUT_MS = 2_500;
 const DETAIL_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
 const COMPLETION_REPLY_SEND_TIMEOUT_MS = 22_000;
 const COMPLETION_REPLY_OPTIMISTIC_SENT_MS = 1_600;
+const LAN_FETCH_TIMEOUT_MESSAGE = "LAN fetch timed out";
 const TIMELINE_REFRESH_TIMEOUT_MS = 8_000;
 const TIMELINE_POLL_TIMEOUT_MS = 4_500;
 const FAST_POLL_STEP_TIMEOUT_MS = 4_500;
@@ -2753,6 +2754,11 @@ function completionReplyWarningMatchesSentText(error, text, attachmentCount = 0)
   const warningText = normalizeCompletionReplyCompareText(warning?.summary || "");
   const sentText = normalizeCompletionReplyCompareText(text);
   return Boolean(warningText && sentText && warningText === sentText);
+}
+
+function isCompletionReplyLateNetworkResult(error) {
+  return error?.errorKey === "request-timeout" ||
+    error?.message === LAN_FETCH_TIMEOUT_MESSAGE;
 }
 
 function normalizeCompletionReplyAttachments(values) {
@@ -10027,7 +10033,7 @@ for (const button of document.querySelectorAll("[data-wallet-address-copy]")) {
       } catch (error) {
         const optimisticDraft = getCompletionReplyDraft(token);
         if (
-          error.errorKey === "request-timeout" &&
+          isCompletionReplyLateNetworkResult(error) &&
           optimisticDraft.collapsedAfterSend &&
           optimisticDraft.sentText === text
         ) {
@@ -11504,6 +11510,7 @@ function localizeApiError(value) {
     "completion-reply-image-limit": "error.completionReplyImageLimit",
     "completion-reply-image-invalid-upload": "error.completionReplyImageInvalidUpload",
     "codex-ipc-not-connected": "error.codexIpcNotConnected",
+    "codex-client-not-found": "error.codexClientNotFound",
     "approval-not-found": "error.approvalNotFound",
     "approval-already-handled": "error.approvalAlreadyHandled",
     "plan-request-not-found": "error.planRequestNotFound",

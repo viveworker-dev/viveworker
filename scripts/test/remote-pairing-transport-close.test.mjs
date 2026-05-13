@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import {
   RemotePairingTransport,
@@ -18,7 +19,7 @@ class FakeWebSocket {
   }
 }
 
-function makeTransport() {
+function makeTransport(transportOptions = {}) {
   const pairingId = `close-unit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const debug = [];
   return new RemotePairingTransport({
@@ -31,6 +32,7 @@ function makeTransport() {
     WebSocketImpl: FakeWebSocket,
     backoffMs: [60_000],
     logger: { debug: (line) => debug.push(line) },
+    ...transportOptions,
   });
 }
 
@@ -88,6 +90,50 @@ test("successful connection resets ordinary reconnect backoff", () => {
 
   try {
     assert.equal(transport._reconnectAttempt, 0);
+  } finally {
+    transport.close();
+  }
+});
+
+test("short-lived relay reset loops open the reconnect circuit", () => {
+  const transport = makeTransport({
+    failureThreshold: 3,
+    circuitBreakerMs: 5_000,
+    maxCircuitBreakerMs: 5_000,
+    stableConnectionMs: 60_000,
+  });
+
+  try {
+    for (let i = 0; i < 3; i++) {
+      transport._setState(STATE.CONNECTED);
+      transport._handleClose({ code: 4004, reason: "fresh-handshake" });
+      transport._cancelReconnectTimer();
+    }
+    assert.ok(
+      transport._circuitDelayMs() > 0,
+      "rapid connected→4004 cycles should keep failure history and open circuit",
+    );
+  } finally {
+    transport.close();
+  }
+});
+
+test("stable connection clears reconnect circuit history", async () => {
+  const transport = makeTransport({
+    stableConnectionMs: 5,
+  });
+
+  try {
+    transport._recentFailureAtMs = [Date.now()];
+    transport._circuitOpenUntilMs = Date.now() + 60_000;
+    transport._circuitOpenCount = 2;
+    transport._setState(STATE.CONNECTED);
+
+    await sleep(20);
+
+    assert.equal(transport._recentFailureAtMs.length, 0);
+    assert.equal(transport._circuitOpenUntilMs, 0);
+    assert.equal(transport._circuitOpenCount, 0);
   } finally {
     transport.close();
   }
