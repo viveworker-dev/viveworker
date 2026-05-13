@@ -304,6 +304,10 @@ node scripts/viveworker.mjs share upload report.pdf \
 node scripts/viveworker.mjs share list
 node scripts/viveworker.mjs share list --metrics
 
+# Replace the file behind an existing share (URL is preserved)
+node scripts/viveworker.mjs share replace <slug> updated-report.html
+node scripts/viveworker.mjs share update <slug> --file updated-report.html
+
 # Update password / price / expiry on an existing share (URL is preserved)
 node scripts/viveworker.mjs share update <slug> --password "hunter2"
 node scripts/viveworker.mjs share update <slug> --no-password
@@ -320,7 +324,7 @@ node scripts/viveworker.mjs share link <slug> --password "hunter2" --ttl-hours 4
 node scripts/viveworker.mjs share delete <slug>
 ```
 
-All commands accept `--json` for machine-readable output. Changing the password via `update` invalidates any previously issued unlock cookies, so existing viewers have to re-enter the new password. `--expires-days` on `update` is always relative to *now* — use it to extend or shorten the TTL.
+All commands accept `--json` for machine-readable output. Changing the password via `update` invalidates any previously issued unlock cookies, so existing viewers have to re-enter the new password. Replacing the file on a paid share rotates `paymentSalt`, so outstanding paid sessions are invalidated before the new bytes are served. `--expires-days` on `update` is always relative to *now* — use it to extend or shorten the TTL.
 
 ### When to use
 

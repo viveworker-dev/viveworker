@@ -189,9 +189,9 @@ Events (written via `writeShareEvent` throughout the payment path):
 
 CLI: `viveworker share list --metrics` appends a "Paid-share metrics" block to the standard file listing.
 
-### PATCH /api/share/:slug — application/json
+### PATCH /api/share/:slug — application/json or multipart/form-data
 
-Owner-only metadata update. Use it to add/change/remove the password or reset the expiry without re-uploading.
+Owner-only update. Use JSON to add/change/remove the password, payment gate, or expiry. Use multipart form data with a `file` field to replace the bytes behind the same public URL.
 
 ```json
 {
@@ -202,23 +202,32 @@ Owner-only metadata update. Use it to add/change/remove the password or reset th
 }
 ```
 
+Multipart fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `file` | File | no | Same validation as upload. Replaces the R2 object under the existing slug and updates `originalName`, `size`, `contentType`, `kind`, and `updatedAtMs`. |
+| `password` / `price` / `payTo` / `expiresDays` | string | no | Same semantics as JSON PATCH. Empty `password` clears the password; empty `price` removes the payment gate. |
+
 Notes:
 - Changing the password rotates the internal `passwordSalt`, which is folded into the unlock-cookie HMAC. That invalidates every previously issued `share_unlock` cookie for this slug — viewers must re-enter the new password.
 - Changing (or setting) `price` rotates `paymentSalt`, invalidating every outstanding `share_paid` cookie for this slug — in-flight paid viewers must re-pay. Changing *only* `payTo` does **not** rotate the salt (paid sessions keep working) and is rejected on shares with no existing price gate (`payTo-without-price`).
+- Replacing the file preserves the slug and all gates. If the share has a payment gate, replacement rotates `paymentSalt` so outstanding paid sessions do not automatically unlock the new bytes.
 - `price` is mutually exclusive with `password` on v1. Attempting to add a price to a password-protected share returns `price-and-password-mutually-exclusive`.
 - `expiresDays` is always relative to *now*, so PATCH both extends and shortens the TTL.
-- When `expiresDays` is touched, the R2 object is re-`put` with the same bytes so R2's `LastModified` advances. The bucket's 90-day lifecycle rule counts from the last modification, and `expiresDays` is capped at 30, so the re-put keeps KV validity within the R2 window even when a user chains PATCH extensions.
+- When `file` is supplied, the R2 object is re-`put` with the new bytes under the existing slug. When only `expiresDays` is touched, the R2 object is re-`put` with the same bytes so R2's `LastModified` advances. The bucket's 90-day lifecycle rule counts from the last modification, and `expiresDays` is capped at 30, so the re-put keeps KV validity within the R2 window even when a user chains PATCH extensions.
 - **Revival:** a share that's already past `expiresAtMs` (and therefore returns 410 on `GET /v/<slug>`) can still be resurrected via PATCH with a new `expiresDays`, provided the KV entry (grace period = 60 days past `expiresAtMs`) and the R2 body (90 days past last write) are both still alive. PATCH on an expired share **without** `expiresDays` is rejected (`expired-requires-expiresDays`, 410) — a password-only change on a share that still 410s to viewers is never what the caller wants.
 - Rate-limited to **10 patches/hour per user** (`share_stats.patchWindow`, rolling hour; separate bucket from the upload rate limit). Returns `429` with `Retry-After` on the 11th attempt.
-- Costs 1 KV read + 2 KV writes (`share:<slug>` + `share_stats:<userId>`) + (if expiry changed) 1 R2 Class-B + 1 R2 Class-A.
+- Costs 1 KV read + 2 KV writes (`share:<slug>` + `share_stats:<userId>`) + (if file replaced) 1 R2 Class-A + (if expiry changed without file replacement) 1 R2 Class-B + 1 R2 Class-A.
 
 Errors:
 
 | HTTP | `error` | Meaning |
 |---|---|---|
-| 400 | `invalid-json` / `invalid-body` / `no-changes` | Body couldn't be parsed, wasn't an object, or had no updatable keys |
+| 400 | `invalid-json` / `invalid-body` / `invalid-form-data` / `no-changes` | Body couldn't be parsed, wasn't an object/form, or had no updatable keys |
 | 400 | `invalid-password` / `password-too-long` | Password value is wrong type or > 256 chars |
 | 400 | `invalid-expiresDays` | Not a finite number in 1–30 (server also returns `maxDays` in the payload) |
+| 400 | `unsupported-extension` / `unsupported-content-type` / `content-mismatch` | Replacement file failed the same validation used by upload |
 | 400 | `invalid-price` / `price-out-of-range` / `invalid-payTo` | Same semantics as on upload |
 | 400 | `price-payTo-both-required` | Setting a price on a share with no existing `payTo` requires `payTo` in the same PATCH |
 | 400 | `price-and-password-mutually-exclusive` | Tried to add a price to a password-protected share (or vice versa) |
@@ -242,7 +251,9 @@ Response:
   "expiresAtMs": 1768512000000,
   "hasPassword": true,
   "size": 12345,
-  "originalName": "report.html"
+  "originalName": "report.html",
+  "updatedAtMs": 1765920300000,
+  "fileReplaced": true
 }
 ```
 

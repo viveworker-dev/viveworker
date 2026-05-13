@@ -284,6 +284,8 @@ Typical commands:
 - `npx viveworker share upload report.pdf --password "hunter2" --expires-days 7`
 - `npx viveworker share upload deck_standalone.html --no-optimize`
 - `npx viveworker share list`
+- `npx viveworker share replace <slug> updated-report.html`
+- `npx viveworker share update <slug> --file updated-report.html`
 - `npx viveworker share update <slug> --password "hunter2"`
 - `npx viveworker share update <slug> --expires-days 7`
 - `npx viveworker share link <slug>`

@@ -43,6 +43,7 @@ passkey/
 npm_recovery_codes.txt
 .viveworker-attachments/
 web/remote-pairing.bundle.js.map
+assets/generated/
 
 # Local launchd output
 launchd/*.plist

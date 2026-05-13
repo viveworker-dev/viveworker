@@ -9,7 +9,7 @@ import { Resvg } from "@cf-wasm/resvg/workerd";
  *   - Per-upload random slug URL (https://share.viveworker.com/v/<slug>)
  *   - Optional PBKDF2 password protection
  *   - Robot / crawler blocking (X-Robots-Tag + robots.txt)
- *   - Owner-only delete via same A2A credentials
+ *   - Owner-only update/delete via same A2A credentials
  *   - CSV is rendered server-side as an HTML table on view (`?raw=1` for bytes)
  *
  * Bindings (see wrangler.toml):
@@ -371,45 +371,9 @@ async function handleUpload(request, env) {
     return jsonResponse({ error: "missing-file-field" }, 400);
   }
 
-  // Enforce size
-  if (file.size > MAX_FILE_SIZE) {
-    return jsonResponse({ error: "file-too-large", maxBytes: MAX_FILE_SIZE }, 413);
-  }
-  if (file.size <= 0) {
-    return jsonResponse({ error: "empty-file" }, 400);
-  }
-
-  // Enforce extension
-  const originalName = sanitizeFilename(file.name || "upload.html");
-  const typeInfo = detectShareType(originalName);
-  if (!typeInfo) {
-    return jsonResponse(
-      { error: "unsupported-extension", allowed: ALLOWED_EXTENSIONS },
-      400,
-    );
-  }
-
-  // Best-effort declared content-type check. We compare against the type
-  // implied by the extension so a `.pdf` uploaded with `Content-Type: text/html`
-  // gets rejected rather than silently stored with the wrong MIME. Browsers /
-  // curl both set a sensible declared type for standard extensions; the check
-  // is skipped when the caller didn't declare anything.
-  const declaredType = (file.type || "").toLowerCase();
-  if (declaredType && !isDeclaredTypeCompatible(declaredType, typeInfo.kind)) {
-    return jsonResponse(
-      { error: "unsupported-content-type", declared: declaredType, expected: typeInfo.mime },
-      400,
-    );
-  }
-
-  const bytes = new Uint8Array(await file.arrayBuffer());
-
-  // Per-kind magic-byte sniff (defense-in-depth, not security-critical).
-  // Protects against a user accidentally uploading a mis-extensioned file;
-  // doesn't try to be a full format validator.
-  if (!sniffKind(bytes, typeInfo.kind)) {
-    return jsonResponse({ error: "content-mismatch", kind: typeInfo.kind }, 400);
-  }
+  const parsedFile = await readShareFile(file);
+  if (parsedFile.response) return parsedFile.response;
+  const { bytes, originalName, typeInfo, size } = parsedFile;
 
   // Optional password
   const passwordRaw = form.get("password");
@@ -534,13 +498,13 @@ async function handleUpload(request, env) {
       409,
     );
   }
-  if ((stats.bytes || 0) + file.size > MAX_TOTAL_BYTES) {
+  if ((stats.bytes || 0) + size > MAX_TOTAL_BYTES) {
     return jsonResponse(
       {
         error: "quota-exceeded",
         maxTotalBytes: MAX_TOTAL_BYTES,
         currentBytes: stats.bytes || 0,
-        fileBytes: file.size,
+        fileBytes: size,
       },
       413,
     );
@@ -553,7 +517,7 @@ async function handleUpload(request, env) {
     slug,
     userId: user.userId,
     originalName,
-    size: file.size,
+    size,
     createdAtMs,
     expiresAtMs,
     passwordHash,
@@ -592,7 +556,7 @@ async function handleUpload(request, env) {
   stats.files = Array.isArray(stats.files) ? stats.files : [];
   if (!stats.files.includes(slug)) stats.files.push(slug);
   stats.count = stats.files.length;
-  stats.bytes = (stats.bytes || 0) + file.size;
+  stats.bytes = (stats.bytes || 0) + size;
   rateWindow.push(now);
   stats.rateWindow = rateWindow;
   await saveUserStats(env, user.userId, stats);
@@ -621,7 +585,7 @@ async function handleUpload(request, env) {
     payoutMethod: payoutMethod || null,
     payoutAddress: payoutAddress || payTo,
     network: chainId ? X402_NETWORKS[chainId]?.name || null : null,
-    size: file.size,
+    size,
     originalName,
     quota: {
       bytes: stats.bytes,
@@ -630,6 +594,70 @@ async function handleUpload(request, env) {
       maxCount: MAX_FILES,
     },
   });
+}
+
+async function readShareFile(file) {
+  // Enforce size.
+  if (file.size > MAX_FILE_SIZE) {
+    return { response: jsonResponse({ error: "file-too-large", maxBytes: MAX_FILE_SIZE }, 413) };
+  }
+  if (file.size <= 0) {
+    return { response: jsonResponse({ error: "empty-file" }, 400) };
+  }
+
+  // Enforce extension.
+  const originalName = sanitizeFilename(file.name || "upload.html");
+  const typeInfo = detectShareType(originalName);
+  if (!typeInfo) {
+    return {
+      response: jsonResponse(
+        { error: "unsupported-extension", allowed: ALLOWED_EXTENSIONS },
+        400,
+      ),
+    };
+  }
+
+  // Best-effort declared content-type check. We compare against the type
+  // implied by the extension so a `.pdf` uploaded with `Content-Type: text/html`
+  // gets rejected rather than silently stored with the wrong MIME. Browsers /
+  // curl both set a sensible declared type for standard extensions; the check
+  // is skipped when the caller didn't declare anything.
+  const declaredType = (file.type || "").toLowerCase();
+  if (declaredType && !isDeclaredTypeCompatible(declaredType, typeInfo.kind)) {
+    return {
+      response: jsonResponse(
+        { error: "unsupported-content-type", declared: declaredType, expected: typeInfo.mime },
+        400,
+      ),
+    };
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+
+  // Per-kind magic-byte sniff (defense-in-depth, not security-critical).
+  // Protects against a user accidentally uploading a mis-extensioned file;
+  // doesn't try to be a full format validator.
+  if (!sniffKind(bytes, typeInfo.kind)) {
+    return { response: jsonResponse({ error: "content-mismatch", kind: typeInfo.kind }, 400) };
+  }
+
+  return { bytes, originalName, typeInfo, size: file.size };
+}
+
+function patchBodyFromForm(form) {
+  const body = {};
+  const stringField = (name) => {
+    const value = form.get(name);
+    return typeof value === "string" ? value : undefined;
+  };
+
+  for (const name of ["password", "price", "payTo", "payoutAddress", "paymentNetwork", "payoutMethod", "expiresDays"]) {
+    if (form.has(name)) {
+      body[name] = stringField(name) ?? "";
+    }
+  }
+
+  return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -803,17 +831,42 @@ async function handlePatch(request, env, slug) {
   }
 
   let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "invalid-json" }, 400);
-  }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return jsonResponse({ error: "invalid-body" }, 400);
+  let replacementFile = null;
+  const contentType = request.headers.get("content-type") || "";
+  if (contentType.includes("multipart/form-data")) {
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return jsonResponse({ error: "invalid-form-data" }, 400);
+    }
+
+    const file = form.get("file");
+    if (file && typeof file === "string") {
+      return jsonResponse({ error: "invalid-file-field" }, 400);
+    }
+    if (file) {
+      const parsedFile = await readShareFile(file);
+      if (parsedFile.response) return parsedFile.response;
+      replacementFile = parsedFile;
+    }
+
+    body = patchBodyFromForm(form);
+  } else {
+    try {
+      body = await request.json();
+    } catch {
+      return jsonResponse({ error: "invalid-json" }, 400);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ error: "invalid-body" }, 400);
+    }
   }
 
   let changed = false;
   let expiryChanged = false;
+  let fileChanged = false;
+  let paymentSessionsInvalidated = false;
 
   // Password: presence of the key is a signal to update, so use `in` rather
   // than truthiness. "" or null removes; non-empty string sets.
@@ -828,6 +881,10 @@ async function handlePatch(request, env, slug) {
     } else if (typeof pw === "string") {
       if (pw.length > 256) {
         return jsonResponse({ error: "password-too-long" }, 400);
+      }
+      const removingPriceInSamePatch = "price" in body && (body.price === null || body.price === "");
+      if (meta.price && !removingPriceInSamePatch) {
+        return jsonResponse({ error: "price-and-password-mutually-exclusive" }, 400);
       }
       const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
       meta.passwordSalt = bytesToBase64(saltBuf);
@@ -999,6 +1056,45 @@ async function handlePatch(request, env, slug) {
     }
   }
 
+  if (replacementFile) {
+    const files = Array.isArray(stats.files) ? stats.files.slice() : [];
+    const oldSize = Number(meta.size) || 0;
+    const oldSizeWasCounted = files.includes(slug);
+    const baseBytes = Math.max(0, (Number(stats.bytes) || 0) - (oldSizeWasCounted ? oldSize : 0));
+    const nextBytes = baseBytes + replacementFile.size;
+    if (nextBytes > MAX_TOTAL_BYTES) {
+      return jsonResponse(
+        {
+          error: "quota-exceeded",
+          maxTotalBytes: MAX_TOTAL_BYTES,
+          currentBytes: stats.bytes || 0,
+          fileBytes: replacementFile.size,
+        },
+        413,
+      );
+    }
+
+    if (!files.includes(slug)) files.push(slug);
+    stats.files = files;
+    stats.count = files.length;
+    stats.bytes = nextBytes;
+
+    meta.originalName = replacementFile.originalName;
+    meta.size = replacementFile.size;
+    meta.contentType = replacementFile.typeInfo.mime;
+    meta.kind = replacementFile.typeInfo.kind;
+    meta.updatedAtMs = Date.now();
+
+    if (meta.price && meta.paymentSalt) {
+      const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
+      meta.paymentSalt = bytesToBase64(saltBuf);
+      paymentSessionsInvalidated = true;
+    }
+
+    changed = true;
+    fileChanged = true;
+  }
+
   if (!changed) {
     return jsonResponse({ error: "no-changes" }, 400);
   }
@@ -1013,10 +1109,14 @@ async function handlePatch(request, env, slug) {
     );
   }
 
-  // R2 re-put: only when expiry was actually touched. Password-only PATCHes
-  // don't need to refresh `LastModified` because the bucket lifecycle rule is
-  // aligned with the original upload (which is still correctly bounded).
-  if (expiryChanged) {
+  // R2 re-put: replacing the file writes the new bytes under the existing
+  // slug. Otherwise we only re-put when expiry changed, to refresh
+  // `LastModified` for the bucket lifecycle rule.
+  if (fileChanged) {
+    await env.SHARE_FILES.put(slug, replacementFile.bytes, {
+      httpMetadata: { contentType: replacementFile.typeInfo.mime },
+    });
+  } else if (expiryChanged) {
     const obj = await env.SHARE_FILES.get(slug);
     if (!obj) {
       // Body went missing (R2 lifecycle already reaped it, or partial
@@ -1062,6 +1162,9 @@ async function handlePatch(request, env, slug) {
     network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
     size: meta.size,
     originalName: meta.originalName,
+    updatedAtMs: meta.updatedAtMs || null,
+    fileReplaced: fileChanged,
+    paymentSessionsInvalidated,
   });
 }
 

@@ -9,7 +9,8 @@
  * Commands:
  *   viveworker share upload <file> [--password <pw>] [--price <usd> --pay-to <0x…>] [--expires-days <n>] [--no-optimize] [--json]
  *   viveworker share list [--json]
- *   viveworker share update <slug> [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--json]
+ *   viveworker share update <slug> [--file <file>] [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--no-optimize] [--json]
+ *   viveworker share replace <slug> <file> [--expires-days <n>] [--no-optimize] [--json]
  *   viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]
  *   viveworker share pay <url> [--output <file>] [--dry-run] [--wallet eoa|hazbase] [--no-approval] [--json]
  *   viveworker share delete <slug>
@@ -80,6 +81,8 @@ export async function runShareCli(args) {
       return handleList(args.slice(1));
     case "update":
       return handleUpdate(args.slice(1));
+    case "replace":
+      return handleReplace(args.slice(1));
     case "link":
       return handleLink(args.slice(1));
     case "pay":
@@ -99,7 +102,8 @@ function printHelp() {
   console.log("Commands:");
   console.log("  viveworker share upload <file> [--password <pw>] [--price <usd> --pay-to <0x…>] [--expires-days <n>] [--no-optimize] [--json]");
   console.log("  viveworker share list [--metrics] [--json]");
-  console.log("  viveworker share update <slug> [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--json]");
+  console.log("  viveworker share update <slug> [--file <file>] [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--no-optimize] [--json]");
+  console.log("  viveworker share replace <slug> <file> [--expires-days <n>] [--no-optimize] [--json]");
   console.log("  viveworker share link <slug> --password <pw> [--ttl-hours <n>] [--json]");
   console.log("  viveworker share pay <url> [--output <file>] [--dry-run] [--no-approval] [--json]");
   console.log("  viveworker share delete <slug>");
@@ -132,28 +136,6 @@ async function handleUpload(args) {
   if (!filePath) {
     throw new Error("Usage: viveworker share upload <file> [--password <pw>] [--expires-days <n>]");
   }
-
-  const absolute = path.resolve(filePath);
-  let stat;
-  try {
-    stat = await fs.stat(absolute);
-  } catch {
-    throw new Error(`File not found: ${filePath}`);
-  }
-  if (!stat.isFile()) {
-    throw new Error(`Not a regular file: ${filePath}`);
-  }
-  if (stat.size === 0) {
-    throw new Error(`File is empty: ${filePath}`);
-  }
-  const ext = path.extname(absolute).toLowerCase();
-  if (!ALLOWED_EXTENSIONS.includes(ext)) {
-    throw new Error(
-      `Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}. ` +
-      `Got: ${ext || "(no extension)"}`
-    );
-  }
-  const { mime } = SHARE_TYPES[ext];
 
   const password = flags["password"] || "";
   const expiresDays = flags["expires-days"] || flags["expiresDays"] || "";
@@ -190,21 +172,10 @@ async function handleUpload(args) {
 
   const { apiKey, userId, shareUrl } = await resolveCredentials();
 
-  const originalBytes = await fs.readFile(absolute);
-  const optimization =
-    flags["no-optimize"] || flags["noOptimize"]
-      ? { bytes: originalBytes, info: null }
-      : maybeOptimizeUpload({ absolute, ext, bytes: originalBytes });
-  const bytes = optimization.bytes;
-  if (bytes.length > MAX_FILE_SIZE) {
-    const detail = optimization.info
-      ? ` after optimization to ${formatSize(bytes.length)}`
-      : "";
-    throw new Error(`File too large (${originalBytes.length} bytes, max ${MAX_FILE_SIZE})${detail}`);
-  }
+  const preparedFile = await prepareShareFile(filePath, flags);
   const form = new FormData();
-  const blob = new Blob([bytes], { type: mime });
-  const file = new File([blob], path.basename(absolute), { type: mime });
+  const blob = new Blob([preparedFile.bytes], { type: preparedFile.mime });
+  const file = new File([blob], path.basename(preparedFile.absolute), { type: preparedFile.mime });
   form.set("file", file);
   if (password) form.set("password", password);
   if (expiresDays) form.set("expiresDays", String(expiresDays));
@@ -233,14 +204,14 @@ async function handleUpload(args) {
   }
 
   console.log("");
-  console.log(`✅ Uploaded ${body.originalName || path.basename(absolute)} (${formatSize(body.size)})`);
+  console.log(`✅ Uploaded ${body.originalName || path.basename(preparedFile.absolute)} (${formatSize(body.size)})`);
   console.log("");
-  if (optimization.info) {
+  if (preparedFile.optimization.info) {
     console.log(
-      `   Optimized HTML: ${formatSize(optimization.info.originalBytes)} → ${formatSize(optimization.info.optimizedBytes)}`
+      `   Optimized HTML: ${formatSize(preparedFile.optimization.info.originalBytes)} → ${formatSize(preparedFile.optimization.info.optimizedBytes)}`
     );
     console.log(
-      `   Removed embedded fonts: ${optimization.info.removedFonts}`
+      `   Removed embedded fonts: ${preparedFile.optimization.info.removedFonts}`
     );
     console.log("");
   }
@@ -260,6 +231,44 @@ async function handleUpload(args) {
     );
   }
   console.log("");
+}
+
+async function prepareShareFile(filePath, flags = {}) {
+  const absolute = path.resolve(String(filePath || ""));
+  let stat;
+  try {
+    stat = await fs.stat(absolute);
+  } catch {
+    throw new Error(`File not found: ${filePath}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Not a regular file: ${filePath}`);
+  }
+  if (stat.size === 0) {
+    throw new Error(`File is empty: ${filePath}`);
+  }
+  const ext = path.extname(absolute).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    throw new Error(
+      `Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}. ` +
+      `Got: ${ext || "(no extension)"}`
+    );
+  }
+  const { mime } = SHARE_TYPES[ext];
+  const originalBytes = await fs.readFile(absolute);
+  const optimization =
+    flags["no-optimize"] || flags["noOptimize"]
+      ? { bytes: originalBytes, info: null }
+      : maybeOptimizeUpload({ absolute, ext, bytes: originalBytes });
+  const bytes = optimization.bytes;
+  if (bytes.length > MAX_FILE_SIZE) {
+    const detail = optimization.info
+      ? ` after optimization to ${formatSize(bytes.length)}`
+      : "";
+    throw new Error(`File too large (${originalBytes.length} bytes, max ${MAX_FILE_SIZE})${detail}`);
+  }
+
+  return { absolute, ext, mime, bytes, optimization };
 }
 
 function maybeOptimizeUpload({ absolute, ext, bytes }) {
@@ -506,14 +515,33 @@ function printMetricsSection(metrics, err) {
 
 async function handleUpdate(args) {
   const flags = parseFlags(args);
+  return handleUpdateWithFlags(flags, "update");
+}
+
+async function handleReplace(args) {
+  const flags = parseFlags(args);
+  const slug = flags._[0];
+  const filePath = flags._[1] || flags.file || flags.f;
+  if (!slug || !filePath || flags._.length > 2) {
+    throw new Error("Usage: viveworker share replace <slug> <file> [--expires-days <n>] [--no-optimize] [--json]");
+  }
+  flags._ = [slug];
+  flags.file = filePath;
+  return handleUpdateWithFlags(flags, "replace");
+}
+
+async function handleUpdateWithFlags(flags, mode = "update") {
   const slug = flags._[0];
   if (!slug) {
     throw new Error(
-      "Usage: viveworker share update <slug> [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>]"
+      "Usage: viveworker share update <slug> [--file <file>] [--password <pw>] [--no-password] [--price <usd>] [--no-price] [--pay-to <0x…>] [--expires-days <n>] [--no-optimize]"
     );
   }
   if (!/^[A-Za-z0-9]+$/.test(slug)) {
     throw new Error(`Invalid slug: ${slug}`);
+  }
+  if (flags._.length > 1) {
+    throw new Error("Unexpected positional argument. Use `share replace <slug> <file>` or `share update <slug> --file <file>`.");
   }
 
   const hasPassword = Object.prototype.hasOwnProperty.call(flags, "password");
@@ -525,6 +553,9 @@ async function handleUpdate(args) {
     Object.prototype.hasOwnProperty.call(flags, "noPrice");
   const hasPayTo = Object.prototype.hasOwnProperty.call(flags, "pay-to") ||
     Object.prototype.hasOwnProperty.call(flags, "payTo");
+  const hasFile = Object.prototype.hasOwnProperty.call(flags, "file") ||
+    Object.prototype.hasOwnProperty.call(flags, "f");
+  const filePath = flags.file || flags.f || "";
 
   if (hasPassword && hasNoPassword) {
     throw new Error("Pass either --password OR --no-password, not both");
@@ -535,9 +566,12 @@ async function handleUpdate(args) {
   if (hasPrice && hasPassword) {
     throw new Error("--price and --password cannot be combined on a single share");
   }
-  if (!hasPassword && !hasNoPassword && !hasExpires && !hasPrice && !hasNoPrice && !hasPayTo) {
+  if (hasFile && (typeof filePath !== "string" || filePath.length === 0)) {
+    throw new Error("--file requires a path");
+  }
+  if (!hasPassword && !hasNoPassword && !hasExpires && !hasPrice && !hasNoPrice && !hasPayTo && !hasFile) {
     throw new Error(
-      "Nothing to update — specify at least one of --password <pw>, --no-password, --price <usd>, --no-price, --pay-to <0x…>, --expires-days <n>"
+      "Nothing to update — specify at least one of --file <file>, --password <pw>, --no-password, --price <usd>, --no-price, --pay-to <0x…>, --expires-days <n>"
     );
   }
 
@@ -603,19 +637,44 @@ async function handleUpdate(args) {
 
   const { apiKey, userId, shareUrl } = await resolveCredentials();
 
-  const res = await fetchWithTimeout(`${shareUrl}/api/share/${encodeURIComponent(slug)}`, {
-    method: "PATCH",
-    headers: {
+  let preparedFile = null;
+  let requestBody;
+  let requestHeaders;
+  let timeoutMs;
+  if (hasFile) {
+    preparedFile = await prepareShareFile(filePath, flags);
+    const form = new FormData();
+    const blob = new Blob([preparedFile.bytes], { type: preparedFile.mime });
+    const file = new File([blob], path.basename(preparedFile.absolute), { type: preparedFile.mime });
+    form.set("file", file);
+    for (const [key, value] of Object.entries(body)) {
+      form.set(key, value === null ? "" : String(value));
+    }
+    requestBody = form;
+    requestHeaders = {
+      "x-a2a-user": userId,
+      "x-a2a-key": apiKey,
+    };
+    timeoutMs = 60_000;
+  } else {
+    requestBody = JSON.stringify(body);
+    requestHeaders = {
       "content-type": "application/json",
       "x-a2a-user": userId,
       "x-a2a-key": apiKey,
-    },
-    body: JSON.stringify(body),
-  }, 30_000);
+    };
+    timeoutMs = 30_000;
+  }
+
+  const res = await fetchWithTimeout(`${shareUrl}/api/share/${encodeURIComponent(slug)}`, {
+    method: "PATCH",
+    headers: requestHeaders,
+    body: requestBody,
+  }, timeoutMs);
 
   const respBody = await readJson(res);
   if (!res.ok || respBody.error) {
-    throw new Error(formatApiError("Update", res.status, respBody));
+    throw new Error(formatApiError(mode === "replace" ? "Replace" : "Update", res.status, respBody));
   }
 
   if (flags.json) {
@@ -624,17 +683,25 @@ async function handleUpdate(args) {
   }
 
   console.log("");
-  console.log(`✅ Updated ${slug}`);
+  console.log(hasFile ? `✅ Replaced file for ${slug}` : `✅ Updated ${slug}`);
   console.log("");
   console.log(`   ${respBody.url}`);
   console.log("");
+  if (hasFile) {
+    console.log(`   File: ${respBody.originalName || path.basename(preparedFile.absolute)} (${formatSize(respBody.size || preparedFile.bytes.length)})`);
+    if (preparedFile.optimization.info) {
+      console.log(
+        `   Optimized HTML: ${formatSize(preparedFile.optimization.info.originalBytes)} → ${formatSize(preparedFile.optimization.info.optimizedBytes)}`
+      );
+    }
+  }
   if (respBody.hasPassword) {
     console.log(`   🔒 Password-protected${hasPassword ? " (existing unlock cookies invalidated)" : ""}`);
   } else if (hasNoPassword) {
     console.log(`   🔓 Password removed`);
   }
   if (respBody.price && respBody.payTo) {
-    const rotated = hasPrice ? " (paid sessions invalidated)" : "";
+    const rotated = hasPrice || respBody.paymentSessionsInvalidated ? " (paid sessions invalidated)" : "";
     console.log(
       `   💰 Paid — ${formatUsdc(respBody.price)} USDC on ${respBody.network || "?"} → ${respBody.payTo}${rotated}`
     );
@@ -1181,6 +1248,12 @@ function formatApiError(op, status, body) {
       return `${op} failed (${status}): file count exceeded — ${body.current}/${body.max}. Delete something first.`;
     case "file-too-large":
       return `${op} failed (${status}): file too large (max ${formatSize(body.maxBytes)})`;
+    case "empty-file":
+      return `${op} failed (${status}): file is empty`;
+    case "invalid-form-data":
+      return `${op} failed (${status}): invalid multipart form data`;
+    case "invalid-file-field":
+      return `${op} failed (${status}): invalid file field`;
     case "unsupported-extension":
       return `${op} failed (${status}): unsupported file type. Accepted: ${(body.allowed || []).join(" / ") || "n/a"}`;
     case "unsupported-content-type":
