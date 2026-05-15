@@ -151,6 +151,7 @@ test("MCP server initialize, list, notify, and status", async () => {
     const names = tools.result.tools.map((tool) => tool.name);
     assert.ok(names.includes("viveworker_status"));
     assert.ok(names.includes("viveworker_notify"));
+    assert.ok(names.includes("viveworker_share_link"));
 
     const notify = await mcp.request("tools/call", {
       name: "viveworker_notify",
@@ -186,6 +187,7 @@ test("MCP prompts and unknown tools", async () => {
 
     const prompt = await mcp.request("prompts/get", { name: "share_deliverable" });
     assert.match(prompt.result.messages[0].content.text, /viveworker_share_file/);
+    assert.match(prompt.result.messages[0].content.text, /viveworker_share_link/);
 
     const unknown = await mcp.request("tools/call", {
       name: "missing_tool",
@@ -456,6 +458,96 @@ test("share_file uploads only after phone approval", async () => {
 
     const cliArgs = JSON.parse(await fs.readFile(cliArgsFile, "utf8"));
     assert.deepEqual(cliArgs, ["share", "upload", await fs.realpath(report), "--json", "--password", "pw", "--expires-days", "3"]);
+  } finally {
+    await mcp.close();
+    await bridge.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("share_file can mint a tokenized URL after password upload", async () => {
+  const bridge = await startFakeBridge();
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const cliArgsFile = path.join(tmp, "fake-cli-args.jsonl");
+  const fakeCli = path.join(tmp, "fake-viveworker-cli.mjs");
+  const report = path.join(tmp, "report.html");
+  await fs.writeFile(report, "<!doctype html><title>report</title>\n", "utf8");
+  await fs.writeFile(fakeCli, [
+    "import { promises as fs } from 'node:fs';",
+    "const args = process.argv.slice(2);",
+    "await fs.appendFile(process.env.VIVEWORKER_MCP_FAKE_CLI_ARGS, JSON.stringify(args) + '\\n');",
+    "if (args[1] === 'upload') console.log(JSON.stringify({ slug: 'abc123', url: 'https://share.example/v/abc123', hasPassword: true }));",
+    "else if (args[1] === 'link') console.log(JSON.stringify({ ok: true, url: 'https://share.example/v/abc123?t=token', token: 'token', expiresAtMs: 1770000000000 }));",
+    "else process.exit(2);",
+  ].join("\n"), "utf8");
+
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_BRIDGE_URL: bridge.baseUrl,
+    VIVEWORKER_MCP_SESSION_SECRET: "test-secret",
+    VIVEWORKER_MCP_CLI: fakeCli,
+    VIVEWORKER_MCP_FAKE_CLI_ARGS: cliArgsFile,
+  });
+  try {
+    const response = await mcp.request("tools/call", {
+      name: "viveworker_share_file",
+      arguments: {
+        path: report,
+        workspaceRoot: tmp,
+        password: "pw",
+        tokenize: true,
+        tokenTtlHours: 6,
+      },
+    });
+    assert.equal(response.result.structuredContent.approved, true);
+    assert.equal(response.result.structuredContent.share.slug, "abc123");
+    assert.equal(response.result.structuredContent.tokenizedLink.url, "https://share.example/v/abc123?t=token");
+    assert.match(bridge.events.at(-1).message, /Token URL/);
+
+    const cliCalls = (await fs.readFile(cliArgsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(cliCalls, [
+      ["share", "upload", await fs.realpath(report), "--json", "--password", "pw"],
+      ["share", "link", "abc123", "--password", "pw", "--json", "--ttl-hours", "6"],
+    ]);
+  } finally {
+    await mcp.close();
+    await bridge.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("share_link mints a token URL after phone approval", async () => {
+  const bridge = await startFakeBridge();
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const cliArgsFile = path.join(tmp, "fake-cli-args.json");
+  const fakeCli = path.join(tmp, "fake-viveworker-cli.mjs");
+  await fs.writeFile(fakeCli, [
+    "import { promises as fs } from 'node:fs';",
+    "await fs.writeFile(process.env.VIVEWORKER_MCP_FAKE_CLI_ARGS, JSON.stringify(process.argv.slice(2)));",
+    "console.log(JSON.stringify({ ok: true, url: 'https://share.example/v/abc123?t=token', token: 'token' }));",
+  ].join("\n"), "utf8");
+
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_BRIDGE_URL: bridge.baseUrl,
+    VIVEWORKER_MCP_SESSION_SECRET: "test-secret",
+    VIVEWORKER_MCP_CLI: fakeCli,
+    VIVEWORKER_MCP_FAKE_CLI_ARGS: cliArgsFile,
+  });
+  try {
+    const response = await mcp.request("tools/call", {
+      name: "viveworker_share_link",
+      arguments: {
+        slug: "abc123",
+        password: "pw",
+        ttlHours: 12,
+      },
+    });
+    assert.equal(response.result.structuredContent.approved, true);
+    assert.equal(response.result.structuredContent.link.url, "https://share.example/v/abc123?t=token");
+    assert.equal(bridge.events.at(-1).approvalKind, "file_share_link");
+    assert.match(bridge.events.at(-1).message, /passwordless/);
+
+    const cliArgs = JSON.parse(await fs.readFile(cliArgsFile, "utf8"));
+    assert.deepEqual(cliArgs, ["share", "link", "abc123", "--password", "pw", "--json", "--ttl-hours", "12"]);
   } finally {
     await mcp.close();
     await bridge.close();

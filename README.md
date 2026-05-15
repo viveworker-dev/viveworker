@@ -163,6 +163,8 @@ Use these commands most often:
   start `viveworker` again using the saved config
 - `npx viveworker stop`
   stop the local background service
+- `npx viveworker restart`
+  restart the local bridge using the saved config
 - `npx viveworker status`
   show the current app URL, launchd/background status, and health
 - `npx viveworker doctor`
@@ -266,6 +268,7 @@ What it supports:
 - PNG / JPG / GIF / WebP
 - CSV rendered as an HTML table by default
 - optional password protection
+- short-lived token URLs for password-protected shares
 - optional expiry
 
 HTML uploads are optimized by default when possible.
@@ -288,9 +291,16 @@ Typical commands:
 - `npx viveworker share update <slug> --file updated-report.html`
 - `npx viveworker share update <slug> --password "hunter2"`
 - `npx viveworker share update <slug> --expires-days 7`
-- `npx viveworker share link <slug>`
+- `npx viveworker share link <slug> --password "hunter2" --ttl-hours 24`
 - `VIVEWORKER_BUYER_PRIVATE_KEY=0x... npx viveworker share pay https://share.viveworker.com/v/<slug> --output ./deliverable.pdf`
 - `npx viveworker share pay https://share.viveworker.com/v/<slug> --wallet hazbase --output ./deliverable.pdf`
+
+`share link` is for agent handoff. It verifies the current password locally with
+the File Share worker and returns a short-lived `https://share.viveworker.com/v/<slug>?t=<token>`
+URL, so the recipient can open the share without seeing the password. The token
+defaults to 24 hours, can be capped with `--ttl-hours` up to 720 hours, never
+outlives the share expiry, and is invalidated when you rotate the share password
+with `share update --password`.
 
 `share pay` is human-in-the-loop by default. EOA mode reads the x402 payment
 requirements and asks the paired device to approve before signing. `--wallet

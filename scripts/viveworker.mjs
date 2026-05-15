@@ -115,6 +115,9 @@ async function main(cliOptions) {
     case "stop":
       await runStop(cliOptions);
       return;
+    case "restart":
+      await runRestart(cliOptions);
+      return;
     case "status":
       await runStatus(cliOptions);
       return;
@@ -1181,6 +1184,11 @@ async function runStop(cliOptions) {
   ]);
 }
 
+async function runRestart(cliOptions) {
+  await runStop(cliOptions);
+  await runStart(cliOptions);
+}
+
 async function runStatus(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
   const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
@@ -1834,6 +1842,7 @@ ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.enable")}
   ${t(locale, "cli.help.start")}
   ${t(locale, "cli.help.stop")}
+  ${t(locale, "cli.help.restart")}
   ${t(locale, "cli.help.status")}
   ${t(locale, "cli.help.doctor")}
   ${t(locale, "cli.help.update")}

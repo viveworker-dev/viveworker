@@ -522,6 +522,9 @@ async function handleUpload(request, env) {
     expiresAtMs,
     passwordHash,
     passwordSalt,
+    // Future password-protected uploads expose a short-lived bearer URL in
+    // owner-only lists, with the token lifetime capped to the share expiry.
+    passwordListTokenEnabled: !!passwordHash,
     contentType: typeInfo.mime,
     kind: typeInfo.kind,
     // Payment fields (v1): all `null` for free shares, set together when a
@@ -664,6 +667,26 @@ function patchBodyFromForm(form) {
 // List
 // ---------------------------------------------------------------------------
 
+async function buildListedShareUrl(origin, slug, env, meta) {
+  const directUrl = `${origin}/v/${slug}`;
+  if (!meta.passwordHash || !meta.passwordSalt || !meta.passwordListTokenEnabled || !meta.expiresAtMs) {
+    return { url: directUrl, directUrl, tokenExpiresAtMs: null };
+  }
+
+  try {
+    const token = await signUnlockToken(slug, env, meta.passwordSalt, meta.expiresAtMs);
+    return {
+      url: `${directUrl}?t=${encodeURIComponent(token)}`,
+      directUrl,
+      tokenExpiresAtMs: meta.expiresAtMs,
+    };
+  } catch {
+    // Listing should stay usable even if an older deployment is missing the
+    // signing secret. The direct password URL remains the safe fallback.
+    return { url: directUrl, directUrl, tokenExpiresAtMs: null };
+  }
+}
+
 async function handleList(request, env) {
   const user = await authenticate(request, env);
   if (!user) return jsonResponse({ error: "unauthorized" }, 401);
@@ -690,9 +713,12 @@ async function handleList(request, env) {
     }
     liveSlugs.push(slug);
     liveBytes += meta.size || 0;
+    const listedUrl = await buildListedShareUrl(origin, slug, env, meta);
     items.push({
       slug,
-      url: `${origin}/v/${slug}`,
+      url: listedUrl.url,
+      directUrl: listedUrl.directUrl,
+      tokenExpiresAtMs: listedUrl.tokenExpiresAtMs,
       originalName: meta.originalName,
       size: meta.size,
       createdAtMs: meta.createdAtMs,
@@ -876,6 +902,7 @@ async function handlePatch(request, env, slug) {
       if (meta.passwordHash || meta.passwordSalt) {
         meta.passwordHash = null;
         meta.passwordSalt = null;
+        meta.passwordListTokenEnabled = false;
         changed = true;
       }
     } else if (typeof pw === "string") {
@@ -889,6 +916,7 @@ async function handlePatch(request, env, slug) {
       const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
       meta.passwordSalt = bytesToBase64(saltBuf);
       meta.passwordHash = await hashPassword(pw, saltBuf);
+      meta.passwordListTokenEnabled = true;
       changed = true;
     } else {
       return jsonResponse({ error: "invalid-password" }, 400);
@@ -1181,10 +1209,11 @@ async function handleView(request, env, ctx, slug, headOnly = false) {
   }
 
   // Password gate. Two entry paths:
-  //   - `?t=<token>`: programmatic/agent view. Token-only, no cookie fallback;
-  //     failed verification returns JSON (the caller is machinery). We do NOT
-  //     Set-Cookie here on success — a shared URL must not turn into a
-  //     durable session for whichever browser later opens it from a log.
+  //   - `?t=<token>`: programmatic/agent view. We do NOT Set-Cookie here on
+  //     success — a shared URL must not turn into a durable session for
+  //     whichever browser later opens it from a log. If a human browser opens
+  //     an expired/invalid token URL, fall back to the password form; machinery
+  //     still gets JSON so clients can distinguish invalid-token from HTML.
   //   - No `?t=`: browser view. Falls back to the existing cookie + HTML
   //     unlock form flow, unchanged.
   if (meta.passwordHash) {
@@ -1193,8 +1222,11 @@ async function handleView(request, env, ctx, slug, headOnly = false) {
     if (queryToken) {
       const ok = await verifyUnlockToken(queryToken, slug, env, meta.passwordSalt);
       if (!ok) {
-        return headOnly
-          ? new Response(null, { status: 401, headers: { "content-type": "application/json; charset=utf-8", ...SECURITY_HEADERS } })
+        if (headOnly) {
+          return new Response(null, { status: 401, headers: { "content-type": "application/json; charset=utf-8", ...SECURITY_HEADERS } });
+        }
+        return prefersHtml(request)
+          ? htmlResponse(renderUnlockForm(slug, true, meta.userId), 401)
           : jsonResponse({ error: "invalid-token" }, 401);
       }
     } else {
@@ -1496,9 +1528,9 @@ async function handleUnlockJson(request, env, slug) {
     return jsonResponse({ error: "password-too-long" }, 400);
   }
 
-  // ttlHours: default 24, cap 168 (7d, matches cookie path). Also capped below
+  // ttlHours: default 24, cap 720 (30d). Also capped below
   // by meta.expiresAtMs so a token can never outlive the share itself.
-  const MAX_TTL_HOURS = 168;
+  const MAX_TTL_HOURS = 720;
   const DEFAULT_TTL_HOURS = 24;
   let ttlHours = DEFAULT_TTL_HOURS;
   if (body.ttlHours !== undefined && body.ttlHours !== null) {

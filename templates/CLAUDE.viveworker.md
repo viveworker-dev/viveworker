@@ -26,7 +26,8 @@ Then restart the Claude Code session. If the tools are not available, ask the us
 - `viveworker_notify` sends an informational phone notification and records a timeline entry.
 - `viveworker_ask` asks the paired phone a question and waits for the answer.
 - `viveworker_request_approval` asks the phone to approve or reject a proposed action.
-- `viveworker_share_file` uploads a workspace file to File Share after phone approval.
+- `viveworker_share_file` uploads a workspace file to File Share after phone approval. For password-protected handoff, pass `tokenize: true` to return a short-lived passwordless `?t=` URL.
+- `viveworker_share_link` mints a short-lived passwordless `?t=` URL for an existing password-protected File Share slug after phone approval.
 - `viveworker_thread_share` shares context into another Codex / Claude / inbox thread.
 - `viveworker_send_a2a_task` sends a task to a registered A2A target after phone approval.
 
@@ -35,6 +36,7 @@ Then restart the Claude Code session. If the tools are not available, ask the us
 - If the user says "ask me on my phone", "スマホに聞いて", or a short decision blocks progress, use `viveworker_ask`.
 - If the user asks you to proceed with a risky, external, irreversible, payment-related, or user-visible action, use `viveworker_request_approval`.
 - If the user asks for a report, prototype, screenshot, PDF, CSV, or standalone HTML to become a shareable link, use `viveworker_share_file`.
+- If the user asks for a password-protected share but wants the recipient to open it without knowing the password, use `viveworker_share_file` with `password` and `tokenize: true`, or use `viveworker_share_link` for an existing slug.
 - If the user says "share this with Codex/Claude", "Aの内容をBに共有して", or wants context handed to another session, use `viveworker_thread_share`.
 - If the user wants another registered agent to do work, use `viveworker_send_a2a_task`.
 

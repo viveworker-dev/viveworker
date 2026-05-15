@@ -719,7 +719,7 @@ async function handleUpdateWithFlags(flags, mode = "update") {
 // password-protected share to another agent without disclosing the password.
 //
 // The owner keeps the password on their side; the receiver only needs to GET
-// the returned URL. Tokens default to 24h, capped at 168h (7d) and capped by
+// the returned URL. Tokens default to 24h, capped at 720h (30d) and capped by
 // the share's own `expiresAtMs`. Rotating the password via `share update
 // --password ...` invalidates every outstanding token for the slug.
 // ---------------------------------------------------------------------------
@@ -748,8 +748,8 @@ async function handleLink(args) {
   if (hasTtl) {
     const raw = flags["ttl-hours"] || flags["ttlHours"];
     const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0 || n > 168) {
-      throw new Error("--ttl-hours must be a number between 1 and 168");
+    if (!Number.isFinite(n) || n <= 0 || n > 720) {
+      throw new Error("--ttl-hours must be a number between 1 and 720");
     }
     ttlHours = n;
   }
@@ -1269,7 +1269,7 @@ function formatApiError(op, status, body) {
     case "not-password-protected":
       return `${op} failed (${status}): share has no password — no link token needed, just share the URL directly`;
     case "invalid-ttlHours":
-      return `${op} failed (${status}): --ttl-hours must be between 1 and ${body.maxHours || 168}`;
+      return `${op} failed (${status}): --ttl-hours must be between 1 and ${body.maxHours || 720}`;
     // x402 / paid-share error codes — thrown by the worker on upload,
     // PATCH, or view. Keep the messages actionable; agents read these
     // back to the user verbatim.

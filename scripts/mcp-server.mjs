@@ -146,6 +146,8 @@ async function callTool(params) {
       return toolOk(await toolRequestApproval(args));
     case "viveworker_share_file":
       return toolOk(await toolShareFile(args));
+    case "viveworker_share_link":
+      return toolOk(await toolShareLink(args));
     case "viveworker_thread_share":
       return toolOk(await toolThreadShare(args));
     case "viveworker_send_a2a_task":
@@ -199,6 +201,13 @@ async function toolShareFile(args) {
   const workspaceRoot = optionalString(args.workspaceRoot) || process.env.VIVEWORKER_MCP_WORKSPACE_ROOT || process.cwd();
   const file = await validateSharePath(requestedPath, workspaceRoot);
   const stat = await fs.stat(file.realPath);
+  const password = optionalString(args.password);
+  const expiresDays = optionalString(args.expiresDays ?? args["expires-days"]);
+  const tokenize = optionalBoolean(args.tokenize) || optionalBoolean(args.tokenizedUrl) || optionalBoolean(args.passwordlessUrl);
+  const tokenTtlHours = normalizeShareTokenTtlHours(args.tokenTtlHours ?? args["token-ttl-hours"] ?? args.ttlHours ?? args["ttl-hours"]);
+  if (tokenize && !password) {
+    throw rpcInvalidParams("tokenize requires password because tokenized URLs are minted from password-protected shares");
+  }
   const approval = await bridgeEvent({
     eventType: "approval_request",
     title: "Share file with viveworker File Share",
@@ -207,6 +216,8 @@ async function toolShareFile(args) {
       "",
       `File: ${file.displayPath}`,
       `Size: ${stat.size} bytes`,
+      password ? "Password gate: enabled" : "Password gate: disabled",
+      tokenize ? `Token URL: create short-lived passwordless ?t= URL${tokenTtlHours ? ` (${tokenTtlHours}h)` : " (24h)"}` : "",
       "",
       "Approve only if this file is safe to send outside this Mac.",
     ].join("\n"),
@@ -219,12 +230,52 @@ async function toolShareFile(args) {
   }
 
   const uploadArgs = ["share", "upload", file.realPath, "--json"];
-  const password = optionalString(args.password);
-  const expiresDays = optionalString(args.expiresDays ?? args["expires-days"]);
   if (password) uploadArgs.push("--password", password);
   if (expiresDays) uploadArgs.push("--expires-days", expiresDays);
   const upload = await runViveworkerCliJson(uploadArgs, 90_000);
-  return { approved: true, share: upload };
+  if (!tokenize) {
+    return { approved: true, share: upload };
+  }
+
+  const slug = optionalString(upload.slug) || slugFromShareUrl(upload.url);
+  if (!slug) {
+    throw new Error("share upload did not return a slug for tokenized URL creation");
+  }
+  const link = await createShareTokenLink(slug, password, tokenTtlHours);
+  return { approved: true, share: upload, tokenizedLink: link };
+}
+
+async function toolShareLink(args) {
+  const slug = requiredString(args.slug, "slug");
+  if (!/^[A-Za-z0-9]+$/.test(slug)) {
+    throw rpcInvalidParams("slug must contain only letters and numbers");
+  }
+  const password = requiredString(args.password, "password");
+  if (password.length > 256) {
+    throw rpcInvalidParams("password is too long (max 256 characters)");
+  }
+  const ttlHours = normalizeShareTokenTtlHours(args.ttlHours ?? args["ttl-hours"] ?? args.tokenTtlHours ?? args["token-ttl-hours"]);
+  const approval = await bridgeEvent({
+    eventType: "approval_request",
+    title: "Create File Share token link",
+    message: [
+      "An MCP client wants to mint a short-lived passwordless File Share URL.",
+      "",
+      `Share slug: ${slug}`,
+      `Token TTL: ${ttlHours || 24}h`,
+      "",
+      "Anyone with the returned ?t= URL can open this share until the token or share expires.",
+      "Approve only if you are comfortable handing off this password-protected share.",
+    ].join("\n"),
+    approvalKind: "file_share_link",
+    timeoutMs: clampTimeout(args.timeoutMs),
+  }, clampTimeout(args.timeoutMs));
+  if (!approval.approved) {
+    return { approved: false, decision: approval.decision || "rejected" };
+  }
+
+  const link = await createShareTokenLink(slug, password, ttlHours);
+  return { approved: true, link };
 }
 
 async function toolThreadShare(args) {
@@ -577,6 +628,43 @@ function normalizeStringArray(value) {
   return value.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
+function optionalBoolean(value) {
+  if (value === true) return true;
+  if (value === false || value == null) return false;
+  const text = String(value).trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+
+function normalizeShareTokenTtlHours(value) {
+  if (value == null || value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0 || n > 720) {
+    throw rpcInvalidParams("token TTL must be a number between 1 and 720 hours");
+  }
+  return n;
+}
+
+function slugFromShareUrl(value) {
+  const text = optionalString(value);
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    const match = url.pathname.match(/^\/v\/([A-Za-z0-9]+)/u);
+    return match?.[1] || "";
+  } catch {
+    const match = text.match(/\/v\/([A-Za-z0-9]+)/u);
+    return match?.[1] || "";
+  }
+}
+
+async function createShareTokenLink(slug, password, ttlHours) {
+  const linkArgs = ["share", "link", slug, "--password", password, "--json"];
+  if (ttlHours !== undefined) {
+    linkArgs.push("--ttl-hours", String(ttlHours));
+  }
+  return runViveworkerCliJson(linkArgs, 30_000);
+}
+
 function requiredString(value, name) {
   const text = optionalString(value);
   if (!text) throw rpcInvalidParams(`${name} is required`);
@@ -789,7 +877,7 @@ const TOOLS = [
   {
     name: "viveworker_share_file",
     title: "Share file",
-    description: "After phone approval, upload a workspace file to viveworker File Share and return the limited URL.",
+    description: "After phone approval, upload a workspace file to viveworker File Share and return the limited URL. If password is set, pass tokenize=true to also mint a short-lived passwordless ?t= URL.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -798,9 +886,27 @@ const TOOLS = [
         workspaceRoot: { type: "string" },
         password: { type: "string" },
         expiresDays: { type: "string" },
+        tokenize: { type: "boolean" },
+        tokenTtlHours: { type: "number" },
         timeoutMs: { type: "number" },
       },
       required: ["path"],
+    },
+  },
+  {
+    name: "viveworker_share_link",
+    title: "Create File Share token URL",
+    description: "After phone approval, mint a short-lived passwordless ?t= URL for an existing password-protected File Share slug.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        slug: { type: "string" },
+        password: { type: "string" },
+        ttlHours: { type: "number" },
+        timeoutMs: { type: "number" },
+      },
+      required: ["slug", "password"],
     },
   },
   {
@@ -871,7 +977,7 @@ const PROMPTS = [
       title: "Share deliverable",
       description: "Package a local deliverable through viveworker File Share with phone approval.",
     },
-    text: "When the user asks to share a report, prototype, screenshot, CSV, or standalone HTML deliverable, use viveworker_share_file. Only share files inside the workspace and never share secrets or credentials.",
+    text: "When the user asks to share a report, prototype, screenshot, CSV, or standalone HTML deliverable, use viveworker_share_file. Only share files inside the workspace and never share secrets or credentials. If the user wants a password-protected share but the recipient should not know the password, set password plus tokenize=true, or use viveworker_share_link for an existing password-protected slug to mint a short-lived ?t= URL.",
   },
   {
     definition: {
