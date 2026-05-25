@@ -27,7 +27,7 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
 });
 
 test("build id marks the current web bundle", () => {
-  assert.match(buildIdSource, /20260508-moltbook-quota-deny-i18n/);
+  assert.match(buildIdSource, /20260524-wallet-payment-capabilities/);
 });
 
 test("timeline render is reported with sanitized client metadata", () => {

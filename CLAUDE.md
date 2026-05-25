@@ -290,15 +290,12 @@ node scripts/viveworker.mjs share upload report.html \
   --password "hunter2" \
   --expires-days 7
 
-# Upload with a payment gate (x402 / USDC on Base). --price is USDC as a
-# decimal (≤6 fractional digits); --pay-to is the seller's EVM address.
-# Mutually exclusive with --password on a single share.
-# ⚠ Replace the zero-address example below with YOUR OWN Base EOA / multisig
-# before running — copy-pasting as-is will either fail verification or burn
-# the USDC (no escrow, no refunds; viveworker never holds the funds).
+# Upload with a payment gate using the agent's wallet defaults.
+# Use explicit accepts like --accept base-sepolia:usdc,polygon-amoy:usdc
+# when you need to pin the offered payment rails.
 node scripts/viveworker.mjs share upload report.pdf \
   --price 0.10 \
-  --pay-to 0x0000000000000000000000000000000000000000
+  --accept wallet-defaults
 
 # List your uploads (append --metrics for 24h/7d payment-flow stats)
 node scripts/viveworker.mjs share list
@@ -367,11 +364,11 @@ Semantics:
 - Owner-auth: only the share owner (the same `A2A_API_KEY` that uploaded it) can mint tokens. Wrong password returns `401 invalid-password`.
 - The endpoint (`POST /v/<slug>/unlock.json`) does **not** Set-Cookie on `?t=` views — a URL pasted into a third-party log or chat must not become a durable session for whichever browser later opens it.
 
-### Paid deliverables (x402 / USDC on Base) — CLOSED BETA (testnet only)
+### Paid deliverables (x402 payment capabilities) — CLOSED BETA (testnet only)
 
-> **⚠ Closed beta.** Paid shares run on **Base Sepolia** (testnet) and are gated by a server-side allowlist (`X402_BETA_ALLOWLIST`). Your `--price` / `--pay-to` upload will fail with `paid-shares-closed-beta` (403) unless the worker operator has added your userId. While in beta, all payment amounts are test-USDC with no monetary value; buyer-side docs and the 402 HTML call this out prominently. Mainnet flip is a `wrangler.toml` change + a `wrangler secret put X402_FACILITATOR_AUTH` — no code changes needed.
+> **⚠ Closed beta.** Paid shares can advertise configured testnet capabilities: **Base Sepolia USDC**, **Polygon Amoy USDC**, and **Liquid Testnet USDt**. They are gated by a server-side allowlist (`X402_BETA_ALLOWLIST`). Your `--price` upload will fail with `paid-shares-closed-beta` (403) unless the worker operator has added your userId. While in beta, all testnet payment amounts have no monetary value; buyer-side docs and the 402 HTML call this out prominently. Mainnet capabilities are intentionally disabled until formal release.
 
-Attach `--price <usd> --pay-to <0x…>` to an upload to gate the share behind a USDC payment on Base. This is the A2A "納品" pattern — Agent A uploads a report, Agent B pays Agent A to unlock it.
+Attach `--price <amount> --accept wallet-defaults` to an upload to gate the share behind the agent's configured payment capabilities. Legacy `--price <usd> --pay-to <0x…>` still creates a single EVM USDC option from `X402_NETWORK`. This is the A2A "納品" pattern — Agent A uploads a report, Agent B pays Agent A to unlock it.
 
 ```bash
 # Seller: upload a paid report. Substitute --pay-to with YOUR OWN Base EOA
@@ -406,7 +403,7 @@ node scripts/viveworker.mjs share update <slug> --no-price
 ```
 
 **Wallet setup split (recommended):**
-- **Human path:** use `Settings -> Integrations -> Wallet` inside viveworker for OTP, passkey registration/assertion, and Base / Base Sepolia wallet issuance.
+- **Human path:** use `Settings -> Integrations -> Wallet` inside viveworker for OTP, passkey registration/assertion, and Base / Polygon / Liquid testnet capability setup.
 - **Agent path:** treat hazbase wallet resolution as **read-only orchestration**. Agents should read local status / payout-address and then call `share upload` / `share update` with the resolved `--pay-to` value.
 - **Do not let agents drive OTP / passkey by default.** If the wallet is missing or the seller is signed out, the agent should instruct the human to complete those steps in the Wallet UI, then continue automatically afterwards.
 
@@ -422,8 +419,8 @@ node scripts/viveworker.mjs share update <slug> --no-price
 curl -sS http://127.0.0.1:8787/api/hazbase/status \
   -H "x-viveworker-hook-secret: $SESSION_SECRET"
 
-# 2) Resolve the seller payout address for Base Sepolia.
-PAYTO="$(curl -sS 'http://127.0.0.1:8787/api/hazbase/payout-address?chainId=84532' \
+# 2) Resolve the seller payout address for Base Sepolia or Polygon Amoy.
+PAYTO="$(curl -sS 'http://127.0.0.1:8787/api/hazbase/payout-address?network=base-sepolia' \
   -H "x-viveworker-hook-secret: $SESSION_SECRET" | jq -r '.payoutAddress')"
 
 # 3) Use the resolved address in the existing share CLI.
@@ -434,7 +431,7 @@ node scripts/viveworker.mjs share upload report.pdf \
 # 4) Buyer: inspect a paid share without signing.
 node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> --dry-run
 
-# 5) Buyer: pay with a Base Sepolia EOA that holds test-USDC and unlock.
+# 5) Buyer: pay with a testnet EVM EOA that holds the selected network's test-USDC and unlock.
 VIVEWORKER_BUYER_PRIVATE_KEY=0x... \
   node scripts/viveworker.mjs share pay https://share.viveworker.com/v/<slug> \
   --output ./paid-report.pdf
@@ -469,7 +466,7 @@ CI run.
 - `--price` and `--password` are mutually exclusive on a single share (v1). Adding one to a share that has the other returns `price-and-password-mutually-exclusive`.
 - Price range: `$0.01` min, `$1000` max per share. Below `$0.01` gas dwarfs the price; the `$1000` cap is an accident-cap, not a policy limit.
 - Decimals: USDC has 6 decimals. `--price 0.10` → stored as atomic units `"100000"`; the CLI shows the USDC decimal back to the user.
-- Network: driven by the worker's `X402_NETWORK` var (`base-sepolia` by default, flip to `base` for mainnet). The chainId is pinned per-share at upload time. **While in closed beta, only `base-sepolia` is in active use.**
+- Network: legacy `--pay-to` uploads use `X402_NETWORK` (`base-sepolia` by default; `polygon-amoy` is also supported). Capability uploads store `paymentOptions[]` and can advertise Base Sepolia, Polygon Amoy, and Liquid Testnet together. Mainnet networks are excluded until formal release.
 - Trust: **pay-first, non-custodial.** viveworker never holds funds. Buyer sends USDC directly to `payTo` via the facilitator-broadcast transaction. No escrow, no dispute resolution — if the deliverable doesn't match the description, the buyer's recourse is to stop buying from that seller.
 - Revocation: change the price (or call `--no-price`) to rotate `paymentSalt` and invalidate every outstanding paid session. Deleting the share (`share delete <slug>`) also works.
 

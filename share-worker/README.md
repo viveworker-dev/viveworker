@@ -8,7 +8,7 @@ Private file hosting for viveworker users. Cloudflare Worker + R2 + KV.
 - **Storage:** one R2 object per upload, keyed by a 16-char base62 slug.
 - **URL shape:** `https://share.viveworker.com/v/<slug>`.
 - **Crawlers:** blocked via `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet` and `robots.txt` `Disallow: /`.
-- **Optional:** per-upload password (PBKDF2-SHA256, 10k rounds), expiry (days), or an **x402 payment gate** (USDC on Base — see "Payment" below). Password and payment gates are mutually exclusive on a single share.
+- **Optional:** per-upload password (PBKDF2-SHA256, 10k rounds), expiry (days), or an **x402 payment gate** (testnet USDC / JPYC / USDt — see "Payment" below). Password and payment gates are mutually exclusive on a single share.
 - **Per-user limits:** 5 MB total, 10 live files, 10 uploads/hour (rolling), 10 patches/hour (rolling, separate bucket), 5 MB per file. Uploads default to a 30-day TTL when `expiresDays` is omitted.
 - **R2 lifecycle:** all objects in `viveworker-share-files` are unconditionally deleted after 90 days of inactivity (enforced by Cloudflare R2, not the Worker). Max `expiresDays` is capped to 30 so KV TTL stays well inside the lifecycle window; PATCH extensions re-`put` the object so the 90-day countdown resets. See the Deployment section for the `wrangler r2 bucket lifecycle add` command.
 - **Grace period:** KV metadata lives for `expiresAtMs + 60 days`, so an already-expired share is still revivable via `PATCH /api/share/:slug` with a new `expiresDays` (as long as R2 hasn't reaped the body). `GET /v/<slug>` is strict — it still returns `410 Expired` past `expiresAtMs` until a revival PATCH lands.
@@ -100,9 +100,10 @@ X-A2A-Key:  <your A2A_API_KEY from ~/.viveworker/a2a.env>
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file` | File | yes | One of `.html` / `.htm` / `.pdf` / `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.csv`, max 5 MB. Magic-byte sniffed per kind (HTML: first non-whitespace byte `<`; PDF: `%PDF`; PNG: 8-byte signature; JPEG: `FF D8`; GIF: `GIF87a` / `GIF89a`; WebP: `RIFF....WEBP`; CSV: no magic). Mismatch → `content-mismatch` 400. |
-| `password` | string | no | 1–256 chars; enables password gate. Mutually exclusive with `price`/`payTo`. |
-| `price` | string | no | Decimal USDC, e.g. `0.10`; ≤6 fractional digits. Must be supplied together with `payTo`. Min `$0.01`, max `$1000` per share. Server-stored as an atomic-units string (`"100000"` = $0.10). |
-| `payTo` | string | no | 0x-prefixed 40-hex-char EVM address receiving the USDC. Must be supplied together with `price`. Normalized to lowercase before storage (EIP-55 casing is not enforced — Workers' Web Crypto has no keccak256 — but EIP-3009 signature verification at the facilitator is case-insensitive). |
+| `password` | string | no | 1–256 chars; enables password gate. Mutually exclusive with `price` / `payTo` / `paymentOptions`. |
+| `price` | string | no | Decimal amount, e.g. `0.10`; must fit the selected asset decimals (6 for USDC, 18 for JPYC, 8 for USDt / L-BTC). Must be supplied with legacy `payTo` or capability-based `paymentOptions`. Min `0.01`, max `1000` asset units per share. |
+| `payTo` | string | no | Legacy single-option EVM payout address. 0x-prefixed 40-hex-char address receiving USDC on `X402_NETWORK`. Must be supplied together with `price`. |
+| `paymentOptions` | JSON string | no | Capability-based x402 options. Array of `{ network, asset, payTo, scheme?, payoutMethod? }`; currently supports `base-sepolia:usdc`, `polygon-amoy:usdc`, `polygon-amoy:jpyc`, and `liquidtestnet:usdt`. Mainnet networks are rejected until formal release. |
 | `expiresDays` | number | no | 1–**30** days; defaults to 30 when omitted. Views return 410 after expiry. Server responds with `{"error":"invalid-expiresDays","maxDays":30}` on out-of-range values. |
 
 Errors:
@@ -112,13 +113,13 @@ Errors:
 | 400 | `unsupported-extension` | File extension is not in the allow-list (`allowed` array in the body lists accepted extensions) |
 | 400 | `unsupported-content-type` | Declared `Content-Type` doesn't match what the extension implies (body includes `declared` + `expected`) |
 | 400 | `content-mismatch` | File body failed the per-kind magic-byte sniff (body includes `kind`) |
-| 400 | `price-payTo-both-required` | Only one of `price` / `payTo` was supplied |
+| 400 | `price-payTo-both-required` | `price` was not paired with `payTo` or `paymentOptions` |
 | 400 | `price-and-password-mutually-exclusive` | Both a password and a price were attached to the same upload |
-| 400 | `invalid-price` | Price wasn't a decimal with ≤6 fractional digits |
+| 400 | `invalid-price` | Price was not a valid decimal for the selected payment asset |
 | 400 | `price-out-of-range` | Price is outside `$0.01`–`$1000` (body includes `minAtomic` + `maxAtomic`) |
 | 400 | `invalid-payTo` | `payTo` isn't a 0x-prefixed 40-hex-char EVM address |
 | 403 | `paid-shares-closed-beta` | Caller's userId isn't in `X402_BETA_ALLOWLIST`. Body includes `hint` and `network`. |
-| 500 | `payment-network-not-configured` | Worker's `X402_NETWORK` var isn't a supported chain name (`base` / `base-sepolia`) |
+| 500 | `payment-network-not-configured` | Worker's `X402_NETWORK` var isn't a supported chain name (`base-sepolia` / `polygon-amoy`; mainnet `base` / `polygon` are reserved for formal release) |
 | 413 | `file-too-large` | File exceeds 5 MB |
 | 413 | `quota-exceeded` | User would exceed the 5 MB total cap |
 | 409 | `file-count-exceeded` | User already has 10 live files |
@@ -137,6 +138,9 @@ Response:
   "payTo": "0x0000000000000000000000000000000000000000",
   "chainId": 84532,
   "network": "base-sepolia",
+  "paymentOptions": [
+    { "network": "base-sepolia", "asset": "usdc", "scheme": "exact", "payTo": "0x0000000000000000000000000000000000000000" }
+  ],
   "size": 12345,
   "originalName": "report.html",
   "quota": { "bytes": 12345, "maxBytes": 5242880, "count": 1, "maxCount": 10 }
@@ -181,11 +185,11 @@ Events (written via `writeShareEvent` throughout the payment path):
 | `upload_paid` | New paid share created via `POST /api/upload` with `price`+`payTo`. |
 | `402_served` | First-visit GET returned `402 Payment Required` (no cookie, no `X-PAYMENT`). |
 | `402_served_head` | HEAD preflight returned 402 with hint headers. |
-| `paid_view` | `X-PAYMENT` header verified and content served. |
+| `paid_view` | `X-PAYMENT` header settled and content served. |
 | `paid_cookie_hit` | Returning buyer's `share_paid` cookie verified; no facilitator round-trip. |
 | `verify_failed` | Facilitator rejected the `X-PAYMENT` header (bad signature, expired nonce, wrong amount). |
 | `facilitator_unavailable` | Facilitator endpoint was unreachable during verify. |
-| `settle_failed` | Async settle (`ctx.waitUntil`) threw or returned non-success after verify passed. |
+| `settle_failed` | Settle/broadcast returned non-success after verify passed. |
 
 CLI: `viveworker share list --metrics` appends a "Paid-share metrics" block to the standard file listing.
 
@@ -198,6 +202,7 @@ Owner-only update. Use JSON to add/change/remove the password, payment gate, or 
   "password": "new-pw",   // optional; omit to keep. "" or null removes. string sets/replaces.
   "price": "0.20",        // optional; omit to keep. "" or null removes the payment gate entirely (also clears payTo/chainId/paymentSalt). string/number sets or changes.
   "payTo": "0x…",         // optional; required alongside price if the share had no prior payTo. On its own (no `price` key), only legal when a price gate already exists — changes the recipient without rotating paymentSalt.
+  "paymentOptions": "[{\"network\":\"polygon-amoy\",\"asset\":\"usdc\",\"payTo\":\"0x…\"}]",
   "expiresDays": 7        // optional; omit to keep. number resets TTL to N days from now. null resets to default 30.
 }
 ```
@@ -207,7 +212,7 @@ Multipart fields:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `file` | File | no | Same validation as upload. Replaces the R2 object under the existing slug and updates `originalName`, `size`, `contentType`, `kind`, and `updatedAtMs`. |
-| `password` / `price` / `payTo` / `expiresDays` | string | no | Same semantics as JSON PATCH. Empty `password` clears the password; empty `price` removes the payment gate. |
+| `password` / `price` / `payTo` / `paymentOptions` / `expiresDays` | string | no | Same semantics as JSON PATCH. Empty `password` clears the password; empty `price` removes the payment gate. |
 
 Notes:
 - Changing the password rotates the internal `passwordSalt`, which is folded into the unlock-cookie HMAC. That invalidates every previously issued `share_unlock` cookie for this slug — viewers must re-enter the new password.
@@ -229,12 +234,12 @@ Errors:
 | 400 | `invalid-expiresDays` | Not a finite number in 1–30 (server also returns `maxDays` in the payload) |
 | 400 | `unsupported-extension` / `unsupported-content-type` / `content-mismatch` | Replacement file failed the same validation used by upload |
 | 400 | `invalid-price` / `price-out-of-range` / `invalid-payTo` | Same semantics as on upload |
-| 400 | `price-payTo-both-required` | Setting a price on a share with no existing `payTo` requires `payTo` in the same PATCH |
+| 400 | `price-payTo-both-required` | Setting a price on a share with no existing payment option requires `payTo` or `paymentOptions` in the same PATCH |
 | 400 | `price-and-password-mutually-exclusive` | Tried to add a price to a password-protected share (or vice versa) |
 | 400 | `payTo-without-price` | Changed `payTo` on a share that has no active price gate |
 | 400 | `payTo-cannot-be-cleared-alone` | Tried to clear `payTo` without also clearing `price` (hint: set `price: null` to remove the whole gate) |
 | 403 | `paid-shares-closed-beta` | Caller's userId isn't in `X402_BETA_ALLOWLIST`. Only fires when the PATCH *sets* a price or rotates `payTo`; clearing with `price: null` is always allowed. Body includes `hint` and `network`. |
-| 500 | `payment-network-not-configured` | Worker's `X402_NETWORK` var isn't a supported chain name |
+| 500 | `payment-network-not-configured` | Worker's `X402_NETWORK` var or requested payment option network is not supported |
 | 403 | `forbidden` | Caller is not the owner |
 | 404 | `not-found` | Slug does not exist |
 | 410 | `expired-requires-expiresDays` | Share is past its `expiresAtMs`; supply `expiresDays` to revive (server also returns `maxDays`) |
@@ -274,13 +279,13 @@ Serves the uploaded bytes. Gates run in order: **password → payment → format
 
 If the upload has a password, this returns `401` with an unlock form instead. The unlock form POSTs to `/v/:slug/unlock`, which sets an HMAC-signed cookie (`share_unlock`, Path=/v/:slug, 7 days) on success. Programmatic callers can POST `/v/:slug/unlock.json` with the password to mint a short-lived `?t=<token>` URL (see "Agent handoff" in the root CLAUDE.md).
 
-If the upload has a price, this returns `402 Payment Required` with an x402 requirements body (see "Payment" below). Callers supply a signed `X-PAYMENT` header on retry; on successful facilitator verify, the share is served with a short-lived `share_paid` cookie + `X-PAYMENT-RESPONSE` header.
+If the upload has a price, this returns `402 Payment Required` with an x402 requirements body (see "Payment" below). Callers supply a signed `X-PAYMENT` header on retry; on successful verify and settle, the share is served with a short-lived `share_paid` cookie + `X-PAYMENT-RESPONSE` header.
 
-## Payment (x402 / USDC on Base) — CLOSED BETA
+## Payment (x402 / payment capabilities) — CLOSED BETA
 
-> **Beta status.** Paid shares run on **Base Sepolia** (testnet) and are gated by the `X402_BETA_ALLOWLIST` secret (CSV of userIds). Uploads / PATCHes that attach `price` or rotate `payTo` from non-allowlisted userIds return `403 paid-shares-closed-beta`. Removing a price (`--no-price` / `price: null`) is always allowed so users who leave the allowlist can wind their shares down cleanly. The 402 HTML page renders a prominent "⚠ CLOSED BETA" banner (testnet-only) so buyers never mistake test-USDC for real value. To promote to mainnet: set `X402_NETWORK = "base"`, point `X402_FACILITATOR_URL` at the Coinbase CDP endpoint, `wrangler secret put X402_FACILITATOR_AUTH` with the CDP API key, and (once comfortable) widen `X402_BETA_ALLOWLIST` or set it to `*`.
+> **Beta status.** Paid shares can advertise configured testnet capabilities: **Base Sepolia USDC**, **Polygon Amoy USDC / JPYC**, and **Liquid Testnet USDt**. Uploads / PATCHes that attach `price` or rotate payment options from non-allowlisted userIds return `403 paid-shares-closed-beta`. Removing a price (`--no-price` / `price: null`) is always allowed so users who leave the allowlist can wind their shares down cleanly. The 402 HTML page renders a prominent "⚠ CLOSED BETA" banner for testnets so buyers never mistake test assets for real value. Mainnet capabilities (`base`, `polygon`, `liquidv1`) are intentionally rejected until formal release.
 
-Shares uploaded with `price` + `payTo` are gated by the [x402](https://x402.org) HTTP-native payment protocol. The worker emits spec-compliant `402 Payment Required` responses; any x402-compatible buyer (e.g. the `x402-fetch` npm library, Cursor's built-in browser, Coinbase AgentKit) can pay the USDC and unlock the content without viveworker holding any funds.
+Shares uploaded with `price` + `payTo` or `price` + `paymentOptions` are gated by the [x402](https://x402.org) HTTP-native payment protocol. The worker emits spec-compliant `402 Payment Required` responses; any compatible buyer can pay one of the advertised options and unlock the content without viveworker holding any funds.
 
 ### Flow
 
@@ -299,7 +304,7 @@ Buyer signs EIP-3009 transferWithAuthorization for the given amount + payTo
     ▼
 Buyer: GET /v/<slug>   (X-PAYMENT: <base64(signed payload)>)
     ▼
-Worker → facilitator.verify → (valid) → facilitator.settle (async) → serve content
+Worker → facilitator.verify → (valid) → facilitator.settle → serve content
         + Set-Cookie: share_paid=<hmac-token>; Path=/v/<slug>; Max-Age=900; HttpOnly; Secure; SameSite=Lax
         + X-PAYMENT-RESPONSE: <base64(preview-json)>
 ```
@@ -310,14 +315,14 @@ The `share_paid` cookie is an HMAC-signed token (same format as the `share_unloc
 
 | Key | Kind | Value |
 |---|---|---|
-| `X402_NETWORK` | `[vars]` in `wrangler.toml` | `"base-sepolia"` for dogfooding; `"base"` for mainnet |
+| `X402_NETWORK` | `[vars]` in `wrangler.toml` | Legacy single-option default. Use `"base-sepolia"` or `"polygon-amoy"` for dogfooding; mainnet values are reserved for formal release. |
 | `X402_FACILITATOR_URL` | `[vars]` in `wrangler.toml` | `"https://x402.org/facilitator"` on testnet; the Coinbase CDP URL on mainnet |
 | `X402_FACILITATOR_AUTH` | Worker secret | Empty string on testnet; CDP API key on mainnet (`wrangler secret put X402_FACILITATOR_AUTH`) |
 | `X402_BETA_ALLOWLIST` | Worker secret | CSV of userIds permitted to attach `price` / `payTo`. Unset → block-all (default-deny). `"*"` → open to everyone (flip this when paid shares leave beta). Example: `echo "alice,bob" \| wrangler secret put X402_BETA_ALLOWLIST` |
 | `CF_ACCOUNT_ID` | Worker secret | Cloudflare account ID for the `share list --metrics` REST call. |
 | `CF_API_TOKEN` | Worker secret | API token scoped to "Account Analytics: Read" on this account. Without both this and `CF_ACCOUNT_ID`, `/api/metrics` returns 501 `metrics-not-configured`. |
 
-Chain selection is driven entirely by `X402_NETWORK` — the USDC contract address and EIP-712 domain fields are derived server-side from `X402_NETWORKS` in `worker.js`. The per-share `chainId` stored at upload time pins the share to that network; changing `X402_NETWORK` on an existing share does not re-target it.
+Legacy `payTo` uploads use `X402_NETWORK` for chain selection. Capability-based uploads store `paymentOptions[]` on the share and can advertise multiple networks or assets at once. EVM asset addresses and EIP-712 domain fields are derived by backend-api's payment registry; Liquid options are delegated to backend-api's Liquid x402 path.
 
 ### Observability
 
@@ -327,9 +332,7 @@ Sellers read their own metrics via `share list --metrics` (hits `GET /api/metric
 
 ### Buyer reference (CLI)
 
-The viveworker CLI ships a minimal buyer flow for Base / Base Sepolia. It reads
-`VIVEWORKER_BUYER_PRIVATE_KEY` or `BUYER_PK`, signs an EIP-3009 authorization,
-retries with `X-PAYMENT`, and optionally writes the unlocked bytes. It can also use the local hazBase Smart Wallet flow with `--wallet hazbase`; that path asks the paired device for Passkey reauth and returns a hazBase-issued `X-PAYMENT` proof after the Smart Wallet payment settles.
+The viveworker CLI ships buyer flows for EVM exact payments and Liquid PSET payments. For EVM networks such as Base Sepolia and Polygon Amoy, it reads `VIVEWORKER_BUYER_PRIVATE_KEY` or `BUYER_PK`, signs an EIP-3009 authorization, retries with `X-PAYMENT`, and optionally writes the unlocked bytes. It can also use the local hazBase Smart Wallet flow with `--wallet hazbase`; that path asks the paired device for Passkey reauth and returns a hazBase-issued `X-PAYMENT` proof after the Smart Wallet payment settles. For Liquid, use `--wallet liquid` with the `VIVEWORKER_LIQUID_*` RPC settings.
 
 By default, the CLI is human-in-the-loop: after it parses the 402 requirements
 and before it signs, it sends the amount, recipient, network, and resource URL

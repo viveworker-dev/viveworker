@@ -1,7 +1,7 @@
 {
   "name": "viveworker",
   "version": "0.8.5",
-  "description": "Open mobile control surface for Codex, Claude, Thread Sharing, File Share, Moltbook, and A2A tasks on your trusted LAN.",
+  "description": "Mobile control plane for AI agents. Approve, answer, and hand off work for Codex, Claude, MCP-ready tools, and A2A from one phone.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
   "keywords": [
@@ -9,6 +9,15 @@
     "codex-desktop",
     "claude",
     "claude-desktop",
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "ai-agents",
+    "agent-control-plane",
+    "agent-handoff",
+    "a2a",
+    "agent-to-agent",
+    "a2a-relay",
     "macos",
     "mobile",
     "ios",
@@ -22,17 +31,15 @@
     "moltbook",
     "file-share",
     "thread-sharing",
-    "ai-agents",
-    "a2a",
-    "agent-to-agent",
-    "a2a-relay",
-    "agent-control-plane",
     "lan",
-    "companion-app",
-    "vivecoding"
+    "remote-pairing",
+    "companion-app"
   ],
   "homepage": "https://viveworker.com/",
   "repository": "viveworker-dev/viveworker",
+  "bugs": {
+    "url": "https://github.com/viveworker-dev/viveworker/issues"
+  },
   "type": "module",
   "bin": {
     "viveworker": "./scripts/viveworker.mjs"
@@ -67,7 +74,8 @@
     "ntfy/docker-compose.yml.example"
   ],
   "dependencies": {
-    "@hazbase/auth": "^0.5.1",
+    "@hazbase/auth": "^0.5.3",
+    "@hazbase/simplicity": "^0.3.0",
     "@noble/ciphers": "^1.0.0",
     "@noble/curves": "^1.2.0",
     "@noble/hashes": "^1.3.2",

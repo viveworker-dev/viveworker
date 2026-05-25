@@ -30,7 +30,10 @@ test("web build id has one source and browser assets use the bridge placeholder"
   assert.match(bridge, /renderWebAssetBuffer/u);
 
   assert.match(appJs, new RegExp(`APP_BUILD_ID = "${BUILD_ID_PLACEHOLDER}"`, "u"));
+  assert.match(appJs, new RegExp(`\\.\\/i18n\\.js\\?v=${BUILD_ID_PLACEHOLDER}`, "u"));
   assert.match(swJs, new RegExp(`APP_BUILD_ID = "${BUILD_ID_PLACEHOLDER}"`, "u"));
+  assert.match(swJs, /I18N_SCRIPT_URL/u);
+  assert.match(swJs, /"\/i18n\.js"/u);
   assert.match(indexHtml, new RegExp(`v=${BUILD_ID_PLACEHOLDER}`, "u"));
 
   for (const [label, text] of [

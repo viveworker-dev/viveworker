@@ -2,6 +2,7 @@ const APP_BUILD_ID = "__VIVEWORKER_APP_BUILD_ID__";
 const CACHE_NAME = `viveworker-${APP_BUILD_ID}`;
 const APP_SCRIPT_URL = `/app.js?v=${APP_BUILD_ID}`;
 const APP_STYLE_URL = `/app.css?v=${APP_BUILD_ID}`;
+const I18N_SCRIPT_URL = `/i18n.js?v=${APP_BUILD_ID}`;
 const API_ROUTER_URL = `/remote-pairing/api-router.js?v=${APP_BUILD_ID}`;
 const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
 const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
@@ -16,6 +17,7 @@ const APP_ASSETS = [
   "/app",
   APP_SCRIPT_URL,
   APP_STYLE_URL,
+  I18N_SCRIPT_URL,
   "/app.js",
   "/i18n.js",
   "/icons/viveworker-v-pulse.svg",
@@ -33,11 +35,13 @@ const CACHED_PATHS = new Set(APP_ASSETS.map((asset) => new URL(asset, self.locat
 const VERSIONED_CACHE_PATHS = new Set([
   "/app.js",
   "/app.css",
+  "/i18n.js",
   "/remote-pairing/api-router.js",
 ]);
 const NETWORK_FIRST_PATHS = new Set([
   "/app.js",
   "/app.css",
+  "/i18n.js",
   "/remote-pairing/api-router.js",
 ]);
 const APP_NAVIGATION_NETWORK_TIMEOUT_MS = 1800;

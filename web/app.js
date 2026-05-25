@@ -1,4 +1,4 @@
-import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "./i18n.js";
+import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "./i18n.js?v=__VIVEWORKER_APP_BUILD_ID__";
 import { ensureIdentityKeypair, bytesToHex } from "./remote-pairing/keys.js";
 import {
   loadPairingState as loadRemotePairingState,
@@ -51,6 +51,7 @@ const TIMELINE_STICKY_LAN_PROBE_TIMEOUT_MS = 350;
 const CLIENT_EVENT_REPORT_TIMEOUT_MS = 1_800;
 const TIMELINE_LIVE_REFRESH_TIMEOUT_MS = 2_000;
 const TIMELINE_LIVE_RETRY_MS = 5_000;
+const HAZBASE_ACTION_TIMEOUT_MS = 30_000;
 const timelineImageObjectUrlCache = new Map();
 
 function wait(ms) {
@@ -141,12 +142,11 @@ const state = {
   hazbaseStatus: null,
   hazbaseNotice: "",
   hazbaseError: "",
-  // Session-only flag: once the Sepolia wallet is ready, the mainnet step
-  // is hidden behind a subtle opt-in link (most beta users won't activate
-  // it). Flipping this reveals the full mainnet step card for the rest of
-  // the session. Not persisted — reopening Wallet next visit starts hidden
-  // again, which is the desired default for the closed beta.
-  hazbaseMainnetOptIn: false,
+  hazbaseFormErrors: { email: "", otp: "", liquid: {} },
+  hazbasePendingAction: "",
+  hazbaseAgentPaymentDefaultsDraft: null,
+  agentPaymentDefaultsModalOpen: false,
+  toast: null,
   // Sign-in OTP flow is a two-step send→verify dance. Showing both
   // buttons side-by-side confused users; they clicked "Verify" before
   // ever requesting a code. We gate the verify button behind a
@@ -202,6 +202,7 @@ let timelineLiveRefreshInFlight = false;
 let timelineLiveRefreshPending = false;
 let lastTimelineLiveRevision = 0;
 const reportedTimelineRenderTokens = new Set();
+let toastDismissTimer = 0;
 
 async function loadHazbasePasskeyModule() {
   if (!hazbasePasskeyModulePromise) {
@@ -1223,9 +1224,9 @@ async function fetchA2aShareStatus() {
 }
 
 
-async function fetchHazbaseStatus() {
+async function fetchHazbaseStatus(opts = {}) {
   try {
-    state.hazbaseStatus = await apiGet("/api/hazbase/status");
+    state.hazbaseStatus = await apiGet("/api/hazbase/status", opts);
   } catch {
     state.hazbaseStatus = null;
   }
@@ -2363,6 +2364,8 @@ async function renderShell() {
       ${renderInstallGuideModal()}
       ${renderLogoutConfirmModal()}
       ${renderHazbaseLogoutConfirmModal()}
+      ${renderAgentPaymentDefaultsModal()}
+      ${renderToastLayer()}
     </div>
     ${!desktop && detail ? renderCompletionReplySheet(detail) : ""}
   `;
@@ -2916,6 +2919,37 @@ function renderMobileTopBar(detail) {
         <h1 class="mobile-topbar__title">${escapeHtml(meta.title)}</h1>
       </div>
     </header>
+  `;
+}
+
+function showToast(message, { tone = "success" } = {}) {
+  const text = String(message || "").trim();
+  if (!text) return;
+  const normalizedTone = tone === "error" ? "error" : "success";
+  const id = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  state.toast = { id, message: text, tone: normalizedTone };
+  if (toastDismissTimer) {
+    clearTimeout(toastDismissTimer);
+  }
+  toastDismissTimer = setTimeout(() => {
+    if (state.toast?.id !== id) {
+      return;
+    }
+    state.toast = null;
+    renderCurrentSurface();
+  }, normalizedTone === "error" ? 5600 : 3800);
+}
+
+function renderToastLayer() {
+  if (!state.toast) {
+    return "";
+  }
+  const tone = state.toast.tone === "error" ? "error" : "success";
+  return `
+    <div class="app-toast app-toast--${escapeHtml(tone)}" role="${tone === "error" ? "alert" : "status"}" aria-live="${tone === "error" ? "assertive" : "polite"}">
+      <span class="app-toast__icon" aria-hidden="true">${renderIcon(tone === "success" ? "completed" : "lock")}</span>
+      <span class="app-toast__message">${escapeHtml(state.toast.message)}</span>
+    </div>
   `;
 }
 
@@ -4764,7 +4798,7 @@ function settingsWalletRootValue(context) {
   if (context.hazbase?.enabled !== true) {
     return L("common.disabled");
   }
-  return deriveHazbaseWalletFlow(context.hazbase).coreReady
+  return effectiveAgentPaymentDefaults(context.hazbase).length > 0
     ? L("common.enabled")
     : settingsNeedsActionValue();
 }
@@ -4923,6 +4957,34 @@ function settingsPageMeta(page) {
         id: "wallet",
         title: L("settings.wallet.title"),
         description: L("settings.wallet.copy"),
+        icon: "coin",
+      };
+    case "walletInventory":
+      return {
+        id: "walletInventory",
+        title: L("settings.wallet.inventory.title"),
+        description: L("settings.wallet.inventory.copy"),
+        icon: "coin",
+      };
+    case "walletInventoryBase":
+      return {
+        id: "walletInventoryBase",
+        title: L("settings.wallet.chain.base.title"),
+        description: L("settings.wallet.chain.base.copy"),
+        icon: "coin",
+      };
+    case "walletInventoryLiquid":
+      return {
+        id: "walletInventoryLiquid",
+        title: L("settings.wallet.chain.liquid.title"),
+        description: L("settings.wallet.chain.liquid.copy"),
+        icon: "coin",
+      };
+    case "walletInventoryPolygon":
+      return {
+        id: "walletInventoryPolygon",
+        title: L("settings.wallet.chain.polygon.title"),
+        description: L("settings.wallet.chain.polygon.copy"),
         icon: "coin",
       };
     case "remotePairing":
@@ -5101,6 +5163,18 @@ function renderSettingsSubpage(context, { mobile }) {
       break;
     case "wallet":
       content = renderSettingsWalletPage(context);
+      break;
+    case "walletInventory":
+      content = renderSettingsWalletInventoryPage(context);
+      break;
+    case "walletInventoryBase":
+      content = renderSettingsWalletChainPage(context, "base");
+      break;
+    case "walletInventoryLiquid":
+      content = renderSettingsWalletChainPage(context, "liquid");
+      break;
+    case "walletInventoryPolygon":
+      content = renderSettingsWalletChainPage(context, "polygon");
       break;
     case "remotePairing":
       content = renderSettingsRemotePairingPage(context);
@@ -6055,13 +6129,19 @@ function renderSettingsA2aSharePage(context) {
     const lock = item.hasPassword
       ? `<span class="settings-compose-badge settings-compose-badge--reply" role="img" title="${escapeHtml(passwordLabel)}" aria-label="${escapeHtml(passwordLabel)}">${renderIcon("lock")}</span>`
       : "";
-    // Paid-share badge. `price` is atomic USDC (6-decimals) on the item.
+    // Paid-share badge. `price` is atomic units for the primary payment option.
     // Mutually exclusive with hasPassword at upload time, so the two badges
     // never both render, but the HTML doesn't assume that — it just renders
     // whichever are set.
+    const primaryPaymentOption = Array.isArray(item.paymentOptions) && item.paymentOptions.length > 0
+      ? item.paymentOptions[0]
+      : null;
+    const paidAsset = paymentAssetLabel(primaryPaymentOption?.asset || item.asset || "usdc");
+    const paidDecimals = Number(primaryPaymentOption?.decimals || paymentAssetDecimals(primaryPaymentOption?.asset || item.asset || "usdc"));
     const paidLabel = item.price
       ? L("settings.a2aShare.paidShare", {
-          price: formatUsdcAtomic(item.price),
+          price: formatAtomicAmount(item.price, paidDecimals),
+          asset: paidAsset,
           network: item.network || "?",
         })
       : "";
@@ -6388,51 +6468,25 @@ function renderSettingsWalletPage(context) {
       </div>
     `;
   }
-  const flow = deriveHazbaseWalletFlow(hazbase);
-
-  // Progressive disclosure. Previous layout rendered the full status summary
-  // plus all four full-sized step cards at once; new account flows were
-  // dominated by locked-looking cards and it was hard to tell which step was
-  // actionable. Now we:
-  //  - skip `locked` steps entirely (still-unreachable actions add noise),
-  //  - collapse `complete` steps to a compact one-line row that keeps the
-  //    verified value visible (email / address) without a full card,
-  //  - keep the single `current`/`pending` step in the full action card so
-  //    the CTA is unambiguous,
-  //  - hide the optional mainnet step behind a subtle opt-in link until the
-  //    user explicitly requests it (see `state.hazbaseMainnetOptIn`).
-  // The compact rows also replace the former "Current status" summary group
-  // above the flow, so signed-in email / passkey state / addresses are no
-  // longer duplicated.
-  const guideRows = [
-    renderHazbaseWalletBanner(flow),
-    renderHazbaseWalletBetaNotice(),
-    state.hazbaseNotice
-      ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--notice"><p>${escapeHtml(state.hazbaseNotice)}</p></div>`
-      : "",
-    state.hazbaseError
-      ? `<div class="settings-copy-block settings-copy-block--compact wallet-flow-message wallet-flow-message--error"><p>${escapeHtml(state.hazbaseError)}</p></div>`
-      : "",
-    renderHazbaseWalletStepList(flow),
-  ].filter(Boolean);
-  const canRefreshSession = Boolean(hazbase.sessionInvalid);
-  const advancedActions = canRefreshSession || hazbase.signedIn
-    ? [
-        canRefreshSession
-          ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="refresh-session">${escapeHtml(L("settings.hazbase.action.refreshSession"))}</button>`
-          : "",
-        hazbase.signedIn
-          ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout">${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
-          : "",
-      ].filter(Boolean).join("")
+  const configured = configuredPaymentCapabilities(hazbase);
+  const agentConfigured = agentEligiblePaymentCapabilities(hazbase);
+  const effectiveDefaults = effectiveAgentPaymentDefaults(hazbase);
+  const defaultsSummary = renderAgentPaymentDefaultsSummary(hazbase, effectiveDefaults);
+  const agentEmptyKey = configured.length ? "settings.wallet.agent.emptyAvailable" : "settings.wallet.agent.empty";
+  const defaultsRows = agentConfigured.length
+    ? agentConfigured.map((capability) => renderAgentPaymentDefaultChoice(hazbase, capability))
+    : [`<div class="settings-copy-block settings-copy-block--compact"><p class="muted">${escapeHtml(L(agentEmptyKey))}</p></div>`];
+  const defaultsDraftNotice = state.hazbaseAgentPaymentDefaultsDraft
+    ? `<div class="settings-copy-block settings-copy-block--compact wallet-agent-draft-notice"><p>${escapeHtml(L("settings.wallet.agent.unsaved"))}</p></div>`
     : "";
-  // Render the wallet flow without `renderSettingsGroup`'s `.settings-list`
-  // wrapper. The banner (`.settings-copy-block`), notice/error blocks, and
-  // each step card (`.wallet-step-card`) already have their own rounded
-  // frame — wrapping them in another `.settings-list` produced a visible
-  // "box inside a box" nest. The title (`.settings-group__title`) still
-  // sits above a flat stack of sibling cards via `.wallet-setup-stack`.
-  const flowTitle = L("settings.wallet.flow.title");
+  const defaultsActions = agentConfigured.length
+    ? `
+      <div class="wallet-agent-actions">
+        <button class="primary primary--wide${state.hazbasePendingAction === "agent-defaults-save" ? " is-loading" : ""}" type="button" data-hazbase-agent-defaults-save ${state.hazbasePendingAction ? "disabled" : ""} ${state.hazbasePendingAction === "agent-defaults-save" ? 'aria-busy="true"' : ""}>${escapeHtml(L("settings.wallet.agent.save"))}</button>
+        <button class="secondary secondary--wide${state.hazbasePendingAction === "agent-defaults-all" ? " is-loading" : ""}" type="button" data-hazbase-agent-defaults-all ${state.hazbasePendingAction ? "disabled" : ""} ${state.hazbasePendingAction === "agent-defaults-all" ? 'aria-busy="true"' : ""}>${escapeHtml(L("settings.wallet.agent.useAllConfigured"))}</button>
+      </div>
+    `
+    : "";
   // Brand attribution. The wallet stack (factory + validator + bundler +
   // paymaster) is provided by hazBase; the link points to their LP so
   // curious users can discover what's running the signing path.
@@ -6443,82 +6497,576 @@ function renderSettingsWalletPage(context) {
   `;
   return `
     <div class="settings-page">
-      <section class="settings-group">
-        ${flowTitle ? `<p class="settings-group__title">${escapeHtml(flowTitle)}</p>` : ""}
-        <div class="wallet-setup-stack">
-          ${guideRows.join("")}
-        </div>
-      </section>
-      ${advancedActions ? renderSettingsActionPanel(advancedActions, L("settings.wallet.advanced.title")) : ""}
+      ${renderHazbaseWalletMessages()}
+      ${renderHazbaseWalletBetaNotice()}
+      ${renderSettingsGroup(L("settings.wallet.summary.title"), [
+        renderSettingsInfoRow(L("settings.row.hazbaseStatus"), hazbase.signedIn ? L("settings.hazbase.status.signedIn") : L("settings.hazbase.status.signedOut"), {
+          valueTone: hazbase.signedIn ? "enabled" : "attention",
+        }),
+        renderSettingsInfoRow(L("settings.wallet.agent.currentDefaults"), defaultsSummary.value, {
+          rawValue: defaultsSummary.rawValue,
+          stacked: defaultsSummary.stacked,
+          valueClassName: defaultsSummary.valueClassName,
+          valueTone: defaultsSummary.valueTone,
+        }),
+      ], { listClassName: "settings-list settings-list--compact" })}
+      ${renderSettingsGroup(L("settings.wallet.agent.title"), [
+        `<div class="settings-copy-block settings-copy-block--compact"><p class="muted">${escapeHtml(L("settings.wallet.agent.copy"))}</p></div>`,
+        ...defaultsRows,
+        defaultsDraftNotice,
+        defaultsActions,
+      ], { listClassName: "settings-list settings-list--compact" })}
+      ${renderSettingsGroup(L("settings.wallet.inventory.navGroup"), [
+        renderSettingsNavRow({
+          page: "walletInventory",
+          icon: "coin",
+          title: L("settings.wallet.inventory.navTitle"),
+          subtitle: L("settings.wallet.inventory.navCopy"),
+          value: L("settings.wallet.inventory.navValue", { count: configured.length }),
+          valueTone: configured.length ? "enabled" : "attention",
+        }),
+      ], { listClassName: "settings-list settings-list--compact" })}
       ${poweredBy}
     </div>
   `;
 }
 
-function renderHazbaseWalletStepList(flow) {
-  const rendered = [];
-  for (const step of flow.steps) {
-    // Keep the Base mainnet roadmap visible only after the usable Base Sepolia
-    // wallet is ready. Showing Step 4 during email/passkey setup makes the
-    // sequential flow feel like there is another action competing for focus.
-    if (step.number === 4 && step.status === "comingSoon" && !flow.coreReady) {
-      continue;
-    }
-
-    // Locked steps don't render. Revealing them only adds grayed-out
-    // placeholders below the active step; users mistake the placeholder
-    // status chips for inactive buttons.
-    if (step.status === "locked") {
-      continue;
-    }
-
-    const mode = step.status === "complete" ? "compact" : "full";
-    rendered.push(renderHazbaseWalletStepCard(step, { mode }));
-  }
-  return `<div class="wallet-step-list">${rendered.join("")}</div>`;
+function renderHazbaseAccountActions(hazbase) {
+  const canRefreshSession = Boolean(hazbase?.sessionInvalid);
+  const actions = canRefreshSession || hazbase?.signedIn
+    ? [
+        canRefreshSession
+          ? `<button class="secondary secondary--wide${isHazbaseActionPending("refresh-session") ? " is-loading" : ""}" type="button" data-hazbase-action="refresh-session" ${state.hazbasePendingAction ? "disabled" : ""} ${isHazbaseActionPending("refresh-session") ? 'aria-busy="true"' : ""}>${escapeHtml(L("settings.hazbase.action.refreshSession"))}</button>`
+          : "",
+        hazbase?.signedIn
+          ? `<button class="secondary secondary--wide" type="button" data-hazbase-action="logout" ${state.hazbasePendingAction ? "disabled" : ""}>${escapeHtml(L("settings.hazbase.action.signOut"))}</button>`
+          : "",
+      ].filter(Boolean).join("")
+    : "";
+  return actions ? renderSettingsActionPanel(actions, L("settings.wallet.advanced.title")) : "";
 }
 
-function renderHazbaseWalletMainnetOptIn() {
+function renderSettingsWalletInventoryPage(context) {
+  const hazbase = context.hazbase || { enabled: false };
+  if (!hazbase?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.wallet.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const flow = deriveHazbaseWalletFlow(hazbase);
+  const authCards = flow.steps
+    .filter((step) => step.kind === "auth")
+    .filter((step) => step.status !== "locked")
+    .map((step) => renderHazbaseWalletStepCard(step, { mode: step.status === "complete" ? "compact" : "full" }));
+  const chainRows = Object.entries(paymentCapabilityChainDefinitions()).map(([chain, definition]) => renderSettingsNavRow({
+    page: definition.page,
+    icon: "coin",
+    title: L(definition.titleKey),
+    subtitle: L(definition.copyKey),
+    value: paymentCapabilityChainValue(hazbase, chain),
+    valueTone: configuredPaymentCapabilitiesForNetworks(hazbase, definition.networks).length ? "enabled" : "attention",
+  }));
   return `
-    <button class="wallet-mainnet-optin" type="button" data-hazbase-action="mainnet-opt-in">
-      <span class="wallet-mainnet-optin__body">
-        <span class="wallet-mainnet-optin__label">${escapeHtml(L("settings.wallet.mainnet.optIn"))}</span>
-        <span class="wallet-mainnet-optin__hint muted">${escapeHtml(L("settings.wallet.mainnet.optInHint"))}</span>
-      </span>
-      <span class="wallet-mainnet-optin__chevron" aria-hidden="true">→</span>
-    </button>
+    <div class="settings-page">
+      ${renderHazbaseWalletMessages()}
+      ${authCards.length ? renderSettingsGroup(L("settings.wallet.inventory.accountTitle"), [
+        `<div class="wallet-setup-stack">${authCards.join("")}</div>`,
+      ], { listClassName: "settings-list settings-list--flat" }) : ""}
+      ${renderHazbaseAccountActions(hazbase)}
+      ${renderSettingsGroup(L("settings.wallet.inventory.issueTitle"), chainRows, { listClassName: "settings-list settings-list--compact" })}
+    </div>
   `;
 }
 
+function renderSettingsWalletChainPage(context, chain) {
+  const hazbase = context.hazbase || { enabled: false };
+  if (!hazbase?.enabled) {
+    return `
+      <div class="settings-page">
+        <p class="settings-page-copy muted">${escapeHtml(L("settings.wallet.unavailable"))}</p>
+      </div>
+    `;
+  }
+  const definition = paymentCapabilityChainDefinition(chain);
+  const networks = definition?.networks || [];
+  const testnetCards = networks
+    .filter((network) => paymentCapabilityDefinition(network)?.environment === "testnet")
+    .map((network) => renderWalletInventoryCapabilityCard(hazbase, network));
+  const mainnetCards = networks
+    .filter((network) => paymentCapabilityDefinition(network)?.environment === "mainnet")
+    .map((network) => renderWalletInventoryCapabilityCard(hazbase, network));
+  return `
+    <div class="settings-page">
+      ${renderHazbaseWalletMessages()}
+      ${testnetCards.length ? renderSettingsGroup(L("settings.wallet.inventory.testnetTitle"), [
+        `<div class="wallet-setup-stack">${testnetCards.join("")}</div>`,
+      ], { listClassName: "settings-list settings-list--flat" }) : ""}
+      ${mainnetCards.length ? renderSettingsGroup(L("settings.wallet.inventory.mainnetTitle"), [
+        `<div class="wallet-setup-stack">${mainnetCards.join("")}</div>`,
+      ], { listClassName: "settings-list settings-list--flat" }) : ""}
+    </div>
+  `;
+}
+
+function renderHazbaseWalletMessages() {
+  return "";
+}
+
+function resetHazbaseFormErrors() {
+  state.hazbaseFormErrors = { email: "", otp: "", liquid: {} };
+}
+
+function setHazbaseFormError(field, message, network = "") {
+  const formErrors = state.hazbaseFormErrors || { email: "", otp: "", liquid: {} };
+  if (field === "email") {
+    state.hazbaseFormErrors = { ...formErrors, email: message };
+    return;
+  }
+  if (field === "otp") {
+    state.hazbaseFormErrors = { ...formErrors, otp: message };
+    return;
+  }
+  if (field === "liquid") {
+    state.hazbaseFormErrors = {
+      ...formErrors,
+      liquid: {
+        ...(formErrors.liquid || {}),
+        [network]: message,
+      },
+    };
+  }
+}
+
+function clearHazbaseFormError(field, network = "") {
+  setHazbaseFormError(field, "", network);
+}
+
+function clearHazbaseFormErrorsForAction(action, network = "") {
+  if (action === "request-otp") {
+    clearHazbaseFormError("email");
+  } else if (action === "verify-otp") {
+    clearHazbaseFormError("email");
+    clearHazbaseFormError("otp");
+  } else if (action === "save-liquid-capability") {
+    clearHazbaseFormError("liquid", network);
+  }
+}
+
+function hazbaseFormError(field, network = "") {
+  const formErrors = state.hazbaseFormErrors || {};
+  if (field === "liquid") {
+    return formErrors.liquid?.[network] || "";
+  }
+  return formErrors[field] || "";
+}
+
+function applyHazbaseInlineError(action, error, network = "") {
+  const key = error?.errorKey || "";
+  const message = error?.message || String(error);
+  if (action === "request-otp" && (key === "email-required" || message === L("error.hazbaseEmailRequired"))) {
+    setHazbaseFormError("email", L("error.hazbaseEmailRequired"));
+    return true;
+  }
+  if (action === "verify-otp") {
+    if (key === "email-required" || message === L("error.hazbaseEmailRequired")) {
+      setHazbaseFormError("email", L("error.hazbaseEmailRequired"));
+      return true;
+    }
+    if (key === "otp-required" || message === L("error.hazbaseOtpRequired")) {
+      setHazbaseFormError("otp", L("error.hazbaseOtpRequired"));
+      return true;
+    }
+  }
+  if (action === "save-liquid-capability") {
+    if (key === "invalid-liquid-address") {
+      setHazbaseFormError("liquid", L("error.hazbaseLiquidAddressInvalid"), network);
+      return true;
+    }
+    if (message === L("error.hazbaseLiquidAddressRequired")) {
+      setHazbaseFormError("liquid", L("error.hazbaseLiquidAddressRequired"), network);
+      return true;
+    }
+  }
+  return false;
+}
+
+function paymentCapabilityDefinitions() {
+  return {
+    "base-sepolia": {
+      environment: "testnet",
+      family: "evm",
+      asset: "usdc",
+      titleKey: "settings.wallet.step.baseSepolia.title",
+      copyKey: "settings.wallet.step.baseSepolia.copy",
+      action: "bootstrap-base-sepolia",
+    },
+    base: {
+      environment: "mainnet",
+      family: "evm",
+      asset: "usdc",
+      titleKey: "settings.wallet.step.base.title",
+      copyKey: "settings.wallet.step.base.copy",
+      action: "bootstrap-base",
+      releaseStatus: "comingSoon",
+    },
+    "polygon-amoy": {
+      environment: "testnet",
+      family: "evm",
+      asset: "usdc",
+      titleKey: "settings.wallet.step.polygonAmoy.title",
+      copyKey: "settings.wallet.step.polygonAmoy.copy",
+      action: "bootstrap-polygon-amoy",
+    },
+    polygon: {
+      environment: "mainnet",
+      family: "evm",
+      asset: "usdc",
+      titleKey: "settings.wallet.step.polygon.title",
+      copyKey: "settings.wallet.step.polygon.copy",
+      action: "bootstrap-polygon",
+      releaseStatus: "comingSoon",
+    },
+    liquidtestnet: {
+      environment: "testnet",
+      family: "liquid",
+      asset: "usdt",
+      titleKey: "settings.wallet.step.liquidTestnet.title",
+      copyKey: "settings.wallet.step.liquidTestnet.copy",
+    },
+    liquidv1: {
+      environment: "mainnet",
+      family: "liquid",
+      asset: "usdt",
+      titleKey: "settings.wallet.step.liquid.title",
+      copyKey: "settings.wallet.step.liquid.copy",
+      releaseStatus: "comingSoon",
+    },
+  };
+}
+
+function paymentCapabilityChainDefinitions() {
+  return {
+    base: {
+      page: "walletInventoryBase",
+      titleKey: "settings.wallet.chain.base.title",
+      copyKey: "settings.wallet.chain.base.copy",
+      networks: ["base-sepolia", "base"],
+    },
+    liquid: {
+      page: "walletInventoryLiquid",
+      titleKey: "settings.wallet.chain.liquid.title",
+      copyKey: "settings.wallet.chain.liquid.copy",
+      networks: ["liquidtestnet", "liquidv1"],
+    },
+    polygon: {
+      page: "walletInventoryPolygon",
+      titleKey: "settings.wallet.chain.polygon.title",
+      copyKey: "settings.wallet.chain.polygon.copy",
+      networks: ["polygon-amoy", "polygon"],
+    },
+  };
+}
+
+function paymentCapabilityChainDefinition(chain) {
+  return paymentCapabilityChainDefinitions()[chain] || null;
+}
+
+function paymentCapabilityDefinition(network) {
+  return paymentCapabilityDefinitions()[network] || null;
+}
+
+function allPaymentCapabilities(hazbase) {
+  return Array.isArray(hazbase?.paymentCapabilities) ? hazbase.paymentCapabilities : [];
+}
+
+function isPaymentCapabilityAvailable(network) {
+  return paymentCapabilityDefinition(network)?.releaseStatus !== "comingSoon";
+}
+
+function availablePaymentCapabilityNetworks(networks) {
+  return (Array.isArray(networks) ? networks : []).filter((network) => isPaymentCapabilityAvailable(network));
+}
+
+function configuredPaymentCapabilities(hazbase) {
+  return allPaymentCapabilities(hazbase).filter((entry) => entry?.configured && entry?.enabled !== false && (entry.payTo || entry.payoutAddress));
+}
+
+function agentEligiblePaymentCapabilities(hazbase) {
+  return configuredPaymentCapabilities(hazbase).filter((entry) => isPaymentCapabilityAvailable(entry.network));
+}
+
+function configuredPaymentCapabilitiesForNetworks(hazbase, networks) {
+  const networkSet = new Set(Array.isArray(networks) ? networks : []);
+  return configuredPaymentCapabilities(hazbase).filter((entry) => networkSet.has(entry?.network));
+}
+
+function paymentCapabilityChainValue(hazbase, chain) {
+  const definition = paymentCapabilityChainDefinition(chain);
+  const networks = definition?.networks || [];
+  const availableNetworks = availablePaymentCapabilityNetworks(networks);
+  const countedNetworks = availableNetworks.length ? availableNetworks : networks;
+  return L("settings.wallet.chain.configuredValue", {
+    count: configuredPaymentCapabilitiesForNetworks(hazbase, countedNetworks).length,
+    total: countedNetworks.length,
+  });
+}
+
+function resolveCapability(hazbase, network, asset = "") {
+  const normalizedAsset = String(asset || paymentCapabilityDefinition(network)?.asset || "").toLowerCase();
+  return allPaymentCapabilities(hazbase).find((entry) => (
+    entry?.network === network &&
+    String(entry?.asset || paymentCapabilityDefinition(network)?.asset || "").toLowerCase() === normalizedAsset
+  )) || null;
+}
+
+function agentPaymentDefaultRef(value) {
+  const network = String(value?.network || "").trim();
+  if (!network) return null;
+  const asset = String(value?.asset || paymentCapabilityDefinition(network)?.asset || "").trim().toLowerCase();
+  if (!asset) return null;
+  return { network, asset };
+}
+
+function agentPaymentDefaultKey(value) {
+  const ref = agentPaymentDefaultRef(value);
+  return ref ? `${ref.network}:${ref.asset}` : "";
+}
+
+function normalizeAgentPaymentDefaultRefs(values) {
+  const accepts = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const ref = agentPaymentDefaultRef(value);
+    const key = ref ? `${ref.network}:${ref.asset}` : "";
+    if (!ref || !isPaymentCapabilityAvailable(ref.network) || seen.has(key)) continue;
+    seen.add(key);
+    accepts.push(ref);
+  }
+  return accepts;
+}
+
+function activeAgentPaymentDefaults(hazbase, { includeDraft = false } = {}) {
+  return includeDraft && state.hazbaseAgentPaymentDefaultsDraft && typeof state.hazbaseAgentPaymentDefaultsDraft === "object"
+    ? state.hazbaseAgentPaymentDefaultsDraft
+    : hazbase?.agentPaymentDefaults;
+}
+
+function effectiveAgentPaymentDefaults(hazbase, { includeDraft = false } = {}) {
+  const activeDefaults = activeAgentPaymentDefaults(hazbase, { includeDraft });
+  const defaults = activeDefaults && typeof activeDefaults === "object"
+    ? activeDefaults
+    : { mode: "configured", effectiveAccepts: [] };
+  if (Array.isArray(defaults.effectiveAccepts)) {
+    return normalizeAgentPaymentDefaultRefs(defaults.effectiveAccepts);
+  }
+  if (String(defaults.mode || "") === "custom") {
+    const configuredKeys = new Set(agentEligiblePaymentCapabilities(hazbase).map(agentPaymentDefaultKey).filter(Boolean));
+    return normalizeAgentPaymentDefaultRefs(defaults.accepts).filter((entry) => configuredKeys.has(agentPaymentDefaultKey(entry)));
+  }
+  return agentEligiblePaymentCapabilities(hazbase).map((entry) => ({
+    network: entry.network,
+    asset: entry.asset || paymentCapabilityDefinition(entry.network)?.asset || "",
+  }));
+}
+
+function isAgentPaymentDefaultEnabled(hazbase, capability) {
+  if (!state.hazbaseAgentPaymentDefaultsDraft && typeof capability.agentEnabled === "boolean") {
+    return capability.agentEnabled;
+  }
+  const key = agentPaymentDefaultKey(capability);
+  return effectiveAgentPaymentDefaults(hazbase, { includeDraft: true }).some((entry) => agentPaymentDefaultKey(entry) === key);
+}
+
+function paymentCapabilityDisplayLabel(capability) {
+  const def = paymentCapabilityDefinition(capability.network);
+  const networkLabel = capability.label || (def ? L(def.titleKey).replace(/^Issue |^Register /u, "") : capability.network);
+  const asset = String(capability.asset || def?.asset || "").toUpperCase();
+  return asset ? `${networkLabel} ${asset}` : networkLabel;
+}
+
+function agentPaymentDefaultDisplayItems(hazbase, defaults) {
+  return defaults.map((entry) => {
+    const capability = resolveCapability(hazbase, entry.network, entry.asset) || entry;
+    return {
+      label: paymentCapabilityDisplayLabel(capability),
+      address: capability.payTo || capability.payoutAddress || capability.smartAccountAddress || "",
+      scheme: capability.scheme || "",
+      network: capability.network || entry.network || "",
+      asset: capability.asset || entry.asset || "",
+    };
+  });
+}
+
+function renderAgentPaymentDefaultsSummary(hazbase, defaults) {
+  if (!defaults.length) {
+    return {
+      value: L("common.none"),
+      valueTone: "attention",
+      rawValue: false,
+      stacked: false,
+      valueClassName: "",
+    };
+  }
+  const items = agentPaymentDefaultDisplayItems(hazbase, defaults);
+  if (items.length === 1) {
+    return {
+      value: items[0].label,
+      valueTone: "enabled",
+      rawValue: false,
+      stacked: false,
+      valueClassName: "",
+    };
+  }
+  return {
+    value: `
+      <button class="wallet-agent-defaults-summary-button" type="button" data-open-agent-payment-defaults aria-label="${escapeHtml(L("settings.wallet.agent.modalTitle"))}">
+        <span class="wallet-agent-default-pill">${escapeHtml(items[0].label)}</span>
+        <span class="wallet-agent-default-more">+${items.length - 1}</span>
+      </button>
+    `,
+    valueTone: "",
+    rawValue: true,
+    stacked: false,
+    valueClassName: "wallet-agent-defaults-summary-wrap",
+  };
+}
+
+function shortAddress(value) {
+  const text = String(value || "");
+  if (text.length <= 20) return text;
+  return `${text.slice(0, 10)}...${text.slice(-6)}`;
+}
+
+function renderAgentPaymentDefaultChoice(hazbase, capability) {
+  const checked = isAgentPaymentDefaultEnabled(hazbase, capability);
+  const address = capability.payTo || capability.payoutAddress || "";
+  return `
+    <label class="settings-choice-row settings-choice-row--checkbox">
+      <span class="settings-row__body">
+        <span class="settings-row__title">${escapeHtml(paymentCapabilityDisplayLabel(capability))}</span>
+        <span class="settings-row__subtitle">${escapeHtml(capability.scheme || "")}${address ? ` · ${escapeHtml(shortAddress(address))}` : ""}</span>
+      </span>
+      <span class="settings-choice-row__check">
+        <input
+          class="settings-choice-row__input"
+          type="checkbox"
+          data-agent-payment-default
+          data-payment-network="${escapeHtml(capability.network)}"
+          data-payment-asset="${escapeHtml(capability.asset || paymentCapabilityDefinition(capability.network)?.asset || "")}"
+          ${checked ? "checked" : ""}
+        />
+      </span>
+    </label>
+  `;
+}
+
+function hazbaseActionPendingKey(action, network = "") {
+  return action === "save-liquid-capability" ? `${action}:${network || ""}` : action;
+}
+
+function isHazbaseActionPending(action, network = "") {
+  return state.hazbasePendingAction === hazbaseActionPendingKey(action, network);
+}
+
+function renderWalletInventoryCapabilityCard(hazbase, network) {
+  const def = paymentCapabilityDefinition(network);
+  const available = isPaymentCapabilityAvailable(network);
+  const capability = resolveCapability(hazbase, network, def?.asset) || {
+    network,
+    asset: def?.asset || "",
+    family: def?.family || "",
+    configured: false,
+  };
+  const sessionInvalid = Boolean(hazbase.sessionInvalid);
+  const signedIn = Boolean(hazbase.signedIn) && !sessionInvalid;
+  const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
+  const configured = Boolean(capability.payTo || capability.payoutAddress || capability.smartAccountAddress);
+  const needsPasskey = def?.family === "evm";
+  const canConfigure = signedIn && (!needsPasskey || hasPasskey);
+  const actionBlocked = Boolean(state.hazbasePendingAction);
+  const environmentKey = def?.environment === "mainnet"
+    ? "settings.wallet.inventory.environment.mainnet"
+    : "settings.wallet.inventory.environment.testnet";
+  const actions = [];
+  if (!available) {
+    actions.push(`
+      <button class="secondary secondary--wide" type="button" disabled>${escapeHtml(L("settings.wallet.status.comingSoon"))}</button>
+    `);
+  } else if (!configured && def?.family === "evm") {
+    const pending = isHazbaseActionPending(def.action);
+    const labelKey = {
+      base: "settings.hazbase.action.bootstrapBase",
+      "base-sepolia": "settings.hazbase.action.bootstrapBaseSepolia",
+      polygon: "settings.hazbase.action.bootstrapPolygon",
+      "polygon-amoy": "settings.hazbase.action.bootstrapPolygonAmoy",
+    }[network] || "settings.hazbase.action.bootstrapBaseSepolia";
+    actions.push(`
+      <button
+        class="${canConfigure ? "primary" : "secondary"} ${canConfigure ? "primary--wide" : "secondary--wide"}${pending ? " is-loading" : ""}"
+        type="button"
+        data-hazbase-action="${escapeHtml(def.action)}"
+        ${canConfigure && !actionBlocked ? "" : "disabled"}
+        ${pending ? 'aria-busy="true"' : ""}
+      >${escapeHtml(L(labelKey))}</button>
+    `);
+  } else if (!configured && def?.family === "liquid") {
+    const pending = isHazbaseActionPending("save-liquid-capability", network);
+    actions.push(`
+      <button
+        class="${canConfigure ? "primary" : "secondary"} ${canConfigure ? "primary--wide" : "secondary--wide"}${pending ? " is-loading" : ""}"
+        type="button"
+        data-hazbase-action="save-liquid-capability"
+        data-payment-network="${escapeHtml(network)}"
+        ${canConfigure && !actionBlocked ? "" : "disabled"}
+        ${pending ? 'aria-busy="true"' : ""}
+      >${escapeHtml(L("settings.hazbase.action.saveLiquidCapability"))}</button>
+    `);
+  }
+  return renderHazbaseWalletStepCard({
+    number: 0,
+    eyebrow: L(environmentKey),
+    icon: "coin",
+    title: L(def.titleKey),
+    copy: L(def.copyKey),
+    detail: !available
+      ? L("settings.wallet.mainnet.comingSoonDetail")
+      : configured ? (capability.payTo || capability.payoutAddress || capability.smartAccountAddress) : L("settings.hazbase.wallet.missing"),
+    monoDetail: available && configured,
+    status: !available ? "comingSoon" : configured ? "complete" : canConfigure ? "optional" : "locked",
+    form: available && !configured && def?.family === "liquid" ? renderLiquidCapabilityForm(network, hazbase) : "",
+    actions,
+  });
+}
+
 function deriveHazbaseWalletFlow(hazbase) {
-  const accounts = Array.isArray(hazbase.accounts) ? hazbase.accounts : [];
-  const baseSepolia = accounts.find((entry) => Number(entry.chainId) === 84532) || null;
-  const baseMainnet = accounts.find((entry) => Number(entry.chainId) === 8453) || null;
   const sessionInvalid = Boolean(hazbase.sessionInvalid);
   const signedIn = Boolean(hazbase.signedIn) && !sessionInvalid;
   const passkeyHost = hazbasePasskeyHostSupport();
   const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
-  const hasBaseSepolia = Boolean(baseSepolia?.smartAccountAddress);
-  const hasBaseMainnet = Boolean(baseMainnet?.smartAccountAddress);
-  const coreReady = signedIn && hasPasskey && hasBaseSepolia;
 
-  const actionButton = (labelKey, action, { primary = false, disabled = false } = {}) => `
+  const actionButton = (labelKey, action, { primary = false, disabled = false, attrs = "" } = {}) => {
+    const pending = isHazbaseActionPending(action);
+    const blocked = disabled || Boolean(state.hazbasePendingAction);
+    return `
     <button
-      class="${primary ? "primary" : "secondary"} ${primary ? "primary--wide" : "secondary--wide"}"
+      class="${primary ? "primary" : "secondary"} ${primary ? "primary--wide" : "secondary--wide"}${pending ? " is-loading" : ""}"
       type="button"
       data-hazbase-action="${action}"
-      ${disabled ? "disabled" : ""}
+      ${attrs}
+      ${blocked ? "disabled" : ""}
+      ${pending ? 'aria-busy="true"' : ""}
     >${escapeHtml(L(labelKey))}</button>
   `;
+  };
 
   return {
     hasPasskey,
-    baseSepolia,
-    baseMainnet,
     sessionInvalid,
-    coreReady,
     steps: [
       {
+        kind: "auth",
         number: 1,
         icon: "approval",
         title: sessionInvalid ? L("settings.wallet.step.refreshSession.title") : L("settings.wallet.step.signIn.title"),
@@ -6560,6 +7108,7 @@ function deriveHazbaseWalletFlow(hazbase) {
               ],
       },
       {
+        kind: "auth",
         number: 2,
         icon: "lock",
         title: L("settings.wallet.step.passkey.title"),
@@ -6579,79 +7128,31 @@ function deriveHazbaseWalletFlow(hazbase) {
               }),
             ],
       },
-      {
-        number: 3,
-        icon: "coin",
-        title: L("settings.wallet.step.baseSepolia.title"),
-        copy: L("settings.wallet.step.baseSepolia.copy"),
-        detail: baseSepolia?.smartAccountAddress || L("settings.hazbase.wallet.missing"),
-        monoDetail: Boolean(baseSepolia?.smartAccountAddress),
-        status: hasBaseSepolia ? "complete" : signedIn && hasPasskey ? "current" : "locked",
-        actions: hasBaseSepolia
-          ? []
-          : [
-              actionButton("settings.hazbase.action.bootstrapBaseSepolia", "bootstrap-base-sepolia", {
-                primary: signedIn && hasPasskey,
-                disabled: !signedIn || !hasPasskey,
-              }),
-            ],
-      },
-      {
-        number: 4,
-        icon: "coin",
-        title: L("settings.wallet.step.base.title"),
-        copy: L("settings.wallet.step.base.copy"),
-        detail: baseMainnet?.smartAccountAddress || L("settings.wallet.step.base.comingSoonDetail"),
-        monoDetail: Boolean(baseMainnet?.smartAccountAddress),
-        status: hasBaseMainnet ? "complete" : "comingSoon",
-        actions: [],
-      },
     ],
   };
 }
 
-function renderHazbaseWalletBanner(flow) {
-  const title = flow.sessionInvalid
-    ? L("settings.wallet.sessionExpired.title")
-    : flow.coreReady ? L("settings.wallet.ready.title") : L("settings.wallet.flow.banner.title");
-  const className = flow.coreReady
-    ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--ready"
-    : flow.sessionInvalid
-      ? "settings-copy-block settings-copy-block--stacked wallet-flow-banner wallet-flow-banner--session-expired"
-    : "settings-copy-block settings-copy-block--stacked wallet-flow-banner";
-  // Ready state: surface the smart-account address prominently so the user
-  // can see at a glance which wallet agents will use as `--pay-to` when
-  // gating paid shares / A2A payouts. The address is the single most
-  // actionable fact on this page once setup is complete — muted filler
-  // copy buries it.
-  const payoutAddress = flow.baseSepolia?.smartAccountAddress || "";
-  const copyLabel = L("settings.wallet.ready.copyAddress");
-  const body = flow.coreReady && payoutAddress
-    ? `
-      <p class="wallet-flow-banner__copy muted">${escapeHtml(L("settings.wallet.ready.payoutIntro"))}</p>
-      <button
-        class="wallet-flow-banner__address"
-        type="button"
-        data-wallet-address-copy="${escapeHtml(payoutAddress)}"
-        aria-label="${escapeHtml(copyLabel)}: ${escapeHtml(payoutAddress)}"
-      >
-        <span class="wallet-flow-banner__address-text">${escapeHtml(payoutAddress)}</span>
-        <span class="wallet-flow-banner__address-icon-slot">
-          <span class="wallet-flow-banner__address-icon wallet-flow-banner__address-icon--copy" aria-hidden="true">${renderIcon("copy")}</span>
-          <span class="wallet-flow-banner__address-icon wallet-flow-banner__address-icon--check" aria-hidden="true">${renderIcon("check")}</span>
-        </span>
-      </button>
-    `
-    : `<p class="wallet-flow-banner__copy muted">${escapeHtml(
-        flow.sessionInvalid
-          ? L("settings.wallet.sessionExpired.copy")
-          : flow.coreReady ? L("settings.wallet.ready.copy") : L("settings.wallet.flow.copy"),
-      )}</p>`;
+function renderLiquidCapabilityForm(network, hazbase) {
+  const capabilities = Array.isArray(hazbase.paymentCapabilities) ? hazbase.paymentCapabilities : [];
+  const existing = capabilities.find((entry) => entry.network === network) || {};
+  const placeholder = network === "liquidtestnet" ? "tlq1..." : "lq1...";
+  const error = hazbaseFormError("liquid", network);
+  const errorId = `hazbase-liquid-error-${network}`;
   return `
-    <div class="${className}">
-      <p class="wallet-flow-banner__eyebrow">${escapeHtml(L("settings.hazbase.title"))}</p>
-      <p class="wallet-flow-banner__title">${escapeHtml(title)}</p>
-      ${body}
+    <div class="wallet-step-card__form">
+      <label class="wallet-step-card__field">
+        <span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.liquidAddressLabel"))}</span>
+        <input
+          class="wallet-step-card__field-input wallet-step-card__field-input--mono${error ? " wallet-step-card__field-input--error" : ""}"
+          data-hazbase-input="liquid-payto"
+          data-payment-network="${escapeHtml(network)}"
+          value="${escapeHtml(existing.payTo || "")}"
+          placeholder="${escapeHtml(placeholder)}"
+          autocomplete="off"
+          ${error ? `aria-invalid="true" aria-describedby="${escapeHtml(errorId)}"` : ""}
+        />
+        ${error ? `<span class="wallet-step-card__field-error" id="${escapeHtml(errorId)}">${escapeHtml(error)}</span>` : ""}
+      </label>
     </div>
   `;
 }
@@ -6705,7 +7206,7 @@ function renderHazbaseWalletStepCard(step, { mode = "full" } = {}) {
         <div class="wallet-step-card__headline">
           <span class="wallet-step-card__icon" aria-hidden="true">${renderIcon(step.icon)}</span>
           <div class="wallet-step-card__title-wrap">
-            <p class="wallet-step-card__eyebrow">${escapeHtml(L("settings.wallet.stepNumber", { count: step.number }))}</p>
+            <p class="wallet-step-card__eyebrow">${escapeHtml(step.eyebrow || L("settings.wallet.stepNumber", { count: step.number }))}</p>
             <h3 class="wallet-step-card__title">${escapeHtml(step.title)}</h3>
           </div>
         </div>
@@ -6730,6 +7231,10 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
   // as the intentional escape hatch — clicking it reverts the form to the
   // pre-sent state (code discarded, email stays for easy typo recovery).
   const emailLocked = Boolean(otpRequested);
+  const emailError = hazbaseFormError("email");
+  const otpError = hazbaseFormError("otp");
+  const emailErrorId = "hazbase-email-error";
+  const otpErrorId = "hazbase-otp-error";
   const emailLabelRow = emailLocked
     ? `<span class="wallet-step-card__field-label-row">
         <span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.emailLabel"))}</span>
@@ -6737,6 +7242,7 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
           type="button"
           class="wallet-step-card__field-link"
           data-hazbase-action="change-email"
+          ${state.hazbasePendingAction ? "disabled" : ""}
         >${escapeHtml(L("settings.hazbase.action.changeEmail"))}</button>
       </span>`
     : `<span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.emailLabel"))}</span>`;
@@ -6745,7 +7251,7 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
       ${emailLabelRow}
       <input
         type="email"
-        class="wallet-step-card__field-input${emailLocked ? " wallet-step-card__field-input--locked" : ""}"
+        class="wallet-step-card__field-input${emailLocked ? " wallet-step-card__field-input--locked" : ""}${emailError ? " wallet-step-card__field-input--error" : ""}"
         data-hazbase-input="otp-email"
         value="${escapeHtml(email || "")}"
         placeholder="${escapeHtml(L("settings.hazbase.field.emailPlaceholder"))}"
@@ -6755,7 +7261,9 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
         autocorrect="off"
         spellcheck="false"
         ${emailLocked ? "disabled aria-disabled=\"true\"" : ""}
+        ${emailError ? `aria-invalid="true" aria-describedby="${escapeHtml(emailErrorId)}"` : ""}
       />
+      ${emailError ? `<span class="wallet-step-card__field-error" id="${escapeHtml(emailErrorId)}">${escapeHtml(emailError)}</span>` : ""}
     </label>
   `;
   const otpField = otpRequested
@@ -6764,7 +7272,7 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
       <span class="wallet-step-card__field-label">${escapeHtml(L("settings.hazbase.field.otpLabel"))}</span>
       <input
         type="text"
-        class="wallet-step-card__field-input wallet-step-card__field-input--mono"
+        class="wallet-step-card__field-input wallet-step-card__field-input--mono${otpError ? " wallet-step-card__field-input--error" : ""}"
         data-hazbase-input="otp-code"
         value="${escapeHtml(code || "")}"
         placeholder="${escapeHtml(L("settings.hazbase.field.otpPlaceholder"))}"
@@ -6774,7 +7282,9 @@ function renderHazbaseSignInForm({ email, otpRequested, code }) {
         autocorrect="off"
         spellcheck="false"
         maxlength="12"
+        ${otpError ? `aria-invalid="true" aria-describedby="${escapeHtml(otpErrorId)}"` : ""}
       />
+      ${otpError ? `<span class="wallet-step-card__field-error" id="${escapeHtml(otpErrorId)}">${escapeHtml(otpError)}</span>` : ""}
     </label>
   `
     : "";
@@ -6822,11 +7332,10 @@ function formatExpiresIn(ms) {
   return rtf ? rtf.format(hr, "hour") : `in ${hr}h`;
 }
 
-// USDC has 6 decimals, stored as atomic units in a string (e.g. "100000" ⇒
-// $0.10). Mirrors formatUsdc() in scripts/share-cli.mjs — kept as a small
+// Payment amounts are stored as asset-native atomic units. Kept as a small
 // standalone helper rather than a shared module since the app bundle has no
 // build step that pulls from scripts/.
-function formatUsdcAtomic(atomic) {
+function formatAtomicAmount(atomic, decimals = 6) {
   let n;
   try {
     n = BigInt(String(atomic ?? "0"));
@@ -6834,10 +7343,31 @@ function formatUsdcAtomic(atomic) {
     return "0.00";
   }
   if (n < 0n) n = -n;
-  const whole = n / 1_000_000n;
-  const frac = (n % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "");
+  const places = Math.max(0, Math.min(18, Number(decimals) || 0));
+  const scale = 10n ** BigInt(places);
+  const whole = scale > 0n ? n / scale : n;
+  const frac = scale > 0n ? (n % scale).toString().padStart(places, "0").replace(/0+$/u, "") : "";
   if (!frac) return `${whole}.00`;
   return `${whole}.${frac.padEnd(2, "0")}`;
+}
+
+function formatUsdcAtomic(atomic) {
+  return formatAtomicAmount(atomic, 6);
+}
+
+function paymentAssetDecimals(asset) {
+  const key = String(asset || "").toLowerCase();
+  if (key === "jpyc") return 18;
+  if (key === "usdt" || key === "lbtc") return 8;
+  return 6;
+}
+
+function paymentAssetLabel(asset) {
+  const key = String(asset || "").toLowerCase();
+  if (key === "jpyc") return "JPYC";
+  if (key === "usdt") return "USDt";
+  if (key === "lbtc") return "L-BTC";
+  return "USDC";
 }
 
 function renderSettingsInfoRow(label, value, options = {}) {
@@ -8461,6 +8991,36 @@ function renderHazbaseLogoutConfirmModal() {
   `;
 }
 
+function renderAgentPaymentDefaultsModal() {
+  if (!state.agentPaymentDefaultsModalOpen) {
+    return "";
+  }
+  const hazbase = state.hazbaseStatus || {};
+  const items = agentPaymentDefaultDisplayItems(hazbase, effectiveAgentPaymentDefaults(hazbase));
+  if (!items.length) {
+    return "";
+  }
+  return `
+    <div class="modal-backdrop" data-close-agent-payment-defaults>
+      <section class="modal-card modal-card--wallet-defaults" role="dialog" aria-modal="true" aria-labelledby="agent-payment-defaults-title">
+        <div class="helper-copy">
+          <strong id="agent-payment-defaults-title">${escapeHtml(L("settings.wallet.agent.modalTitle"))}</strong>
+          <p class="muted">${escapeHtml(L("settings.wallet.agent.modalCopy"))}</p>
+        </div>
+        <div class="wallet-agent-defaults-modal-list">
+          ${items.map((item) => `
+            <div class="wallet-agent-defaults-modal-row">
+              <span class="wallet-agent-defaults-modal-title">${escapeHtml(item.label)}</span>
+              <span class="wallet-agent-defaults-modal-meta">${escapeHtml([item.scheme, shortAddress(item.address)].filter(Boolean).join(" · "))}</span>
+            </div>
+          `).join("")}
+        </div>
+        <button class="primary primary--wide" type="button" data-close-agent-payment-defaults>${escapeHtml(L("common.close"))}</button>
+      </section>
+    </div>
+  `;
+}
+
 function renderLogoutConfirmModal() {
   if (!state.logoutConfirmOpen || !state.session?.authenticated) {
     return "";
@@ -9493,9 +10053,48 @@ function bindShellInteractions() {
 
 for (const button of document.querySelectorAll("[data-hazbase-action]")) {
   button.addEventListener("click", async () => {
+    const action = button.dataset.hazbaseAction || "";
+    if (!action || button.disabled || state.hazbasePendingAction) {
+      return;
+    }
+    const actionNetwork = button.dataset.paymentNetwork || "";
     state.hazbaseNotice = "";
     state.hazbaseError = "";
-    const action = button.dataset.hazbaseAction || "";
+    clearHazbaseFormErrorsForAction(action, actionNetwork);
+    if (action === "logout") {
+      // Gate wallet logout behind an explicit confirm — the modal's
+      // "confirm" button dispatches `logout-confirm`, which actually
+      // hits the API. Short-circuit here so the initial click only
+      // opens the dialog.
+      state.hazbaseLogoutConfirmOpen = true;
+      await renderShell();
+      return;
+    }
+    if (action === "change-email") {
+      // Flip the form back to pre-send mode. We keep the email so typo
+      // recovery ("hoshin" -> "hoshino") stays one edit away, but drop
+      // the now-stale OTP code. No server call — hazbase invalidates
+      // the previous OTP automatically when a fresh one is requested.
+      state.hazbaseOtpRequested = false;
+      state.hazbaseOtpCode = "";
+      state.hazbaseNotice = "";
+      state.hazbaseError = "";
+      clearHazbaseFormError("email");
+      clearHazbaseFormError("otp");
+      await renderShell();
+      // Move focus back to the (now re-enabled) email input so the user
+      // can start editing immediately.
+      document.querySelector('[data-hazbase-input="otp-email"]')?.focus();
+      return;
+    }
+    state.hazbasePendingAction = hazbaseActionPendingKey(action, actionNetwork);
+    // Wallet auth touches external services and WebAuthn; without an
+    // immediate affordance the button looked dead while the request was
+    // still in flight. Mutate the current DOM synchronously so the first
+    // tap visibly "takes", then let the final render reconcile state.
+    button.classList.add("is-loading");
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     try {
       if (action === "request-otp") {
         // Read from the DOM input, not just state. The state mirror is
@@ -9505,14 +10104,20 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         // Treat DOM as authoritative and fall back to state.
         const emailInput = document.querySelector('[data-hazbase-input="otp-email"]');
         const email = (emailInput?.value || state.hazbaseOtpEmail || "").trim();
-        if (!email) throw new Error(L("error.hazbaseEmailRequired"));
-        const result = await apiPost("/api/hazbase/request-otp", { email });
+        if (!email) {
+          setHazbaseFormError("email", L("error.hazbaseEmailRequired"));
+          emailInput?.focus();
+          return;
+        }
+        const result = await apiPost("/api/hazbase/request-otp", { email }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
         state.hazbaseOtpEmail = email;
         state.hazbaseOtpRequested = true;
         state.hazbaseOtpCode = "";
-        state.hazbaseNotice = result?.debugCode
+        clearHazbaseFormError("email");
+        clearHazbaseFormError("otp");
+        showToast(result?.debugCode
           ? `${L("settings.hazbase.notice.otpRequested")} (${result.debugCode})`
-          : L("settings.hazbase.notice.otpRequested");
+          : L("settings.hazbase.notice.otpRequested"));
       } else if (action === "verify-otp") {
         // Same pattern — DOM wins, state fallback covers the rare case
         // where the field was removed/re-added between type and click.
@@ -9520,88 +10125,148 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         const codeInput = document.querySelector('[data-hazbase-input="otp-code"]');
         const email = (emailInput?.value || state.hazbaseOtpEmail || "").trim();
         const code = (codeInput?.value || state.hazbaseOtpCode || "").trim();
-        if (!email) throw new Error(L("error.hazbaseEmailRequired"));
-        if (!code) throw new Error(L("error.hazbaseOtpRequired"));
-        await apiPost("/api/hazbase/verify-otp", { email, code });
+        let hasInlineError = false;
+        if (!email) {
+          setHazbaseFormError("email", L("error.hazbaseEmailRequired"));
+          hasInlineError = true;
+        }
+        if (!code) {
+          setHazbaseFormError("otp", L("error.hazbaseOtpRequired"));
+          hasInlineError = true;
+        }
+        if (hasInlineError) {
+          (email ? codeInput : emailInput)?.focus();
+          return;
+        }
+        await apiPost("/api/hazbase/verify-otp", { email, code }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
         state.hazbaseOtpRequested = false;
         state.hazbaseOtpEmail = "";
         state.hazbaseOtpCode = "";
-        state.hazbaseNotice = L("settings.hazbase.notice.otpVerified");
+        clearHazbaseFormError("email");
+        clearHazbaseFormError("otp");
+        showToast(L("settings.hazbase.notice.otpVerified"));
       } else if (action === "register-passkey") {
         if (!hazbasePasskeyHostSupport().eligible) {
           throw new Error(L("error.hazbasePasskeyLocalHostRequired"));
         }
         const { createPasskeyRegistrationCredential } = await loadHazbasePasskeyModule();
-        const challenge = await apiPost("/api/hazbase/passkey/register/challenge", {});
+        const challenge = await apiPost("/api/hazbase/passkey/register/challenge", {}, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
         const credential = await createPasskeyRegistrationCredential(challenge);
         await apiPost("/api/hazbase/passkey/register/complete", {
           challengeId: challenge.challengeId,
           credential,
-        });
-        state.hazbaseNotice = L("settings.hazbase.notice.passkeyRegistered");
-      } else if (action === "bootstrap-base-sepolia" || action === "bootstrap-base") {
+        }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+        showToast(L("settings.hazbase.notice.passkeyRegistered"));
+      } else if (action === "bootstrap-base-sepolia" || action === "bootstrap-base" || action === "bootstrap-polygon-amoy" || action === "bootstrap-polygon") {
         if (!hazbasePasskeyHostSupport().eligible) {
           throw new Error(L("error.hazbasePasskeyLocalHostRequired"));
         }
         const { createPasskeyAssertionCredential } = await loadHazbasePasskeyModule();
-        const chainId = action === "bootstrap-base" ? 8453 : 84532;
-        const challenge = await apiPost("/api/hazbase/passkey/assert/challenge", { purpose: "bootstrap" });
+        const chainId = {
+          "bootstrap-base": 8453,
+          "bootstrap-base-sepolia": 84532,
+          "bootstrap-polygon": 137,
+          "bootstrap-polygon-amoy": 80002,
+        }[action];
+        const challenge = await apiPost("/api/hazbase/passkey/assert/challenge", { purpose: "bootstrap" }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
         const credential = await createPasskeyAssertionCredential(challenge);
         await apiPost("/api/hazbase/passkey/assert/complete", {
           challengeId: challenge.challengeId,
           credential,
           purpose: "bootstrap",
-        });
-        await apiPost("/api/hazbase/account/bootstrap", { chainId });
-        state.hazbaseNotice = L("settings.hazbase.notice.walletBootstrapped", { chainId });
-      } else if (action === "logout") {
-        // Gate wallet logout behind an explicit confirm — the modal's
-        // "confirm" button dispatches `logout-confirm`, which actually
-        // hits the API. Short-circuit here so the initial click only
-        // opens the dialog.
-        state.hazbaseLogoutConfirmOpen = true;
-        await renderShell();
-        return;
+        }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+        await apiPost("/api/hazbase/account/bootstrap", { chainId }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+        showToast(L("settings.hazbase.notice.walletBootstrapped", { chainId }));
+      } else if (action === "save-liquid-capability") {
+        const network = actionNetwork;
+        const input = document.querySelector(`[data-hazbase-input="liquid-payto"][data-payment-network="${CSS.escape(network)}"]`);
+        const payTo = (input?.value || "").trim();
+        if (!payTo) {
+          setHazbaseFormError("liquid", L("error.hazbaseLiquidAddressRequired"), network);
+          input?.focus();
+          return;
+        }
+        await apiPost("/api/hazbase/payment-capability", { network, asset: "usdt", payTo }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+        clearHazbaseFormError("liquid", network);
+        showToast(L("settings.hazbase.notice.paymentCapabilitySaved", { network }));
       } else if (action === "logout-confirm") {
         state.hazbaseLogoutConfirmOpen = false;
-        await apiPost("/api/hazbase/logout", {});
-        state.hazbaseNotice = L("settings.hazbase.notice.signedOut");
+        await apiPost("/api/hazbase/logout", {}, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+        showToast(L("settings.hazbase.notice.signedOut"));
       } else if (action === "refresh-session") {
-        await apiPost("/api/hazbase/session/refresh", {});
+        await apiPost("/api/hazbase/session/refresh", {}, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
         state.hazbaseOtpRequested = false;
         state.hazbaseOtpCode = "";
-        state.hazbaseNotice = L("settings.hazbase.notice.sessionRefreshStarted");
-      } else if (action === "change-email") {
-        // Flip the form back to pre-send mode. We keep the email so typo
-        // recovery ("hoshin" → "hoshino") stays one edit away, but drop
-        // the now-stale OTP code. No server call — hazbase invalidates
-        // the previous OTP automatically when a fresh one is requested.
-        state.hazbaseOtpRequested = false;
-        state.hazbaseOtpCode = "";
-        state.hazbaseNotice = "";
-        state.hazbaseError = "";
-        await renderShell();
-        // Move focus back to the (now re-enabled) email input so the user
-        // can start editing immediately.
-        document.querySelector('[data-hazbase-input="otp-email"]')?.focus();
-        return;
-      } else if (action === "mainnet-opt-in") {
-        // Pure client-side reveal — the mainnet step is always in the flow
-        // data, we just hide it behind an opt-in link to keep the default
-        // path (testnet only) focused. No network call; no status refetch.
-        state.hazbaseMainnetOptIn = true;
-        await renderShell();
-        return;
+        showToast(L("settings.hazbase.notice.sessionRefreshStarted"));
       }
-      await fetchHazbaseStatus();
+      await fetchHazbaseStatus({ timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
     } catch (error) {
       if (error?.errorKey === "hazbase-session-expired") {
         state.hazbaseOtpRequested = false;
         state.hazbaseOtpCode = "";
-        await fetchHazbaseStatus();
+        await fetchHazbaseStatus({ timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
       }
-      state.hazbaseError = error.message || String(error);
+      const message = error.message || String(error);
+      if (!applyHazbaseInlineError(action, error, actionNetwork)) {
+        showToast(message, { tone: "error" });
+      }
+    } finally {
+      state.hazbasePendingAction = "";
+      await renderShell();
     }
+  });
+}
+
+for (const button of document.querySelectorAll("[data-hazbase-agent-defaults-save], [data-hazbase-agent-defaults-all]")) {
+  button.addEventListener("click", async () => {
+    if (button.disabled || state.hazbasePendingAction) {
+      return;
+    }
+    state.hazbaseNotice = "";
+    state.hazbaseError = "";
+    state.hazbasePendingAction = button.hasAttribute("data-hazbase-agent-defaults-all")
+      ? "agent-defaults-all"
+      : "agent-defaults-save";
+    button.classList.add("is-loading");
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      if (button.hasAttribute("data-hazbase-agent-defaults-all")) {
+        await apiPost("/api/hazbase/agent-payment-defaults", { mode: "configured" }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+      } else {
+        const accepts = state.hazbaseAgentPaymentDefaultsDraft?.mode === "custom"
+          ? normalizeAgentPaymentDefaultRefs(state.hazbaseAgentPaymentDefaultsDraft.accepts)
+          : selectedAgentPaymentDefaultRefs();
+        await apiPost("/api/hazbase/agent-payment-defaults", { mode: "custom", accepts }, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+      }
+      state.hazbaseAgentPaymentDefaultsDraft = null;
+      showToast(L("settings.hazbase.notice.agentDefaultsSaved"));
+      await fetchHazbaseStatus({ timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
+    } catch (error) {
+      showToast(error.message || String(error), { tone: "error" });
+    } finally {
+      state.hazbasePendingAction = "";
+      await renderShell();
+    }
+  });
+}
+
+function selectedAgentPaymentDefaultRefs() {
+  return normalizeAgentPaymentDefaultRefs(Array.from(document.querySelectorAll("[data-agent-payment-default]:checked"))
+    .map((input) => ({
+      network: input.dataset.paymentNetwork || "",
+      asset: input.dataset.paymentAsset || "",
+    })));
+}
+
+for (const input of document.querySelectorAll("[data-agent-payment-default]")) {
+  input.addEventListener("change", async () => {
+    state.hazbaseNotice = "";
+    state.hazbaseError = "";
+    state.hazbaseAgentPaymentDefaultsDraft = {
+      mode: "custom",
+      accepts: selectedAgentPaymentDefaultRefs(),
+    };
     await renderShell();
   });
 }
@@ -9610,11 +10275,31 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
 // notice clear, etc.) can repopulate `value="..."` without wiping what
 // the user was typing. Reads happen at button-click time against state,
 // which is why we don't need to also query the DOM in the handler.
+function clearRenderedHazbaseInputError(input) {
+  input.classList.remove("wallet-step-card__field-input--error");
+  input.removeAttribute("aria-invalid");
+  const describedBy = input.getAttribute("aria-describedby");
+  if (describedBy) {
+    document.getElementById(describedBy)?.remove();
+    input.removeAttribute("aria-describedby");
+  }
+}
+
 for (const input of document.querySelectorAll("[data-hazbase-input]")) {
   const name = input.dataset.hazbaseInput || "";
   input.addEventListener("input", () => {
-    if (name === "otp-email") state.hazbaseOtpEmail = input.value;
-    else if (name === "otp-code") state.hazbaseOtpCode = input.value;
+    if (name === "otp-email") {
+      state.hazbaseOtpEmail = input.value;
+      clearHazbaseFormError("email");
+      clearRenderedHazbaseInputError(input);
+    } else if (name === "otp-code") {
+      state.hazbaseOtpCode = input.value;
+      clearHazbaseFormError("otp");
+      clearRenderedHazbaseInputError(input);
+    } else if (name === "liquid-payto") {
+      clearHazbaseFormError("liquid", input.dataset.paymentNetwork || "");
+      clearRenderedHazbaseInputError(input);
+    }
   });
   // Enter key submits the step. In the email field it triggers "send"
   // (or "verify" once a code was already issued — the email field stays
@@ -10248,6 +10933,23 @@ function bindSharedUi(renderFn) {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-open-agent-payment-defaults]")) {
+    button.addEventListener("click", async () => {
+      state.agentPaymentDefaultsModalOpen = true;
+      await renderFn();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-close-agent-payment-defaults]")) {
+    button.addEventListener("click", async (event) => {
+      if (button.classList.contains("modal-backdrop") && event.target.closest(".modal-card")) {
+        return;
+      }
+      state.agentPaymentDefaultsModalOpen = false;
+      await renderFn();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-dismiss-install]")) {
     button.addEventListener("click", async () => {
       state.installBannerDismissed = true;
@@ -10406,18 +11108,37 @@ function openSettingsSubpage(page) {
   if (!page) {
     return;
   }
+  const openingFromRoot = !state.settingsSubpage;
   if (!isDesktopLayout()) {
-    state.settingsScrollState = {
-      y: currentViewportScrollY(),
-    };
-    state.pendingSettingsScrollRestore = false;
+    if (openingFromRoot) {
+      state.settingsScrollState = {
+        y: currentViewportScrollY(),
+      };
+      state.pendingSettingsScrollRestore = false;
+    }
     state.pendingSettingsSubpageScrollReset = true;
   }
   state.settingsSubpage = page;
 }
 
+function parentSettingsSubpage(page) {
+  if (page === "walletInventoryBase" || page === "walletInventoryLiquid" || page === "walletInventoryPolygon") {
+    return "walletInventory";
+  }
+  return page === "walletInventory" ? "wallet" : "";
+}
+
 function closeSettingsSubpage() {
   if (!state.settingsSubpage) {
+    return;
+  }
+  const parentPage = parentSettingsSubpage(state.settingsSubpage);
+  if (parentPage) {
+    state.settingsSubpage = parentPage;
+    if (!isDesktopLayout()) {
+      state.pendingSettingsSubpageScrollReset = true;
+      state.pendingSettingsScrollRestore = false;
+    }
     return;
   }
   state.settingsSubpage = "";
@@ -11478,7 +12199,7 @@ async function apiPost(url, body, opts = {}) {
 async function readError(response) {
   try {
     const payload = await response.json();
-    const errorKey = typeof payload.error === "string" ? payload.error : "";
+    const errorKey = firstApiErrorKey(payload);
     const message = localizeApiError(errorKey || payload.message || response.statusText);
     return { message, errorKey, payload };
   } catch {
@@ -11486,9 +12207,56 @@ async function readError(response) {
   }
 }
 
-function localizeApiError(value) {
+function firstApiErrorKey(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  return [
+    payload.error,
+    payload.code,
+    payload.errorCode,
+    payload.message,
+  ].map(extractApiErrorKey).find(Boolean) || "";
+}
+
+function extractApiErrorKey(value) {
   const raw = normalizeClientText(value);
   if (!raw) {
+    return "";
+  }
+  const embedded = extractEmbeddedApiErrorPayload(raw);
+  if (embedded) {
+    return firstApiErrorKey(embedded);
+  }
+  const [head] = raw.split(":");
+  const normalized = normalizeApiErrorKey(head);
+  return normalized || normalizeApiErrorKey(raw);
+}
+
+function extractEmbeddedApiErrorPayload(value) {
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return null;
+  }
+  try {
+    return JSON.parse(value.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeApiErrorKey(value) {
+  return normalizeClientText(value)
+    .toLowerCase()
+    .replace(/_/g, "-")
+    .replace(/[^a-z0-9-]/g, "");
+}
+
+function localizeApiError(value) {
+  const original = normalizeClientText(value);
+  const raw = extractApiErrorKey(value) || normalizeApiErrorKey(value);
+  if (!original && !raw) {
     return "";
   }
   const map = {
@@ -11523,10 +12291,14 @@ function localizeApiError(value) {
     "hazbase-session-expired": "error.hazbaseSessionExpired",
     "hazbase-passkey-local-host-required": "error.hazbasePasskeyLocalHostRequired",
     "hazbase-wallet-account-missing": "error.hazbaseWalletAccountMissing",
+    "email-required": "error.hazbaseEmailRequired",
+    "otp-required": "error.hazbaseOtpRequired",
+    "invalid-liquid-address": "error.hazbaseLiquidAddressInvalid",
+    "payment-network-coming-soon": "error.paymentNetworkComingSoon",
     "unsupported-chain": "error.unsupportedChain",
   };
   const key = map[raw];
-  return key ? L(key) : raw;
+  return key ? L(key) : original;
 }
 
 function normalizeClientText(value) {

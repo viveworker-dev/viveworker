@@ -55,6 +55,26 @@ test("completion reply retries without stale Codex owner client", async () => {
   );
 });
 
+test("completion reply reopens the Codex thread before surfacing no-client-found", async () => {
+  const bridge = await readBridge();
+
+  assert.match(
+    bridge,
+    /const DEFAULT_COMPLETION_REPLY_THREAD_REOPEN_WAIT_MS = 1800;/u,
+    "The thread reopen fallback should wait briefly for Codex Desktop to attach the target thread"
+  );
+  assert.match(
+    bridge,
+    /function codexThreadDeepLink\(conversationId\)[\s\S]*?codex:\/\/local\/[\s\S]*?function openCodexThreadBestEffort\(conversationId\)/u,
+    "Bridge should be able to reopen the target Codex thread via the desktop deep link"
+  );
+  assert.match(
+    bridge,
+    /isIpcNoClientFoundError\(candidateError\)[\s\S]*?openCodexThreadBestEffort\(conversationId\)[\s\S]*?waitForCodexThreadOwner\([\s\S]*?sendReplyCandidate\(candidate,\s*"after-reopen"\)/u,
+    "A no-client-found reply should auto-reopen the target thread and retry once before returning an error"
+  );
+});
+
 test("completion reply UI does not stay stuck on sending when the response is slow", async () => {
   const app = await readApp();
 

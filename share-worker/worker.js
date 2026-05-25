@@ -119,6 +119,23 @@ const DEFAULT_HAZBASE_API_ENDPOINT = "https://api.hazbase.com";
 const X402_NETWORKS = {
   8453:  { name: "base",         usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", eip712Name: "USD Coin", eip712Version: "2" },
   84532: { name: "base-sepolia", usdc: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", eip712Name: "USDC",     eip712Version: "2" },
+  137:   { name: "polygon",      usdc: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", eip712Name: "USD Coin", eip712Version: "2" },
+  80002: { name: "polygon-amoy", usdc: "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582", eip712Name: "USDC",     eip712Version: "2" },
+};
+const LIQUID_X402_SCHEME = "exact-liquid-pset";
+const PAYMENT_NETWORKS = {
+  base: { family: "evm", chainId: 8453, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base", releaseStatus: "comingSoon" },
+  "base-sepolia": { family: "evm", chainId: 84532, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base Sepolia" },
+  polygon: { family: "evm", chainId: 137, asset: "usdc", assets: ["usdc", "jpyc"], scheme: "exact", label: "Polygon", releaseStatus: "comingSoon" },
+  "polygon-amoy": { family: "evm", chainId: 80002, asset: "usdc", assets: ["usdc", "jpyc"], scheme: "exact", label: "Polygon Amoy" },
+  liquidtestnet: { family: "liquid", chainId: null, asset: "usdt", assets: ["usdt", "lbtc"], scheme: LIQUID_X402_SCHEME, label: "Liquid Testnet" },
+  liquidv1: { family: "liquid", chainId: null, asset: "usdt", assets: ["usdt", "lbtc"], scheme: LIQUID_X402_SCHEME, label: "Liquid", releaseStatus: "comingSoon" },
+};
+const PAYMENT_ASSETS = {
+  usdc: { decimals: 6, label: "USDC" },
+  jpyc: { decimals: 18, label: "JPYC" },
+  usdt: { decimals: 8, label: "USDt" },
+  lbtc: { decimals: 8, label: "L-BTC" },
 };
 const MIN_PRICE_ATOMIC = 10_000n;         // $0.01 min (below this, gas dwarfs price)
 const MAX_PRICE_ATOMIC = 1_000_000_000n;  // $1000 max per share (accident-cap)
@@ -337,6 +354,13 @@ async function handle(request, env, ctx) {
     return await handleUnlockJson(request, env, unlockJsonMatch[1]);
   }
 
+  // Browser/manual x402 payment submit. Kept as a compatibility endpoint for
+  // direct POST clients; the public 402 page now steers humans to the extension.
+  const paymentSubmitMatch = pathname.match(/^\/v\/([A-Za-z0-9]+)\/payment$/);
+  if (paymentSubmitMatch && method === "POST") {
+    return await handlePaymentSubmit(request, env, ctx, paymentSubmitMatch[1]);
+  }
+
   // Render
   const viewMatch = pathname.match(/^\/v\/([A-Za-z0-9]+)\/?$/);
   if (viewMatch && (method === "GET" || method === "HEAD")) {
@@ -398,19 +422,35 @@ async function handleUpload(request, env) {
   const payoutAddressRaw = form.get("payoutAddress");
   const paymentNetworkRaw = form.get("paymentNetwork");
   const payoutMethodRaw = form.get("payoutMethod");
+  const paymentOptionsRaw = form.get("paymentOptions");
   let priceAtomic = null;
   let payTo = null;
   let chainId = null;
   let paymentNetwork = null;
   let payoutMethod = null;
   let payoutAddress = null;
+  let paymentOptions = [];
   let paymentSalt = null;
-  const anyPricePresent = typeof priceRaw === "string" && priceRaw.length > 0;
-  const requestedPayout = parseRequestedPayoutAddress(payToRaw, payoutAddressRaw);
-  if (requestedPayout.error) {
-    return jsonResponse({ error: requestedPayout.error }, 400);
+  const parsedPaymentOptions = parsePaymentOptionsForRequest({
+    priceRaw,
+    paymentOptionsRaw,
+    payToRaw,
+    payoutAddressRaw,
+    paymentNetworkRaw,
+    payoutMethodRaw,
+    env,
+  });
+  if (parsedPaymentOptions.error) {
+    return jsonResponse(
+      {
+        error: parsedPaymentOptions.error,
+        ...(parsedPaymentOptions.minAtomic ? { minAtomic: parsedPaymentOptions.minAtomic } : {}),
+        ...(parsedPaymentOptions.maxAtomic ? { maxAtomic: parsedPaymentOptions.maxAtomic } : {}),
+      },
+      parsedPaymentOptions.error === "payment-network-not-configured" ? 500 : 400,
+    );
   }
-  if (anyPricePresent || requestedPayout.sawValue) {
+  if (parsedPaymentOptions.sawPaymentValue) {
     // Closed-beta gate: while x402 is pinned to testnet, only allowlisted
     // userIds can attach a price. Check first so a non-allowlisted user who
     // fat-fingered `--price` + `--pay-to` gets a clear "not in beta" error
@@ -425,37 +465,17 @@ async function handleUpload(request, env) {
         403,
       );
     }
-    if (!anyPricePresent || !requestedPayout.address) {
-      return jsonResponse({ error: "price-payTo-both-required" }, 400);
-    }
     if (passwordHash) {
       return jsonResponse({ error: "price-and-password-mutually-exclusive" }, 400);
     }
-    const parsed = parseUsdcPrice(priceRaw);
-    if (parsed === null) {
-      return jsonResponse({ error: "invalid-price" }, 400);
-    }
-    if (parsed < MIN_PRICE_ATOMIC || parsed > MAX_PRICE_ATOMIC) {
-      return jsonResponse(
-        {
-          error: "price-out-of-range",
-          minAtomic: MIN_PRICE_ATOMIC.toString(),
-          maxAtomic: MAX_PRICE_ATOMIC.toString(),
-        },
-        400,
-      );
-    }
-    const requestedNetwork = typeof paymentNetworkRaw === "string" ? paymentNetworkRaw : "";
-    const resolvedChainId = resolveChainId(env, requestedNetwork);
-    if (!resolvedChainId) {
-      return jsonResponse({ error: "payment-network-not-configured" }, 500);
-    }
-    priceAtomic = parsed.toString();
-    payTo = requestedPayout.address;
-    chainId = resolvedChainId;
-    paymentNetwork = X402_NETWORKS[resolvedChainId]?.name || null;
-    payoutMethod = normalizeRequestedPayoutMethod(payoutMethodRaw);
-    payoutAddress = payTo;
+    paymentOptions = parsedPaymentOptions.options;
+    const primary = paymentOptions[0];
+    priceAtomic = primary?.priceAtomic || null;
+    payTo = primary?.payTo || null;
+    chainId = primary?.chainId || null;
+    paymentNetwork = primary?.network || null;
+    payoutMethod = primary?.payoutMethod || null;
+    payoutAddress = primary?.payoutAddress || payTo;
     const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
     paymentSalt = bytesToBase64(saltBuf);
   }
@@ -537,6 +557,7 @@ async function handleUpload(request, env) {
     paymentNetwork,
     payoutMethod,
     payoutAddress,
+    paymentOptions,
     paymentSalt,
   };
 
@@ -569,7 +590,7 @@ async function handleUpload(request, env) {
   if (priceAtomic) {
     writeShareEvent(env, "upload_paid", slug, {
       userId: user.userId,
-      network: chainId ? X402_NETWORKS[chainId]?.name || "" : "",
+      network: paymentNetwork || "",
     });
   }
 
@@ -587,7 +608,8 @@ async function handleUpload(request, env) {
     paymentNetwork: paymentNetwork || (chainId ? X402_NETWORKS[chainId]?.name || null : null),
     payoutMethod: payoutMethod || null,
     payoutAddress: payoutAddress || payTo,
-    network: chainId ? X402_NETWORKS[chainId]?.name || null : null,
+    paymentOptions,
+    network: paymentNetwork || (chainId ? X402_NETWORKS[chainId]?.name || null : null),
     size,
     originalName,
     quota: {
@@ -654,7 +676,7 @@ function patchBodyFromForm(form) {
     return typeof value === "string" ? value : undefined;
   };
 
-  for (const name of ["password", "price", "payTo", "payoutAddress", "paymentNetwork", "payoutMethod", "expiresDays"]) {
+  for (const name of ["password", "price", "payTo", "payoutAddress", "paymentNetwork", "payoutMethod", "paymentOptions", "expiresDays"]) {
     if (form.has(name)) {
       body[name] = stringField(name) ?? "";
     }
@@ -714,6 +736,8 @@ async function handleList(request, env) {
     liveSlugs.push(slug);
     liveBytes += meta.size || 0;
     const listedUrl = await buildListedShareUrl(origin, slug, env, meta);
+    const primaryOption = primaryPaymentOption(meta);
+    const paymentOptions = paymentOptionsFromMeta(meta);
     items.push({
       slug,
       url: listedUrl.url,
@@ -725,12 +749,13 @@ async function handleList(request, env) {
       expiresAtMs: meta.expiresAtMs || null,
       hasPassword: !!meta.passwordHash,
       price: meta.price || null,
-      payTo: meta.payTo || null,
-      chainId: meta.chainId || null,
-      paymentNetwork: meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
-      payoutMethod: meta.payoutMethod || null,
-      payoutAddress: meta.payoutAddress || meta.payTo || null,
-      network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
+      payTo: primaryOption?.payTo || meta.payTo || null,
+      chainId: primaryOption?.chainId ?? meta.chainId ?? null,
+      paymentNetwork: primaryOption?.network || meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
+      payoutMethod: primaryOption?.payoutMethod || meta.payoutMethod || null,
+      payoutAddress: primaryOption?.payoutAddress || meta.payoutAddress || meta.payTo || null,
+      paymentOptions,
+      network: primaryOption?.network || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
     });
   }
 
@@ -939,13 +964,14 @@ async function handlePatch(request, env, slug) {
       // Removing the gate is always allowed — even for users who are no longer
       // on the beta allowlist — so they can always downgrade a paid share back
       // to public without having to wait for re-approval.
-      if (meta.price || meta.payTo || meta.paymentSalt || meta.chainId) {
+      if (meta.price || meta.payTo || meta.paymentSalt || meta.chainId || Array.isArray(meta.paymentOptions)) {
         meta.price = null;
         meta.payTo = null;
         meta.chainId = null;
         meta.paymentNetwork = null;
         meta.payoutMethod = null;
         meta.payoutAddress = null;
+        meta.paymentOptions = [];
         meta.paymentSalt = null;
         changed = true;
       }
@@ -964,51 +990,43 @@ async function handlePatch(request, env, slug) {
       if (meta.passwordHash) {
         return jsonResponse({ error: "price-and-password-mutually-exclusive" }, 400);
       }
-      const parsed = parseUsdcPrice(String(pv));
-      if (parsed === null) {
-        return jsonResponse({ error: "invalid-price" }, 400);
+      const hasPaymentOptions = Object.prototype.hasOwnProperty.call(body, "paymentOptions");
+      const hasPayout = Object.prototype.hasOwnProperty.call(body, "payTo") ||
+        Object.prototype.hasOwnProperty.call(body, "payoutAddress");
+      let parsedOptions;
+      if (hasPaymentOptions || hasPayout) {
+        parsedOptions = parsePaymentOptionsForRequest({
+          priceRaw: String(pv),
+          paymentOptionsRaw: hasPaymentOptions ? body.paymentOptions : undefined,
+          payToRaw: hasPayout && Object.prototype.hasOwnProperty.call(body, "payTo") ? body.payTo : undefined,
+          payoutAddressRaw: hasPayout && Object.prototype.hasOwnProperty.call(body, "payoutAddress") ? body.payoutAddress : undefined,
+          paymentNetworkRaw: typeof body.paymentNetwork === "string" ? body.paymentNetwork : (meta.paymentNetwork || ""),
+          payoutMethodRaw: body.payoutMethod || meta.payoutMethod,
+          env,
+        });
+      } else {
+        parsedOptions = repricePaymentOptions(paymentOptionsFromMeta(meta), String(pv));
       }
-      if (parsed < MIN_PRICE_ATOMIC || parsed > MAX_PRICE_ATOMIC) {
+      if (parsedOptions.error) {
         return jsonResponse(
           {
-            error: "price-out-of-range",
-            minAtomic: MIN_PRICE_ATOMIC.toString(),
-            maxAtomic: MAX_PRICE_ATOMIC.toString(),
+            error: parsedOptions.error,
+            ...(parsedOptions.minAtomic ? { minAtomic: parsedOptions.minAtomic } : {}),
+            ...(parsedOptions.maxAtomic ? { maxAtomic: parsedOptions.maxAtomic } : {}),
           },
-          400,
+          parsedOptions.error === "payment-network-not-configured" ? 500 : 400,
         );
       }
-      // Recipient: take from body if present, else keep existing. If neither,
-      // reject — a price without a recipient is unusable.
-      const requestedPayout = parseRequestedPayoutAddress(
-        Object.prototype.hasOwnProperty.call(body, "payTo") ? body.payTo : undefined,
-        Object.prototype.hasOwnProperty.call(body, "payoutAddress") ? body.payoutAddress : undefined,
-      );
-      if (requestedPayout.error) {
-        return jsonResponse({ error: requestedPayout.error }, 400);
-      }
-      let effectivePayTo;
-      if (requestedPayout.sawValue) {
-        if (!requestedPayout.address) {
-          return jsonResponse({ error: "price-payTo-both-required" }, 400);
-        }
-        effectivePayTo = requestedPayout.address;
-      } else if (meta.payoutAddress || meta.payTo) {
-        effectivePayTo = meta.payoutAddress || meta.payTo;
-      } else {
-        return jsonResponse({ error: "price-payTo-both-required" }, 400);
-      }
-      const requestedNetwork = typeof body.paymentNetwork === "string" ? body.paymentNetwork : (meta.paymentNetwork || "");
-      const resolvedChainId = meta.chainId || resolveChainId(env, requestedNetwork);
-      if (!resolvedChainId) {
-        return jsonResponse({ error: "payment-network-not-configured" }, 500);
-      }
-      meta.price = parsed.toString();
-      meta.payTo = effectivePayTo;
-      meta.chainId = resolvedChainId;
-      meta.paymentNetwork = X402_NETWORKS[resolvedChainId]?.name || null;
-      meta.payoutMethod = normalizeRequestedPayoutMethod(body.payoutMethod || meta.payoutMethod);
-      meta.payoutAddress = effectivePayTo;
+      const nextOptions = parsedOptions.options || [];
+      if (nextOptions.length === 0) return jsonResponse({ error: "price-payTo-both-required" }, 400);
+      const primary = nextOptions[0];
+      meta.price = primary.priceAtomic;
+      meta.payTo = primary.payTo;
+      meta.chainId = primary.chainId;
+      meta.paymentNetwork = primary.network;
+      meta.payoutMethod = primary.payoutMethod;
+      meta.payoutAddress = primary.payoutAddress;
+      meta.paymentOptions = nextOptions;
       const saltBuf = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_BYTES));
       meta.paymentSalt = bytesToBase64(saltBuf);
       changed = true;
@@ -1174,6 +1192,8 @@ async function handlePatch(request, env, slug) {
   await saveUserStats(env, user.userId, stats);
 
   const origin = new URL(request.url).origin;
+  const responsePaymentOptions = paymentOptionsFromMeta(meta);
+  const primaryOption = responsePaymentOptions[0] || null;
   return jsonResponse({
     ok: true,
     slug,
@@ -1182,12 +1202,13 @@ async function handlePatch(request, env, slug) {
     expiresAtMs: meta.expiresAtMs,
     hasPassword: !!meta.passwordHash,
     price: meta.price || null,
-    payTo: meta.payTo || null,
-    chainId: meta.chainId || null,
-    paymentNetwork: meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
-    payoutMethod: meta.payoutMethod || null,
-    payoutAddress: meta.payoutAddress || meta.payTo || null,
-    network: meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null,
+    payTo: primaryOption?.payTo || meta.payTo || null,
+    chainId: primaryOption?.chainId ?? meta.chainId ?? null,
+    paymentNetwork: primaryOption?.network || meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
+    payoutMethod: primaryOption?.payoutMethod || meta.payoutMethod || null,
+    payoutAddress: primaryOption?.payoutAddress || meta.payoutAddress || meta.payTo || null,
+    paymentOptions: responsePaymentOptions,
+    network: primaryOption?.network || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null),
     size: meta.size,
     originalName: meta.originalName,
     updatedAtMs: meta.updatedAtMs || null,
@@ -1244,14 +1265,14 @@ async function handleView(request, env, ctx, slug, headOnly = false) {
   // Payment gate (x402). Runs after the password gate — content-type-agnostic,
   // independent from password auth. On first visit (no cookie, no X-PAYMENT
   // header), returns 402 with the x402 requirements body. When X-PAYMENT is
-  // present, verifies via the configured facilitator, mints a short-lived
-  // `share_paid` cookie, and falls through to the format branch. Settlement
-  // (broadcasting the transfer tx on-chain) is fired via ctx.waitUntil after
-  // verify — the facilitator has already confirmed the signature + nonce, so
-  // settle is essentially a formality.
+  // present, verifies via the configured facilitator, settles/broadcasts the
+  // payment, mints a short-lived `share_paid` cookie, and falls through to the
+  // format branch. Do not unlock on verify-only: Liquid PSETs can verify but
+  // still fail mempool acceptance, and paid content must fail closed.
 
 const paymentExtraHeaders = {};
-if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
+const activePaymentOptions = paymentOptionsFromMeta(meta);
+if (meta.price && meta.paymentSalt && activePaymentOptions.length > 0) {
   const cookies = parseCookies(request.headers.get("cookie") || "");
   const paidToken = cookies[PAID_COOKIE_NAME] || "";
   const hasPaidSession = paidToken
@@ -1291,7 +1312,8 @@ if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
       return build402Response(request, slug, x402Body);
     }
 
-    const verifyResult = await verifyHazbasePayment(env, requirementResult.paymentRequestId, xPaymentHeader);
+    const paymentRequestId = resolvePaymentRequestIdForHeader(xPaymentHeader, requirementResult);
+    const verifyResult = await verifyHazbasePayment(env, paymentRequestId, xPaymentHeader);
     if (!verifyResult || !verifyResult.verified) {
       const reason = (verifyResult && (verifyResult.invalidReason || verifyResult.errorCode)) || "payment-verification-failed";
       writeShareEvent(env, reason === "facilitator_unavailable" ? "facilitator_unavailable" : "verify_failed", slug, {
@@ -1308,21 +1330,20 @@ if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
       );
     }
 
-    writeShareEvent(env, "paid_view", slug, {
-      userId: meta.userId || "",
-      network: requirements.network || "",
-    });
-
-    if (ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(
-        settleHazbasePayment(env, requirementResult.paymentRequestId, xPaymentHeader).catch((err) => {
-          console.error("[share-worker] hazbase settle failed", err?.stack || err);
-          writeShareEvent(env, "settle_failed", slug, {
-            userId: meta.userId || "",
-            network: requirements.network || "",
-            reason: String(err?.message || err || "").slice(0, 200),
-          });
-        }),
+    const settleResult = await settleHazbasePayment(env, paymentRequestId, xPaymentHeader);
+    if (!isHazbaseSettlementSuccess(settleResult)) {
+      const reason = hazbaseSettlementFailureReason(settleResult);
+      writeShareEvent(env, "settle_failed", slug, {
+        userId: meta.userId || "",
+        network: requirements.network || "",
+        reason,
+      });
+      return jsonResponse(
+        {
+          x402Version: X402_VERSION,
+          error: reason,
+        },
+        402,
       );
     }
 
@@ -1340,10 +1361,14 @@ if (meta.price && meta.paymentSalt && meta.chainId && meta.payTo) {
     if (previewHeader) {
       paymentExtraHeaders["x-payment-response"] = previewHeader;
     }
+    writeShareEvent(env, "paid_view", slug, {
+      userId: meta.userId || "",
+      network: requirements.network || "",
+    });
   } else {
     writeShareEvent(env, "paid_cookie_hit", slug, {
       userId: meta.userId || "",
-      network: meta.paymentNetwork || X402_NETWORKS[meta.chainId]?.name || "",
+      network: activePaymentOptions[0]?.network || meta.paymentNetwork || "",
     });
   }
 }
@@ -1475,6 +1500,193 @@ async function handleUnlock(request, env, slug) {
       ...SECURITY_HEADERS,
     },
   });
+}
+
+async function handlePaymentSubmit(request, env, ctx, slug) {
+  const meta = await loadMetadata(env, slug);
+  if (!meta) return textResponse("Not Found", 404, SECURITY_HEADERS);
+  if (meta.expiresAtMs && Date.now() > meta.expiresAtMs) {
+    return textResponse("Expired", 410, SECURITY_HEADERS);
+  }
+
+  const activePaymentOptions = paymentOptionsFromMeta(meta);
+  if (!meta.price || !meta.paymentSalt || activePaymentOptions.length === 0) {
+    return paymentSubmitErrorResponse(request, slug, "payment-not-configured", 400);
+  }
+
+  const xPaymentHeader = await readSubmittedXPayment(request);
+  if (!xPaymentHeader) {
+    return paymentSubmitErrorResponse(request, slug, "x-payment-required", 400);
+  }
+
+  const viewUrl = new URL(`/v/${slug}`, request.url).toString();
+  const requirementResult = await requestHazbasePaymentRequirements(env, meta, slug, viewUrl);
+  if (!requirementResult.ok) {
+    return paymentSubmitErrorResponse(
+      request,
+      slug,
+      requirementResult.errorCode || "payment-service-unavailable",
+      503,
+    );
+  }
+
+  const requirements = requirementResult.requirements;
+  const paymentRequestId = resolvePaymentRequestIdForHeader(xPaymentHeader, requirementResult);
+  const verifyResult = await verifyHazbasePayment(env, paymentRequestId, xPaymentHeader);
+  if (!verifyResult || !verifyResult.verified) {
+    const reason = (verifyResult && (verifyResult.invalidReason || verifyResult.errorCode)) || "payment-verification-failed";
+    writeShareEvent(env, reason === "facilitator_unavailable" ? "facilitator_unavailable" : "verify_failed", slug, {
+      userId: meta.userId || "",
+      network: requirements?.network || "",
+      reason,
+    });
+    return paymentSubmitErrorResponse(request, slug, reason, 402);
+  }
+
+  const settleResult = await settleHazbasePayment(env, paymentRequestId, xPaymentHeader);
+  if (!isHazbaseSettlementSuccess(settleResult)) {
+    const reason = hazbaseSettlementFailureReason(settleResult);
+    writeShareEvent(env, "settle_failed", slug, {
+      userId: meta.userId || "",
+      network: requirements?.network || "",
+      reason,
+      source: "payment_submit",
+    });
+    return paymentSubmitErrorResponse(request, slug, reason, 402);
+  }
+
+  const setCookie = await buildPaidShareCookieHeader(slug, env, meta.paymentSalt);
+  const previewHeader = verifyResult?.responsePreview?.headers?.["x-payment-response"];
+  const successHeaders = { "set-cookie": setCookie };
+  if (previewHeader) successHeaders["x-payment-response"] = previewHeader;
+  writeShareEvent(env, "paid_view", slug, {
+    userId: meta.userId || "",
+    network: requirements?.network || activePaymentOptions[0]?.network || "",
+    source: "payment_submit",
+  });
+
+  if (!prefersHtml(request)) {
+    return jsonResponse({
+      ok: true,
+      slug,
+      paymentRequestId,
+      status: "settled",
+    }, 200, successHeaders);
+  }
+
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: `/v/${slug}`,
+      ...successHeaders,
+      ...SECURITY_HEADERS,
+    },
+  });
+}
+
+async function readSubmittedXPayment(request) {
+  const headerPayment = sanitizeSubmittedXPayment(request.headers.get("x-payment") || "");
+  if (headerPayment) return headerPayment;
+
+  const contentType = String(request.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("application/json")) {
+    const body = await request.json().catch(() => null);
+    if (body && typeof body === "object" && !Array.isArray(body)) {
+      return sanitizeSubmittedXPayment(body.xPayment || body.x_payment || body.payment || body.paymentHeader || "");
+    }
+    return "";
+  }
+
+  if (contentType.includes("application/x-www-form-urlencoded") || contentType.includes("multipart/form-data")) {
+    const form = await request.formData().catch(() => null);
+    if (!form) return "";
+    return sanitizeSubmittedXPayment(form.get("xPayment") || form.get("x-payment") || form.get("payment") || "");
+  }
+
+  const text = await request.text().catch(() => "");
+  return sanitizeSubmittedXPayment(text);
+}
+
+function sanitizeSubmittedXPayment(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || text.length > 256 * 1024) return "";
+  return text;
+}
+
+async function buildPaidShareCookieHeader(slug, env, paymentSalt) {
+  const expMs = Date.now() + PAID_COOKIE_MAX_AGE_SEC * 1000;
+  const token = await signUnlockToken(slug, env, paymentSalt, expMs);
+  return [
+    `${PAID_COOKIE_NAME}=${token}`,
+    `Path=/v/${slug}`,
+    `Max-Age=${PAID_COOKIE_MAX_AGE_SEC}`,
+    "HttpOnly",
+    "Secure",
+    "SameSite=Lax",
+  ].join("; ");
+}
+
+function paymentSubmitErrorResponse(request, slug, reason, status = 400) {
+  if (!prefersHtml(request)) {
+    return jsonResponse({ ok: false, error: reason }, status);
+  }
+  return htmlResponse(renderPaymentSubmitError(slug, reason), status);
+}
+
+function renderPaymentSubmitError(slug, reason) {
+  const title = paymentSubmitErrorTitle(reason);
+  const message = paymentSubmitErrorMessage(reason);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)} · viveworker share</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+${FAVICON_LINK}
+<style>
+  :root { color-scheme: light dark; --bg: #0b0f17; --fg: #e8ecf1; --dim: #9aa4b2; --accent: #5ce0a8; --card: #141a24; --border: #2f3b4c; --danger: #ff9b9b; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f6f7f9; --fg: #161a22; --dim: #5a6270; --accent: #0a9863; --card: #ffffff; --border: #dfe3ea; --danger: #b3261e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 32px 20px; background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }
+  main { width: min(100%, 560px); background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 28px; }
+  h1 { margin: 0 0 10px; color: var(--danger); font-size: 22px; }
+  p { margin: 0 0 16px; color: var(--dim); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>${escapeHtml(title)}</h1>
+  <p>${escapeHtml(message)}</p>
+  <p><a href="/v/${escapeHtml(slug)}">Back to payment page</a></p>
+</main>
+</body>
+</html>`;
+}
+
+function paymentSubmitErrorTitle(reason) {
+  if (reason === "x-payment-required") return "Signed payment is missing";
+  if (reason === "payment-not-configured") return "Payment is not available";
+  if (reason === "payment-service-unavailable" || reason === "facilitator_unavailable") return "Payment service is temporarily unavailable";
+  return "Payment could not be verified";
+}
+
+function paymentSubmitErrorMessage(reason) {
+  if (reason === "x-payment-required") {
+    return "Paste the signed X-PAYMENT value from your wallet or agent, then submit again.";
+  }
+  if (reason === "payment-not-configured") {
+    return "This share does not currently have an active payment option.";
+  }
+  if (reason === "payment-service-unavailable" || reason === "facilitator_unavailable") {
+    return "Please wait a moment and try again. The share is still safe; the payment backend just could not be reached.";
+  }
+  if (reason === "expired" || reason === "payment_expired") {
+    return "This payment request has expired. Open the share again to get a fresh payment request.";
+  }
+  return "The signed payment did not match this share, amount, recipient, or network. Please request a fresh signature and try again.";
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,11 +1985,16 @@ function sniffImage(bytes) {
 // "0.10" → 100000n ; "1" → 1000000n ; "0.000001" → 1n.
 // Returns null on bad format or >6 fractional digits.
 function parseUsdcPrice(raw) {
+  return parseAtomicPrice(raw, 6);
+}
+
+function parseAtomicPrice(raw, decimals) {
   if (typeof raw !== "string") return null;
-  if (!/^\d+(\.\d{1,6})?$/.test(raw)) return null;
+  const maxDecimals = Math.max(0, Math.min(18, Number(decimals) || 0));
+  const pattern = new RegExp(`^\\d+(\\.\\d{1,${maxDecimals}})?$`);
+  if (!pattern.test(raw)) return null;
   const [whole, frac = ""] = raw.split(".");
-  // Pad fractional part to exactly 6 digits (USDC decimals).
-  const padded = frac.padEnd(6, "0").slice(0, 6);
+  const padded = frac.padEnd(maxDecimals, "0").slice(0, maxDecimals);
   // Strip leading zeros (but preserve a single zero for "0").
   const combined = `${whole}${padded}`.replace(/^0+(?=\d)/, "");
   try {
@@ -1796,10 +2013,39 @@ function normalizeEthAddress(addr) {
   return String(addr || "").toLowerCase();
 }
 
-function normalizeRequestedPayoutMethod(raw) {
-  return typeof raw === "string" && raw.trim() === "hazbase_wallet"
-    ? "hazbase_wallet"
-    : "external_eoa";
+function normalizePaymentNetworkKey(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "basesepolia") return "base-sepolia";
+  if (value === "polygonamoy" || value === "amoy") return "polygon-amoy";
+  if (value === "matic") return "polygon";
+  if (value === "liquid" || value === "liquid-mainnet") return "liquidv1";
+  return PAYMENT_NETWORKS[value] ? value : "";
+}
+
+function isPaymentNetworkAvailable(network) {
+  return PAYMENT_NETWORKS[network]?.releaseStatus !== "comingSoon";
+}
+
+function paymentNetworkForChainId(chainId) {
+  const id = Number(chainId || 0);
+  return Object.entries(PAYMENT_NETWORKS).find(([, entry]) => entry.chainId === id)?.[0] || "";
+}
+
+function normalizePaymentAsset(raw, network) {
+  const networkInfo = PAYMENT_NETWORKS[network] || null;
+  const value = String(raw || networkInfo?.asset || "").trim().toLowerCase();
+  if (value === "usd-t" || value === "tether") return "usdt";
+  if (value === "jpy" || value === "jpy-coin") return "jpyc";
+  if (value === "bitcoin" || value === "btc") return "lbtc";
+  const allowed = Array.isArray(networkInfo?.assets) ? networkInfo.assets : [networkInfo?.asset].filter(Boolean);
+  return PAYMENT_ASSETS[value] && allowed.includes(value) ? value : "";
+}
+
+function normalizeRequestedPayoutMethod(raw, network = "") {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  const family = PAYMENT_NETWORKS[network]?.family || "evm";
+  if (family === "liquid") return "external_liquid";
+  return value === "hazbase_wallet" ? "hazbase_wallet" : "external_eoa";
 }
 
 function parseRequestedPayoutAddress(...values) {
@@ -1822,10 +2068,184 @@ function parseRequestedPayoutAddress(...values) {
   return { address: normalized, sawValue };
 }
 
+function isValidLiquidAddress(addr, network) {
+  if (typeof addr !== "string") return false;
+  const value = addr.trim().toLowerCase();
+  if (network === "liquidtestnet") return /^(tlq1|tex1)[0-9a-z]{20,}$/u.test(value);
+  if (network === "liquidv1") return /^(lq1|ex1)[0-9a-z]{20,}$/u.test(value);
+  return false;
+}
+
+function normalizePayoutAddressForNetwork(value, network) {
+  const raw = String(value || "").trim();
+  const family = PAYMENT_NETWORKS[network]?.family || "";
+  if (family === "evm") {
+    if (!isValidEthAddress(raw)) return { error: "invalid-payTo" };
+    return { address: normalizeEthAddress(raw) };
+  }
+  if (family === "liquid") {
+    if (!isValidLiquidAddress(raw, network)) return { error: "invalid-payTo" };
+    return { address: raw.toLowerCase() };
+  }
+  return { error: "payment-network-not-configured" };
+}
+
+function parsePaymentOptionsJson(raw) {
+  if (typeof raw !== "string" || raw.trim().length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function minAtomicForAsset(asset) {
+  const decimals = PAYMENT_ASSETS[asset]?.decimals ?? 6;
+  if (decimals < 2) return 1n;
+  return 10n ** BigInt(decimals - 2);
+}
+
+function maxAtomicForAsset(asset) {
+  const decimals = PAYMENT_ASSETS[asset]?.decimals ?? 6;
+  return 1000n * (10n ** BigInt(decimals));
+}
+
+function normalizePaymentOptionInput(option, priceRaw) {
+  const network = normalizePaymentNetworkKey(option?.network);
+  if (!network) return { error: "payment-network-not-configured" };
+  if (!isPaymentNetworkAvailable(network)) return { error: "payment-network-coming-soon" };
+  const networkInfo = PAYMENT_NETWORKS[network];
+  const asset = normalizePaymentAsset(option?.asset, network);
+  if (!asset) return { error: "unsupported-payment-asset" };
+  const decimals = PAYMENT_ASSETS[asset]?.decimals ?? 6;
+  const priceAtomic = parseAtomicPrice(priceRaw, decimals);
+  if (priceAtomic === null) return { error: "invalid-price" };
+  if (priceAtomic < minAtomicForAsset(asset) || priceAtomic > maxAtomicForAsset(asset)) {
+    return {
+      error: "price-out-of-range",
+      minAtomic: minAtomicForAsset(asset).toString(),
+      maxAtomic: maxAtomicForAsset(asset).toString(),
+    };
+  }
+  const payout = normalizePayoutAddressForNetwork(option?.payTo || option?.payoutAddress, network);
+  if (payout.error) return payout;
+  return {
+    network,
+    family: networkInfo.family,
+    chainId: networkInfo.chainId,
+    scheme: option?.scheme || networkInfo.scheme,
+    asset,
+    assetId: typeof option?.assetId === "string" ? option.assetId : "",
+    decimals,
+    priceAtomic: priceAtomic.toString(),
+    payTo: payout.address,
+    payoutAddress: payout.address,
+    payoutMethod: normalizeRequestedPayoutMethod(option?.payoutMethod, network),
+  };
+}
+
+function parsePaymentOptionsForRequest({ priceRaw, paymentOptionsRaw, payToRaw, payoutAddressRaw, paymentNetworkRaw, payoutMethodRaw, env }) {
+  const anyPricePresent = typeof priceRaw === "string" && priceRaw.length > 0;
+  const rawOptions = parsePaymentOptionsJson(paymentOptionsRaw);
+  if (rawOptions) {
+    if (!anyPricePresent) return { error: "price-payTo-both-required", sawPaymentValue: true };
+    if (rawOptions.length === 0 || rawOptions.length > 8) return { error: "invalid-payment-options", sawPaymentValue: true };
+    const normalized = [];
+    for (const option of rawOptions) {
+      const parsed = normalizePaymentOptionInput(option, priceRaw);
+      if (parsed.error) return { ...parsed, sawPaymentValue: true };
+      const duplicate = normalized.some((entry) => (
+        entry.network === parsed.network &&
+        entry.asset === parsed.asset &&
+        entry.payTo === parsed.payTo
+      ));
+      if (!duplicate) normalized.push(parsed);
+    }
+    return { options: normalized, sawPaymentValue: true };
+  }
+
+  const requestedPayout = parseRequestedPayoutAddress(payToRaw, payoutAddressRaw);
+  if (requestedPayout.error) return { error: requestedPayout.error, sawPaymentValue: true };
+  if (!anyPricePresent && !requestedPayout.sawValue) return { options: [], sawPaymentValue: false };
+  if (!anyPricePresent || !requestedPayout.address) return { error: "price-payTo-both-required", sawPaymentValue: true };
+  const requestedNetwork = typeof paymentNetworkRaw === "string" ? paymentNetworkRaw : "";
+  const resolvedChainId = resolveChainId(env, requestedNetwork);
+  if (!resolvedChainId) return { error: "payment-network-not-configured", sawPaymentValue: true };
+  const network = paymentNetworkForChainId(resolvedChainId) || X402_NETWORKS[resolvedChainId]?.name || "";
+  const parsed = normalizePaymentOptionInput({
+    network,
+    asset: "usdc",
+    payTo: requestedPayout.address,
+    payoutMethod: payoutMethodRaw,
+  }, priceRaw);
+  if (parsed.error) return { ...parsed, sawPaymentValue: true };
+  return { options: [parsed], sawPaymentValue: true };
+}
+
+function paymentOptionsFromMeta(meta) {
+  if (Array.isArray(meta?.paymentOptions)) {
+    return meta.paymentOptions
+      .map((option) => {
+        const network = normalizePaymentNetworkKey(option?.network);
+        const asset = normalizePaymentAsset(option?.asset, network);
+        const payTo = String(option?.payTo || option?.payoutAddress || "").trim();
+        if (!network || !asset || !payTo) return null;
+        const networkInfo = PAYMENT_NETWORKS[network];
+        return {
+          network,
+          family: networkInfo.family,
+          chainId: networkInfo.chainId,
+          scheme: option?.scheme || networkInfo.scheme,
+          asset,
+          assetId: String(option?.assetId || ""),
+          decimals: Number(option?.decimals || PAYMENT_ASSETS[asset]?.decimals || 6),
+          priceAtomic: String(option?.priceAtomic || meta.price || ""),
+          payTo,
+          payoutAddress: payTo,
+          payoutMethod: normalizeRequestedPayoutMethod(option?.payoutMethod, network),
+        };
+      })
+      .filter(Boolean);
+  }
+  if (!meta?.price || !meta?.payTo) return [];
+  const network = normalizePaymentNetworkKey(meta.paymentNetwork) || paymentNetworkForChainId(meta.chainId);
+  if (!network) return [];
+  return [{
+    network,
+    family: PAYMENT_NETWORKS[network].family,
+    chainId: PAYMENT_NETWORKS[network].chainId,
+    scheme: PAYMENT_NETWORKS[network].scheme,
+    asset: "usdc",
+    assetId: X402_NETWORKS[meta.chainId]?.usdc || "",
+    decimals: 6,
+    priceAtomic: String(meta.price),
+    payTo: meta.payoutAddress || meta.payTo,
+    payoutAddress: meta.payoutAddress || meta.payTo,
+    payoutMethod: normalizeRequestedPayoutMethod(meta.payoutMethod, network),
+  }];
+}
+
+function primaryPaymentOption(meta) {
+  return paymentOptionsFromMeta(meta)[0] || null;
+}
+
+function repricePaymentOptions(options, priceRaw) {
+  const repriced = [];
+  for (const option of options) {
+    const parsed = normalizePaymentOptionInput(option, priceRaw);
+    if (parsed.error) return parsed;
+    repriced.push(parsed);
+  }
+  return { options: repriced };
+}
+
 function resolveChainId(env, explicitNetwork = "") {
   const net = String(explicitNetwork || env?.X402_NETWORK || "").toLowerCase().trim();
   if (net === "base") return 8453;
   if (net === "base-sepolia" || net === "basesepolia" || net === "sepolia") return 84532;
+  if (net === "polygon" || net === "matic") return 137;
+  if (net === "polygon-amoy" || net === "polygonamoy" || net === "amoy") return 80002;
   return null;
 }
 
@@ -1862,63 +2282,86 @@ function hazbaseApiBase(env) {
   return String(env?.HAZBASE_API_ENDPOINT || DEFAULT_HAZBASE_API_ENDPOINT).replace(/\/$/u, "");
 }
 
-function effectivePaymentNetwork(meta) {
-  return meta.paymentNetwork || (meta.chainId ? X402_NETWORKS[meta.chainId]?.name || null : null);
-}
-
-function buildHazbasePaymentPayload(meta, slug, requestUrl) {
-  const network = effectivePaymentNetwork(meta);
-  const payoutAddress = meta.payoutAddress || meta.payTo;
-  if (!network || !payoutAddress) return null;
-  return {
-    resourceId: `share:${slug}`,
+function buildHazbasePaymentPayloads(meta, slug, requestUrl) {
+  const options = paymentOptionsFromMeta(meta);
+  return options.map((option, index) => ({
+    resourceId: `share:${slug}:${option.network}:${option.asset}:${index}`,
     resourceUrl: canonicalizeResourceUrl(requestUrl),
     description: `Unlock viveworker share ${slug}`,
     mimeType: meta.contentType || LEGACY_CONTENT_TYPE,
-    network,
-    asset: "usdc",
-    priceAtomic: meta.price,
+    network: option.network,
+    asset: option.asset,
+    priceAtomic: option.priceAtomic || meta.price,
     payoutMethod: {
-      kind: "external_eoa",
-      address: payoutAddress,
+      kind: payoutMethodForRequirements(option),
+      address: option.payTo,
     },
     metadata: {
       slug,
       ownerUserId: meta.userId || "",
       paymentSalt: meta.paymentSalt || "",
-      payoutOriginKind: meta.payoutMethod || "external_eoa",
+      payoutOriginKind: option.payoutMethod,
+      paymentOptionIndex: index,
+      scheme: option.scheme,
     },
-  };
+  }));
+}
+
+function payoutMethodForRequirements(option) {
+  const family = PAYMENT_NETWORKS[option?.network]?.family || "evm";
+  if (family === "liquid") return "external_liquid";
+  return "external_eoa";
 }
 
 async function requestHazbasePaymentRequirements(env, meta, slug, requestUrl) {
-  const payload = buildHazbasePaymentPayload(meta, slug, requestUrl);
-  if (!payload) return { ok: false, errorCode: "payment-network-not-configured" };
+  const payloads = buildHazbasePaymentPayloads(meta, slug, requestUrl);
+  if (payloads.length === 0) return { ok: false, errorCode: "payment-network-not-configured" };
   try {
-    const res = await fetch(`${hazbaseApiBase(env)}/api/payments/x402/requirements`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-request-id": `share_req_${crypto.randomUUID()}`,
-      },
-      body: JSON.stringify(payload),
-    });
-    const json = await res.json().catch(() => null);
-    const data = json?.data || json;
-    if (!res.ok || !data?.paymentRequestId || !data?.x402?.accepts?.[0]) {
-      return { ok: false, errorCode: data?.errorCode || data?.error || "payment-service-unavailable" };
+    const accepts = [];
+    const paymentRequests = [];
+    for (const payload of payloads) {
+      const res = await fetch(`${hazbaseApiBase(env)}/api/payments/x402/requirements`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": `share_req_${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json().catch(() => null);
+      const data = json?.data || json;
+      if (!res.ok || !data?.paymentRequestId || !data?.x402?.accepts?.[0]) {
+        return { ok: false, errorCode: data?.errorCode || data?.error || "payment-service-unavailable" };
+      }
+      const requirement = data.x402.accepts[0];
+      requirement.extra = {
+        ...(requirement.extra || {}),
+        paymentRequestId: data.paymentRequestId,
+      };
+      accepts.push(requirement);
+      paymentRequests.push({
+        paymentRequestId: data.paymentRequestId,
+        scheme: requirement.scheme || payload.metadata.scheme,
+        network: requirement.network || payload.network,
+        asset: payload.asset,
+        assetAddress: requirement.asset || payload.assetAddress || "",
+      });
     }
+    const firstPaymentRequestId = paymentRequests[0]?.paymentRequestId || "";
     const x402 = {
-      ...data.x402,
+      x402Version: X402_VERSION,
+      accepts,
       // Non-standard but additive: viveworker's hazBase Smart Wallet buyer
       // can use this stable id to ask hazBase to execute the payment, while
       // normal x402 clients keep reading accepts[0] unchanged.
-      paymentRequestId: data.paymentRequestId,
-      hazbase: { paymentRequestId: data.paymentRequestId },
+      paymentRequestId: firstPaymentRequestId,
+      hazbase: { paymentRequestId: firstPaymentRequestId },
+      viveworker: { paymentRequests },
     };
     return {
       ok: true,
-      paymentRequestId: data.paymentRequestId,
+      paymentRequestId: firstPaymentRequestId,
+      paymentRequests,
       x402,
       requirements: x402.accepts[0],
     };
@@ -1926,6 +2369,24 @@ async function requestHazbasePaymentRequirements(env, meta, slug, requestUrl) {
     console.error("[share-worker] hazbase requirements error", err?.stack || err);
     return { ok: false, errorCode: "payment-service-unavailable" };
   }
+}
+
+function resolvePaymentRequestIdForHeader(xPaymentHeader, requirementResult) {
+  const decoded = decodeX402Header(xPaymentHeader);
+  const direct = String(decoded?.paymentRequestId || decoded?.payload?.paymentRequestId || "").trim();
+  if (/^[a-zA-Z0-9:_-]{8,160}$/u.test(direct)) return direct;
+  const scheme = String(decoded?.scheme || "").trim();
+  const network = String(decoded?.network || "").trim();
+  const assetAddress = String(decoded?.asset || decoded?.payload?.asset || "").trim().toLowerCase();
+  const assetKey = String(decoded?.assetKey || decoded?.payload?.assetKey || "").trim().toLowerCase();
+  const requests = Array.isArray(requirementResult?.paymentRequests) ? requirementResult.paymentRequests : [];
+  const match = requests.find((entry) => (
+    (!scheme || String(entry.scheme || "") === scheme) &&
+    (!network || String(entry.network || "") === network) &&
+    (!assetKey || String(entry.asset || "") === assetKey) &&
+    (!assetAddress || String(entry.assetAddress || "").toLowerCase() === assetAddress)
+  ));
+  return match?.paymentRequestId || requirementResult?.paymentRequestId || "";
 }
 
 async function verifyHazbasePayment(env, paymentRequestId, xPaymentHeader) {
@@ -1952,6 +2413,29 @@ async function settleHazbasePayment(env, paymentRequestId, xPaymentHeader) {
   });
   const json = await res.json().catch(() => null);
   return json?.data || json;
+}
+
+function isHazbaseSettlementSuccess(result) {
+  return Boolean(result && (
+    result.settled === true ||
+    result.success === true ||
+    result.status === "settled"
+  ));
+}
+
+function hazbaseSettlementFailureReason(result) {
+  const payload = result?.payload || result?.facilitator || {};
+  const reason = String(
+    result?.invalidReason ||
+    result?.errorCode ||
+    result?.error ||
+    payload?.invalidReason ||
+    payload?.errorCode ||
+    payload?.error ||
+    result?.status ||
+    "payment-settlement-failed",
+  ).trim();
+  return (reason || "payment-settlement-failed").slice(0, 200);
 }
 
 // Header-only advertisement of the payment gate. Used on both GET and HEAD so
@@ -2045,9 +2529,11 @@ function build402Response(request, slug, jsonBody) {
 // the embedded JSON keeps the atomic-units string authoritative.
 function build402HtmlBody(jsonBody, requirements, slug) {
   const network = requirements.network;
-  const isTestnet = network === "base-sepolia";
-  const netLabel = isTestnet ? "Base Sepolia (testnet)" : "Base (mainnet)";
-  const priceDecimal = formatUsdcAtomic(requirements.maxAmountRequired);
+  const isLiquid = requirements.scheme === LIQUID_X402_SCHEME;
+  const isTestnet = network === "base-sepolia" || network === "polygon-amoy" || network === "liquidtestnet";
+  const netLabel = networkLabelForRequirement(requirements);
+  const assetLabel = assetLabelForRequirement(requirements);
+  const priceDecimal = formatRequirementAmount(requirements);
   const payToShort = shortenAddress(requirements.payTo);
   const resourceDisplay = escapeHtml(requirements.resource);
   const descriptionDisplay = escapeHtml(requirements.description || `Unlock viveworker share ${slug}`);
@@ -2056,28 +2542,38 @@ function build402HtmlBody(jsonBody, requirements, slug) {
   const assetDisplay = escapeHtml(requirements.asset);
   const jsonPretty = JSON.stringify(jsonBody, null, 2);
   const jsonForScript = jsonPretty.replace(/<\/script/giu, "<\\/script");
+  const paymentTarget = `${assetLabel} on ${netLabel}`;
+  const subtitleCopy = isLiquid
+    ? `This viveworker share is gated by a Liquid x402 payment. Open it with Liquid x402 Wallet or an x402-compatible agent, then approve the payment to unlock.`
+    : `This viveworker share is gated by an x402 payment. Pay the amount below in ${paymentTarget} and the content unlocks instantly.`;
   // Origin derived from the resource URL (always absolute in the x402 body).
   // Fallback to production host on any parse failure.
   let origin = "https://share.viveworker.com";
   try { origin = new URL(requirements.resource).origin; } catch {}
-  const ogDescription = `Payment required · ${priceDecimal} USDC on ${netLabel}. Gated via x402.`;
+  const ogDescription = `Payment required · ${priceDecimal} ${paymentTarget}. Gated via x402.`;
   const codeSnippet = [
-    `// buyer side (Node.js, requires viem + x402-fetch + a Base Sepolia wallet)`,
-    `import { wrapFetchWithPayment } from "x402-fetch";`,
-    `import { createWalletClient, http } from "viem";`,
-    `import { privateKeyToAccount } from "viem/accounts";`,
-    `import { ${isTestnet ? "baseSepolia" : "base"} } from "viem/chains";`,
-    ``,
-    `const wallet = createWalletClient({`,
-    `  account: privateKeyToAccount(process.env.BUYER_PK),`,
-    `  chain: ${isTestnet ? "baseSepolia" : "base"},`,
-    `  transport: http(),`,
-    `});`,
-    `const fetchPaid = wrapFetchWithPayment(fetch, wallet);`,
-    `const res = await fetchPaid(${JSON.stringify(requirements.resource)});`,
+    isLiquid
+      ? `// buyer side: use viveworker share pay with a configured Liquid wallet`
+      : `// buyer side (Node.js, requires viem + x402-fetch + a Base wallet)`,
+    isLiquid
+      ? `// VIVEWORKER_LIQUID_RPC_URL=... viveworker share pay ${requirements.resource}`
+      : `import { wrapFetchWithPayment } from "x402-fetch";`,
+    isLiquid
+      ? `const res = await fetch(${JSON.stringify(requirements.resource)}, { headers: { "X-PAYMENT": "..." } });`
+      : `// ... create a viem wallet client and wrap fetch with payment`,
     `console.log(await res.text());`,
   ].join("\n");
   const codeSnippetEscaped = escapeHtml(codeSnippet);
+  const toolsLead = isLiquid
+    ? `Use the browser extension for human approval, or keep using the normal x402 retry flow from an agent.`
+    : `You need an x402-compatible client (viveworker does not ship a buyer wallet). Easiest path:`;
+  const toolsList = isLiquid ? `
+        <li><strong>Liquid x402 Wallet</strong> — browser extension flow for detecting this page, signing the Liquid PSET, and retrying with <code>X-PAYMENT</code>.</li>
+        <li><strong>viveworker CLI</strong> — configured Liquid wallet/RPC path for agent-style test payments.</li>
+        <li><strong>Raw fetch</strong> — send the signed value as <code>X-PAYMENT</code> when requesting the share URL.</li>` : `
+        <li><strong>x402-fetch</strong> (npm) — spec-compliant <code>fetch</code> wrapper, works with any <a href="https://viem.sh" style="color: inherit;">viem</a> wallet client.</li>
+        <li><strong>Coinbase AgentKit</strong> — <code>x402</code> action, drop-in for CDP-built agents.</li>
+        <li><strong>Raw curl</strong> — possible if you can sign EIP-3009 <code>transferWithAuthorization</code> yourself and base64 it into <code>X-PAYMENT</code>. Spec: <a href="https://x402.org" style="color: inherit;">x402.org</a>.</li>`;
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -2252,6 +2748,14 @@ ${FAVICON_LINK}
     font-size: 14px;
     color: var(--fg);
   }
+  p.card-lead code {
+    background: rgba(92, 224, 168, 0.10);
+    color: var(--accent);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+  }
   pre {
     background: rgba(0, 0, 0, 0.35);
     border: 1px solid var(--border);
@@ -2333,13 +2837,13 @@ ${FAVICON_LINK}
 <body>
 <main class="wrap">
   ${isTestnet ? `<div class="beta-banner">
-    <strong>⚠ CLOSED BETA</strong> · viveworker paid shares are gated on <strong>Base Sepolia</strong> (testnet).
-    No real USDC is being moved. Pay with <a href="https://faucet.circle.com" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline;">test USDC</a>; wallets, settlements, and this UI may change without notice.
+    <strong>⚠ CLOSED BETA</strong> · viveworker paid shares are gated on <strong>${escapeHtml(netLabel)}</strong>.
+    Testnet payments have no production monetary value; wallets, settlements, and this UI may change without notice.
   </div>` : ""}
   <section class="intro">
     <span class="status">402 · Payment Required</span>
     <h1>Unlock this share</h1>
-    <p class="subtitle">This viveworker share is gated by an <a href="https://x402.org" style="color: inherit;">x402</a> payment. Pay the amount below in USDC on Base and the content unlocks instantly.</p>
+    <p class="subtitle">${escapeHtml(subtitleCopy)} <a href="https://x402.org" style="color: inherit;">Learn about x402</a>.</p>
   </section>
 
   <details class="accordion">
@@ -2349,10 +2853,10 @@ ${FAVICON_LINK}
     </summary>
 
     <section class="card">
-      ${isTestnet ? `<div class="testnet-note">⚠️ Testnet — this share is on <strong>Base Sepolia</strong>. Use <strong>test USDC</strong> from the Circle faucet; any "payment" here has no monetary value.</div>` : ""}
+      ${isTestnet ? `<div class="testnet-note">Testnet — this share is on <strong>${escapeHtml(netLabel)}</strong>. Any payment here has no production monetary value.</div>` : ""}
       <div class="price">
         <span class="amount">${escapeHtml(priceDecimal)}</span>
-        <span class="unit">USDC · ${escapeHtml(netLabel)}</span>
+        <span class="unit">${escapeHtml(assetLabel)} · ${escapeHtml(netLabel)}</span>
       </div>
       <dl>
         <dt>Pay to</dt>
@@ -2362,7 +2866,7 @@ ${FAVICON_LINK}
         <dt>Resource</dt>
         <dd class="mono-dim">${resourceDisplay}</dd>
         <dt>Asset</dt>
-        <dd class="mono-dim">USDC @ ${assetDisplay}</dd>
+        <dd class="mono-dim">${escapeHtml(assetLabel)} @ ${assetDisplay}</dd>
         <dt>Network ID</dt>
         <dd>${escapeHtml(String(requirements.network))}</dd>
       </dl>
@@ -2370,12 +2874,10 @@ ${FAVICON_LINK}
 
     <section class="how-to-pay">
       <h2>How to pay</h2>
-      <p class="card-lead">You need an x402-compatible client (viveworker does not ship a buyer wallet). Easiest path:</p>
+      <p class="card-lead">${escapeHtml(toolsLead)}</p>
       <pre>${codeSnippetEscaped}</pre>
       <ul class="tools">
-        <li><strong>x402-fetch</strong> (npm) — spec-compliant <code>fetch</code> wrapper, works with any <a href="https://viem.sh" style="color: inherit;">viem</a> wallet client.</li>
-        <li><strong>Coinbase AgentKit</strong> — <code>x402</code> action, drop-in for CDP-built agents.</li>
-        <li><strong>Raw curl</strong> — possible if you can sign EIP-3009 <code>transferWithAuthorization</code> yourself and base64 it into <code>X-PAYMENT</code>. Spec: <a href="https://x402.org" style="color: inherit;">x402.org</a>.</li>
+        ${toolsList}
       </ul>
     </section>
   </details>
@@ -2399,6 +2901,10 @@ ${FAVICON_LINK}
 // page matches what sellers see in their CLI. Falls back to "0.00" on bad
 // input — the embedded JSON still carries the authoritative atomic value.
 function formatUsdcAtomic(atomic) {
+  return formatAtomicAmount(atomic, 6);
+}
+
+function formatAtomicAmount(atomic, decimals) {
   let n;
   try {
     n = BigInt(String(atomic || "0"));
@@ -2406,10 +2912,32 @@ function formatUsdcAtomic(atomic) {
     return "0.00";
   }
   if (n < 0n) n = -n;
-  const whole = n / 1_000_000n;
-  const frac = (n % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "");
+  const places = Math.max(0, Math.min(18, Number(decimals) || 0));
+  const scale = 10n ** BigInt(places);
+  const whole = scale > 0n ? n / scale : n;
+  const frac = scale > 0n ? (n % scale).toString().padStart(places, "0").replace(/0+$/u, "") : "";
   if (!frac) return `${whole}.00`;
   return `${whole}.${frac.padEnd(2, "0")}`;
+}
+
+function assetLabelForRequirement(requirements) {
+  const key = String(requirements?.extra?.asset || "").toLowerCase();
+  if (key && PAYMENT_ASSETS[key]?.label) return PAYMENT_ASSETS[key].label;
+  const network = normalizePaymentNetworkKey(requirements?.network);
+  const asset = normalizePaymentAsset(key || "", network);
+  return PAYMENT_ASSETS[asset]?.label || (requirements?.scheme === LIQUID_X402_SCHEME ? "USDt" : "USDC");
+}
+
+function formatRequirementAmount(requirements) {
+  const decimals = Number(requirements?.extra?.decimals ?? (requirements?.scheme === LIQUID_X402_SCHEME ? 8 : 6));
+  return formatAtomicAmount(requirements?.maxAmountRequired, decimals);
+}
+
+function networkLabelForRequirement(requirements) {
+  const network = normalizePaymentNetworkKey(requirements?.network);
+  const label = PAYMENT_NETWORKS[network]?.label || String(requirements?.network || "");
+  const testnet = network === "base-sepolia" || network === "polygon-amoy" || network === "liquidtestnet";
+  return `${label}${testnet ? " (testnet)" : ""}`;
 }
 
 function shortenAddress(addr) {
@@ -2889,7 +3417,9 @@ function bytesToBase64(bytes) {
 }
 
 function base64ToBytes(b64) {
-  const s = atob(b64);
+  const normalized = String(b64 || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+  const s = atob(padded);
   const out = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;

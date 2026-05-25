@@ -65,12 +65,21 @@ const REMOTE_PAIRING_RELAY_TOKEN_ROTATION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_COMPLETION_REPLY_ACK_TIMEOUT_MS = 1200;
+const DEFAULT_COMPLETION_REPLY_THREAD_REOPEN_WAIT_MS = 1800;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 const COMPLETION_PUSH_CONTENT_DEDUPE_WINDOW_MS = 2 * 60 * 1000;
 const HAZBASE_METADATA_TIMEOUT_MS = 1500;
 const NPM_VERSION_CHECK_TIMEOUT_MS = 2500;
 const NPM_VERSION_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMELINE_ACTIVITY_TTL_MS = 2 * 60 * 1000;
+const PAYMENT_NETWORKS = {
+  base: { family: "evm", chainId: 8453, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base", releaseStatus: "comingSoon" },
+  "base-sepolia": { family: "evm", chainId: 84532, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base Sepolia" },
+  polygon: { family: "evm", chainId: 137, asset: "usdc", assets: ["usdc", "jpyc"], scheme: "exact", label: "Polygon", releaseStatus: "comingSoon" },
+  "polygon-amoy": { family: "evm", chainId: 80002, asset: "usdc", assets: ["usdc", "jpyc"], scheme: "exact", label: "Polygon Amoy" },
+  liquidtestnet: { family: "liquid", chainId: null, asset: "usdt", assets: ["usdt", "lbtc"], scheme: "exact-liquid-pset", label: "Liquid Testnet" },
+  liquidv1: { family: "liquid", chainId: null, asset: "usdt", assets: ["usdt", "lbtc"], scheme: "exact-liquid-pset", label: "Liquid", releaseStatus: "comingSoon" },
+};
 
 // Shared memo for buildDiffThreadGroups. Each call spawns 3 git subprocesses
 // per tracked repo (`git diff --name-status`, `git status --porcelain`,
@@ -806,7 +815,7 @@ function localizedMcpApprovalPushContent(locale, approval) {
 
 function localizedPaymentApprovalPushContent(locale, approval) {
   const payment = isPlainObject(approval?.rawParams) ? approval.rawParams : {};
-  const amount = cleanText(payment.amountUsdc || payment.amountAtomic || "");
+  const amount = cleanText(`${payment.amountUsdc || payment.amountAtomic || ""} ${payment.assetLabel || ""}`.trim());
   const network = cleanText(payment.network || "");
   const resource = cleanText(payment.resource || payment.url || "");
   const titleKey = cleanText(approval?.kind || "") === "hazbase_wallet_payment"
@@ -7962,7 +7971,7 @@ function createX402PaymentApproval({ config, body, now = Date.now() }) {
   const requestId = cleanText(body.paymentRequestId || body.requestId || crypto.randomUUID());
   const requestKey = `payment:${requestId}`;
   const title = payment.amountUsdc
-    ? `Payment approval — ${payment.amountUsdc} USDC`
+    ? `Payment approval — ${payment.amountUsdc} ${payment.assetLabel || "USDC"}`
     : "Payment approval";
   return {
     token,
@@ -8001,7 +8010,7 @@ function createHazbaseWalletPaymentApproval({ config, body, now = Date.now() }) 
   const token = crypto.randomBytes(18).toString("hex");
   const requestKey = `hazbase_wallet_payment:${paymentRequestId}`;
   const title = payment.amountUsdc
-    ? `Hazbase wallet payment — ${payment.amountUsdc} USDC`
+    ? `Hazbase wallet payment — ${payment.amountUsdc} ${payment.assetLabel || "USDC"}`
     : "Hazbase wallet payment";
   return {
     token,
@@ -8036,7 +8045,7 @@ function formatHazbaseWalletPaymentApprovalMessage(payment) {
   const lines = [
     "Hazbase Smart Wallet payment requested.",
     "",
-    `Amount: ${payment.amountUsdc || payment.amountAtomic} USDC`,
+    `Amount: ${payment.amountUsdc || payment.amountAtomic} ${payment.assetLabel || "USDC"}`,
     `Network: ${payment.network} (chainId ${payment.chainId})`,
     `Pay to: ${payment.payTo}`,
     `Asset: ${payment.asset}`,
@@ -8053,15 +8062,16 @@ function normalizeX402PaymentApprovalBody(body) {
   if (!isPlainObject(body)) return null;
   const payment = isPlainObject(body.payment) ? body.payment : {};
   const network = cleanText(payment.network || "");
-  const chainId = Number(payment.chainId) || 0;
+  const chainId = payment.chainId === null ? null : Number(payment.chainId) || 0;
   const amountAtomic = cleanText(payment.amountAtomic || "");
-  const amountUsdc = cleanText(payment.amountUsdc || "");
+  const amountUsdc = cleanText(payment.amountUsdc || payment.amount || "");
+  const assetLabel = cleanText(payment.assetLabel || "");
   const payTo = cleanText(payment.payTo || "");
   const asset = cleanText(payment.asset || "");
   const resource = cleanText(payment.resource || body.url || "");
   const description = cleanText(payment.description || "");
   const url = cleanText(body.url || resource);
-  if (!network || !chainId || !amountAtomic || !payTo || !asset || !resource) {
+  if (!network || (chainId !== null && !chainId) || !amountAtomic || !payTo || !asset || !resource) {
     return null;
   }
   return {
@@ -8070,6 +8080,7 @@ function normalizeX402PaymentApprovalBody(body) {
     chainId,
     amountAtomic,
     amountUsdc,
+    assetLabel,
     payTo,
     asset,
     resource,
@@ -8081,8 +8092,8 @@ function formatX402PaymentApprovalMessage(payment) {
   const lines = [
     "x402 payment approval requested.",
     "",
-    `Amount: ${payment.amountUsdc || payment.amountAtomic} USDC`,
-    `Network: ${payment.network} (chainId ${payment.chainId})`,
+    `Amount: ${payment.amountUsdc || payment.amountAtomic} ${payment.assetLabel || "USDC"}`,
+    `Network: ${payment.network}${payment.chainId === null ? "" : ` (chainId ${payment.chainId})`}`,
     `Pay to: ${payment.payTo}`,
     `Asset: ${payment.asset}`,
     `Resource: ${payment.resource}`,
@@ -9638,6 +9649,50 @@ function isIpcNoClientFoundError(errorValue) {
     message === "target-client-not-found" ||
     message.includes("no client found") ||
     message.includes("client not found");
+}
+
+function codexThreadDeepLink(conversationId) {
+  const id = cleanText(conversationId || "");
+  if (!id || !/^[0-9a-z-]{16,}$/iu.test(id)) {
+    return "";
+  }
+  return `codex://local/${encodeURIComponent(id)}`;
+}
+
+function openCodexThreadBestEffort(conversationId) {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+  const url = codexThreadDeepLink(conversationId);
+  if (!url) {
+    return false;
+  }
+  try {
+    const child = spawn("open", [url], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref?.();
+    console.log(`[completion-reply] reopened Codex thread via ${url}`);
+    return true;
+  } catch (error) {
+    console.warn(
+      `[completion-reply] failed to reopen Codex thread=${cleanText(conversationId || "") || "unknown"} ` +
+      `error=${cleanText(error?.message || error || "") || "unknown"}`
+    );
+    return false;
+  }
+}
+
+async function waitForCodexThreadOwner(runtime, conversationId, timeoutMs) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  while (Date.now() <= deadline) {
+    if (runtime.threadOwnerClientIds.has(conversationId)) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
 }
 
 function buildDefaultCollaborationMode(threadState) {
@@ -14344,7 +14399,6 @@ async function handleCompletionReply({
     stagedWorkspaceImagePaths
   );
   let lastError = null;
-  const ownerClientId = runtime.threadOwnerClientIds.get(conversationId) ?? null;
   const finalizeReplyAccepted = async () => {
     if (timelineImageAliases.length > 0) {
       const aliases = isPlainObject(state.timelineImagePathAliases)
@@ -14357,46 +14411,76 @@ async function handleCompletionReply({
     }
     scheduleBestEffortFileCleanup(stagedWorkspaceImagePaths);
   };
+  const sendReplyCandidate = async (candidate, attemptLabel = "initial") => {
+    const currentOwnerClientId = runtime.threadOwnerClientIds.get(conversationId) ?? null;
+    console.log(
+      `[completion-reply] try candidate=${candidate.name} attempt=${attemptLabel} transport=${cleanText(candidate.transport || "thread-follower")} owner=${cleanText(currentOwnerClientId || "") || "none"} images=${normalizedLocalImagePaths.length} workspaceImages=${stagedWorkspaceImagePaths.length} cwd=${cleanText(resolvedCwd || "") || "none"}`
+    );
+    if (candidate.transport === "direct-turn-start" && currentOwnerClientId) {
+      return runtime.ipcClient.startTurnDirect(
+        conversationId,
+        candidate.turnStartParams,
+        currentOwnerClientId,
+        { timeoutMs: config.completionReplyAckTimeoutMs }
+      );
+    }
+    return runtime.ipcClient.startTurn(
+      conversationId,
+      candidate.turnStartParams,
+      currentOwnerClientId,
+      { timeoutMs: config.completionReplyAckTimeoutMs }
+    );
+  };
+  let reopenedCodexThread = false;
 
   for (const candidate of turnCandidates) {
     try {
-      console.log(
-        `[completion-reply] try candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} owner=${cleanText(ownerClientId || "") || "none"} images=${normalizedLocalImagePaths.length} workspaceImages=${stagedWorkspaceImagePaths.length} cwd=${cleanText(resolvedCwd || "") || "none"}`
-      );
-      if (candidate.transport === "direct-turn-start" && ownerClientId) {
-        await runtime.ipcClient.startTurnDirect(
-          conversationId,
-          candidate.turnStartParams,
-          ownerClientId,
-          { timeoutMs: config.completionReplyAckTimeoutMs }
-        );
-      } else {
-        await runtime.ipcClient.startTurn(
-          conversationId,
-          candidate.turnStartParams,
-          ownerClientId,
-          { timeoutMs: config.completionReplyAckTimeoutMs }
-        );
-      }
+      await sendReplyCandidate(candidate);
       console.log(
         `[completion-reply] success at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
       );
       await finalizeReplyAccepted();
       return { alreadyAccepted: false };
     } catch (error) {
-      if (isStartTurnAckTimeout(error)) {
+      let candidateError = error;
+      if (isIpcNoClientFoundError(candidateError) && !reopenedCodexThread) {
+        reopenedCodexThread = true;
+        runtime.threadOwnerClientIds.delete(conversationId);
+        const reopened = openCodexThreadBestEffort(conversationId);
+        if (reopened) {
+          const ownerReady = await waitForCodexThreadOwner(
+            runtime,
+            conversationId,
+            config.completionReplyThreadReopenWaitMs
+          );
+          console.log(
+            `[completion-reply] retry after Codex thread reopen candidate=${candidate.name} ownerReady=${ownerReady ? 1 : 0}`
+          );
+          try {
+            await sendReplyCandidate(candidate, "after-reopen");
+            console.log(
+              `[completion-reply] success at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} reopened=1`
+            );
+            await finalizeReplyAccepted();
+            return { alreadyAccepted: false, reopenedCodexThread: true };
+          } catch (retryError) {
+            candidateError = retryError;
+          }
+        }
+      }
+      if (isStartTurnAckTimeout(candidateError)) {
         // Codex can create the turn but fail to send the bridge an ACK before
         // its internal follower timeout fires. Retrying risks duplicate user
         // turns, so treat this as accepted and let the timeline catch up.
         console.log(
-          `[completion-reply] accepted at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(error)}`
+          `[completion-reply] accepted at=${new Date().toISOString()} candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} ack-timeout=${normalizeIpcErrorMessage(candidateError)}`
         );
         await finalizeReplyAccepted();
         return { alreadyAccepted: false, ackTimeout: true };
       }
-      lastError = error;
+      lastError = candidateError;
       console.log(
-        `[completion-reply] failed candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} error=${normalizeIpcErrorMessage(error)} raw=${inspect(error?.ipcError ?? error, { depth: 6, breakLength: 160 })}`
+        `[completion-reply] failed candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} error=${normalizeIpcErrorMessage(candidateError)} raw=${inspect(candidateError?.ipcError ?? candidateError, { depth: 6, breakLength: 160 })}`
       );
     }
   }
@@ -16641,12 +16725,26 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     errors.push(chainsResult.reason?.message || String(chainsResult.reason || "chains metadata unavailable"));
   }
   const supportedChains = Array.isArray(chains?.chains)
-    ? chains.chains.filter((entry) => Number(entry.chainId) === 8453 || Number(entry.chainId) === 84532)
+    ? chains.chains.filter((entry) => Boolean(paymentNetworkForChainId(Number(entry.chainId))))
+        .filter((entry) => isPaymentNetworkAvailable(paymentNetworkForChainId(Number(entry.chainId))))
     : [];
   const payoutAddresses = {
-    8453: resolveHazbaseAccountForChain(hazbase.accounts, 8453)?.smartAccountAddress || "",
     84532: resolveHazbaseAccountForChain(hazbase.accounts, 84532)?.smartAccountAddress || "",
+    80002: resolveHazbaseAccountForChain(hazbase.accounts, 80002)?.smartAccountAddress || "",
   };
+  const rawPaymentCapabilities = buildPaymentCapabilities({ hazbase, payments });
+  const paymentCapabilities = applyAgentPaymentDefaults(rawPaymentCapabilities, hazbase.agentPaymentDefaults);
+  const agentPaymentDefaults = agentPaymentDefaultsStatus(hazbase.agentPaymentDefaults, rawPaymentCapabilities);
+  const supportedPayments = (Array.isArray(payments?.networks) ? payments.networks : [])
+    .filter((entry) => isPaymentNetworkAvailable(normalizePaymentNetworkKey(entry?.network || entry?.id || "")));
+  const defaultPaymentNetwork = isPaymentNetworkAvailable(normalizePaymentNetworkKey(payments?.defaultNetwork || ""))
+    ? payments.defaultNetwork
+    : "base-sepolia";
+  for (const capability of paymentCapabilities) {
+    if (capability.payTo) {
+      payoutAddresses[capability.network] = capability.payTo;
+    }
+  }
   const signedIn = Boolean(hazbase.accessToken) && !hazbase.sessionInvalid;
   return writeJson(res, 200, {
     enabled: true,
@@ -16663,9 +16761,11 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     credentialId: hazbase.credentialId,
     highTrustExpiresAt: hazbase.highTrustExpiresAt,
     accounts: hazbase.accounts,
-    supportedPayments: payments?.networks || [],
+    paymentCapabilities,
+    agentPaymentDefaults,
+    supportedPayments,
     supportedChains,
-    defaultPaymentNetwork: payments?.defaultNetwork || "base-sepolia",
+    defaultPaymentNetwork,
     payoutAddresses,
     error: errors.join(" | "),
   });
@@ -16680,16 +16780,48 @@ if (url.pathname === "/api/hazbase/payout-address" && req.method === "GET") {
   }
   const hazbase = normalizeHazbaseState(state.hazbase);
   if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
-  const chainId = Number(url.searchParams.get("chainId") || 0);
-  if (chainId !== 8453 && chainId !== 84532) {
+  const networkParam = normalizePaymentNetworkKey(url.searchParams.get("network") || "");
+  if (networkParam && PAYMENT_NETWORKS[networkParam]?.family === "liquid") {
+    if (!isPaymentNetworkAvailable(networkParam)) {
+      return writeJson(res, 409, { error: "payment-network-coming-soon" });
+    }
+    const capability = resolvePaymentCapability(
+      buildPaymentCapabilities({ hazbase, payments: null }),
+      networkParam,
+      url.searchParams.get("asset") || "usdt",
+    );
+    if (!capability?.payTo) return writeJson(res, 409, { error: "hazbase-wallet-account-missing" });
+    return writeJson(res, 200, {
+      chainId: null,
+      network: networkParam,
+      asset: capability.asset,
+      scheme: capability.scheme,
+      payoutMethod: "external_liquid",
+      payoutAddress: capability.payTo,
+      payTo: capability.payTo,
+      issuer: capability.issuer || "external",
+    });
+  }
+  const chainId = networkParam && PAYMENT_NETWORKS[networkParam]?.family === "evm"
+    ? Number(PAYMENT_NETWORKS[networkParam].chainId || 0)
+    : Number(url.searchParams.get("chainId") || 0);
+  if (!paymentNetworkForChainId(chainId)) {
     return writeJson(res, 400, { error: "unsupported-chain" });
   }
+  if (!isPaymentNetworkAvailable(paymentNetworkForChainId(chainId))) {
+    return writeJson(res, 409, { error: "payment-network-coming-soon" });
+  }
+  const evmNetwork = paymentNetworkForChainId(chainId);
+  const asset = normalizePaymentAssetKey(url.searchParams.get("asset") || PAYMENT_NETWORKS[evmNetwork]?.asset, evmNetwork);
+  if (!asset) return writeJson(res, 400, { error: "unsupported-payment-asset" });
   const account = resolveHazbaseAccountForChain(hazbase.accounts, chainId);
   if (!account?.smartAccountAddress) {
     return writeJson(res, 409, { error: "hazbase-wallet-account-missing" });
   }
   return writeJson(res, 200, {
     chainId,
+    network: evmNetwork,
+    asset,
     payoutMethod: "hazbase_wallet",
     payoutAddress: account.smartAccountAddress,
     smartAccountAddress: account.smartAccountAddress,
@@ -16867,8 +16999,11 @@ if (url.pathname === "/api/hazbase/account/bootstrap" && req.method === "POST") 
   }
   const body = await parseJsonBody(req);
   const chainId = Number(body?.chainId || 0);
-  if (chainId !== 8453 && chainId !== 84532) {
+  if (!paymentNetworkForChainId(chainId)) {
     return writeJson(res, 400, { error: "unsupported-chain" });
+  }
+  if (!isPaymentNetworkAvailable(paymentNetworkForChainId(chainId))) {
+    return writeJson(res, 409, { error: "payment-network-coming-soon" });
   }
   let result;
   try {
@@ -16898,6 +17033,88 @@ if (url.pathname === "/api/hazbase/account/bootstrap" && req.method === "POST") 
   };
   await saveState(config.stateFile, state);
   return writeJson(res, 200, result);
+}
+
+if (url.pathname === "/api/hazbase/payment-capability" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  if (!hazbase.accessToken) return writeJson(res, 401, { error: "hazbase-auth-required" });
+  const body = await parseJsonBody(req);
+  const network = normalizePaymentNetworkKey(body?.network);
+  if (!network || PAYMENT_NETWORKS[network]?.family !== "liquid") {
+    return writeJson(res, 400, { error: "unsupported-payment-network" });
+  }
+  if (!isPaymentNetworkAvailable(network)) {
+    return writeJson(res, 409, { error: "payment-network-coming-soon" });
+  }
+  const asset = normalizePaymentAssetKey(body?.asset || "usdt", network);
+  if (!asset) return writeJson(res, 400, { error: "unsupported-payment-asset" });
+  const payTo = cleanText(body?.payTo || body?.payoutAddress || "").toLowerCase();
+  if (!isValidLiquidAddressForNetwork(payTo, network)) {
+    return writeJson(res, 400, { error: "invalid-liquid-address" });
+  }
+  const nextCapability = {
+    network,
+    asset,
+    scheme: PAYMENT_NETWORKS[network].scheme,
+    payoutMethod: "external_liquid",
+    payTo,
+    configured: true,
+    issuer: "external",
+  };
+  const existing = normalizeStoredPaymentCapabilities(hazbase.paymentCapabilities)
+    .filter((entry) => !(entry.network === network && entry.asset === asset));
+  state.hazbase = {
+    ...hazbase,
+    paymentCapabilities: [...existing, nextCapability],
+    sessionInvalid: false,
+    sessionInvalidReason: "",
+    sessionInvalidAt: "",
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, { ok: true, capability: nextCapability });
+}
+
+if (url.pathname === "/api/hazbase/agent-payment-defaults" && req.method === "POST") {
+  const session = requireMutatingApiSession(req, res, config, state);
+  if (!session) return;
+  const hazbase = normalizeHazbaseState(state.hazbase);
+  const body = await parseJsonBody(req);
+  const mode = cleanText(body?.mode || "").toLowerCase() === "configured" ? "configured" : "custom";
+  let nextDefaults;
+  if (mode === "configured") {
+    nextDefaults = { mode: "configured", accepts: [] };
+  } else {
+    const capabilities = buildPaymentCapabilities({ hazbase, payments: null });
+    const configuredKeys = new Set(
+      capabilities
+        .filter((entry) => entry?.configured && entry?.enabled !== false && isPaymentNetworkAvailable(entry.network))
+        .map((entry) => paymentCapabilityKey(entry))
+        .filter(Boolean)
+    );
+    const rawAccepts = Array.isArray(body?.accepts) ? body.accepts : [];
+    const accepts = [];
+    const seen = new Set();
+    for (const entry of rawAccepts) {
+      const ref = paymentCapabilityRef(entry);
+      if (!ref) return writeJson(res, 400, { error: "unsupported-payment-capability" });
+      const key = `${ref.network}:${ref.asset}`;
+      if (!configuredKeys.has(key)) {
+        return writeJson(res, 409, { error: "payment-capability-not-configured", network: ref.network, asset: ref.asset });
+      }
+      if (seen.has(key)) continue;
+      seen.add(key);
+      accepts.push(ref);
+    }
+    nextDefaults = { mode: "custom", accepts };
+  }
+  state.hazbase = {
+    ...hazbase,
+    agentPaymentDefaults: nextDefaults,
+  };
+  await saveState(config.stateFile, state);
+  return writeJson(res, 200, { ok: true, agentPaymentDefaults: nextDefaults });
 }
 
 if (url.pathname === "/api/hazbase/session/refresh" && req.method === "POST") {
@@ -21246,6 +21463,10 @@ function buildConfig(cli) {
       "COMPLETION_REPLY_ACK_TIMEOUT_MS",
       DEFAULT_COMPLETION_REPLY_ACK_TIMEOUT_MS
     ),
+    completionReplyThreadReopenWaitMs: numberEnv(
+      "COMPLETION_REPLY_THREAD_REOPEN_WAIT_MS",
+      DEFAULT_COMPLETION_REPLY_THREAD_REOPEN_WAIT_MS
+    ),
     choicePageSize: numberEnv("CHOICE_PAGE_SIZE", 5),
     completionReplyImageMaxBytes: numberEnv(
       "COMPLETION_REPLY_IMAGE_MAX_BYTES",
@@ -21291,6 +21512,8 @@ function normalizeHazbaseState(raw) {
     highTrustToken: cleanText(value.highTrustToken ?? ""),
     highTrustExpiresAt: cleanText(value.highTrustExpiresAt ?? ""),
     accounts,
+    paymentCapabilities: normalizeStoredPaymentCapabilities(value.paymentCapabilities),
+    agentPaymentDefaults: normalizeAgentPaymentDefaults(value.agentPaymentDefaults),
     sessionInvalid: value.sessionInvalid === true,
     sessionInvalidReason: cleanText(value.sessionInvalidReason ?? ""),
     sessionInvalidAt: cleanText(value.sessionInvalidAt ?? ""),
@@ -21549,6 +21772,202 @@ function resolveHazbaseAccountForChain(accounts, chainId) {
   if (!normalizedChainId) return null;
   const list = Array.isArray(accounts) ? accounts : [];
   return list.find((entry) => Number(entry?.chainId) === normalizedChainId && cleanText(entry?.smartAccountAddress || "")) || null;
+}
+
+function normalizePaymentNetworkKey(raw) {
+  const value = cleanText(raw || "").toLowerCase();
+  if (value === "basesepolia") return "base-sepolia";
+  if (value === "polygonamoy" || value === "amoy") return "polygon-amoy";
+  if (value === "matic") return "polygon";
+  if (value === "liquid" || value === "liquid-mainnet") return "liquidv1";
+  return PAYMENT_NETWORKS[value] ? value : "";
+}
+
+function isPaymentNetworkAvailable(network) {
+  return PAYMENT_NETWORKS[network]?.releaseStatus !== "comingSoon";
+}
+
+function paymentNetworkForChainId(chainId) {
+  const id = Number(chainId || 0);
+  return Object.entries(PAYMENT_NETWORKS).find(([, entry]) => entry.chainId === id)?.[0] || "";
+}
+
+function normalizePaymentAssetKey(raw, network) {
+  const networkInfo = PAYMENT_NETWORKS[network] || null;
+  const value = cleanText(raw || networkInfo?.asset || "").toLowerCase();
+  if (value === "usd-t" || value === "tether") return "usdt";
+  if (value === "jpy" || value === "jpy-coin") return "jpyc";
+  if (value === "bitcoin" || value === "btc") return "lbtc";
+  const allowed = Array.isArray(networkInfo?.assets) ? networkInfo.assets : [networkInfo?.asset].filter(Boolean);
+  if ((value === "usdc" || value === "jpyc" || value === "usdt" || value === "lbtc") && allowed.includes(value)) return value;
+  return "";
+}
+
+function isValidLiquidAddressForNetwork(address, network) {
+  const value = cleanText(address || "").toLowerCase();
+  if (network === "liquidtestnet") return /^(tlq1|tex1)[0-9a-z]{20,}$/u.test(value);
+  if (network === "liquidv1") return /^(lq1|ex1)[0-9a-z]{20,}$/u.test(value);
+  return false;
+}
+
+function normalizeStoredPaymentCapabilities(value) {
+  const list = Array.isArray(value) ? value : [];
+  const out = [];
+  for (const entry of list) {
+    const network = normalizePaymentNetworkKey(entry?.network);
+    if (!network || PAYMENT_NETWORKS[network]?.family !== "liquid") continue;
+    const asset = normalizePaymentAssetKey(entry?.asset, network);
+    const payTo = cleanText(entry?.payTo || entry?.payoutAddress || "").toLowerCase();
+    if (!asset || !isValidLiquidAddressForNetwork(payTo, network)) continue;
+    out.push({
+      network,
+      asset,
+      scheme: PAYMENT_NETWORKS[network].scheme,
+      payoutMethod: "external_liquid",
+      payTo,
+      configured: true,
+      issuer: cleanText(entry?.issuer || "external") || "external",
+    });
+  }
+  return out;
+}
+
+function paymentCapabilityRef(entry) {
+  const network = normalizePaymentNetworkKey(entry?.network);
+  const asset = normalizePaymentAssetKey(entry?.asset, network);
+  if (!network || !asset) return null;
+  return { network, asset };
+}
+
+function paymentCapabilityKey(entry) {
+  const ref = paymentCapabilityRef(entry);
+  return ref ? `${ref.network}:${ref.asset}` : "";
+}
+
+function normalizeAgentPaymentDefaults(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const mode = cleanText(raw.mode || "").toLowerCase() === "custom" ? "custom" : "configured";
+  const list = Array.isArray(raw.accepts) ? raw.accepts : Array.isArray(value) ? value : [];
+  const accepts = [];
+  const seen = new Set();
+  for (const entry of list) {
+    const ref = paymentCapabilityRef(entry);
+    if (!ref || !isPaymentNetworkAvailable(ref.network)) continue;
+    const key = `${ref.network}:${ref.asset}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    accepts.push(ref);
+  }
+  return { mode, accepts };
+}
+
+function effectiveAgentPaymentDefaultRefs(defaults, capabilities) {
+  const normalized = normalizeAgentPaymentDefaults(defaults);
+  const configured = (Array.isArray(capabilities) ? capabilities : [])
+    .filter((entry) => entry?.configured && entry?.enabled !== false && isPaymentNetworkAvailable(entry.network))
+    .map((entry) => paymentCapabilityRef(entry))
+    .filter(Boolean);
+  if (normalized.mode !== "custom") {
+    return configured;
+  }
+  const configuredKeys = new Set(configured.map((entry) => `${entry.network}:${entry.asset}`));
+  return normalized.accepts.filter((entry) => configuredKeys.has(`${entry.network}:${entry.asset}`));
+}
+
+function applyAgentPaymentDefaults(capabilities, defaults) {
+  const effective = effectiveAgentPaymentDefaultRefs(defaults, capabilities);
+  const enabledKeys = new Set(effective.map((entry) => `${entry.network}:${entry.asset}`));
+  return (Array.isArray(capabilities) ? capabilities : []).map((entry) => ({
+    ...entry,
+    agentEnabled: enabledKeys.has(paymentCapabilityKey(entry)),
+  }));
+}
+
+function agentPaymentDefaultsStatus(defaults, capabilities) {
+  const normalized = normalizeAgentPaymentDefaults(defaults);
+  return {
+    mode: normalized.mode,
+    accepts: normalized.accepts,
+    effectiveAccepts: effectiveAgentPaymentDefaultRefs(normalized, capabilities),
+  };
+}
+
+function liquidCapabilityFromEnv(network) {
+  if (!isPaymentNetworkAvailable(network)) return null;
+  const suffix = network === "liquidtestnet" ? "LIQUIDTESTNET" : "LIQUIDV1";
+  const payTo = cleanText(process.env[`VIVEWORKER_${suffix}_PAYOUT_ADDRESS`] || process.env[`VIVEWORKER_${suffix}_PAY_TO`] || "").toLowerCase();
+  if (!isValidLiquidAddressForNetwork(payTo, network)) return null;
+  return {
+    network,
+    asset: "usdt",
+    scheme: PAYMENT_NETWORKS[network].scheme,
+    payoutMethod: "external_liquid",
+    payTo,
+    configured: true,
+    issuer: "env",
+  };
+}
+
+function buildPaymentCapabilities({ hazbase, payments }) {
+  const supported = Array.isArray(payments?.networks) ? payments.networks : [];
+  const supportedByNetwork = new Map(supported.map((entry) => [cleanText(entry?.network || entry?.id || ""), entry]));
+  const capabilities = [];
+  for (const network of ["base-sepolia", "base", "polygon-amoy", "polygon"]) {
+    const meta = PAYMENT_NETWORKS[network];
+    const paymentMeta = supportedByNetwork.get(network) || null;
+    const supportedAssets = Array.isArray(paymentMeta?.assets) && paymentMeta.assets.length > 0
+      ? paymentMeta.assets.map((entry) => normalizePaymentAssetKey(entry?.asset, network)).filter(Boolean)
+      : meta.assets || [meta.asset];
+    const account = resolveHazbaseAccountForChain(hazbase.accounts, meta.chainId);
+    const available = isPaymentNetworkAvailable(network);
+    for (const asset of [...new Set(supportedAssets)]) {
+      capabilities.push({
+        network,
+        family: "evm",
+        chainId: meta.chainId,
+        asset,
+        scheme: "exact",
+        payoutMethod: "hazbase_wallet",
+        payTo: account?.smartAccountAddress || "",
+        smartAccountAddress: account?.smartAccountAddress || "",
+        configured: Boolean(account?.smartAccountAddress),
+        enabled: available && (supportedByNetwork.has(network) || supported.length === 0),
+        label: meta.label,
+        issuer: "hazbase",
+        releaseStatus: meta.releaseStatus || "available",
+      });
+    }
+  }
+  const stored = normalizeStoredPaymentCapabilities(hazbase.paymentCapabilities);
+  for (const network of ["liquidtestnet", "liquidv1"]) {
+    const meta = PAYMENT_NETWORKS[network];
+    const existing = stored.find((entry) => entry.network === network) || liquidCapabilityFromEnv(network);
+    const available = isPaymentNetworkAvailable(network);
+    capabilities.push({
+      network,
+      family: "liquid",
+      chainId: null,
+      asset: existing?.asset || meta.asset,
+      scheme: meta.scheme,
+      payoutMethod: "external_liquid",
+      payTo: existing?.payTo || "",
+      configured: Boolean(existing?.payTo),
+      enabled: available && (supportedByNetwork.has(network) || supported.length === 0),
+      label: meta.label,
+      issuer: existing?.issuer || "external",
+      releaseStatus: meta.releaseStatus || "available",
+    });
+  }
+  return capabilities;
+}
+
+function resolvePaymentCapability(capabilities, network, asset = "") {
+  const normalizedNetwork = normalizePaymentNetworkKey(network);
+  const normalizedAsset = normalizePaymentAssetKey(asset, normalizedNetwork);
+  return capabilities.find((entry) => (
+    normalizePaymentNetworkKey(entry.network) === normalizedNetwork &&
+    (!normalizedAsset || normalizePaymentAssetKey(entry.asset, normalizedNetwork) === normalizedAsset)
+  )) || null;
 }
 
 
