@@ -27,7 +27,7 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
 });
 
 test("build id marks the current web bundle", () => {
-  assert.match(buildIdSource, /20260524-wallet-payment-capabilities/);
+  assert.match(buildIdSource, /20260525-wallet-network-count/);
 });
 
 test("timeline render is reported with sanitized client metadata", () => {

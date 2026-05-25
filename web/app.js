@@ -6469,6 +6469,7 @@ function renderSettingsWalletPage(context) {
     `;
   }
   const configured = configuredPaymentCapabilities(hazbase);
+  const configuredNetworkCount = configuredPaymentCapabilityNetworkCount(hazbase);
   const agentConfigured = agentEligiblePaymentCapabilities(hazbase);
   const effectiveDefaults = effectiveAgentPaymentDefaults(hazbase);
   const defaultsSummary = renderAgentPaymentDefaultsSummary(hazbase, effectiveDefaults);
@@ -6522,8 +6523,8 @@ function renderSettingsWalletPage(context) {
           icon: "coin",
           title: L("settings.wallet.inventory.navTitle"),
           subtitle: L("settings.wallet.inventory.navCopy"),
-          value: L("settings.wallet.inventory.navValue", { count: configured.length }),
-          valueTone: configured.length ? "enabled" : "attention",
+          value: L("settings.wallet.inventory.navValue", { count: configuredNetworkCount }),
+          valueTone: configuredNetworkCount ? "enabled" : "attention",
         }),
       ], { listClassName: "settings-list settings-list--compact" })}
       ${poweredBy}
@@ -6566,7 +6567,7 @@ function renderSettingsWalletInventoryPage(context) {
     title: L(definition.titleKey),
     subtitle: L(definition.copyKey),
     value: paymentCapabilityChainValue(hazbase, chain),
-    valueTone: configuredPaymentCapabilitiesForNetworks(hazbase, definition.networks).length ? "enabled" : "attention",
+    valueTone: configuredPaymentCapabilityNetworkCount(hazbase, definition.networks) ? "enabled" : "attention",
   }));
   return `
     <div class="settings-page">
@@ -6797,9 +6798,16 @@ function agentEligiblePaymentCapabilities(hazbase) {
   return configuredPaymentCapabilities(hazbase).filter((entry) => isPaymentCapabilityAvailable(entry.network));
 }
 
-function configuredPaymentCapabilitiesForNetworks(hazbase, networks) {
-  const networkSet = new Set(Array.isArray(networks) ? networks : []);
-  return configuredPaymentCapabilities(hazbase).filter((entry) => networkSet.has(entry?.network));
+function configuredPaymentCapabilityNetworkCount(hazbase, networks) {
+  const shouldCountAllNetworks = !Array.isArray(networks);
+  const networkSet = new Set(shouldCountAllNetworks ? [] : networks);
+  const configuredNetworks = new Set();
+  for (const entry of configuredPaymentCapabilities(hazbase)) {
+    if (shouldCountAllNetworks || networkSet.has(entry?.network)) {
+      configuredNetworks.add(entry.network);
+    }
+  }
+  return configuredNetworks.size;
 }
 
 function paymentCapabilityChainValue(hazbase, chain) {
@@ -6808,7 +6816,7 @@ function paymentCapabilityChainValue(hazbase, chain) {
   const availableNetworks = availablePaymentCapabilityNetworks(networks);
   const countedNetworks = availableNetworks.length ? availableNetworks : networks;
   return L("settings.wallet.chain.configuredValue", {
-    count: configuredPaymentCapabilitiesForNetworks(hazbase, countedNetworks).length,
+    count: configuredPaymentCapabilityNetworkCount(hazbase, countedNetworks),
     total: countedNetworks.length,
   });
 }

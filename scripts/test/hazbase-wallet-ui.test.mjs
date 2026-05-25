@@ -72,6 +72,16 @@ test("wallet inventory groups issuance by chain before network environment", () 
   assert.match(appSource, /case "walletInventoryPolygon":[\s\S]*?renderSettingsWalletChainPage\(context, "polygon"\)/);
 });
 
+test("wallet inventory chain values count configured networks instead of assets", () => {
+  assert.match(functionBody("renderSettingsWalletPage"), /const configuredNetworkCount = configuredPaymentCapabilityNetworkCount\(hazbase\)/);
+  assert.match(functionBody("renderSettingsWalletPage"), /settings\.wallet\.inventory\.navValue", \{ count: configuredNetworkCount \}/);
+  assert.match(functionBody("renderSettingsWalletInventoryPage"), /configuredPaymentCapabilityNetworkCount\(hazbase, definition\.networks\)/);
+  assert.match(functionBody("configuredPaymentCapabilityNetworkCount"), /const shouldCountAllNetworks = !Array\.isArray\(networks\)/);
+  assert.match(functionBody("configuredPaymentCapabilityNetworkCount"), /const configuredNetworks = new Set\(\)/);
+  assert.match(functionBody("configuredPaymentCapabilityNetworkCount"), /configuredNetworks\.add\(entry\.network\)/);
+  assert.match(functionBody("paymentCapabilityChainValue"), /count: configuredPaymentCapabilityNetworkCount\(hazbase, countedNetworks\)/);
+});
+
 test("account actions live on wallet inventory instead of wallet defaults", () => {
   assert.doesNotMatch(functionBody("renderSettingsWalletPage"), /settings\.wallet\.advanced\.title/);
   assert.match(functionBody("renderHazbaseAccountActions"), /settings\.wallet\.advanced\.title/);
