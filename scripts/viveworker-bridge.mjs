@@ -10486,6 +10486,45 @@ function isHiddenCodexApprovalAssessmentText(text) {
   return /\bThe following is the Codex agent history(?: added since your last approval assessment)?\b/iu.test(single);
 }
 
+function isHiddenCodexApprovalDecisionJsonText(text) {
+  const single = cleanText(stripNotificationMarkup(stripEnvironmentContextBlocks(text || "")));
+  if (!single || !single.startsWith("{") || !single.endsWith("}")) {
+    return false;
+  }
+
+  const parsed = safeJsonParse(single);
+  if (!isPlainObject(parsed)) {
+    return false;
+  }
+
+  const allowedKeys = new Set(["risk_level", "user_authorization", "outcome", "rationale"]);
+  const keys = Object.keys(parsed);
+  if (!keys.includes("outcome") || keys.some((key) => !allowedKeys.has(key))) {
+    return false;
+  }
+
+  const outcome = cleanText(parsed.outcome || "");
+  if (outcome !== "allow" && outcome !== "deny") {
+    return false;
+  }
+
+  const riskLevel = cleanText(parsed.risk_level || "");
+  if (riskLevel && !["low", "medium", "high", "critical"].includes(riskLevel)) {
+    return false;
+  }
+
+  const userAuthorization = cleanText(parsed.user_authorization || "");
+  if (userAuthorization && !["unknown", "low", "medium", "high"].includes(userAuthorization)) {
+    return false;
+  }
+
+  if (parsed.rationale != null && typeof parsed.rationale !== "string") {
+    return false;
+  }
+
+  return keys.length === 1 || keys.some((key) => key === "risk_level" || key === "user_authorization" || key === "rationale");
+}
+
 function shouldHideInternalTimelineItem(item) {
   return shouldHideClaudeInternalItem(item) || shouldHideCodexInternalApprovalItem(item) || shouldHideMoltbookHarnessItem(item);
 }
@@ -10563,14 +10602,23 @@ function shouldHideCodexInternalApprovalItem(item) {
 
   const title = cleanText(item.title ?? "");
   const threadLabel = cleanText(item.threadLabel ?? "");
-  if (isHiddenCodexApprovalAssessmentText(title) || isHiddenCodexApprovalAssessmentText(threadLabel)) {
+  if (
+    isHiddenCodexApprovalAssessmentText(title) ||
+    isHiddenCodexApprovalAssessmentText(threadLabel) ||
+    isHiddenCodexApprovalDecisionJsonText(title) ||
+    isHiddenCodexApprovalDecisionJsonText(threadLabel)
+  ) {
     return true;
   }
   return (
     isHiddenCodexApprovalAssessmentText(item.messageText) ||
     isHiddenCodexApprovalAssessmentText(item.summary) ||
     isHiddenCodexApprovalAssessmentText(item.detailText) ||
-    isHiddenCodexApprovalAssessmentText(item.message)
+    isHiddenCodexApprovalAssessmentText(item.message) ||
+    isHiddenCodexApprovalDecisionJsonText(item.messageText) ||
+    isHiddenCodexApprovalDecisionJsonText(item.summary) ||
+    isHiddenCodexApprovalDecisionJsonText(item.detailText) ||
+    isHiddenCodexApprovalDecisionJsonText(item.message)
   );
 }
 

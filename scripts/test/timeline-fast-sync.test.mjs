@@ -39,6 +39,14 @@ test("timeline render is reported with sanitized client metadata", () => {
   assert.doesNotMatch(appSource, /messageText:\s*latest/);
 });
 
+test("timeline hides Codex auto-review decision JSON", () => {
+  assert.match(bridgeSource, /function isHiddenCodexApprovalDecisionJsonText/);
+  assert.match(bridgeSource, /new Set\(\["risk_level", "user_authorization", "outcome", "rationale"\]\)/);
+  assert.match(bridgeSource, /outcome !== "allow" && outcome !== "deny"/);
+  assert.match(bridgeSource, /isHiddenCodexApprovalDecisionJsonText\(item\.messageText\)/);
+  assert.match(bridgeSource, /isHiddenCodexApprovalDecisionJsonText\(item\.summary\)/);
+});
+
 test("LAN timeline live sync uses SSE with polling fallback", () => {
   assert.match(bridgeSource, /class TimelineBus/);
   assert.match(bridgeSource, /\/api\/timeline\/stream/);
