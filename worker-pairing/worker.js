@@ -26,6 +26,12 @@ const RELAY_TOKEN_RE = /^v1\.[A-Za-z0-9_-]{32}\.[a-z0-9]{1,13}$/u;
 const RELAY_TOKEN_POW_BITS = 16;
 const RELAY_TOKEN_DOMAIN = "viveworker-remote-pairing-relay-token";
 const RELAY_CHANNEL_DOMAIN = "viveworker-remote-pairing-relay-channel";
+// The relay token travels in the Sec-WebSocket-Protocol handshake header, not
+// the URL, so it stays out of request URLs and access logs. Clients offer
+// [RELAY_SUBPROTOCOL, `${TOKEN_SUBPROTOCOL_PREFIX}<token>`]; the server only
+// echoes RELAY_SUBPROTOCOL back — never the token.
+const RELAY_SUBPROTOCOL = "viveworker.relay.v1";
+const TOKEN_SUBPROTOCOL_PREFIX = "vwtok.";
 const VALID_ROLES = new Set(["phone", "bridge"]);
 const DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE = 20;
 const RELAY_ANALYTICS_FULL_FIDELITY_EVENTS = new Set(["token_rotation"]);
@@ -118,7 +124,7 @@ export default {
       if (!role || !VALID_ROLES.has(role)) {
         return new Response("invalid role (must be phone|bridge)", { status: 400 });
       }
-      const relayToken = url.searchParams.get("token") || "";
+      const relayToken = resolveRelayTokenFromRequest(request, url);
       const cfIp = request.headers.get("cf-connecting-ip") || "unknown";
       if (!await verifyRelayToken(pairingId, relayToken)) {
         // CF-native rate limit aggregates across every isolate, so a
@@ -326,20 +332,34 @@ async function verifyRelayToken(pairingId, relayToken) {
   return countLeadingZeroBits(digest) >= RELAY_TOKEN_POW_BITS;
 }
 
+// Read the relay token from the Sec-WebSocket-Protocol header, falling back to
+// the legacy `?token=` query param for older clients.
+function resolveRelayTokenFromRequest(request, url) {
+  const offered = String(request.headers.get("Sec-WebSocket-Protocol") || "");
+  for (const proto of offered.split(",")) {
+    const candidate = proto.trim();
+    if (candidate.startsWith(TOKEN_SUBPROTOCOL_PREFIX)) {
+      return candidate.slice(TOKEN_SUBPROTOCOL_PREFIX.length);
+    }
+  }
+  return url.searchParams.get("token") || "";
+}
+
 function shortPairing(pairingId) {
   return String(pairingId || "").slice(0, 8);
 }
 
 /**
- * Wrapper around a Rate Limit binding that gracefully handles missing
- * bindings (e.g. older deploys, `wrangler dev --local` sessions) and any
- * runtime errors from the limit() call. We never want a rate-limit hiccup
- * to take the relay down — fail-open and let the next request retry.
+ * Wrapper around a Rate Limit binding.
+ *
+ * A *missing* binding (wrangler dev --local, older deploy) stays fail-open, so
+ * local dev isn't broken and the per-isolate cooldown still applies. A binding
+ * that *exists and throws* fails CLOSED so a transient limiter outage can't be
+ * used to spam WS upgrades / invalid tokens; the client retries with backoff.
  *
  * Returns:
  *   { success: true }  — binding missing OR limiter said "allowed"
- *   { success: false } — limiter exceeded
- *   null               — limiter threw; caller should treat as allowed
+ *   { success: false } — limiter exceeded OR limiter threw (fail closed)
  */
 async function safeRateLimit(binding, key) {
   if (!binding || typeof binding.limit !== "function") {
@@ -348,8 +368,7 @@ async function safeRateLimit(binding, key) {
   try {
     return await binding.limit({ key });
   } catch {
-    // Limiter is best-effort; an outage here must not break the relay.
-    return null;
+    return { success: false };
   }
 }
 

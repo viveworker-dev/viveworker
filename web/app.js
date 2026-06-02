@@ -6989,7 +6989,7 @@ function renderWalletInventoryCapabilityCard(hazbase, network) {
   };
   const sessionInvalid = Boolean(hazbase.sessionInvalid);
   const signedIn = Boolean(hazbase.signedIn) && !sessionInvalid;
-  const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
+  const hasPasskey = Boolean(hazbase.passkeyRegistered || hazbase.credentialId || hazbase.deviceBindingId);
   const configured = Boolean(capability.payTo || capability.payoutAddress || capability.smartAccountAddress);
   const needsPasskey = def?.family === "evm";
   const canConfigure = signedIn && (!needsPasskey || hasPasskey);
@@ -7052,7 +7052,7 @@ function deriveHazbaseWalletFlow(hazbase) {
   const sessionInvalid = Boolean(hazbase.sessionInvalid);
   const signedIn = Boolean(hazbase.signedIn) && !sessionInvalid;
   const passkeyHost = hazbasePasskeyHostSupport();
-  const hasPasskey = Boolean(hazbase.credentialId || hazbase.deviceBindingId);
+  const hasPasskey = Boolean(hazbase.passkeyRegistered || hazbase.credentialId || hazbase.deviceBindingId);
 
   const actionButton = (labelKey, action, { primary = false, disabled = false, attrs = "" } = {}) => {
     const pending = isHazbaseActionPending(action);
@@ -10159,7 +10159,15 @@ for (const button of document.querySelectorAll("[data-hazbase-action]")) {
         }
         const { createPasskeyRegistrationCredential } = await loadHazbasePasskeyModule();
         const challenge = await apiPost("/api/hazbase/passkey/register/challenge", {}, { timeoutMs: HAZBASE_ACTION_TIMEOUT_MS });
-        const credential = await createPasskeyRegistrationCredential(challenge);
+        let credential;
+        try {
+          credential = await createPasskeyRegistrationCredential(challenge);
+        } catch (error) {
+          if (error?.name === "InvalidStateError" || /invalid state/i.test(error?.message || String(error))) {
+            throw new Error(L("error.hazbasePasskeyAlreadyRegistered"));
+          }
+          throw error;
+        }
         await apiPost("/api/hazbase/passkey/register/complete", {
           challengeId: challenge.challengeId,
           credential,

@@ -47,6 +47,11 @@ import {
   frameTypeName,
 } from "../scripts/lib/remote-pairing/envelope.mjs";
 
+// Fixed WebSocket subprotocol the relay echoes back on the 101 so browser
+// handshakes that carried the token via Sec-WebSocket-Protocol succeed. The
+// token subprotocol is never echoed. Must match worker.js.
+const RELAY_SUBPROTOCOL = "viveworker.relay.v1";
+
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
@@ -261,7 +266,18 @@ export class PairingChannel {
     // and there's no double-delivery race with shouldDrainOnAccept firing
     // before the inbound RESUME_REQ arrives.
 
-    return new Response(null, { status: 101, webSocket: client });
+    // Echo the fixed relay subprotocol when the client offered it: a browser WS
+    // handshake fails unless the server selects one of the offered subprotocols,
+    // and the token now rides Sec-WebSocket-Protocol. Only RELAY_SUBPROTOCOL is
+    // echoed — never the token. Older clients offer nothing, so no header is set.
+    const offeredSubprotocols = String(request.headers.get("Sec-WebSocket-Protocol") || "")
+      .split(",")
+      .map((proto) => proto.trim());
+    const responseInit = { status: 101, webSocket: client };
+    if (offeredSubprotocols.includes(RELAY_SUBPROTOCOL)) {
+      responseInit.headers = { "Sec-WebSocket-Protocol": RELAY_SUBPROTOCOL };
+    }
+    return new Response(null, responseInit);
   }
 
   // -------------------------------------------------------------------------

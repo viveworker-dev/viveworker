@@ -91,6 +91,14 @@ const DEFAULT_MAX_CIRCUIT_BREAKER_MS = 10 * 60_000;
 const DEFAULT_STABLE_CONNECTION_MS = 15_000;
 const DEFAULT_PROLOGUE = new TextEncoder().encode("viveworker/remote-pairing/v1");
 
+// The relay token is carried in the Sec-WebSocket-Protocol handshake header,
+// not a `?token=` query param, so it stays out of URLs and access logs. We
+// offer the fixed RELAY_SUBPROTOCOL (which the relay echoes on the 101 so the
+// handshake completes) plus the token as `${TOKEN_SUBPROTOCOL_PREFIX}<token>`.
+// Must match worker-pairing/worker.js and worker-pairing/pairing-do.js.
+const RELAY_SUBPROTOCOL = "viveworker.relay.v1";
+const TOKEN_SUBPROTOCOL_PREFIX = "vwtok.";
+
 // CloseEvent codes we emit. 1000 is normal; 4xxx is application-defined.
 const CLOSE_NORMAL = 1000;
 const CLOSE_HANDSHAKE_TIMEOUT = 4001;
@@ -354,12 +362,16 @@ export class RemotePairingTransport {
 
     const url =
       `${this._relayUrl}/v1/pairing/${encodeURIComponent(this._pairingId)}` +
-      `/ws?role=${encodeURIComponent(this._role)}` +
-      `&token=${encodeURIComponent(this._relayToken)}`;
+      `/ws?role=${encodeURIComponent(this._role)}`;
+
+    // Send the relay token via Sec-WebSocket-Protocol instead of the URL. Both
+    // the browser WebSocket and the Node `ws` package take a protocols list as
+    // the 2nd arg; the relay echoes only RELAY_SUBPROTOCOL back.
+    const subprotocols = [RELAY_SUBPROTOCOL, `${TOKEN_SUBPROTOCOL_PREFIX}${this._relayToken}`];
 
     let ws;
     try {
-      ws = new this._WebSocketImpl(url);
+      ws = new this._WebSocketImpl(url, subprotocols);
     } catch (err) {
       this._onError(err);
       this._setState(STATE.DISCONNECTED, { reason: "open-threw", error: err });

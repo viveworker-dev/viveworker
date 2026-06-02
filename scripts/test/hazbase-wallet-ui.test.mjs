@@ -44,6 +44,19 @@ test("hazbase upstream error codes are localized before display", () => {
   assert.match(functionBody("localizeApiError"), /"invalid-liquid-address": "error\.hazbaseLiquidAddressInvalid"/);
 });
 
+test("hazbase wallet treats server-side passkeys as already registered", () => {
+  assert.equal(t("en", "settings.hazbase.passkey.ready"), "Registered for this account");
+  assert.equal(t("ja", "settings.hazbase.passkey.ready"), "このアカウントで登録済み");
+  assert.equal(
+    t("ja", "error.hazbasePasskeyAlreadyRegistered"),
+    "このアカウントには既にパスキーが登録されています。既存のパスキーで続行してください。"
+  );
+  assert.match(functionBody("renderWalletInventoryCapabilityCard"), /hazbase\.passkeyRegistered/);
+  assert.match(functionBody("deriveHazbaseWalletFlow"), /hazbase\.passkeyRegistered/);
+  assert.match(appSource, /InvalidStateError/);
+  assert.match(appSource, /error\.hazbasePasskeyAlreadyRegistered/);
+});
+
 test("wallet inventory is localized and backs out to wallet settings", () => {
   assert.equal(t("ja", "settings.wallet.agent.copy"), "有料ファイル共有で支払いを受け取るウォレットを選びます。mainnet は正式リリースまで除外されます。");
   assert.equal(t("ja", "settings.wallet.betaNotice"), "ウォレット機能はベータテスト中です。Testnet を安全な既定値にし、mainnet は正式リリース時にご利用いただけます。");

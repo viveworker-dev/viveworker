@@ -37,6 +37,7 @@ const {
   bootstrapPasskeyAccount,
   completePasskeyAssertion,
   completePasskeyRegistration,
+  listPasskeyDevices,
   listSupportedChains,
   requestEmailOtp: requestHazbaseEmailOtp,
   requestPasskeyAssertionChallenge,
@@ -1549,11 +1550,19 @@ function normalizeTrustedReadTokens(tokens) {
   }
   if (strippedTokens.some((token) => {
     const value = String(token || "");
-    return (
-      ["||", "&&", ";", "&"].includes(value) ||
-      value.includes("`") ||
-      value.includes("$(")
-    );
+    if (value === "|") {
+      // A standalone pipe is the only operator allowed here; the pipe-stage
+      // split below validates that each downstream stage is an allow-listed
+      // post-processor (head/tail/wc).
+      return false;
+    }
+    // Reject any token that *contains* a command separator or command
+    // substitution, not just tokens that equal one. The whitespace tokenizer
+    // keeps separators attached to adjacent text (e.g. "README.md;id" or
+    // "README.md|sh"), so a whole-token equality check let the shell run an
+    // injected second command the classifier never saw. A substring check on
+    // ; & | and backtick (plus "$(") closes that gap.
+    return /[;&|`]/u.test(value) || value.includes("$(");
   })) {
     return null;
   }
@@ -1587,6 +1596,14 @@ function evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot }) {
   const normalizedCwd = cleanText(cwd || "");
   const normalizedWorkspaceRoot = cleanText(workspaceRoot || normalizedCwd);
   const normalizedCommandText = unwrapShellCommand(commandText);
+  // A literal newline or carriage return is a shell command separator, but
+  // tokenizeShellWords() treats it as ordinary whitespace — so an injected
+  // second command (e.g. "rg foo\ntouch evil") would be split into harmless
+  // looking word tokens and misclassified as a single safe read. Refuse to
+  // auto-classify anything carrying these so it falls back to manual approval.
+  if (/[\n\r]/u.test(normalizedCommandText)) {
+    return null;
+  }
   const rawTokens = tokenizeShellWords(normalizedCommandText);
   if (!normalizedCommandText || !normalizedCwd || !normalizedWorkspaceRoot || rawTokens.length === 0) {
     return null;
@@ -15704,7 +15721,7 @@ function resolveManifestPairingToken({ config, state, requestedToken }) {
   if (!isPairingAvailable(config)) {
     return "";
   }
-  return cleanText(config.pairingToken) === token ? token : "";
+  return constantTimeStringEqual(cleanText(config.pairingToken), token) ? token : "";
 }
 
 function buildWebManifest({ pairToken }) {
@@ -15739,7 +15756,7 @@ function buildWebManifest({ pairToken }) {
   );
 }
 
-function buildWebAppHtml({ pairToken }) {
+function buildWebAppHtml({ pairToken, nonce }) {
   const manifestHref = pairToken
     ? `/manifest.webmanifest?pairToken=${encodeURIComponent(pairToken)}`
     : "/manifest.webmanifest";
@@ -15862,7 +15879,7 @@ function buildWebAppHtml({ pairToken }) {
       </div>
     </div>
     <div id="app"></div>
-    <script>
+    <script nonce="${nonce}">
       (() => {
         const isJa = (navigator.language || "").toLowerCase().startsWith("ja");
         const message = isJa ? "同じWi-Fi内のPCを確認中..." : "Checking your trusted Wi-Fi...";
@@ -16147,10 +16164,22 @@ function createNativeApprovalServer({ config, runtime, state }) {
           state,
           requestedToken: url.searchParams.get("pairToken"),
         });
+        const cspNonce = crypto.randomBytes(16).toString("base64url");
         res.statusCode = 200;
         res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store, max-age=0");
-        res.end(buildWebAppHtml({ pairToken }));
+        // Defense-in-depth against XSS in the control-plane PWA: this document
+        // renders server-built HTML that can contain untrusted agent content,
+        // so lock script execution to same-origin plus the single nonce'd inline
+        // boot script. Without 'unsafe-inline', an injected <script>, onerror=
+        // handler, or javascript: URL cannot run even if it slips past the
+        // markdown sanitizer. img/style/connect are intentionally left to the
+        // browser default so remote connection, wallet, and images keep working.
+        res.setHeader(
+          "Content-Security-Policy",
+          `script-src 'self' 'nonce-${cspNonce}'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'`
+        );
+        res.end(buildWebAppHtml({ pairToken, nonce: cspNonce }));
         return;
       }
 
@@ -16281,7 +16310,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
       const apiA2ATaskStatus = url.pathname.match(/^\/api\/providers\/a2a\/tasks\/([^/]+)\/status$/u);
       if (apiA2ATaskStatus && req.method === "GET") {
         const apiKey = req.headers["x-a2a-key"] || "";
-        if (!config.a2aApiKey || apiKey !== config.a2aApiKey) {
+        if (!config.a2aApiKey || !constantTimeStringEqual(apiKey, config.a2aApiKey)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
         const token = decodeURIComponent(apiA2ATaskStatus[1]);
@@ -16750,7 +16779,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
 
 if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
   const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  const hookAuth = config.sessionSecret && constantTimeStringEqual(hookSecret, config.sessionSecret);
   if (!hookAuth) {
     const session = requireApiSession(req, res, config, state);
     if (!session) return;
@@ -16759,18 +16788,30 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     return writeJson(res, 200, { enabled: false });
   }
   const hazbase = normalizeHazbaseState(state.hazbase);
-  const [paymentsResult, chainsResult] = await Promise.allSettled([
+  const localPasskeyRegistered = Boolean(hazbase.deviceBindingId || hazbase.credentialId);
+  const devicesPromise = hazbase.accessToken && !hazbase.sessionInvalid && !localPasskeyRegistered
+    ? listPasskeyDevices({ emailSession: hazbase.accessToken })
+    : Promise.resolve(null);
+  const [paymentsResult, chainsResult, devicesResult] = await Promise.allSettled([
     fetchHazbaseMetadata(config, "/api/meta/payments"),
     fetchHazbaseMetadata(config, "/api/meta/chains"),
+    devicesPromise,
   ]);
   const payments = paymentsResult.status === "fulfilled" ? paymentsResult.value : null;
   const chains = chainsResult.status === "fulfilled" ? chainsResult.value : null;
+  const passkeyDevices = devicesResult.status === "fulfilled" && Array.isArray(devicesResult.value?.devices)
+    ? devicesResult.value.devices
+    : [];
   const errors = [];
   if (paymentsResult.status === "rejected") {
     errors.push(paymentsResult.reason?.message || String(paymentsResult.reason || "payments metadata unavailable"));
   }
   if (chainsResult.status === "rejected") {
     errors.push(chainsResult.reason?.message || String(chainsResult.reason || "chains metadata unavailable"));
+  }
+  if (devicesResult.status === "rejected") {
+    if (await maybeWriteHazbaseSessionExpiredResponse({ error: devicesResult.reason, config, state, res })) return;
+    errors.push(devicesResult.reason?.message || String(devicesResult.reason || "passkey devices unavailable"));
   }
   const supportedChains = Array.isArray(chains?.chains)
     ? chains.chains.filter((entry) => Boolean(paymentNetworkForChainId(Number(entry.chainId))))
@@ -16807,6 +16848,8 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
     sessionId: hazbase.sessionId,
     deviceBindingId: hazbase.deviceBindingId,
     credentialId: hazbase.credentialId,
+    passkeyRegistered: Boolean(localPasskeyRegistered || passkeyDevices.length),
+    passkeyDeviceCount: passkeyDevices.length,
     highTrustExpiresAt: hazbase.highTrustExpiresAt,
     accounts: hazbase.accounts,
     paymentCapabilities,
@@ -16821,7 +16864,7 @@ if (url.pathname === "/api/hazbase/status" && req.method === "GET") {
 
 if (url.pathname === "/api/hazbase/payout-address" && req.method === "GET") {
   const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  const hookAuth = config.sessionSecret && constantTimeStringEqual(hookSecret, config.sessionSecret);
   if (!hookAuth) {
     const session = requireApiSession(req, res, config, state);
     if (!session) return;
@@ -17167,7 +17210,7 @@ if (url.pathname === "/api/hazbase/agent-payment-defaults" && req.method === "PO
 
 if (url.pathname === "/api/hazbase/session/refresh" && req.method === "POST") {
   const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-  const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+  const hookAuth = config.sessionSecret && constantTimeStringEqual(hookSecret, config.sessionSecret);
   if (!hookAuth) {
     const session = requireMutatingApiSession(req, res, config, state);
     if (!session) return;
@@ -17776,7 +17819,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       // List known threads (active + registry) for the share target picker.
       if (url.pathname === "/api/threads/list" && req.method === "GET") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+        const hookAuth = config.sessionSecret && constantTimeStringEqual(hookSecret, config.sessionSecret);
         if (!hookAuth) { const session = requireApiSession(req, res, config, state); if (!session) return; }
         const codexConnected = Boolean(runtime.ipcClient?.clientId);
         const activeIds = new Set();
@@ -17820,7 +17863,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       // Submit a thread share request (creates an approval item on the phone).
       if (url.pathname === "/api/threads/share" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        const hookAuth = config.sessionSecret && hookSecret === config.sessionSecret;
+        const hookAuth = config.sessionSecret && constantTimeStringEqual(hookSecret, config.sessionSecret);
         if (!hookAuth) { const session = requireApiSession(req, res, config, state); if (!session) return; }
         const body = await parseJsonBody(req);
         const shareType = cleanText(body?.shareType || "message");
@@ -18070,7 +18113,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       // time-slot-based compose.  Defaults to full-day today.
       if (url.pathname === "/api/providers/moltbook/activity-summary" && req.method === "GET") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 403, { error: "forbidden" });
         }
         const slot = String(url.searchParams.get("slot") || "").toLowerCase();
@@ -18245,7 +18288,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/payments/x402/hazbase-wallet" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
 
@@ -18335,7 +18378,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/payments/x402/approval" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
 
@@ -18403,7 +18446,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/providers/mcp/events" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
 
@@ -18419,7 +18462,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/providers/claude/events" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
 
@@ -18783,7 +18826,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/providers/moltbook/events" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
         let body;
@@ -18935,7 +18978,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
 
       if (url.pathname === "/api/providers/moltbook/draft" && req.method === "POST") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
         let body;
@@ -19062,7 +19105,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       );
       if (apiMoltbookDraftDecisionGet && req.method === "GET") {
         const hookSecret = req.headers["x-viveworker-hook-secret"] || "";
-        if (!config.sessionSecret || hookSecret !== config.sessionSecret) {
+        if (!config.sessionSecret || !constantTimeStringEqual(hookSecret, config.sessionSecret)) {
           return writeJson(res, 401, { error: "unauthorized" });
         }
         const token = decodeURIComponent(apiMoltbookDraftDecisionGet[1]);
@@ -22487,8 +22530,13 @@ async function saveState(stateFile, state) {
   // single newline at the end keeps diffs/hexdumps working on the off chance
   // someone cats the file.
   const output = JSON.stringify(state);
-  await fs.mkdir(path.dirname(stateFile), { recursive: true });
-  await fs.writeFile(stateFile, `${output}\n`, "utf8");
+  await fs.mkdir(path.dirname(stateFile), { recursive: true, mode: 0o700 });
+  // state.json holds hazbase wallet tokens, push subscriptions, and device
+  // records — keep it owner-only so other local users can't read it. writeFile's
+  // mode only applies on create, so chmod explicitly to also tighten any file
+  // that was previously written world-readable.
+  await fs.writeFile(stateFile, `${output}\n`, { mode: 0o600 });
+  await fs.chmod(stateFile, 0o600).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------

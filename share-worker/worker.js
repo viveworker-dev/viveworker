@@ -1313,6 +1313,20 @@ if (meta.price && meta.paymentSalt && activePaymentOptions.length > 0) {
     }
 
     const paymentRequestId = resolvePaymentRequestIdForHeader(xPaymentHeader, requirementResult);
+    if (!paymentRequestId) {
+      // No worker-generated payment request matched the submitted X-PAYMENT, so
+      // there is nothing share-bound to verify against. Fail closed rather than
+      // handing an unconstrained id to the facilitator.
+      writeShareEvent(env, "verify_failed", slug, {
+        userId: meta.userId || "",
+        network: requirements.network || "",
+        reason: "payment-request-mismatch",
+      });
+      return jsonResponse(
+        { x402Version: X402_VERSION, error: "payment-request-mismatch" },
+        402,
+      );
+    }
     const verifyResult = await verifyHazbasePayment(env, paymentRequestId, xPaymentHeader);
     if (!verifyResult || !verifyResult.verified) {
       const reason = (verifyResult && (verifyResult.invalidReason || verifyResult.errorCode)) || "payment-verification-failed";
@@ -2372,14 +2386,23 @@ async function requestHazbasePaymentRequirements(env, meta, slug, requestUrl) {
 }
 
 function resolvePaymentRequestIdForHeader(xPaymentHeader, requirementResult) {
+  const requests = Array.isArray(requirementResult?.paymentRequests) ? requirementResult.paymentRequests : [];
+  const allowedIds = new Set(
+    requests.map((entry) => String(entry?.paymentRequestId || "")).filter(Boolean),
+  );
   const decoded = decodeX402Header(xPaymentHeader);
   const direct = String(decoded?.paymentRequestId || decoded?.payload?.paymentRequestId || "").trim();
-  if (/^[a-zA-Z0-9:_-]{8,160}$/u.test(direct)) return direct;
+  // Only resolve to a paymentRequestId the worker just generated for THIS share
+  // — those are bound by the facilitator to this share's amount / payTo /
+  // network / resource URL. A client-supplied id is honoured only when it
+  // exactly matches one of ours; otherwise a buyer could unlock this share with
+  // a paymentRequestId + X-PAYMENT from a different, cheaper share they own. The
+  // raw client value is never passed through to verify/settle.
+  if (direct && allowedIds.has(direct)) return direct;
   const scheme = String(decoded?.scheme || "").trim();
   const network = String(decoded?.network || "").trim();
   const assetAddress = String(decoded?.asset || decoded?.payload?.asset || "").trim().toLowerCase();
   const assetKey = String(decoded?.assetKey || decoded?.payload?.assetKey || "").trim().toLowerCase();
-  const requests = Array.isArray(requirementResult?.paymentRequests) ? requirementResult.paymentRequests : [];
   const match = requests.find((entry) => (
     (!scheme || String(entry.scheme || "") === scheme) &&
     (!network || String(entry.network || "") === network) &&

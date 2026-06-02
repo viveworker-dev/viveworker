@@ -18,7 +18,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { upsertEnvText } from "./lib/pairing.mjs";
 
 const A2A_ENV_FILE = path.join(os.homedir(), ".viveworker", "a2a.env");
@@ -355,13 +355,30 @@ async function fetchJson(url, options = {}) {
 }
 
 function openBrowser(url) {
+  // authUrl comes from the relay response, so a malicious or compromised relay
+  // (or a user pointed at one via --relay-url) must not be able to smuggle shell
+  // metacharacters into a command line. Parse and require http(s), then hand the
+  // URL to the OS opener as a single argv entry via execFileSync (no shell) so
+  // it can never be reinterpreted as a command.
+  let target;
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      console.log(`   (refusing to auto-open a non-http(s) URL — open it manually)`);
+      return;
+    }
+    target = parsed.toString();
+  } catch {
+    console.log(`   (could not parse the authorization URL — open it manually)`);
+    return;
+  }
   try {
     if (process.platform === "darwin") {
-      execSync(`open "${url}"`, { stdio: "ignore" });
+      execFileSync("open", [target], { stdio: "ignore" });
     } else if (process.platform === "linux") {
-      execSync(`xdg-open "${url}"`, { stdio: "ignore" });
+      execFileSync("xdg-open", [target], { stdio: "ignore" });
     } else if (process.platform === "win32") {
-      execSync(`start "" "${url}"`, { stdio: "ignore" });
+      execFileSync("rundll32", ["url.dll,FileProtocolHandler", target], { stdio: "ignore" });
     }
   } catch {
     // Browser open failed — URL is already printed for manual use

@@ -210,7 +210,7 @@ async function runSetup(cliOptions) {
     : null;
 
   progress.update("cli.setup.progress.writeConfig");
-  await fs.mkdir(path.dirname(envFile), { recursive: true });
+  await fs.mkdir(path.dirname(envFile), { recursive: true, mode: 0o700 });
   await fs.mkdir(path.dirname(logFile), { recursive: true });
 
   const envLines = [
@@ -248,7 +248,8 @@ async function runSetup(cliOptions) {
     enableNtfy && existing.NTFY_ACCESS_TOKEN ? `NTFY_ACCESS_TOKEN=${existing.NTFY_ACCESS_TOKEN}` : null,
   ].filter(Boolean);
 
-  await fs.writeFile(envFile, `${envLines.join("\n")}\n`, "utf8");
+  await fs.writeFile(envFile, `${envLines.join("\n")}\n`, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600).catch(() => {});
 
   progress.update("cli.setup.progress.providers");
   const providerSetup = await autoConfigureProvidersDuringSetup({
@@ -1455,8 +1456,9 @@ async function refreshPairingCredentials(envFile, config = {}, { force = false }
     PAIRING_TOKEN: nextPairing.pairingToken,
     PAIRING_EXPIRES_AT_MS: String(nextPairing.pairingExpiresAtMs),
   });
-  await fs.mkdir(path.dirname(envFile), { recursive: true });
-  await fs.writeFile(envFile, nextText, "utf8");
+  await fs.mkdir(path.dirname(envFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(envFile, nextText, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600).catch(() => {});
 
   return {
     rotated: true,
@@ -1604,7 +1606,8 @@ async function repairDoctorIssues(cliOptions, { envFile, config, locale, hostnam
 
   const currentText = (await fileExists(envFile)) ? await fs.readFile(envFile, "utf8") : "";
   const nextText = upsertEnvText(currentText, updates);
-  await fs.writeFile(envFile, nextText, "utf8");
+  await fs.writeFile(envFile, nextText, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600).catch(() => {});
   return changed;
 }
 
@@ -2059,8 +2062,9 @@ async function maybeRotateStartupPairing(envFile, config = {}) {
     PAIRING_TOKEN: nextPairing.pairingToken,
     PAIRING_EXPIRES_AT_MS: String(nextPairing.pairingExpiresAtMs),
   });
-  await fs.mkdir(path.dirname(envFile), { recursive: true });
-  await fs.writeFile(envFile, nextText, "utf8");
+  await fs.mkdir(path.dirname(envFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(envFile, nextText, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600).catch(() => {});
 
   return {
     rotated: true,
