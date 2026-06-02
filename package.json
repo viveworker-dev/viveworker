@@ -1,6 +1,6 @@
 {
   "name": "viveworker",
-  "version": "0.8.6",
+  "version": "0.8.7",
   "description": "Mobile control plane for AI agents. Approve, answer, and hand off work for Codex, Claude, MCP-ready tools, and A2A from one phone.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
