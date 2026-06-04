@@ -23,11 +23,12 @@
  * Frame routing summary:
  *   FRAME_DATA       buffer + forward to peer
  *   FRAME_ACK        GC counterparty's outbox up to acked seq
- *   FRAME_PING       reply with PONG (relay-local)
+ *   FRAME_PING       reply with PONG (legacy relay-local binary keepalive)
  *   FRAME_PONG       drop (was just keepalive)
  *   FRAME_RESUME_REQ check buffer, reply OK + replay or FAIL
  *   FRAME_RESUME_OK
  *   FRAME_RESUME_FAIL  reject (clients shouldn't send these to relay)
+ *   text keepalive   auto-reply with text PONG without waking hibernated DOs
  */
 
 import {
@@ -51,6 +52,8 @@ import {
 // handshakes that carried the token via Sec-WebSocket-Protocol succeed. The
 // token subprotocol is never echoed. Must match worker.js.
 const RELAY_SUBPROTOCOL = "viveworker.relay.v1";
+export const TEXT_KEEPALIVE_PING = "viveworker.keepalive.ping.v1";
+export const TEXT_KEEPALIVE_PONG = "viveworker.keepalive.pong.v1";
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -119,6 +122,8 @@ export class PairingChannel {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+
+    configureWebSocketAutoResponse(state);
 
     // role → PeerState. PeerState shape:
     //   {
@@ -290,6 +295,13 @@ export class PairingChannel {
    */
   async webSocketMessage(ws, message) {
     if (typeof message === "string") {
+      if (message === TEXT_KEEPALIVE_PING) {
+        trySend(ws, TEXT_KEEPALIVE_PONG);
+        return;
+      }
+      if (message === TEXT_KEEPALIVE_PONG) {
+        return;
+      }
       this._closeWithError(ws, CODE_PROTOCOL_ERROR, "binary frames only");
       return;
     }
@@ -619,6 +631,18 @@ function safeAttachment(ws) {
     return ws.deserializeAttachment();
   } catch {
     return null;
+  }
+}
+
+function configureWebSocketAutoResponse(state) {
+  if (typeof state?.setWebSocketAutoResponse !== "function") return;
+  const Pair = globalThis.WebSocketRequestResponsePair;
+  if (typeof Pair !== "function") return;
+  try {
+    state.setWebSocketAutoResponse(new Pair(TEXT_KEEPALIVE_PING, TEXT_KEEPALIVE_PONG));
+  } catch {
+    // Older runtimes/tests may not expose auto-response. The string fallback
+    // in webSocketMessage keeps the protocol functional without it.
   }
 }
 

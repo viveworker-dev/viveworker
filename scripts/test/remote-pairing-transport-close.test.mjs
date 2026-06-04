@@ -5,6 +5,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   RemotePairingTransport,
   STATE,
+  TEXT_KEEPALIVE_PING,
 } from "../../web/remote-pairing/transport.js";
 import { generateIdentityKeypair } from "../lib/remote-pairing/noise.mjs";
 import { generateRelayToken } from "../lib/remote-pairing/pairings.mjs";
@@ -12,8 +13,12 @@ import { generateRelayToken } from "../lib/remote-pairing/pairings.mjs";
 class FakeWebSocket {
   constructor() {
     this.readyState = 0;
+    this.sent = [];
   }
   addEventListener() {}
+  send(data) {
+    this.sent.push(data);
+  }
   close() {
     this.readyState = 3;
   }
@@ -134,6 +139,39 @@ test("stable connection clears reconnect circuit history", async () => {
     assert.equal(transport._recentFailureAtMs.length, 0);
     assert.equal(transport._circuitOpenUntilMs, 0);
     assert.equal(transport._circuitOpenCount, 0);
+  } finally {
+    transport.close();
+  }
+});
+
+test("keepalive ping uses text frames for Durable Object auto-response", () => {
+  const transport = makeTransport();
+  const ws = new FakeWebSocket();
+  ws.readyState = 1;
+  transport._ws = ws;
+
+  try {
+    transport._sendPing();
+
+    assert.deepEqual(ws.sent, [TEXT_KEEPALIVE_PING]);
+  } finally {
+    transport.close();
+  }
+});
+
+test("activity delays the next adaptive keepalive ping", async () => {
+  const transport = makeTransport({ pingIntervalMs: 20 });
+  const ws = new FakeWebSocket();
+  ws.readyState = 1;
+  transport._ws = ws;
+  transport._lastActivityAtMs = Date.now() - 10_000;
+
+  try {
+    transport._startPing();
+    transport._markActivity();
+    await sleep(30);
+
+    assert.deepEqual(ws.sent, []);
   } finally {
     transport.close();
   }

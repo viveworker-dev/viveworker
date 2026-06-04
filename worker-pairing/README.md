@@ -84,6 +84,11 @@ replay buffer does **not**. On a cold wake, every reconnecting peer that
 sends `RESUME_REQ(lastSeenSeq > 0)` gets `RESUME_FAIL(HIBERNATED)` and
 redoes the Noise handshake.
 
+Keepalive frames use a small text ping/pong pair registered with
+`state.setWebSocketAutoResponse()`. That lets Cloudflare answer idle
+heartbeats without waking the hibernated DO. Legacy binary envelope
+`PING`/`PONG` is still accepted as a fallback for older clients.
+
 This is intentional. Persisting every frame to DO storage would burn
 writes on what is already a forward-secret transport — the cheaper move
 is to make re-handshake correct + fast and accept that long idle gaps
@@ -179,7 +184,7 @@ What this Worker guarantees today:
 - ✅ DATA frame routing without payload inspection.
 - ✅ Replay buffer with ACK-driven GC and TTL safety net.
 - ✅ RESUME flow (OK + replay / FAIL on gap or hibernation).
-- ✅ PING/PONG keepalive support (relay-local).
+- ✅ Text PING/PONG keepalive support via DO auto-response, with legacy binary fallback.
 - ✅ Same-role reconnects perform controlled `4003 replaced` handoff for iOS/PWA recovery.
 - ✅ Hibernatable DO — no $$ for idle pairings.
 

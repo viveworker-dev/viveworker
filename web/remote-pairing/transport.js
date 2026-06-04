@@ -48,7 +48,6 @@ import {
   decode,
   encodeData,
   encodeAck,
-  encodePing,
   encodeResumeReq,
   generateMid,
   FRAME_DATA,
@@ -79,7 +78,11 @@ export const STATE = Object.freeze({
   FAILED: "failed",
 });
 
-const DEFAULT_PING_INTERVAL_MS = 30_000;          // CF idle timeout is ~100s
+export const TEXT_KEEPALIVE_PING = "viveworker.keepalive.ping.v1";
+export const TEXT_KEEPALIVE_PONG = "viveworker.keepalive.pong.v1";
+
+const DEFAULT_PING_INTERVAL_MS = 75_000;          // CF idle timeout is ~100s
+const MIN_PING_INTERVAL_MS = 5_000;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
 const MAX_PRE_CONNECT_BACKOFF_MS = 4_000;
@@ -169,6 +172,7 @@ export class RemotePairingTransport {
     this._onHandshakeComplete = opts.onHandshakeComplete ?? noop;
 
     this._pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    if (Number(this._pingIntervalMs) <= 0) this._pingIntervalMs = 0;
     this._backoffMs = (opts.backoffMs ?? DEFAULT_BACKOFF_MS).slice();
     if (this._backoffMs.length === 0) this._backoffMs = [1_000];
     this._handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
@@ -207,7 +211,7 @@ export class RemotePairingTransport {
     this._reconnectAttempt = 0;
     /** @type {ReturnType<typeof setTimeout> | null} */
     this._reconnectTimer = null;
-    /** @type {ReturnType<typeof setInterval> | null} */
+    /** @type {ReturnType<typeof setTimeout> | null} */
     this._pingTimer = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     this._handshakeTimer = null;
@@ -229,6 +233,7 @@ export class RemotePairingTransport {
     // ---- sequencing (monotonic across the transport lifetime) ----
     this._outboundSeq = 0;
     this._lastSeenPeerSeq = 0;
+    this._lastActivityAtMs = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -395,6 +400,7 @@ export class RemotePairingTransport {
       try { this._ws?.close(CLOSE_NORMAL, "closed during open"); } catch {}
       return;
     }
+    this._markActivity({ reschedulePing: false });
     if (this._session) {
       // We have a live noise session from a previous connection — try to
       // resume rather than re-handshaking. `lastSeenPeerSeq` tells the relay
@@ -421,6 +427,21 @@ export class RemotePairingTransport {
   }
 
   _handleMessage(evt) {
+    if (typeof evt?.data === "string") {
+      if (evt.data === TEXT_KEEPALIVE_PONG) {
+        this._markActivity();
+        return;
+      }
+      if (evt.data === TEXT_KEEPALIVE_PING) {
+        this._markActivity();
+        this._wireSend(TEXT_KEEPALIVE_PONG);
+        return;
+      }
+      this._onError(new Error("unexpected text websocket frame"));
+      return;
+    }
+
+    this._markActivity();
     let frame;
     try {
       frame = decode(asU8(evt.data));
@@ -720,16 +741,39 @@ export class RemotePairingTransport {
 
   _startPing() {
     this._stopPing();
-    this._pingTimer = setInterval(() => {
-      this._sendPing();
-    }, this._pingIntervalMs);
+    if (!this._pingIntervalMs) return;
+    if (!this._lastActivityAtMs) this._lastActivityAtMs = Date.now();
+    this._schedulePing();
   }
 
   _stopPing() {
     if (this._pingTimer != null) {
-      clearInterval(this._pingTimer);
+      clearTimeout(this._pingTimer);
       this._pingTimer = null;
     }
+  }
+
+  _schedulePing() {
+    if (!this._pingIntervalMs || this._closed || !this._ws || this._ws.readyState !== 1) return;
+    const interval = Math.max(MIN_PING_INTERVAL_MS, Number(this._pingIntervalMs) || DEFAULT_PING_INTERVAL_MS);
+    const idleFor = Date.now() - (this._lastActivityAtMs || Date.now());
+    const delay = Math.max(1, interval - idleFor);
+    this._pingTimer = setTimeout(() => {
+      this._pingTimer = null;
+      if (this._closed || !this._ws || this._ws.readyState !== 1) return;
+      const nextIdleFor = Date.now() - (this._lastActivityAtMs || Date.now());
+      if (nextIdleFor >= interval) {
+        this._sendPing();
+      }
+      this._schedulePing();
+    }, delay);
+  }
+
+  _markActivity({ reschedulePing = true } = {}) {
+    this._lastActivityAtMs = Date.now();
+    if (!reschedulePing || this._pingTimer == null) return;
+    this._stopPing();
+    this._schedulePing();
   }
 
   // -------------------------------------------------------------------------
@@ -751,22 +795,27 @@ export class RemotePairingTransport {
   }
 
   _sendPing() {
-    this._wireSend(encodePing());
+    if (this._wireSend(TEXT_KEEPALIVE_PING, { countAsActivity: false })) {
+      this._markActivity({ reschedulePing: false });
+    }
   }
 
   _sendResumeReq(lastSeenSeq) {
     this._wireSend(encodeResumeReq(lastSeenSeq));
   }
 
-  _wireSend(bytes) {
+  _wireSend(bytes, { countAsActivity = true } = {}) {
     if (!this._ws || this._ws.readyState !== 1 /* OPEN */) {
       this._log.warn?.("send while WS not open — dropping");
-      return;
+      return false;
     }
     try {
       this._ws.send(bytes);
+      if (countAsActivity) this._markActivity();
+      return true;
     } catch (err) {
       this._onError(err);
+      return false;
     }
   }
 

@@ -16,7 +16,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { PairingChannel } from "../../worker-pairing/pairing-do.js";
+import {
+  PairingChannel,
+  TEXT_KEEPALIVE_PING,
+  TEXT_KEEPALIVE_PONG,
+} from "../../worker-pairing/pairing-do.js";
 import {
   FRAME_RESUME_OK,
   FRAME_RESUME_FAIL,
@@ -45,7 +49,7 @@ class FakeWS {
   }
   send(data) {
     if (this.closed) throw new Error("send on closed socket");
-    this.sent.push(toU8(data));
+    this.sent.push(typeof data === "string" ? data : toU8(data));
   }
   close(code, reason) {
     this.closed = { code, reason };
@@ -59,10 +63,14 @@ class FakeState {
   constructor() {
     /** @type {Array<{ws: FakeWS, tags: string[]}>} */
     this.accepted = [];
+    this.autoResponse = null;
   }
   acceptWebSocket(ws, tags = []) {
     // Mirror the real API: idempotent attach + tag binding.
     this.accepted.push({ ws, tags });
+  }
+  setWebSocketAutoResponse(pair) {
+    this.autoResponse = pair;
   }
   getWebSockets(tag) {
     if (tag == null) return this.accepted.map((a) => a.ws);
@@ -579,6 +587,37 @@ test("PING is answered with a PONG to the same socket", async () => {
 
   assert.equal(phone.sent.length, 1);
   assert.equal(decode(phone.sent[0]).type, FRAME_PONG);
+});
+
+test("text keepalive is answered without touching the envelope decoder", async () => {
+  const channel = new PairingChannel(new FakeState(), {});
+  const phone = new FakeWS();
+  connect(channel, "phone", phone);
+
+  await channel.webSocketMessage(phone, TEXT_KEEPALIVE_PING);
+
+  assert.deepEqual(phone.sent, [TEXT_KEEPALIVE_PONG]);
+});
+
+test("constructor registers text keepalive auto-response when runtime supports it", () => {
+  const previous = globalThis.WebSocketRequestResponsePair;
+  class FakeWebSocketRequestResponsePair {
+    constructor(request, response) {
+      this.request = request;
+      this.response = response;
+    }
+  }
+  globalThis.WebSocketRequestResponsePair = FakeWebSocketRequestResponsePair;
+  try {
+    const state = new FakeState();
+    new PairingChannel(state, {});
+
+    assert.equal(state.autoResponse.request, TEXT_KEEPALIVE_PING);
+    assert.equal(state.autoResponse.response, TEXT_KEEPALIVE_PONG);
+  } finally {
+    if (previous === undefined) delete globalThis.WebSocketRequestResponsePair;
+    else globalThis.WebSocketRequestResponsePair = previous;
+  }
 });
 
 test("RESUME_REQ(0) on a fresh channel returns RESUME_OK(0)", async () => {
