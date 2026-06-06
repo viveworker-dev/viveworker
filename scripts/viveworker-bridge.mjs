@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { promises as fs, readFileSync, createReadStream, watch as watchFs } from "node:fs";
+import { promises as fs, readFileSync, realpathSync, createReadStream, watch as watchFs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1243,11 +1243,46 @@ function resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }) {
   if (rawToken === "-" || rawToken.startsWith("~") || rawToken.startsWith("http://") || rawToken.startsWith("https://")) {
     return null;
   }
-  const resolved = path.resolve(normalizedCwd, rawToken);
-  if (!isPathWithinRoot(normalizedWorkspaceRoot, resolved)) {
+  // Reject shell-active metacharacters in a path argument. The classifier
+  // resolves the token lexically (path.resolve does NOT expand them), but the
+  // agent later runs the ORIGINAL command through a shell that WOULD expand
+  // globs (* ? [ ]), brace lists ({a,b}) and variables ($VAR / ${VAR}) — reading
+  // files the classifier never vetted (e.g. "cat *.env", "cat {x,/etc/passwd}").
+  if (/[*?[\]{}$]/.test(rawToken)) {
     return null;
   }
-  if (isSensitiveCommandPath(resolved)) {
+  const resolved = path.resolve(normalizedCwd, rawToken);
+  // Canonicalize via realpath so an in-workspace symlink cannot redirect the
+  // read at an existing file outside the root or at a sensitive path. Root and
+  // target are both realpath'd so platform symlinks (e.g. macOS /var ->
+  // /private/var) do not cause false negatives.
+  let canonicalTarget;
+  try {
+    canonicalTarget = realpathSync(resolved);
+  } catch {
+    // The target does not exist (e.g. a flag value like the "5" in `head -n 5`
+    // mis-parsed as a path, or a not-yet-created file). With no existing file
+    // there is no symlink to follow out of the root, so fall back to the lexical
+    // confinement check against the raw root — this still blocks "../" escapes
+    // and sensitive names.
+    if (!isPathWithinRoot(normalizedWorkspaceRoot, resolved)) {
+      return null;
+    }
+    if (isSensitiveCommandPath(resolved)) {
+      return null;
+    }
+    return resolved;
+  }
+  let canonicalRoot;
+  try {
+    canonicalRoot = realpathSync(normalizedWorkspaceRoot);
+  } catch {
+    return null;
+  }
+  if (!isPathWithinRoot(canonicalRoot, canonicalTarget)) {
+    return null;
+  }
+  if (isSensitiveCommandPath(canonicalTarget)) {
     return null;
   }
   return resolved;
@@ -1592,6 +1627,29 @@ function normalizeTrustedReadTokens(tokens) {
   return stages[0];
 }
 
+function commandHasDangerousReadFlag(tokens) {
+  // Read-tool options that execute external commands or read arbitrary files.
+  const longDanger = ["--pre", "--pre-glob", "--hostname-bin", "--search-zip", "--file", "--config", "--ext-diff", "--textconv"];
+  for (const token of tokens) {
+    const value = String(token || "");
+    if (!value.startsWith("-")) {
+      continue;
+    }
+    if (longDanger.some((flag) => value === flag || value.startsWith(`${flag}=`))) {
+      return true;
+    }
+    // Single-dash short clusters carrying a value-taking dangerous flag:
+    // ripgrep -f (read a patterns file) and -z (run decompressors). A value-
+    // taking short flag must be last in its cluster, so any single-dash token
+    // containing lowercase f or z is rejected. Uppercase -F/-Z and long options
+    // (--fixed-strings etc.) are unaffected.
+    if (!value.startsWith("--") && /[fz]/.test(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot }) {
   const normalizedCwd = cleanText(cwd || "");
   const normalizedWorkspaceRoot = cleanText(workspaceRoot || normalizedCwd);
@@ -1615,6 +1673,16 @@ function evaluateTrustedReadCommandPolicy({ commandText, cwd, workspaceRoot }) {
 
   const tokens = normalizeTrustedReadTokens(rawTokens);
   if (!tokens || tokens.length === 0) {
+    return null;
+  }
+
+  // Reject read-tool flags that execute external commands or read arbitrary
+  // files (ripgrep --pre= / --hostname-bin= / -f patternfile / -z search-zip,
+  // git --ext-diff / --textconv, ...). The per-command branches below skip
+  // "-"-prefixed tokens without inspecting their values, so without this guard
+  // `rg --pre=/tmp/evil foo .` would auto-approve and ripgrep would execute the
+  // attacker-named command.
+  if (commandHasDangerousReadFlag(tokens)) {
     return null;
   }
 

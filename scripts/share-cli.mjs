@@ -1007,9 +1007,28 @@ function selectSupportedPaymentRequirement(x402, flags = {}) {
 
 function summarizeRequirement(requirement) {
   const network = SUPPORTED_BUYER_NETWORKS[String(requirement.network)];
-  const assetKey = String(requirement.extra?.asset || "").toLowerCase();
-  const decimals = Number(requirement.extra?.decimals ?? (String(requirement.scheme || "") === LIQUID_X402_SCHEME ? 8 : 6));
-  const assetLabel = PAYMENT_ASSETS[assetKey]?.label || (String(requirement.scheme || "") === LIQUID_X402_SCHEME ? "USDt" : "USDC");
+  const isLiquid = String(requirement.scheme || "") === LIQUID_X402_SCHEME;
+  // SECURITY: never trust the seller-supplied requirement.extra.decimals or the
+  // free-form asset label for the amount shown to / approved by the human.
+  // Resolve the asset against the network's known assets and take decimals +
+  // label from the trusted PAYMENT_ASSETS table, so the displayed/approved
+  // amount always matches what is actually signed (the atomic maxAmountRequired).
+  // Otherwise a hostile seller could advertise inflated decimals to make the
+  // phone show a tiny amount while a much larger value is authorized.
+  const claimedAssetKey = String(requirement.extra?.asset || "").toLowerCase();
+  const resolvedAsset =
+    normalizePaymentAsset(claimedAssetKey, String(requirement.network)) || (isLiquid ? "usdt" : "usdc");
+  const trustedAsset = PAYMENT_ASSETS[resolvedAsset] || PAYMENT_ASSETS[isLiquid ? "usdt" : "usdc"];
+  const decimals = trustedAsset.decimals;
+  const assetLabel = trustedAsset.label;
+  // Refuse if the seller advertised decimals that disagree with the known token
+  // decimals — the 402 is malformed or is attempting an amount-display spoof.
+  const advertisedDecimals = requirement.extra?.decimals;
+  if (advertisedDecimals != null && Number(advertisedDecimals) !== decimals) {
+    throw new Error(
+      `x402 requirement decimals (${advertisedDecimals}) do not match the known ${assetLabel} decimals (${decimals}) on ${requirement.network}; refusing to sign a possibly spoofed amount.`
+    );
+  }
   return {
     network: String(requirement.network),
     chainId: network?.chainId ?? null,
@@ -1019,8 +1038,11 @@ function summarizeRequirement(requirement) {
     amountUsdc: formatAtomicAmount(requirement.maxAmountRequired, decimals),
     assetLabel,
     payTo: String(requirement.payTo),
+    // The on-chain token contract that will actually be signed against. Surfaced
+    // (printPaymentSummary / phone approval payload) so a seller cannot label a
+    // payment "USDC" while pointing requirement.asset at a different token.
     asset: String(requirement.asset),
-    assetKey,
+    assetKey: resolvedAsset,
     resource: String(requirement.resource || ""),
     description: String(requirement.description || ""),
   };
@@ -1031,6 +1053,7 @@ function printPaymentSummary(summary) {
   console.log("");
   console.log(`${summary.paid ? "Paid" : "Payment required"} — ${summary.amount} ${summary.assetLabel} on ${network?.label || summary.network}`);
   console.log(`   to: ${summary.payTo}`);
+  if (summary.asset) console.log(`   token contract: ${summary.asset}`);
   if (summary.payer) console.log(`   from: ${summary.payer}`);
   if (summary.resource) console.log(`   resource: ${summary.resource}`);
   console.log("");
