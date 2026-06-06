@@ -36,6 +36,7 @@ import {
   pickInboxReplyCandidate,
   reconcileInboxDraftMarkers,
   getMoltbookReplyQuotaState,
+  loopbackFetch,
 } from "./moltbook-api.mjs";
 
 function fail(message, code = 1) {
@@ -58,10 +59,8 @@ async function resolveOnBridge(env, commentId) {
   const base = (env.VIVEWORKER_BASE_URL || "https://127.0.0.1:8810").replace(/\/+$/u, "");
   const secret = env.VIVEWORKER_HOOK_SECRET || "";
   if (!secret) return;
-  const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  if (!prev) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   try {
-    await fetch(`${base}/api/providers/moltbook/events`, {
+    await loopbackFetch(`${base}/api/providers/moltbook/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -71,8 +70,6 @@ async function resolveOnBridge(env, commentId) {
     });
   } catch {
     // ignore
-  } finally {
-    if (!prev) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev ?? "";
   }
 }
 
@@ -596,14 +593,12 @@ async function cmdPropose(postId, flags) {
   const secret = env.VIVEWORKER_HOOK_SECRET || "";
   if (!secret) fail("VIVEWORKER_HOOK_SECRET missing (expected in ~/.viveworker/moltbook.env)");
 
-  const prevTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
   // Submit draft to bridge. The bridge persists it to disk and handles posting
   // on approval — the CLI exits immediately (fire-and-forget).
   let submitRes;
   try {
-    const r = await fetch(`${base}/api/providers/moltbook/draft`, {
+    const r = await loopbackFetch(`${base}/api/providers/moltbook/draft`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-viveworker-hook-secret": secret },
       body: JSON.stringify({
@@ -643,7 +638,6 @@ async function cmdPropose(postId, flags) {
   }
 
   console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
 }
 
 async function cmdMarkScoutSeen(postId) {
@@ -907,8 +901,6 @@ async function cmdCompose(flags) {
   const secret = env.VIVEWORKER_HOOK_SECRET || "";
   if (!secret) fail("VIVEWORKER_HOOK_SECRET missing");
 
-  const prevTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
   const state = rollScoutDayIfNeeded(await readScoutState());
   const maxCompose = Number(flags["max-daily"]) || 3;
@@ -942,7 +934,7 @@ async function cmdCompose(flags) {
   // Fetch activity summary from bridge.
   let summary;
   try {
-    const r = await fetch(`${base}/api/providers/moltbook/activity-summary?${params}`, {
+    const r = await loopbackFetch(`${base}/api/providers/moltbook/activity-summary?${params}`, {
       headers: { "x-viveworker-hook-secret": secret },
     });
     if (!r.ok) fail(`activity-summary: ${r.status}`);
@@ -978,7 +970,6 @@ async function cmdCompose(flags) {
     maxComposeDaily: maxCompose,
   }));
 
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
 }
 
 async function cmdComposePropose(flags) {
@@ -996,8 +987,6 @@ async function cmdComposePropose(flags) {
   const secret = env.VIVEWORKER_HOOK_SECRET || "";
   if (!secret) fail("VIVEWORKER_HOOK_SECRET missing");
 
-  const prevTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
   const sourceId = `compose:${Date.now()}`;
 
@@ -1005,7 +994,7 @@ async function cmdComposePropose(flags) {
   // on approval — the CLI exits immediately (fire-and-forget).
   let submitRes;
   try {
-    const r = await fetch(`${base}/api/providers/moltbook/draft`, {
+    const r = await loopbackFetch(`${base}/api/providers/moltbook/draft`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-viveworker-hook-secret": secret },
       body: JSON.stringify({
@@ -1033,7 +1022,6 @@ async function cmdComposePropose(flags) {
   if (!token) fail(`bridge did not return a token: ${JSON.stringify(submitRes)}`);
 
   console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
-  if (!prevTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = prevTls ?? "";
 }
 
 export async function runMoltbookCli(argv) {

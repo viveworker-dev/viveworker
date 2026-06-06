@@ -5,8 +5,57 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import http from "node:http";
+import https from "node:https";
 
 export const API_BASE = "https://www.moltbook.com/api/v1";
+
+// Fetch helper for the LOOPBACK viveworker bridge only. The bridge serves HTTPS
+// with a self-signed cert on 127.0.0.1/localhost, so certificate verification is
+// skipped for THAT connection only — safe on loopback, where no network MITM is
+// possible. Every other request (notably the Bearer-authenticated
+// www.moltbook.com API) keeps using the default, fully-verified global fetch, so
+// the API key is never sent over an unverified TLS connection. This replaces the
+// old process-global NODE_TLS_REJECT_UNAUTHORIZED=0, which disabled verification
+// for ALL outbound TLS including the moltbook.com calls.
+export function loopbackFetch(url, { method = "GET", headers = {}, body, signal } = {}) {
+  const target = new URL(url);
+  const isHttps = target.protocol === "https:";
+  const isLoopback =
+    target.hostname === "127.0.0.1" || target.hostname === "localhost" || target.hostname === "::1";
+  const lib = isHttps ? https : http;
+  const outHeaders = { ...headers };
+  let payload = null;
+  if (body != null) {
+    payload = Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
+    if (outHeaders["content-length"] == null && outHeaders["Content-Length"] == null) {
+      outHeaders["content-length"] = String(payload.length);
+    }
+  }
+  const options = { method, headers: outHeaders };
+  if (signal) options.signal = signal;
+  if (isHttps && isLoopback) options.rejectUnauthorized = false;
+  return new Promise((resolve, reject) => {
+    const req = lib.request(target, options, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        const status = res.statusCode || 0;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => text,
+          json: async () => JSON.parse(text),
+        });
+      });
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
 
 export const DEFAULT_ENV_FILE = path.join(os.homedir(), ".viveworker", "moltbook.env");
 export const DEFAULT_INBOX_DIR = path.join(os.homedir(), ".viveworker", "moltbook-inbox");

@@ -231,7 +231,7 @@ async function flushPendingStateWrite(config, state) {
 const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
 loadEnvFile(envFile);
-loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
+loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"), { allowKeys: (key) => key.startsWith("A2A_") });
 loadEnvFile(path.join(os.homedir(), ".viveworker", "remote-pairing.env"));
 await maybeRotateStartupPairingEnv(envFile);
 
@@ -22400,9 +22400,20 @@ function parseEnvText(text) {
   return output;
 }
 
-function loadEnvFile(filePath) {
+function loadEnvFile(filePath, { allowKeys = null } = {}) {
   try {
-    Object.assign(process.env, parseEnvText(readFileSync(filePath, "utf8")));
+    const parsed = parseEnvText(readFileSync(filePath, "utf8"));
+    if (typeof allowKeys === "function") {
+      // Only copy allow-listed keys into the environment. Used for files derived
+      // from untrusted/remote data (e.g. a2a.env, written from the relay's setup
+      // response) so a tampered file cannot inject keys that override
+      // security-critical config such as AUTH_REQUIRED or SESSION_SECRET.
+      for (const [key, value] of Object.entries(parsed)) {
+        if (allowKeys(key)) process.env[key] = value;
+      }
+    } else {
+      Object.assign(process.env, parsed);
+    }
   } catch {
     // Optional env file.
   }
@@ -22477,8 +22488,12 @@ async function maybeRotateStartupPairingEnv(envFile) {
   }
 
   const nextText = upsertEnvText(currentText, updates);
-  await fs.mkdir(path.dirname(envFile), { recursive: true });
-  await fs.writeFile(envFile, nextText, "utf8");
+  await fs.mkdir(path.dirname(envFile), { recursive: true, mode: 0o700 });
+  // This env file holds the freshly-rotated PAIRING_TOKEN (trusted control-plane
+  // access) — keep it owner-only. writeFile's mode only applies on create, so
+  // chmod explicitly to also tighten any pre-existing world-readable file.
+  await fs.writeFile(envFile, nextText, { mode: 0o600 });
+  await fs.chmod(envFile, 0o600).catch(() => {});
 }
 
 async function loadState(stateFile) {
@@ -22598,13 +22613,21 @@ async function saveState(stateFile, state) {
   // single newline at the end keeps diffs/hexdumps working on the off chance
   // someone cats the file.
   const output = JSON.stringify(state);
-  await fs.mkdir(path.dirname(stateFile), { recursive: true, mode: 0o700 });
+  const stateDir = path.dirname(stateFile);
+  const tmpFile = path.join(stateDir, `.${path.basename(stateFile)}.tmp-${process.pid}-${Date.now()}`);
+  await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
   // state.json holds hazbase wallet tokens, push subscriptions, and device
-  // records — keep it owner-only so other local users can't read it. writeFile's
-  // mode only applies on create, so chmod explicitly to also tighten any file
-  // that was previously written world-readable.
-  await fs.writeFile(stateFile, `${output}\n`, { mode: 0o600 });
-  await fs.chmod(stateFile, 0o600).catch(() => {});
+  // records — write a private temp file first so ENOSPC never truncates the
+  // last known-good state.json.
+  try {
+    await fs.writeFile(tmpFile, `${output}\n`, { mode: 0o600 });
+    await fs.chmod(tmpFile, 0o600).catch(() => {});
+    await fs.rename(tmpFile, stateFile);
+    await fs.chmod(stateFile, 0o600).catch(() => {});
+  } catch (error) {
+    await fs.unlink(tmpFile).catch(() => {});
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -23973,7 +23996,7 @@ async function main() {
       if (now - lastA2aEnvCheckAt > A2A_ENV_CHECK_INTERVAL_MS) {
         lastA2aEnvCheckAt = now;
         try {
-          loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"));
+          loadEnvFile(path.join(os.homedir(), ".viveworker", "a2a.env"), { allowKeys: (key) => key.startsWith("A2A_") });
           const newRelayUrl = cleanText(process.env.A2A_RELAY_URL || "");
           const newRelayUserId = cleanText(process.env.A2A_RELAY_USER_ID || "");
           const newRelayRegisterSecret = cleanText(process.env.A2A_RELAY_REGISTER_SECRET || "");

@@ -19,6 +19,13 @@ test("Claude approval Web Push delivery is awaited and logged", () => {
   assert.match(bridgeSource, /\[claude-approval-push\]/);
 });
 
+test("bridge saves state through a private temp file before replacing state.json", () => {
+  assert.match(bridgeSource, /const tmpFile = path\.join\(stateDir,/);
+  assert.match(bridgeSource, /await fs\.writeFile\(tmpFile,/);
+  assert.match(bridgeSource, /await fs\.rename\(tmpFile, stateFile\);/);
+  assert.match(bridgeSource, /await fs\.unlink\(tmpFile\)\.catch\(\(\) => \{\}\);/);
+});
+
 test("approval action outcome uses the loaded detail provider before falling back", () => {
   assert.match(
     appSource,

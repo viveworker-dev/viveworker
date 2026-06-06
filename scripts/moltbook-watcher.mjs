@@ -17,14 +17,8 @@
 import http from "node:http";
 import process from "node:process";
 
-// The bridge usually listens on HTTPS with a self-signed certificate. Since
-// we only ever talk to it on loopback, disable TLS verification for outgoing
-// fetch calls from this process. Scoped to the watcher process only.
-if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-}
-
 import {
+  loopbackFetch,
   createMoltbookClient,
   extractNotifications,
   isCommentNotification,
@@ -81,7 +75,7 @@ async function pushToBridge(item) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const res = await fetch(`${VIVEWORKER_BASE}/api/providers/moltbook/events`, {
+    const res = await loopbackFetch(`${VIVEWORKER_BASE}/api/providers/moltbook/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",

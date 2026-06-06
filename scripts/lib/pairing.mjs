@@ -37,6 +37,21 @@ export function upsertEnvText(rawText, updates) {
     return text;
   }
 
+  // Reject keys/values that would corrupt the line-based env file or inject
+  // extra assignments. A value containing CR/LF (e.g. from a hostile/compromised
+  // relay response during `a2a setup`) could otherwise smuggle additional
+  // KEY=VALUE lines — including ones that override security-critical config such
+  // as AUTH_REQUIRED or SESSION_SECRET when the file is later loaded into the
+  // environment.
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(String(key))) {
+      throw new Error(`upsertEnvText: invalid env key ${JSON.stringify(key)}`);
+    }
+    if (/[\r\n]/u.test(String(value ?? ""))) {
+      throw new Error(`upsertEnvText: env value for ${key} contains a newline; refusing to write a possibly injected env file`);
+    }
+  }
+
   const updateMap = new Map(entries.map(([key, value]) => [String(key), String(value ?? "")]));
   const seen = new Set();
   const output = [];
