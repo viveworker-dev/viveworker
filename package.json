@@ -36,13 +36,16 @@
     "companion-app"
   ],
   "homepage": "https://viveworker.com/",
-  "repository": "viveworker-dev/viveworker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/viveworker-dev/viveworker.git"
+  },
   "bugs": {
     "url": "https://github.com/viveworker-dev/viveworker/issues"
   },
   "type": "module",
   "bin": {
-    "viveworker": "./scripts/viveworker.mjs"
+    "viveworker": "scripts/viveworker.mjs"
   },
   "files": [
     "scripts/viveworker.mjs",
