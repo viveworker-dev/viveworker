@@ -507,6 +507,23 @@ function todayKey() {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
+/**
+ * Cloudflare-native Rate Limit binding wrapper. Atomic and aggregated across all
+ * isolates (unlike the KV quota counters), so it closes the concurrent
+ * get-then-put race. Fail-closed: success:true only when the binding is absent
+ * (local dev) or the limiter allows; success:false when exceeded or it throws.
+ */
+async function safeRateLimit(binding, key) {
+  if (!binding || typeof binding.limit !== "function") {
+    return { success: true };
+  }
+  try {
+    return await binding.limit({ key });
+  } catch {
+    return { success: false };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
@@ -860,6 +877,22 @@ async function handleMessageSend(env, request, userRecord, userId, rpcId, params
   const instruction = extractTextFromParts(message.parts);
   if (!instruction) {
     return jsonResponse(jsonRpcError(rpcId, -32602, "Invalid params: no text content in message parts"));
+  }
+
+  // Atomic per-minute burst gate, BEFORE the KV quota reads below. The KV
+  // daily/pending/per-IP counters are non-atomic get-then-put, so concurrent
+  // message/send from one caller could otherwise all read the same pre-increment
+  // value and bypass every limit, flooding the user's phone with push
+  // notifications. These CF-native limiters aggregate across isolates and are
+  // atomic, capping a single caller to ~10 accepted sends/minute.
+  const callerIpForRl = request.headers.get("cf-connecting-ip") || "unknown";
+  const userRl = await safeRateLimit(env.SEND_USER_RL, userId);
+  if (userRl && !userRl.success) {
+    return jsonResponse(jsonRpcError(rpcId, -32000, "Rate limit: too many tasks per minute"), 429);
+  }
+  const ipRl = await safeRateLimit(env.SEND_IP_RL, `${userId}:${callerIpForRl}`);
+  if (ipRl && !ipRl.success) {
+    return jsonResponse(jsonRpcError(rpcId, -32000, "Rate limit: too many tasks per minute from this IP"), 429);
   }
 
   // Load pending record (contains tasks + daily counts in one KV entry)

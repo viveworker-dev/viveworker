@@ -171,7 +171,7 @@ export default {
         });
       }
 
-      const localCooldownMs = checkLocalWsUpgradeBudget(pairingId, role);
+      const localCooldownMs = checkLocalWsUpgradeBudget(pairingId, role, cfIp);
       if (localCooldownMs > 0) {
         const retryAfter = String(Math.max(1, Math.ceil(localCooldownMs / 1000)));
         console.log(`[relay-ws-local-cooldown] pairing=${shortPairing(pairingId)} role=${role} retryAfter=${retryAfter}s`);
@@ -271,9 +271,13 @@ function relayMetricSampleWeight(env, event) {
   return DEFAULT_RELAY_ANALYTICS_SAMPLE_RATE;
 }
 
-function checkLocalWsUpgradeBudget(pairingId, role) {
+function checkLocalWsUpgradeBudget(pairingId, role, cfIp) {
   const now = Date.now();
-  const key = `${pairingId}:${role}`;
+  // Include the (Cloudflare-set, non-spoofable) caller IP so an attacker IP that
+  // knows a leaked pairingId cannot exhaust the shared cooldown bucket and
+  // 429-lock the legitimate phone/bridge. Mirrors the CF-native WS_UPGRADE_RL key.
+  const ipKeyPart = String(cfIp || "unknown");
+  const key = `${pairingId}:${role}:${ipKeyPart}`;
   pruneLocalWsUpgradeBuckets(now);
   const bucket = LOCAL_WS_UPGRADE_BUCKETS.get(key) || {
     windowStartMs: now,

@@ -1233,6 +1233,79 @@ function isSensitiveCommandPath(candidatePath) {
   return false;
 }
 
+// Confine a stored timeline image path to the dirs the bridge itself writes
+// attachments into. Timeline entries can be created by SESSION_SECRET-authed
+// ingestion paths (provider/timeline events) that set entry.imagePaths to an
+// arbitrary absolute path; the per-path HMAC is signed by the bridge over that
+// same path, so it is NOT a confinement control. The /api/timeline image route
+// fs.readFile()s whatever this resolves to, so confinement MUST happen here.
+// Returns the original path string on success; fails closed ("") for anything
+// outside the roots, non-existent files, symlink escapes, sensitive names, or
+// missing config.
+function resolveConfinedTimelineImagePath(config, candidatePath) {
+  const normalized = cleanText(candidatePath || "");
+  if (!normalized || !path.isAbsolute(normalized)) {
+    return "";
+  }
+  if (isSensitiveCommandPath(normalized)) {
+    return "";
+  }
+  const roots = [config?.timelineAttachmentsDir, config?.replyUploadsDir]
+    .map((root) => cleanText(root || ""))
+    .filter(Boolean);
+  if (roots.length === 0) {
+    return "";
+  }
+  let canonicalTarget;
+  try {
+    canonicalTarget = realpathSync(normalized);
+  } catch {
+    return "";
+  }
+  for (const root of roots) {
+    let canonicalRoot;
+    try {
+      canonicalRoot = realpathSync(root);
+    } catch {
+      continue;
+    }
+    if (isPathWithinRoot(canonicalRoot, canonicalTarget)) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function realpathNearestExistingAncestor(resolvedPath) {
+  // Walk up from resolvedPath to the nearest ancestor that exists on disk,
+  // realpath that ancestor (following any symlinks), and re-attach the
+  // not-yet-existing trailing segments. Returns the canonicalized full path, or
+  // null if no ancestor can be canonicalized. This lets a non-existent
+  // write/read target still be symlink-checked via its existing parent dir.
+  const normalized = cleanText(resolvedPath || "");
+  if (!normalized) {
+    return null;
+  }
+  const trailing = [];
+  let current = normalized;
+  for (let depth = 0; depth < 4096; depth += 1) {
+    let canonicalAncestor;
+    try {
+      canonicalAncestor = realpathSync(current);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return null;
+      }
+      trailing.unshift(path.basename(current));
+      current = parent;
+      continue;
+    }
+    return trailing.length === 0 ? canonicalAncestor : path.join(canonicalAncestor, ...trailing);
+  }
+  return null;
+}
+
 function resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }) {
   const rawToken = cleanText(token || "");
   const normalizedCwd = cleanText(cwd || "");
@@ -1260,15 +1333,26 @@ function resolveTrustedReadTargetPath({ token, cwd, workspaceRoot }) {
   try {
     canonicalTarget = realpathSync(resolved);
   } catch {
-    // The target does not exist (e.g. a flag value like the "5" in `head -n 5`
-    // mis-parsed as a path, or a not-yet-created file). With no existing file
-    // there is no symlink to follow out of the root, so fall back to the lexical
-    // confinement check against the raw root — this still blocks "../" escapes
-    // and sensitive names.
-    if (!isPathWithinRoot(normalizedWorkspaceRoot, resolved)) {
+    // The target does not exist yet (e.g. a flag value like the "5" in
+    // `head -n 5` mis-parsed as a path, or a not-yet-created WRITE target). The
+    // target's PARENT may still be an in-workspace symlink that redirects the
+    // write/read outside the root (e.g. "notes -> /etc" with "notes/readme.md").
+    // Canonicalize via the nearest existing ancestor and re-check confinement
+    // against the realpath'd root. Fail closed if nothing can be canonicalized.
+    const canonicalNonExistent = realpathNearestExistingAncestor(resolved);
+    if (!canonicalNonExistent) {
       return null;
     }
-    if (isSensitiveCommandPath(resolved)) {
+    let canonicalRootForMissing;
+    try {
+      canonicalRootForMissing = realpathSync(normalizedWorkspaceRoot);
+    } catch {
+      return null;
+    }
+    if (!isPathWithinRoot(canonicalRootForMissing, canonicalNonExistent)) {
+      return null;
+    }
+    if (isSensitiveCommandPath(canonicalNonExistent)) {
       return null;
     }
     return resolved;
@@ -4390,6 +4474,88 @@ function buildPushPayload({ config, kind, token, stableId, title, body, tab = ""
       url: buildAppItemUrl(config, kind, token, { tab, subtab }),
     },
   };
+}
+
+const ALLOWED_PUSH_HOSTS = new Set([
+  "fcm.googleapis.com",
+  "android.googleapis.com",
+  "updates.push.services.mozilla.com",
+]);
+const ALLOWED_PUSH_HOST_SUFFIXES = [
+  ".push.apple.com",
+  ".notify.windows.com",
+  ".push.services.mozilla.com",
+];
+
+function isBlockedPushIpLiteral(host) {
+  const family = net.isIP(host);
+  if (family === 0) {
+    return false;
+  }
+  if (family === 6) {
+    const lower = host.toLowerCase();
+    if (lower === "::1" || lower === "::") {
+      return true;
+    }
+    const mapped = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/u);
+    if (mapped) {
+      return isBlockedPushIpLiteral(mapped[1]);
+    }
+    const head = parseInt(lower.split(":")[0] || "0", 16);
+    if ((head & 0xfe00) === 0xfc00) {
+      return true;
+    }
+    if ((head & 0xffc0) === 0xfe80) {
+      return true;
+    }
+    return false;
+  }
+  const parts = host.split(".").map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
+    return true;
+  }
+  const [a, b] = parts;
+  if (a === 0 || a === 127) return true;
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  return false;
+}
+
+// Validate a web-push subscription endpoint before persisting it. The endpoint
+// is attacker-controllable by any session-holder; deliverWebPushItem POSTs every
+// (encrypted) notification to it, so an unrestricted endpoint is both a
+// notification-exfiltration channel and an SSRF primitive. Require https, reject
+// embedded credentials and private/loopback/link-local IP literals, and
+// allow-list the known public push provider hosts.
+function isAllowedPushEndpoint(endpoint) {
+  let parsed;
+  try {
+    parsed = new URL(String(endpoint || ""));
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") {
+    return false;
+  }
+  if (parsed.username || parsed.password) {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[/u, "").replace(/\]$/u, "");
+  if (!host) {
+    return false;
+  }
+  if (isBlockedPushIpLiteral(host)) {
+    return false;
+  }
+  if (ALLOWED_PUSH_HOSTS.has(host)) {
+    return true;
+  }
+  return ALLOWED_PUSH_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix));
 }
 
 function pushSubscriptionId(endpoint) {
@@ -12095,6 +12261,10 @@ function normalizePushSubscriptionBody(payload, deviceId) {
   if (!endpoint || !p256dh || !auth || !deviceId) {
     return null;
   }
+  if (!isAllowedPushEndpoint(endpoint)) {
+    console.warn(`[web-push] rejected subscription endpoint host: ${(() => { try { return new URL(endpoint).host; } catch { return "invalid"; } })()}`);
+    return null;
+  }
   return normalizePushSubscriptionRecord({
     id: pushSubscriptionId(endpoint),
     endpoint,
@@ -15619,7 +15789,7 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
   return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
 }
 
-function resolveTimelineEntryImagePath(runtime, state, token, index) {
+function resolveTimelineEntryImagePath(runtime, state, token, index, config) {
   const normalizedToken = cleanText(token || "");
   const entry = timelineEntryByToken(runtime, normalizedToken)
     || (state?.recentTimelineEntries ?? []).find((candidate) => cleanText(candidate?.token || "") === normalizedToken)
@@ -15629,7 +15799,9 @@ function resolveTimelineEntryImagePath(runtime, state, token, index) {
   }
   const imagePaths = normalizeTimelineImagePaths(entry.imagePaths ?? []);
   const resolvedIndex = Math.max(0, Number(index) || 0);
-  return cleanText(imagePaths[resolvedIndex] || "");
+  const candidate = cleanText(imagePaths[resolvedIndex] || "");
+  // Fail closed: only serve images confined to the attachment/upload roots.
+  return resolveConfinedTimelineImagePath(config, candidate);
 }
 
 function resolveWebAsset(urlPath) {
@@ -19343,7 +19515,7 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
       if (apiTimelineImageMatch && req.method === "GET") {
         const token = decodeURIComponent(apiTimelineImageMatch[1]);
         const index = Number(apiTimelineImageMatch[2]) || 0;
-        const filePath = resolveTimelineEntryImagePath(runtime, state, token, index);
+        const filePath = resolveTimelineEntryImagePath(runtime, state, token, index, config);
         if (!filePath) {
           res.statusCode = 404;
           res.end("not-found");

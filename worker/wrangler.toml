@@ -17,3 +17,30 @@ preview_id = "06279d9087ea4242a2a3055ea6f57583"
 [[analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "viveworker_a2a_events"
+
+# Cloudflare-native Rate Limit bindings for message/send. Atomic + aggregated
+# across isolates, so they close the concurrency race the KV get-then-put quota
+# counters cannot: N parallel message/send from one caller used to all read the
+# same pre-increment value and bypass the daily/pending/per-IP limits, flooding
+# the user's phone. These burst gates run BEFORE the KV reads, capping a caller
+# to `limit` accepted sends/minute.
+# NOTE: [[ratelimits]].simple supports period = 10 or 60 only — a per-minute
+# burst cap, NOT the per-day quota (that stays in KV; free tier is 25/day).
+# NOTE: `wrangler dev --local` returns success:true for rate-limit bindings.
+# NOTE: confirm namespace_id 3001/3002 are unused for a different binding shape
+# in this Cloudflare account before deploy.
+[[ratelimits]]
+name = "SEND_USER_RL"
+namespace_id = "3001"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60
+
+[[ratelimits]]
+name = "SEND_IP_RL"
+namespace_id = "3002"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60
