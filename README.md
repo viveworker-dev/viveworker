@@ -218,10 +218,19 @@ If you prefer manual setup, add this to an MCP client:
 Available tools:
 
 - `viveworker_status` checks bridge, pairing, Remote connection, A2A, File Share, and Moltbook status
+- `viveworker_stats` reads package adoption and usage stats
+- `viveworker_share_list` lists File Share uploads and optional usage metrics
+- `viveworker_a2a_activity` reads local A2A activity
+- `viveworker_a2a_card` reads the current local A2A agent card
+- `viveworker_moltbook_list` lists Moltbook inbox comments
+- `viveworker_moltbook_show` reads one Moltbook comment
+- `viveworker_moltbook_thread` reads the thread for one Moltbook comment
 - `viveworker_notify` sends an informational phone notification and timeline entry
 - `viveworker_ask` asks a question on the paired phone and waits for the answer
 - `viveworker_request_approval` asks the phone to approve or reject a proposed action
 - `viveworker_share_file` uploads a workspace file to File Share after phone approval
+- `viveworker_share_replace` replaces the file behind an existing File Share slug after phone approval
+- `viveworker_share_link` mints a short-lived passwordless File Share token URL after phone approval
 - `viveworker_thread_share` shares context into another Codex / Claude / inbox thread
 - `viveworker_send_a2a_task` sends a task to a registered A2A target after phone approval
 
@@ -230,8 +239,9 @@ Available prompts include setup guidance, control-plane usage, risky-action appr
 Security defaults:
 
 - MCP is stdio-only in this release; there is no HTTP MCP server
+- MCP read-only inspection tools use a fixed command allowlist; MCP is not a generic shell or CLI executor
 - file sharing is limited to the current workspace and refuses `.env`, credential directories, private keys, and secret-looking paths
-- File Share and A2A task sending require phone approval
+- File Share uploads/replacements and A2A task sending require phone approval
 - MCP tool calls are recorded locally with `provider: "mcp"`
 - prompts, message bodies, file contents, file paths, command text, tokens, public keys, and IP addresses are not sent to central analytics
 

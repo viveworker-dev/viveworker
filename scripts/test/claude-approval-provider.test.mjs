@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const bridgeSource = readFileSync(new URL("../viveworker-bridge.mjs", import.meta.url), "utf8");
+const claudeHookSource = readFileSync(new URL("../viveworker-claude-hook.mjs", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../../web/app.js", import.meta.url), "utf8");
 
 test("Claude approvals carry raw params for Web Push body generation", () => {
@@ -31,4 +32,12 @@ test("approval action outcome uses the loaded detail provider before falling bac
     appSource,
     /approvalOutcomeMessage\(actionUrl, state\.currentDetail\?\.provider \|\| activeItem\?\.provider\)/
   );
+});
+
+test("command approval markdown fences are escaped before display", () => {
+  assert.match(bridgeSource, /function escapeMarkdownCodeFenceBody/);
+  assert.match(bridgeSource, /escapeMarkdownCodeFenceBody\(command\)/);
+  assert.match(bridgeSource, /escapeMarkdownCodeFenceBody\(commandText\)/);
+  assert.match(claudeHookSource, /function escapeMarkdownCodeFenceBody/);
+  assert.match(claudeHookSource, /escapeMarkdownCodeFenceBody\(cmd\.slice\(0, 500\)\)/);
 });

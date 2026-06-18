@@ -1803,11 +1803,6 @@ function unwrapShellCommand(commandText) {
     .trim();
 }
 
-function extractCommandLineFromFunctionOutput(outputText) {
-  const match = String(outputText || "").match(/^Command:\s+(.+)$/mu);
-  return unwrapShellCommand(match?.[1] || "");
-}
-
 function parseToolArgumentsJson(value) {
   if (isPlainObject(value)) {
     return value;
@@ -1864,16 +1859,21 @@ function redactTimelineCommandText(commandText) {
     .replace(/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=)(["']?)[^\s"']+\2/giu, "$1[redacted]");
 }
 
+function escapeMarkdownCodeFenceBody(text) {
+  return cleanText(text || "").replace(/```/gu, "\\`\\`\\`");
+}
+
 function timelineCommandMessage(locale, { commandText = "", toolName = "", fileRefs = [] } = {}) {
+  const safeCommandText = escapeMarkdownCodeFenceBody(redactTimelineCommandText(commandText));
   const commandBlock = commandText
-    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${redactTimelineCommandText(commandText)}\n\`\`\``
+    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${safeCommandText}\n\`\`\``
     : "";
   const toolBlock = !commandBlock && toolName
-    ? `${t(locale, "server.message.toolLabel")}\n\`\`\`text\n${cleanText(toolName)}\n\`\`\``
+    ? `${t(locale, "server.message.toolLabel")}\n\`\`\`text\n${escapeMarkdownCodeFenceBody(toolName)}\n\`\`\``
     : "";
   const files = normalizeTimelineFileRefs(fileRefs);
   const filesBlock = files.length
-    ? `${t(locale, "server.message.filesLabel")}\n\`\`\`text\n${files.join("\n")}\n\`\`\``
+    ? `${t(locale, "server.message.filesLabel")}\n\`\`\`text\n${files.map(escapeMarkdownCodeFenceBody).join("\n")}\n\`\`\``
     : "";
   return [commandBlock || toolBlock, filesBlock].filter(Boolean).join("\n\n");
 }
@@ -2003,7 +2003,7 @@ function sedCommandPathArgs(tokens) {
 function autoPilotApprovalMessage(locale, commandText) {
   const prefix = t(locale, "server.message.autoPilotTrustedReadApproved");
   const commandBlock = cleanText(commandText || "")
-    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${cleanText(commandText || "")}\n\`\`\``
+    ? `${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${escapeMarkdownCodeFenceBody(commandText)}\n\`\`\``
     : "";
   return [prefix, commandBlock].filter(Boolean).join("\n\n");
 }
@@ -7080,11 +7080,6 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
       });
       return [];
     }
-    const commandText = extractCommandLineFromFunctionOutput(payload.output ?? "");
-    if (!commandText) {
-      return [];
-    }
-    const classified = classifyTimelineCommand(commandText);
     upsertTimelineActivity({
       config,
       runtime,
@@ -7096,19 +7091,7 @@ async function buildRolloutFileTimelineEntries({ config, record, fileState, runt
       source: "codex-tool-output",
       atMs: createdAtMs,
     });
-    return [
-      buildToolTimelineEntry({
-        provider: "codex",
-        threadId,
-        threadLabel,
-        callId,
-        createdAtMs,
-        fileEventType: classified.fileEventType,
-        commandText: classified.commandText || commandText,
-        fileRefs: classified.fileRefs,
-        cwd: fileState.cwd || "",
-      }),
-    ].filter(Boolean);
+    return [];
   }
 
   if (payloadType === "custom_tool_call_output") {
@@ -11033,7 +11016,7 @@ function formatCommandApprovalMessage(params, locale = config?.defaultLocale || 
     parts.push(t(locale, "server.message.commandApprovalNeeded"));
   }
   if (command) {
-    parts.push(`${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${command}\n\`\`\``);
+    parts.push(`${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${escapeMarkdownCodeFenceBody(command)}\n\`\`\``);
   }
   return parts.join("\n\n") || t(locale, "server.message.commandApprovalNeeded");
 }

@@ -127,7 +127,7 @@ class ViveworkerMcpServer {
         websiteUrl: "https://viveworker.com",
       },
       instructions:
-        "Use viveworker tools when you need to notify, ask, request approval, share a file, hand off context, or delegate an A2A task through the user's paired mobile control plane.",
+        "Use viveworker tools when you need to inspect viveworker state, notify, ask, request approval, share a file, hand off context, or delegate an A2A task through the user's paired mobile control plane.",
     };
   }
 }
@@ -138,6 +138,20 @@ async function callTool(params) {
   switch (name) {
     case "viveworker_status":
       return toolOk(await bridgeEvent({ eventType: "status" }, SHORT_TIMEOUT_MS));
+    case "viveworker_stats":
+      return toolOk(await toolStats(args));
+    case "viveworker_share_list":
+      return toolOk(await toolShareList(args));
+    case "viveworker_a2a_activity":
+      return toolOk(await toolA2AActivity(args));
+    case "viveworker_a2a_card":
+      return toolOk(await toolA2ACard(args));
+    case "viveworker_moltbook_list":
+      return toolOk(await toolMoltbookList(args));
+    case "viveworker_moltbook_show":
+      return toolOk(await toolMoltbookShow(args));
+    case "viveworker_moltbook_thread":
+      return toolOk(await toolMoltbookThread(args));
     case "viveworker_notify":
       return toolOk(await toolNotify(args));
     case "viveworker_ask":
@@ -146,6 +160,8 @@ async function callTool(params) {
       return toolOk(await toolRequestApproval(args));
     case "viveworker_share_file":
       return toolOk(await toolShareFile(args));
+    case "viveworker_share_replace":
+      return toolOk(await toolShareReplace(args));
     case "viveworker_share_link":
       return toolOk(await toolShareLink(args));
     case "viveworker_thread_share":
@@ -155,6 +171,52 @@ async function callTool(params) {
     default:
       throw rpcInvalidParams(`Unknown tool: ${name}`);
   }
+}
+
+async function toolStats(args) {
+  const pkg = optionalString(args.pkg || args.packageName);
+  const cliArgs = ["stats", "--json"];
+  if (pkg) {
+    assertSafeNpmPackageName(pkg);
+    cliArgs.push("--pkg", pkg);
+  }
+  return runViveworkerCliJson(cliArgs, 60_000);
+}
+
+async function toolShareList(args) {
+  const cliArgs = ["share", "list", "--json"];
+  if (optionalBoolean(args.metrics)) {
+    cliArgs.push("--metrics");
+  }
+  return runViveworkerCliJson(cliArgs, 45_000);
+}
+
+async function toolA2AActivity(_args) {
+  return runViveworkerCliJson(["a2a", "activity"], 30_000);
+}
+
+async function toolA2ACard(_args) {
+  const output = await runViveworkerCliText(["a2a", "card"], 30_000);
+  return { ok: true, output: output.stdout.trim() };
+}
+
+async function toolMoltbookList(args) {
+  const cliArgs = ["moltbook", "list"];
+  if (optionalBoolean(args.all)) {
+    cliArgs.push("--all");
+  }
+  const output = await runViveworkerCliText(cliArgs, 30_000);
+  return { ok: true, output: output.stdout.trim() };
+}
+
+async function toolMoltbookShow(args) {
+  const commentId = requiredSafeIdentifier(args.commentId, "commentId");
+  return runViveworkerCliJson(["moltbook", "show", commentId], 30_000);
+}
+
+async function toolMoltbookThread(args) {
+  const commentId = requiredSafeIdentifier(args.commentId, "commentId");
+  return runViveworkerCliJson(["moltbook", "thread", commentId], 45_000);
 }
 
 async function toolNotify(args) {
@@ -245,11 +307,46 @@ async function toolShareFile(args) {
   return { approved: true, share: upload, tokenizedLink: link };
 }
 
-async function toolShareLink(args) {
-  const slug = requiredString(args.slug, "slug");
-  if (!/^[A-Za-z0-9]+$/.test(slug)) {
-    throw rpcInvalidParams("slug must contain only letters and numbers");
+async function toolShareReplace(args) {
+  const slug = requiredShareSlug(args.slug);
+  const requestedPath = requiredString(args.path, "path");
+  const workspaceRoot = optionalString(args.workspaceRoot) || process.env.VIVEWORKER_MCP_WORKSPACE_ROOT || process.cwd();
+  const file = await validateSharePath(requestedPath, workspaceRoot, "share_replace");
+  const stat = await fs.stat(file.realPath);
+  const expiresDays = optionalString(args.expiresDays ?? args["expires-days"]);
+  const noOptimize = optionalBoolean(args.noOptimize ?? args["no-optimize"]);
+  const approval = await bridgeEvent({
+    eventType: "approval_request",
+    title: "Replace viveworker File Share file",
+    message: [
+      "An MCP client wants to replace the file behind an existing viveworker File Share URL.",
+      "",
+      `Share slug: ${slug}`,
+      `New file: ${file.displayPath}`,
+      `Size: ${stat.size} bytes`,
+      expiresDays ? `Expires days: ${expiresDays}` : "Expires days: keep existing/default",
+      noOptimize ? "HTML optimization: disabled for this replace" : "",
+      "",
+      "This changes what existing recipients see at the same share link.",
+      "Approve only if this replacement file is safe to send outside this Mac.",
+    ].filter(Boolean).join("\n"),
+    approvalKind: "file_share_replace",
+    fileRefs: [file.displayPath],
+    timeoutMs: clampTimeout(args.timeoutMs),
+  }, clampTimeout(args.timeoutMs));
+  if (!approval.approved) {
+    return { approved: false, decision: approval.decision || "rejected" };
   }
+
+  const replaceArgs = ["share", "replace", slug, file.realPath, "--json"];
+  if (expiresDays) replaceArgs.push("--expires-days", expiresDays);
+  if (noOptimize) replaceArgs.push("--no-optimize");
+  const replace = await runViveworkerCliJson(replaceArgs, 90_000);
+  return { approved: true, share: replace };
+}
+
+async function toolShareLink(args) {
+  const slug = requiredShareSlug(args.slug);
   const password = requiredString(args.password, "password");
   if (password.length > 256) {
     throw rpcInvalidParams("password is too long (max 256 characters)");
@@ -424,7 +521,7 @@ function httpJson(endpoint, options) {
   });
 }
 
-async function validateSharePath(filePath, workspaceRoot) {
+async function validateSharePath(filePath, workspaceRoot, toolName = "share_file") {
   const root = path.resolve(String(workspaceRoot || ""));
   const candidate = path.resolve(String(filePath || ""));
   const [rootReal, fileReal] = await Promise.all([
@@ -433,16 +530,16 @@ async function validateSharePath(filePath, workspaceRoot) {
   ]);
   const rel = path.relative(rootReal, fileReal);
   if (rel.startsWith("..") || path.isAbsolute(rel)) {
-    throw new Error("share_file is limited to the current workspace root");
+    throw new Error(`${toolName} is limited to the current workspace root`);
   }
   const stat = await fs.stat(fileReal);
   if (!stat.isFile()) {
-    throw new Error("share_file path must be a regular file");
+    throw new Error(`${toolName} path must be a regular file`);
   }
   assertNotSensitivePath(rel || path.basename(fileReal));
   const ext = path.extname(fileReal).toLowerCase();
   if (!SHARE_FILE_EXTENSIONS.has(ext)) {
-    throw new Error(`share_file accepts only ${Array.from(SHARE_FILE_EXTENSIONS).join(" / ")} files. Got: ${ext || "(no extension)"}`);
+    throw new Error(`${toolName} accepts only ${Array.from(SHARE_FILE_EXTENSIONS).join(" / ")} files. Got: ${ext || "(no extension)"}`);
   }
   return {
     realPath: fileReal,
@@ -476,7 +573,16 @@ function assertNotSensitivePath(relPath) {
   }
 }
 
-function runViveworkerCliJson(args, timeoutMs) {
+async function runViveworkerCliJson(args, timeoutMs) {
+  const { stdout } = await runViveworkerCliText(args, timeoutMs);
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`viveworker CLI returned non-JSON: ${stdout.slice(0, 200)}`);
+  }
+}
+
+function runViveworkerCliText(args, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [viveworkerCli, ...args], {
       cwd: packageRoot,
@@ -502,11 +608,7 @@ function runViveworkerCliJson(args, timeoutMs) {
         reject(new Error((stderr || stdout || `viveworker CLI failed with code ${code}`).trim()));
         return;
       }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch {
-        reject(new Error(`viveworker CLI returned non-JSON: ${stdout.slice(0, 200)}`));
-      }
+      resolve({ stdout, stderr });
     });
   });
 }
@@ -655,6 +757,29 @@ function slugFromShareUrl(value) {
     const match = text.match(/\/v\/([A-Za-z0-9]+)/u);
     return match?.[1] || "";
   }
+}
+
+function assertSafeNpmPackageName(value) {
+  const text = optionalString(value);
+  if (!/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u.test(text)) {
+    throw rpcInvalidParams("pkg must be a valid npm package name");
+  }
+}
+
+function requiredSafeIdentifier(value, name) {
+  const text = requiredString(value, name);
+  if (!/^[A-Za-z0-9._:-]{1,160}$/u.test(text)) {
+    throw rpcInvalidParams(`${name} contains unsupported characters`);
+  }
+  return text;
+}
+
+function requiredShareSlug(value) {
+  const slug = requiredString(value, "slug");
+  if (!/^[A-Za-z0-9]+$/.test(slug)) {
+    throw rpcInvalidParams("slug must contain only letters and numbers");
+  }
+  return slug;
 }
 
 async function createShareTokenLink(slug, password, ttlHours) {
@@ -809,6 +934,87 @@ const TOOLS = [
     inputSchema: { type: "object", additionalProperties: false },
   },
   {
+    name: "viveworker_stats",
+    title: "Read viveworker stats",
+    description: "Read viveworker package adoption and usage stats. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        pkg: { type: "string" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_share_list",
+    title: "List File Share uploads",
+    description: "List File Share uploads and optionally include usage metrics. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        metrics: { type: "boolean" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_a2a_activity",
+    title: "Read A2A activity",
+    description: "Read local A2A activity from the default viveworker state. Read-only.",
+    inputSchema: { type: "object", additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_a2a_card",
+    title: "Read A2A card",
+    description: "Read the current local A2A agent card settings. Read-only.",
+    inputSchema: { type: "object", additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_moltbook_list",
+    title: "List Moltbook inbox",
+    description: "List Moltbook inbox comments. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        all: { type: "boolean" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_moltbook_show",
+    title: "Read Moltbook comment",
+    description: "Show one Moltbook comment by commentId. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        commentId: { type: "string" },
+      },
+      required: ["commentId"],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "viveworker_moltbook_thread",
+    title: "Read Moltbook thread",
+    description: "Show the Moltbook thread for one commentId. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        commentId: { type: "string" },
+      },
+      required: ["commentId"],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: "viveworker_notify",
     title: "Notify phone",
     description: "Send an informational notification to the paired phone and leave it in the timeline.",
@@ -891,6 +1097,24 @@ const TOOLS = [
         timeoutMs: { type: "number" },
       },
       required: ["path"],
+    },
+  },
+  {
+    name: "viveworker_share_replace",
+    title: "Replace File Share file",
+    description: "After phone approval, replace the file behind an existing viveworker File Share slug.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        slug: { type: "string" },
+        path: { type: "string" },
+        workspaceRoot: { type: "string" },
+        expiresDays: { type: "string" },
+        noOptimize: { type: "boolean" },
+        timeoutMs: { type: "number" },
+      },
+      required: ["slug", "path"],
     },
   },
   {
@@ -977,7 +1201,7 @@ const PROMPTS = [
       title: "Share deliverable",
       description: "Package a local deliverable through viveworker File Share with phone approval.",
     },
-    text: "When the user asks to share a report, prototype, screenshot, CSV, or standalone HTML deliverable, use viveworker_share_file. Only share files inside the workspace and never share secrets or credentials. If the user wants a password-protected share but the recipient should not know the password, set password plus tokenize=true, or use viveworker_share_link for an existing password-protected slug to mint a short-lived ?t= URL.",
+    text: "When the user asks to share a report, prototype, screenshot, CSV, or standalone HTML deliverable, use viveworker_share_file. When the user asks to replace the file behind an existing File Share slug, use viveworker_share_replace. Only share files inside the workspace and never share secrets or credentials. If the user wants a password-protected share but the recipient should not know the password, set password plus tokenize=true, or use viveworker_share_link for an existing password-protected slug to mint a short-lived ?t= URL.",
   },
   {
     definition: {

@@ -148,7 +148,7 @@ async function handlePermissionRequest() {
   } else if (toolName === "Bash") {
     approvalKind = "command";
     const cmd = String(toolInput.command || "");
-    messageText = `Command approval needed.\n\`\`\`\n${cmd.slice(0, 500)}\n\`\`\``;
+    messageText = `Command approval needed.\n\`\`\`\n${escapeMarkdownCodeFenceBody(cmd.slice(0, 500))}\n\`\`\``;
   } else if (toolName === "ExitPlanMode") {
     approvalKind = "plan";
     messageText = "Plan approval needed.";
@@ -706,6 +706,10 @@ function generateId() {
 
 function sanitizeForPath(s) {
   return s.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
+}
+
+function escapeMarkdownCodeFenceBody(text) {
+  return String(text || "").replace(/```/gu, "\\`\\`\\`");
 }
 
 function encodeFilePathForSnapshot(filePath) {

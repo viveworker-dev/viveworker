@@ -34,9 +34,14 @@ Keep onboarding calm and step-by-step. Do not make the user debug config files u
 ## Tool Selection
 
 - Use `viveworker_notify` for informational milestones that should appear on the phone or timeline, such as "build finished", "review ready", or "agent is blocked".
+- Use `viveworker_stats` when the user asks for viveworker package adoption or usage stats.
+- Use `viveworker_share_list` when the user asks what is currently in File Share or asks for share usage metrics.
+- Use `viveworker_a2a_activity` or `viveworker_a2a_card` when troubleshooting A2A activity or local agent-card settings.
+- Use `viveworker_moltbook_list`, `viveworker_moltbook_show`, or `viveworker_moltbook_thread` when inspecting Moltbook inbox comments or threads.
 - Use `viveworker_ask` when the next step depends on a human preference, missing requirement, or choice that should not be guessed.
 - Use `viveworker_request_approval` before actions that are externally visible, hard to undo, risky, sensitive, delegated, paid, or likely to surprise the user.
 - Use `viveworker_share_file` when the user wants a workspace deliverable shared as a limited File Share URL. Good fits include `.html`, `.htm`, `.pdf`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, and `.csv`.
+- Use `viveworker_share_replace` when the user wants to replace or update the file behind an existing File Share slug.
 - Use `viveworker_thread_share` when context should move to another Codex session, Claude session, or viveworker inbox while preserving a human-visible handoff.
 - Use `viveworker_send_a2a_task` only for registered A2A target aliases and bounded tasks with clear acceptance criteria.
 
@@ -47,10 +52,12 @@ Keep onboarding calm and step-by-step. Do not make the user debug config files u
 - Include relevant file refs, but never include secrets, tokens, private keys, or unnecessary file contents.
 - Treat timeout, rejection, or transport failure as "not approved". Do not continue as if approval was granted.
 - After the tool returns, summarize the decision or returned artifact to the user.
+- Read-only inspection tools use fixed command allowlists. Do not try to route arbitrary shell commands or side-effectful viveworker CLI actions through MCP.
 
 ## File Share Rules
 
 - Share only files inside the workspace root.
+- Replacing an existing share changes what existing recipients see at that URL; require phone approval and make that consequence clear.
 - Do not share `.env`, credential files, private keys, `.ssh`, `.aws`, `.gnupg`, or secret-looking paths.
 - Prefer sharing final deliverables, not internal source files, unless the user explicitly asks.
 - For unsupported file types, explain the accepted types and suggest exporting to HTML, PDF, image, or CSV first.

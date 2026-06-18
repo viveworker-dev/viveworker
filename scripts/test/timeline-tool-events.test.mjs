@@ -68,5 +68,9 @@ test("timeline operation details include command context but not command output"
   assert.doesNotMatch(i18nSource, /"fileEvent\.timeline\.readOne"/);
   assert.doesNotMatch(i18nSource, /"fileEvent\.timeline\.searchOne"/);
   assert.match(bridgeSource, /redactTimelineCommandText/);
+  assert.match(bridgeSource, /function escapeMarkdownCodeFenceBody/);
+  assert.match(bridgeSource, /escapeMarkdownCodeFenceBody\(redactTimelineCommandText\(commandText\)\)/);
   assert.doesNotMatch(bridgeSource, /payload\.output[\s\S]{0,120}messageText/);
+  assert.doesNotMatch(bridgeSource, /extractCommandLineFromFunctionOutput/);
+  assert.doesNotMatch(bridgeSource, /payload\.output[\s\S]{0,160}buildToolTimelineEntry/);
 });

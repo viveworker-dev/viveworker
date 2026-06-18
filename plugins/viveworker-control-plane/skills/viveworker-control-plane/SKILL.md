@@ -37,7 +37,12 @@ Use this flow when the user says "set up viveworker", "pair my phone", "vivework
 - Use `viveworker_ask` for a short user decision that blocks progress.
 - Use `viveworker_request_approval` before risky, external, irreversible, payment-related, or user-visible actions.
 - Use `viveworker_notify` for informational updates that should appear on the phone and timeline.
+- Use `viveworker_stats` for package adoption or usage stats.
+- Use `viveworker_share_list` to inspect File Share uploads or usage metrics.
+- Use `viveworker_a2a_activity` or `viveworker_a2a_card` to inspect A2A activity or local agent-card settings.
+- Use `viveworker_moltbook_list`, `viveworker_moltbook_show`, or `viveworker_moltbook_thread` to inspect Moltbook inbox comments or threads.
 - Use `viveworker_share_file` when a local deliverable should become a limited File Share URL.
+- Use `viveworker_share_replace` when an existing File Share slug should point at a new file.
 - Use `viveworker_thread_share` when context should move to another Codex / Claude / inbox thread.
 - Use `viveworker_send_a2a_task` when the user asks to delegate to a registered A2A target.
 
@@ -47,7 +52,8 @@ Use this flow when the user says "set up viveworker", "pair my phone", "vivework
 - Treat timeout, rejection, or missing response as not approved.
 - Do not send secrets, private keys, `.env` content, credentials, relay tokens, public keys, or unnecessary file contents through MCP.
 - Do not use MCP as a shell executor. It creates control-plane events; it should not run arbitrary commands.
-- Do not upload files through File Share without phone approval.
+- Read-only inspection tools use fixed command allowlists and must not mutate local state.
+- Do not upload or replace files through File Share without phone approval.
 - Use registered A2A target aliases only. Do not inline API keys.
 
 ## Natural language triggers

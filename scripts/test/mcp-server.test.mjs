@@ -150,8 +150,16 @@ test("MCP server initialize, list, notify, and status", async () => {
     const tools = await mcp.request("tools/list");
     const names = tools.result.tools.map((tool) => tool.name);
     assert.ok(names.includes("viveworker_status"));
+    assert.ok(names.includes("viveworker_stats"));
+    assert.ok(names.includes("viveworker_share_list"));
+    assert.ok(names.includes("viveworker_a2a_activity"));
+    assert.ok(names.includes("viveworker_a2a_card"));
+    assert.ok(names.includes("viveworker_moltbook_list"));
+    assert.ok(names.includes("viveworker_moltbook_show"));
+    assert.ok(names.includes("viveworker_moltbook_thread"));
     assert.ok(names.includes("viveworker_notify"));
     assert.ok(names.includes("viveworker_share_link"));
+    assert.ok(names.includes("viveworker_share_replace"));
 
     const notify = await mcp.request("tools/call", {
       name: "viveworker_notify",
@@ -172,6 +180,121 @@ test("MCP server initialize, list, notify, and status", async () => {
   }
 });
 
+test("read-only MCP tools call the fixed viveworker CLI commands", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const cliArgsFile = path.join(tmp, "fake-cli-args.jsonl");
+  const fakeCli = path.join(tmp, "fake-viveworker-cli.mjs");
+  await fs.writeFile(fakeCli, [
+    "import { promises as fs } from 'node:fs';",
+    "const args = process.argv.slice(2);",
+    "await fs.appendFile(process.env.VIVEWORKER_MCP_FAKE_CLI_ARGS, JSON.stringify(args) + '\\n');",
+    "if (args[0] === 'stats') console.log(JSON.stringify({ snapshot: { pkgName: args.at(-1) } }));",
+    "else if (args[0] === 'share' && args[1] === 'list') console.log(JSON.stringify({ items: [], metrics: { ok: true } }));",
+    "else if (args[0] === 'a2a' && args[1] === 'activity') console.log(JSON.stringify({ totalEntries: 0 }));",
+    "else if (args[0] === 'a2a' && args[1] === 'card') console.log('Current Agent Card settings');",
+    "else if (args[0] === 'moltbook' && args[1] === 'list') console.log('pending c1');",
+    "else if (args[0] === 'moltbook' && args[1] === 'show') console.log(JSON.stringify({ commentId: args[2] }));",
+    "else if (args[0] === 'moltbook' && args[1] === 'thread') console.log(JSON.stringify({ comments: [] }));",
+    "else process.exit(2);",
+  ].join("\n"), "utf8");
+
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_CLI: fakeCli,
+    VIVEWORKER_MCP_FAKE_CLI_ARGS: cliArgsFile,
+  });
+  try {
+    const stats = await mcp.request("tools/call", {
+      name: "viveworker_stats",
+      arguments: { pkg: "@scope/pkg" },
+    });
+    assert.equal(stats.result.structuredContent.snapshot.pkgName, "@scope/pkg");
+
+    const shareList = await mcp.request("tools/call", {
+      name: "viveworker_share_list",
+      arguments: { metrics: true },
+    });
+    assert.equal(shareList.result.structuredContent.metrics.ok, true);
+
+    const activity = await mcp.request("tools/call", {
+      name: "viveworker_a2a_activity",
+      arguments: {},
+    });
+    assert.equal(activity.result.structuredContent.totalEntries, 0);
+
+    const card = await mcp.request("tools/call", {
+      name: "viveworker_a2a_card",
+      arguments: {},
+    });
+    assert.equal(card.result.structuredContent.output, "Current Agent Card settings");
+
+    const moltbookList = await mcp.request("tools/call", {
+      name: "viveworker_moltbook_list",
+      arguments: { all: true },
+    });
+    assert.equal(moltbookList.result.structuredContent.output, "pending c1");
+
+    const comment = await mcp.request("tools/call", {
+      name: "viveworker_moltbook_show",
+      arguments: { commentId: "c1" },
+    });
+    assert.equal(comment.result.structuredContent.commentId, "c1");
+
+    const thread = await mcp.request("tools/call", {
+      name: "viveworker_moltbook_thread",
+      arguments: { commentId: "c1" },
+    });
+    assert.deepEqual(thread.result.structuredContent.comments, []);
+
+    const cliCalls = (await fs.readFile(cliArgsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(cliCalls, [
+      ["stats", "--json", "--pkg", "@scope/pkg"],
+      ["share", "list", "--json", "--metrics"],
+      ["a2a", "activity"],
+      ["a2a", "card"],
+      ["moltbook", "list", "--all"],
+      ["moltbook", "show", "c1"],
+      ["moltbook", "thread", "c1"],
+    ]);
+  } finally {
+    await mcp.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("read-only MCP tools reject unsafe CLI parameters", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const cliArgsFile = path.join(tmp, "fake-cli-args.json");
+  const fakeCli = path.join(tmp, "fake-viveworker-cli.mjs");
+  await fs.writeFile(fakeCli, [
+    "import { promises as fs } from 'node:fs';",
+    "await fs.writeFile(process.env.VIVEWORKER_MCP_FAKE_CLI_ARGS, JSON.stringify(process.argv.slice(2)));",
+    "console.log(JSON.stringify({ ok: true }));",
+  ].join("\n"), "utf8");
+
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_CLI: fakeCli,
+    VIVEWORKER_MCP_FAKE_CLI_ARGS: cliArgsFile,
+  });
+  try {
+    const badPkg = await mcp.request("tools/call", {
+      name: "viveworker_stats",
+      arguments: { pkg: "../pkg" },
+    });
+    assert.equal(badPkg.error.code, -32602);
+
+    const badCommentId = await mcp.request("tools/call", {
+      name: "viveworker_moltbook_show",
+      arguments: { commentId: "../../secret" },
+    });
+    assert.equal(badCommentId.error.code, -32602);
+
+    await assert.rejects(() => fs.readFile(cliArgsFile, "utf8"), /ENOENT/);
+  } finally {
+    await mcp.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("MCP prompts and unknown tools", async () => {
   const bridge = await startFakeBridge();
   const mcp = startMcpServer({
@@ -187,6 +310,7 @@ test("MCP prompts and unknown tools", async () => {
 
     const prompt = await mcp.request("prompts/get", { name: "share_deliverable" });
     assert.match(prompt.result.messages[0].content.text, /viveworker_share_file/);
+    assert.match(prompt.result.messages[0].content.text, /viveworker_share_replace/);
     assert.match(prompt.result.messages[0].content.text, /viveworker_share_link/);
 
     const unknown = await mcp.request("tools/call", {
@@ -548,6 +672,74 @@ test("share_link mints a token URL after phone approval", async () => {
 
     const cliArgs = JSON.parse(await fs.readFile(cliArgsFile, "utf8"));
     assert.deepEqual(cliArgs, ["share", "link", "abc123", "--password", "pw", "--json", "--ttl-hours", "12"]);
+  } finally {
+    await mcp.close();
+    await bridge.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("share_replace replaces an existing File Share file after phone approval", async () => {
+  const bridge = await startFakeBridge();
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const cliArgsFile = path.join(tmp, "fake-cli-args.json");
+  const fakeCli = path.join(tmp, "fake-viveworker-cli.mjs");
+  const report = path.join(tmp, "report.html");
+  await fs.writeFile(report, "<!doctype html><title>replacement</title>\n", "utf8");
+  await fs.writeFile(fakeCli, [
+    "import { promises as fs } from 'node:fs';",
+    "await fs.writeFile(process.env.VIVEWORKER_MCP_FAKE_CLI_ARGS, JSON.stringify(process.argv.slice(2)));",
+    "console.log(JSON.stringify({ ok: true, slug: 'abc123', url: 'https://share.example/v/abc123', replaced: true }));",
+  ].join("\n"), "utf8");
+
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_BRIDGE_URL: bridge.baseUrl,
+    VIVEWORKER_MCP_SESSION_SECRET: "test-secret",
+    VIVEWORKER_MCP_CLI: fakeCli,
+    VIVEWORKER_MCP_FAKE_CLI_ARGS: cliArgsFile,
+  });
+  try {
+    const response = await mcp.request("tools/call", {
+      name: "viveworker_share_replace",
+      arguments: {
+        slug: "abc123",
+        path: report,
+        workspaceRoot: tmp,
+        expiresDays: "7",
+        noOptimize: true,
+      },
+    });
+    assert.equal(response.result.structuredContent.approved, true);
+    assert.equal(response.result.structuredContent.share.replaced, true);
+    assert.equal(bridge.events.at(-1).approvalKind, "file_share_replace");
+    assert.match(bridge.events.at(-1).message, /existing viveworker File Share URL/);
+    assert.match(bridge.events.at(-1).message, /abc123/);
+
+    const cliArgs = JSON.parse(await fs.readFile(cliArgsFile, "utf8"));
+    assert.deepEqual(cliArgs, ["share", "replace", "abc123", await fs.realpath(report), "--json", "--expires-days", "7", "--no-optimize"]);
+  } finally {
+    await mcp.close();
+    await bridge.close();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("share_replace rejects unsafe slug before bridge approval", async () => {
+  const bridge = await startFakeBridge();
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
+  const report = path.join(tmp, "report.html");
+  await fs.writeFile(report, "<!doctype html><title>replacement</title>\n", "utf8");
+  const mcp = startMcpServer({
+    VIVEWORKER_MCP_BRIDGE_URL: bridge.baseUrl,
+    VIVEWORKER_MCP_SESSION_SECRET: "test-secret",
+  });
+  try {
+    const response = await mcp.request("tools/call", {
+      name: "viveworker_share_replace",
+      arguments: { slug: "../abc123", path: report, workspaceRoot: tmp },
+    });
+    assert.equal(response.error.code, -32602);
+    assert.equal(bridge.events.length, 0);
   } finally {
     await mcp.close();
     await bridge.close();
