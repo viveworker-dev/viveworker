@@ -837,6 +837,7 @@ async function installMoltbookScout({ cliOptions, suppressOutput = false }) {
     // Use the auto script which runs scout (no LLM), then drafts via harness, then proposes.
     const envVars = [
       `SCOUT_HARNESS=${harness.kind}`,
+      harness.bin ? `SCOUT_HARNESS_BIN=${shellQuote(harness.bin)}` : "",
       submoltsFlag ? `SCOUT_FLAGS="${submoltsFlag.trim()}${maxDailyFlag}"` : maxDailyFlag ? `SCOUT_FLAGS="${maxDailyFlag.trim()}"` : "",
     ].filter(Boolean).join(" ");
     inner =
@@ -2776,6 +2777,10 @@ function escapeXml(value) {
     .replace(/</gu, "&lt;")
     .replace(/>/gu, "&gt;")
     .replace(/"/gu, "&quot;");
+}
+
+function shellQuote(value) {
+  return `'${String(value ?? "").replace(/'/gu, "'\\''")}'`;
 }
 
 async function printPairingInfo(locale, config, { sectioned = false } = {}) {

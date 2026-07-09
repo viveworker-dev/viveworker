@@ -24,6 +24,10 @@ import { dirname, resolve } from "node:path";
 import WebSocket from "ws";
 
 import {
+  BRIDGE_RELAY_CIRCUIT_BREAKER_MS,
+  BRIDGE_RELAY_FAILURE_THRESHOLD,
+  BRIDGE_RELAY_MAX_CIRCUIT_BREAKER_MS,
+  BRIDGE_RELAY_STABLE_CONNECTION_MS,
   BridgeRelayClient,
   MAX_INFLIGHT_PER_SESSION,
 } from "../lib/remote-pairing/bridge-relay-client.mjs";
@@ -146,6 +150,68 @@ test("start() with N pairings opens N sessions", async () => {
     assert.equal(s.channelBindingHex, null);
   }
   client.close();
+});
+
+test("bridge sessions use conservative relay reset circuit defaults", async () => {
+  const Stub = makeStubWebSocketImpl();
+  const pairing = buildPairing({
+    pairingId: "p-circuit-defaults",
+    phonePub: generateIdentityKeypair().pub,
+    label: "Phone",
+  });
+  const client = new BridgeRelayClient({
+    relayUrl: "wss://example",
+    identityKeypair: generateIdentityKeypair(),
+    pairings: [pairing],
+    dispatch: async () => ({ status: 204 }),
+    WebSocketImpl: Stub,
+  });
+  await client.start();
+
+  try {
+    const session = client._sessions.get(pairing.pairingId);
+    assert.ok(session, "session should be spawned");
+    assert.equal(session._transportOpts.failureThreshold, BRIDGE_RELAY_FAILURE_THRESHOLD);
+    assert.equal(session._transportOpts.circuitBreakerMs, BRIDGE_RELAY_CIRCUIT_BREAKER_MS);
+    assert.equal(session._transportOpts.maxCircuitBreakerMs, BRIDGE_RELAY_MAX_CIRCUIT_BREAKER_MS);
+    assert.equal(session._transportOpts.stableConnectionMs, BRIDGE_RELAY_STABLE_CONNECTION_MS);
+  } finally {
+    client.close();
+  }
+});
+
+test("bridge relay reset circuit tuning can be overridden", async () => {
+  const Stub = makeStubWebSocketImpl();
+  const pairing = buildPairing({
+    pairingId: "p-circuit-custom",
+    phonePub: generateIdentityKeypair().pub,
+    label: "Phone",
+  });
+  const client = new BridgeRelayClient({
+    relayUrl: "wss://example",
+    identityKeypair: generateIdentityKeypair(),
+    pairings: [pairing],
+    dispatch: async () => ({ status: 204 }),
+    WebSocketImpl: Stub,
+    failureThreshold: 4,
+    failureWindowMs: 90_000,
+    circuitBreakerMs: 123_000,
+    maxCircuitBreakerMs: 456_000,
+    stableConnectionMs: 78_000,
+  });
+  await client.start();
+
+  try {
+    const session = client._sessions.get(pairing.pairingId);
+    assert.ok(session, "session should be spawned");
+    assert.equal(session._transportOpts.failureThreshold, 4);
+    assert.equal(session._transportOpts.failureWindowMs, 90_000);
+    assert.equal(session._transportOpts.circuitBreakerMs, 123_000);
+    assert.equal(session._transportOpts.maxCircuitBreakerMs, 456_000);
+    assert.equal(session._transportOpts.stableConnectionMs, 78_000);
+  } finally {
+    client.close();
+  }
 });
 
 test("start() is idempotent", async () => {

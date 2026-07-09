@@ -40,7 +40,7 @@ MAX_SKIP=5
 
 # ── Detect harness ────────────────────────────────────────────
 HARNESS="${SCOUT_HARNESS:-}"
-HARNESS_BIN=""
+HARNESS_BIN="${SCOUT_HARNESS_BIN:-}"
 if [ -z "$HARNESS" ]; then
   if command -v claude >/dev/null 2>&1; then
     HARNESS="claude"
@@ -48,8 +48,14 @@ if [ -z "$HARNESS" ]; then
     HARNESS="codex"
   fi
 fi
-if [ -n "$HARNESS" ]; then
+if [ -n "$HARNESS_BIN" ] && [ ! -x "$HARNESS_BIN" ]; then
+  HARNESS_BIN=""
+fi
+if [ -n "$HARNESS" ] && [ -z "$HARNESS_BIN" ]; then
   HARNESS_BIN=$(command -v "$HARNESS" 2>/dev/null || true)
+fi
+if [ -z "${SCOUT_DRAFT_TIMEOUT:-}" ] && [ "$HARNESS" = "codex" ]; then
+  DRAFT_TIMEOUT_SEC=300
 fi
 
 # ── Load persona & avoid keywords ─────────────────────────────
@@ -84,6 +90,19 @@ fi
 candidate_should_skip() {
   [ -z "$AVOID_PATTERN" ] && return 1
   printf '%s\n%s' "$1" "$2" | grep -iqE "$AVOID_PATTERN"
+}
+
+looks_like_harness_error() {
+  printf '%s' "$1" | grep -Eiq 'failed to authenticate|invalid authentication credentials|authentication_error|api error:[[:space:]]*(401|403)|incorrect api key|invalid api key'
+}
+
+abort_if_harness_error() {
+  local stage="$1"
+  local text="$2"
+  if looks_like_harness_error "$text"; then
+    echo "[scout-auto] $stage: harness returned a provider authentication error; not proposing a Moltbook draft"
+    exit 1
+  fi
 }
 
 # Temp file for JSON interchange
@@ -164,12 +183,13 @@ INBOX_PROMPT_EOF
     if [ "$HARNESS" = "claude" ]; then
       INBOX_DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$INBOX_PROMPT" --output-format text 2>/dev/null) || true
     elif [ "$HARNESS" = "codex" ]; then
-      INBOX_DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec "$INBOX_PROMPT" 2>/dev/null) || true
+      INBOX_DRAFT_TEXT=$(printf '%s' "$INBOX_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
     fi
 
     if [ -z "$INBOX_DRAFT_TEXT" ]; then
       echo "[scout-auto] inbox: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
     else
+      abort_if_harness_error "inbox" "$INBOX_DRAFT_TEXT"
       INBOX_INTENT=""
       INBOX_REPLY_BODY=""
       if echo "$INBOX_DRAFT_TEXT" | grep -q "^---$"; then
@@ -210,16 +230,17 @@ fi
 #   Max 3 approved posts/day. Each slot proposed at most once.
 # ═══════════════════════════════════════════════════════════════
 COMPOSE_MAX="${COMPOSE_MAX:-3}"
+COMPOSE_ACTIVITY_LIMIT="${SCOUT_COMPOSE_ACTIVITY_LIMIT:-30}"
 COMPOSE_JSON=$("$NODE" "$VIVEWORKER" moltbook compose --max-daily "$COMPOSE_MAX" 2>/dev/null) || true
 COMPOSE_STATUS=$(json_field "$COMPOSE_JSON" "status")
 
 if [ "$COMPOSE_STATUS" = "material" ] && [ -n "$HARNESS_BIN" ]; then
   COMPOSE_SLOT=$(json_field "$COMPOSE_JSON" "slot")
   ACTIVITY_COUNT=$(json_field "$COMPOSE_JSON" "activityCount")
-  ACTIVITY_SUMMARY=$(echo "$COMPOSE_JSON" | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);const e=o.activitySummary||[];console.log(e.map(x=>'- ['+x.kind+'] '+x.title+(x.summary?' — '+x.summary:'')).join('\n'))}catch{}})")
-  RECENT_TITLES=$(echo "$COMPOSE_JSON" | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);console.log((o.recentTitles||[]).join(', '))}catch{}})")
+  ACTIVITY_SUMMARY=$(echo "$COMPOSE_JSON" | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);const limit=Number('$COMPOSE_ACTIVITY_LIMIT')||30;const e=(o.activitySummary||[]).slice(0,limit);console.log(e.map(x=>'- ['+x.kind+'] '+x.title+(x.summary?' — '+x.summary:'')).join('\n'))}catch{}})")
+  RECENT_TITLES=$(echo "$COMPOSE_JSON" | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);const titles=(o.recentTitles||[]).map(x=>typeof x==='string'?x:(x&&x.title)||'').filter(Boolean).slice(0,10);console.log(titles.join(', '))}catch{}})")
 
-  echo "[scout-auto] compose ($COMPOSE_SLOT): ${ACTIVITY_COUNT} activities found"
+  echo "[scout-auto] compose ($COMPOSE_SLOT): ${ACTIVITY_COUNT} activities found (using ${COMPOSE_ACTIVITY_LIMIT})"
 
   # Slot-specific tone instructions.
   case "$COMPOSE_SLOT" in
@@ -277,12 +298,13 @@ COMPOSE_EOF
 
   COMPOSE_DRAFT=""
   if [ "$HARNESS" = "claude" ]; then
-    COMPOSE_DRAFT=$(portable_timeout 60 "$HARNESS_BIN" -p "$COMPOSE_PROMPT" --output-format text 2>/dev/null) || true
+    COMPOSE_DRAFT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$COMPOSE_PROMPT" --output-format text 2>/dev/null) || true
   elif [ "$HARNESS" = "codex" ]; then
-    COMPOSE_DRAFT=$(portable_timeout 60 "$HARNESS_BIN" exec "$COMPOSE_PROMPT" 2>/dev/null) || true
+    COMPOSE_DRAFT=$(printf '%s' "$COMPOSE_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
   fi
 
   if [ -n "$COMPOSE_DRAFT" ]; then
+    abort_if_harness_error "compose ($COMPOSE_SLOT)" "$COMPOSE_DRAFT"
     # Check for NO_MATCH signal (persona doesn't align with today's work).
     if echo "$COMPOSE_DRAFT" | grep -q "NO_MATCH"; then
       echo "[scout-auto] compose ($COMPOSE_SLOT): persona has no match with current activities — skipping"
@@ -397,13 +419,14 @@ PROMPT_EOF
   if [ "$HARNESS" = "claude" ]; then
     DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$DRAFT_PROMPT" --output-format text 2>/dev/null) || true
   elif [ "$HARNESS" = "codex" ]; then
-    DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec "$DRAFT_PROMPT" 2>/dev/null) || true
+    DRAFT_TEXT=$(printf '%s' "$DRAFT_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
   fi
 
   if [ -z "$DRAFT_TEXT" ]; then
     echo "[scout-auto] error: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
     exit 1
   fi
+  abort_if_harness_error "draft" "$DRAFT_TEXT"
 
   # Parse INTENT and reply body
   INTENT=""
@@ -502,8 +525,9 @@ Reply with ONLY a number from 0 to 100. Nothing else."
     if [ "$HARNESS" = "claude" ]; then
       SCORE_RAW=$(portable_timeout 30 "$HARNESS_BIN" -p "$SCORE_PROMPT" --output-format text 2>/dev/null) || true
     elif [ "$HARNESS" = "codex" ]; then
-      SCORE_RAW=$(portable_timeout 30 "$HARNESS_BIN" exec "$SCORE_PROMPT" 2>/dev/null) || true
+      SCORE_RAW=$(printf '%s' "$SCORE_PROMPT" | portable_timeout 30 "$HARNESS_BIN" exec 2>/dev/null) || true
     fi
+    abort_if_harness_error "score" "$SCORE_RAW"
 
     SCORE=$(echo "$SCORE_RAW" | tr -dc '0-9\n' | head -1)
     SCORE=${SCORE:-0}

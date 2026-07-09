@@ -670,16 +670,19 @@ function shouldConfirmLanReachability(now, opts = {}) {
   if (opts.confirmLanReachabilityBeforeRelay === false) {
     return false;
   }
+  if (opts.confirmLanReachabilityBeforeRelay === true) {
+    return true;
+  }
   return _lastLanOkAtMs > 0 && now - _lastLanOkAtMs <= RECENT_LAN_OK_GRACE_MS;
 }
 
-async function confirmLanUnavailableBeforeRelay(url, err, opts = {}) {
+async function recoverLanBeforeRelay(url, init, err, opts = {}) {
   if (!shouldConfirmLanReachability(nowMs(opts), opts)) {
-    return false;
+    return { recovered: false, suppressRelay: false };
   }
   const path = urlToRelayPath(url);
   if (path === LAN_REACHABILITY_PROBE_PATH) {
-    return false;
+    return { recovered: false, suppressRelay: false };
   }
 
   const probe = await attemptLanFetch(LAN_REACHABILITY_PROBE_PATH, {
@@ -691,12 +694,22 @@ async function confirmLanUnavailableBeforeRelay(url, err, opts = {}) {
     lanTimeoutMs: opts.lanReachabilityProbeTimeoutMs ?? LAN_REACHABILITY_PROBE_TIMEOUT_MS,
   });
   if (!probe.ok) {
-    return false;
+    return { recovered: false, suppressRelay: false };
+  }
+
+  if (opts.retryLanAfterReachabilityProbe === true) {
+    const retry = await attemptLanFetch(url, init, {
+      ...opts,
+      lanTimeoutMs: opts.lanRecoveryTimeoutMs ?? opts.lanTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS,
+    });
+    if (retry.ok) {
+      return { recovered: true, response: retry.response, suppressRelay: true };
+    }
   }
 
   _telemetry.lanReachableAfterFailure++;
   suppressRelayAfterRecentLanFailure(url, err, opts);
-  return true;
+  return { recovered: false, suppressRelay: true };
 }
 
 async function attemptStickyLanProbe(url, init, opts) {
@@ -980,6 +993,8 @@ function nowMs(opts) {
  *   autoProbeLanWhileSticky?: boolean,
  *   delayRelayAfterRecentLanFailure?: boolean,
  *   confirmLanReachabilityBeforeRelay?: boolean,
+ *   retryLanAfterReachabilityProbe?: boolean,
+ *   lanRecoveryTimeoutMs?: number,
  *   stickyLanProbeTimeoutMs?: number,
  *   lanReachabilityProbeTimeoutMs?: number,
  * }} [opts]
@@ -1004,7 +1019,9 @@ export async function routedFetch(url, init = {}, opts = {}) {
         suppressRelayAfterRecentLanFailure(url, lan.err, opts);
         throw lan.err;
       }
-      if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+      const recovery = await recoverLanBeforeRelay(url, init, lan.err, opts);
+      if (recovery.recovered) return recovery.response;
+      if (recovery.suppressRelay) {
         throw lan.err;
       }
     }
@@ -1012,7 +1029,9 @@ export async function routedFetch(url, init = {}, opts = {}) {
     if (opts.probeLanWhileSticky === true || autoProbe) {
       const lan = await attemptStickyLanProbe(url, init, stickyLanProbeOpts(opts, autoProbe));
       if (lan.ok) return lan.response;
-      if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+      const recovery = await recoverLanBeforeRelay(url, init, lan.err, opts);
+      if (recovery.recovered) return recovery.response;
+      if (recovery.suppressRelay) {
         throw lan.err;
       }
     }
@@ -1038,7 +1057,9 @@ export async function routedFetch(url, init = {}, opts = {}) {
     suppressRelayAfterRecentLanFailure(url, lan.err, opts);
     throw lan.err;
   }
-  if (await confirmLanUnavailableBeforeRelay(url, lan.err, opts)) {
+  const recovery = await recoverLanBeforeRelay(url, init, lan.err, opts);
+  if (recovery.recovered) return recovery.response;
+  if (recovery.suppressRelay) {
     throw lan.err;
   }
 

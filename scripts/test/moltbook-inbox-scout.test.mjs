@@ -8,6 +8,7 @@ import {
   getMoltbookReplyQuotaState,
   hasPendingMoltbookDraftForInboxItem,
   isOwnMoltbookInboxItem,
+  looksLikeProviderErrorText,
   pickInboxReplyCandidate,
   reconcileInboxDraftMarkers,
   todayKey,
@@ -16,6 +17,7 @@ import {
 } from "../moltbook-api.mjs";
 
 const scoutAutoPath = new URL("../moltbook-scout-auto.sh", import.meta.url);
+const viveworkerCliPath = new URL("../viveworker.mjs", import.meta.url);
 
 test("pickInboxReplyCandidate prioritizes newest pending inbound comment", () => {
   const picked = pickInboxReplyCandidate([
@@ -173,6 +175,32 @@ test("auto scout proposes drafts with a 24 hour default TTL", async () => {
   assert.match(source, /SCOUT_TIMEOUT:-86400/);
   assert.match(source, /PROPOSE_TIMEOUT_SEC="\$\{SCOUT_TIMEOUT:-86400\}"/);
   assert.match(source, /COMPOSE_TIMEOUT="\$PROPOSE_TIMEOUT_SEC"/);
+});
+
+test("provider authentication errors are detected before drafting", async () => {
+  assert.equal(looksLikeProviderErrorText("Failed to authenticate. API Error: 401"), true);
+  assert.equal(
+    looksLikeProviderErrorText(
+      '{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}',
+    ),
+    true,
+  );
+  assert.equal(looksLikeProviderErrorText("this reply mentions a 401 status as an example"), false);
+
+  const source = await readFile(scoutAutoPath, "utf8");
+  assert.match(source, /looks_like_harness_error\(\)/);
+  assert.match(source, /abort_if_harness_error "score" "\$SCORE_RAW"/);
+  assert.match(source, /abort_if_harness_error "draft" "\$DRAFT_TEXT"/);
+});
+
+test("auto scout can use a harness binary outside launchd PATH", async () => {
+  const scoutSource = await readFile(scoutAutoPath, "utf8");
+  const cliSource = await readFile(viveworkerCliPath, "utf8");
+
+  assert.match(scoutSource, /HARNESS_BIN="\$\{SCOUT_HARNESS_BIN:-\}"/);
+  assert.match(scoutSource, /COMPOSE_ACTIVITY_LIMIT="\$\{SCOUT_COMPOSE_ACTIVITY_LIMIT:-30\}"/);
+  assert.match(scoutSource, /printf '%s' "\$COMPOSE_PROMPT" \| portable_timeout "\$DRAFT_TIMEOUT_SEC" "\$HARNESS_BIN" exec/);
+  assert.match(cliSource, /SCOUT_HARNESS_BIN=\$\{shellQuote\(harness\.bin\)\}/);
 });
 
 test("reply quota counts active pending reply drafts as reserved slots", async () => {

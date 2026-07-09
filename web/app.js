@@ -990,6 +990,9 @@ async function refreshBootstrap() {
   const bootstrap = await apiGet("/api/bootstrap", {
     timeoutMs: BOOTSTRAP_REMOTE_TIMEOUT_MS,
     preferRelayError: true,
+    confirmLanReachabilityBeforeRelay: true,
+    retryLanAfterReachabilityProbe: true,
+    lanRecoveryTimeoutMs: 5_000,
   });
   recordBootTraceEvent("bootstrap-response", { url: "/api/bootstrap" });
   state.session = bootstrap?.session || null;

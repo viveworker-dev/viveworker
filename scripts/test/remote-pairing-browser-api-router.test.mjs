@@ -569,6 +569,43 @@ test("LAN health success prevents relay after endpoint-specific failures", async
   assert.ok(events.includes("remote-delayed"));
 });
 
+test("bootstrap can retry LAN after a reachability probe before using relay", async () => {
+  const events = [];
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("LAN fetch timed out") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({
+        status: 200,
+        body: '{"bootstrap":"relay"}',
+      }),
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, {
+    ...opts,
+    confirmLanReachabilityBeforeRelay: true,
+    retryLanAfterReachabilityProbe: true,
+    lanRecoveryTimeoutMs: 5_000,
+    onRouteStatus: (event) => events.push(event.phase),
+  });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan" });
+  assert.equal(fetchCalls.length, 3);
+  assert.deepEqual(fetchCalls.map((call) => call.url), [
+    "/api/bootstrap",
+    "/health",
+    "/api/bootstrap",
+  ]);
+  assert.equal(rpcCalls.fetch.length, 0);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+  assert.ok(!events.includes("remote-switching"));
+});
+
 test("interactive GET can re-probe LAN inside sticky relay window", async () => {
   const fetchPair = makeFakeFetch([
     { mode: "throw", err: new TypeError("Failed to fetch") },

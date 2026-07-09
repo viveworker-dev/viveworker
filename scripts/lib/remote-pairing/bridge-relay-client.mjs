@@ -68,6 +68,10 @@ import {
  * (long-poll + a few short ones), so 64 is way above the working set.
  */
 export const MAX_INFLIGHT_PER_SESSION = 64;
+export const BRIDGE_RELAY_FAILURE_THRESHOLD = 2;
+export const BRIDGE_RELAY_CIRCUIT_BREAKER_MS = 5 * 60_000;
+export const BRIDGE_RELAY_MAX_CIRCUIT_BREAKER_MS = 30 * 60_000;
+export const BRIDGE_RELAY_STABLE_CONNECTION_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // BridgeRelayClient — coordinates many BridgePairingSessions
@@ -89,6 +93,11 @@ export const MAX_INFLIGHT_PER_SESSION = 64;
  * @property {number[]} [backoffMs]                forwarded to the transport
  * @property {number} [handshakeTimeoutMs]         forwarded to the transport
  * @property {Uint8Array} [prologue]               forwarded to the transport
+ * @property {number} [failureThreshold]           bridge-side relay reset circuit threshold
+ * @property {number} [failureWindowMs]            bridge-side relay reset circuit window
+ * @property {number} [circuitBreakerMs]           bridge-side relay reset cooldown
+ * @property {number} [maxCircuitBreakerMs]        bridge-side max relay reset cooldown
+ * @property {number} [stableConnectionMs]         bridge-side stable duration before clearing circuit
  */
 
 /**
@@ -284,6 +293,11 @@ export class BridgeRelayClient {
       backoffMs: this._opts.backoffMs,
       handshakeTimeoutMs: this._opts.handshakeTimeoutMs,
       prologue: this._opts.prologue,
+      failureThreshold: this._opts.failureThreshold,
+      failureWindowMs: this._opts.failureWindowMs,
+      circuitBreakerMs: this._opts.circuitBreakerMs,
+      maxCircuitBreakerMs: this._opts.maxCircuitBreakerMs,
+      stableConnectionMs: this._opts.stableConnectionMs,
     });
     this._sessions.set(pairing.pairingId, session);
     session.start().catch((err) => {
@@ -334,6 +348,11 @@ class BridgePairingSession {
     backoffMs,
     handshakeTimeoutMs,
     prologue,
+    failureThreshold,
+    failureWindowMs,
+    circuitBreakerMs,
+    maxCircuitBreakerMs,
+    stableConnectionMs,
   }) {
     this.pairing = pairing;
     this._dispatch = dispatch;
@@ -370,6 +389,11 @@ class BridgePairingSession {
       backoffMs,
       handshakeTimeoutMs,
       prologue,
+      failureThreshold: failureThreshold ?? BRIDGE_RELAY_FAILURE_THRESHOLD,
+      failureWindowMs,
+      circuitBreakerMs: circuitBreakerMs ?? BRIDGE_RELAY_CIRCUIT_BREAKER_MS,
+      maxCircuitBreakerMs: maxCircuitBreakerMs ?? BRIDGE_RELAY_MAX_CIRCUIT_BREAKER_MS,
+      stableConnectionMs: stableConnectionMs ?? BRIDGE_RELAY_STABLE_CONNECTION_MS,
       logger: logger,
     };
     this._transport = this._createTransport();

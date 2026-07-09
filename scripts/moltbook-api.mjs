@@ -62,6 +62,33 @@ export const DEFAULT_INBOX_DIR = path.join(os.homedir(), ".viveworker", "moltboo
 export const DEFAULT_SCOUT_STATE_FILE = path.join(os.homedir(), ".viveworker", "moltbook-scout-state.json");
 export const DEFAULT_DRAFTS_DIR = path.join(os.homedir(), ".viveworker", "moltbook-drafts");
 
+const PROVIDER_ERROR_TEXT_PATTERNS = [
+  /\bfailed to authenticate\b/iu,
+  /\binvalid authentication credentials\b/iu,
+  /\bauthentication_error\b/iu,
+  /\bapi error:\s*(?:401|403)\b/iu,
+  /\bincorrect api key\b/iu,
+  /\binvalid api key\b/iu,
+];
+
+export function looksLikeProviderErrorText(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const compact = text.replace(/\s+/gu, " ");
+  if (PROVIDER_ERROR_TEXT_PATTERNS.some((pattern) => pattern.test(compact))) {
+    return true;
+  }
+  if (!compact.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(compact);
+    const type = String(parsed?.error?.type || parsed?.type || "").toLowerCase();
+    const message = String(parsed?.error?.message || parsed?.message || "").toLowerCase();
+    return type === "authentication_error" || message.includes("invalid authentication credentials");
+  } catch {
+    return false;
+  }
+}
+
 export async function loadMoltbookEnv(envFile = DEFAULT_ENV_FILE) {
   const env = {};
   try {

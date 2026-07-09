@@ -68,6 +68,11 @@ const RELOAD_DEBOUNCE_MS = 250;
  * @property {number[]} [backoffMs]               forwarded to BridgeRelayClient
  * @property {number} [handshakeTimeoutMs]        forwarded to BridgeRelayClient
  * @property {Uint8Array} [prologue]              forwarded to BridgeRelayClient
+ * @property {number} [failureThreshold]          forwarded to BridgeRelayClient
+ * @property {number} [failureWindowMs]           forwarded to BridgeRelayClient
+ * @property {number} [circuitBreakerMs]          forwarded to BridgeRelayClient
+ * @property {number} [maxCircuitBreakerMs]       forwarded to BridgeRelayClient
+ * @property {number} [stableConnectionMs]        forwarded to BridgeRelayClient
  * @property {boolean} [watchPairingsFile]        defaults to true
  * @property {(event: object) => void | Promise<void>} [auditEventSink]
  */
@@ -227,6 +232,11 @@ export async function startRemotePairingRelay(opts) {
     backoffMs: opts.backoffMs,
     handshakeTimeoutMs: opts.handshakeTimeoutMs,
     prologue: opts.prologue,
+    failureThreshold: opts.failureThreshold,
+    failureWindowMs: opts.failureWindowMs,
+    circuitBreakerMs: opts.circuitBreakerMs,
+    maxCircuitBreakerMs: opts.maxCircuitBreakerMs,
+    stableConnectionMs: opts.stableConnectionMs,
     logger: log,
   });
 

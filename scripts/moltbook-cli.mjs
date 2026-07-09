@@ -36,6 +36,7 @@ import {
   pickInboxReplyCandidate,
   reconcileInboxDraftMarkers,
   getMoltbookReplyQuotaState,
+  looksLikeProviderErrorText,
   loopbackFetch,
 } from "./moltbook-api.mjs";
 
@@ -572,6 +573,9 @@ async function cmdPropose(postId, flags) {
   if (!postId) fail("usage: viveworker moltbook propose <postId> --text \"...\"");
   const text = typeof flags.text === "string" ? flags.text : "";
   if (!text.trim()) fail("--text is required and must be non-empty");
+  if (looksLikeProviderErrorText(text)) {
+    fail("--text looks like an LLM/provider authentication error; refusing to create a Moltbook draft");
+  }
   const ttlSec = Number(flags.ttl) || Number(flags.timeout) || 86400;
   const parentCommentId = typeof flags["parent-id"] === "string" ? flags["parent-id"] : "";
   const postTitle = typeof flags.title === "string" ? flags.title : "";
@@ -948,10 +952,6 @@ async function cmdCompose(flags) {
     return;
   }
 
-  // Mark slot as attempted (even before drafting, to avoid re-proposal on deny).
-  state.composeSlotsAttempted = [...attempted, slot];
-  await writeScoutState(state);
-
   // Load persona.
   let persona = "";
   try {
@@ -1020,6 +1020,14 @@ async function cmdComposePropose(flags) {
   }
   const token = submitRes?.token;
   if (!token) fail(`bridge did not return a token: ${JSON.stringify(submitRes)}`);
+  if (slot) {
+    const state = rollScoutDayIfNeeded(await readScoutState());
+    const attempted = Array.isArray(state.composeSlotsAttempted) ? state.composeSlotsAttempted : [];
+    if (!attempted.includes(slot)) {
+      state.composeSlotsAttempted = [...attempted, slot];
+      await writeScoutState(state);
+    }
+  }
 
   console.log(JSON.stringify({ ok: true, token, ttlSec, fireAndForget: true }));
 }

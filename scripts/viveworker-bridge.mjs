@@ -21,7 +21,7 @@ import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
-import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems, updateInboxStatus, getMoltbookReplyQuotaState } from "./moltbook-api.mjs";
+import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems, updateInboxStatus, getMoltbookReplyQuotaState, looksLikeProviderErrorText } from "./moltbook-api.mjs";
 import { startRemotePairingRelay, DEFAULT_RELAY_URL } from "./lib/remote-pairing/orchestrator.mjs";
 import { restartRemotePairingRelay, persistRemotePairingEnv, getRemotePairingStatus } from "./lib/remote-pairing/control.mjs";
 import { appendRemotePairingAuditEvent, readRemotePairingAuditEvents } from "./lib/remote-pairing/audit.mjs";
@@ -337,6 +337,11 @@ try {
       await deleteDraft(draft.token).catch(() => {});
       continue;
     }
+    if (looksLikeProviderErrorText(draft.draftText)) {
+      await deleteDraft(draft.token).catch(() => {});
+      console.warn(`[moltbook-draft-provider-error] Dropped persisted draft ${draft.token}`);
+      continue;
+    }
     runtime.moltbookDraftsByToken.set(draft.token, { ...draft, decisionWaiters: [] });
   }
   if (runtime.moltbookDraftsByToken.size) {
@@ -351,6 +356,12 @@ setInterval(async () => {
   const now = Date.now();
   for (const [token, draft] of runtime.moltbookDraftsByToken) {
     if (draft.decision) continue;
+    if (looksLikeProviderErrorText(draft.draftText)) {
+      runtime.moltbookDraftsByToken.delete(token);
+      await deleteDraft(token).catch(() => {});
+      console.warn(`[moltbook-draft-provider-error] Dropped pending draft ${token}`);
+      continue;
+    }
     const age = now - (draft.createdAtMs || 0);
     if (age > (draft.ttlMs || 86400000)) {
       runtime.moltbookDraftsByToken.delete(token);
@@ -19217,6 +19228,9 @@ if (url.pathname === "/api/hazbase/logout" && req.method === "POST") {
         const submoltName = cleanText(body.submoltName || "");
         if (!sourceId || !draftText) {
           return writeJson(res, 400, { error: "missing-sourceId-or-draftText" });
+        }
+        if (looksLikeProviderErrorText(draftText)) {
+          return writeJson(res, 422, { error: "moltbook-draft-provider-error" });
         }
         if (draftType === "reply" && !postId) {
           return writeJson(res, 400, { error: "missing-postId-for-reply" });
