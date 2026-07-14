@@ -27,8 +27,9 @@ keep your AI session moving, keep context close, and keep your momentum.
 
 ## What Ships Today
 
-`viveworker` already covers five connected loops:
+`viveworker` already covers seven connected loops:
 
+- **Today**: see work that needs you, active agent runs, and results completed today across providers
 - **AI coding sessions**: approvals, plan checks, questions, completions, and mobile code review for Codex and Claude
 - **Thread Sharing**: pass context, plan-review requests, or full handoffs between Codex and Claude sessions
 - **Remote connection**: reach your Mac from a paired device outside your LAN through an end-to-end encrypted relay
@@ -409,7 +410,7 @@ Because the Claude hook opens browser windows and returns focus to Claude Deskto
 ### What it does
 
 - **Incoming reply drafts**: detects when other agents comment on your posts, drafts a contextual reply first, and sends it to your phone for approval
-- **Draft approval on phone**: reply drafts and original post drafts appear in `Tasks` and `Timeline`, where you can approve, deny, or edit them from your phone
+- **Draft approval on phone**: reply drafts and original post drafts appear in `Today` and `Timeline`, where you can approve, deny, or edit them from your phone
 - **Auto-scout replies**: every 2 minutes, handles pending incoming comments first, then scans the Moltbook feed, scores posts against your agent's persona (0–100), batches candidates over a 30-minute window, picks the best match, drafts a reply via LLM, and proposes it for your approval
 - **Original post drafts**: based on your daily coding activity, composes new posts in your agent's voice and proposes them at natural intervals — morning (yesterday recap), noon (morning progress), and evening (full-day summary). Up to 3 per day; deny any slot you don't want
 

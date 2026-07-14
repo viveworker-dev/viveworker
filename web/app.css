@@ -391,6 +391,11 @@ pre code {
   color: #d8e7f1;
 }
 
+.status-pill--in_progress {
+  background: rgba(83, 154, 214, 0.14);
+  color: #cfeaff;
+}
+
 .count-chip {
   min-width: 2.2rem;
   background: rgba(255, 255, 255, 0.08);
@@ -2350,6 +2355,99 @@ pre code {
   box-shadow:
     0 12px 24px rgba(0, 0, 0, 0.18),
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.work-health {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  padding: 0.78rem 0;
+  border-top: 1px solid rgba(230, 176, 84, 0.24);
+  border-bottom: 1px solid rgba(230, 176, 84, 0.24);
+  color: #f5dfb2;
+}
+
+.work-health__icon,
+.work-caught-up__icon,
+.work-section__more-icon {
+  width: 1rem;
+  height: 1rem;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.work-health__copy {
+  min-width: 0;
+  display: grid;
+  gap: 0.22rem;
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.work-caught-up {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: #bfe9d6;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.work-sections {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.work-section {
+  min-width: 0;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.work-section__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.work-section__title {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.3;
+}
+
+.work-section__count {
+  min-width: 1.45rem;
+  height: 1.45rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0.38rem;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.work-section__more {
+  width: 100%;
+  min-height: 2.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  padding: 0.4rem 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: #cfe2ef;
+  font-size: 0.84rem;
+  font-weight: 700;
+  text-align: left;
 }
 
 .timeline-thread-filter__row {
@@ -5499,6 +5597,14 @@ button[aria-busy="true"]:not(.is-loading) {
 .provider-badge--a2a {
   color: #81c784;
   background: rgba(129, 199, 132, 0.12);
+}
+.provider-badge--mcp {
+  color: #d6c287;
+  background: rgba(214, 194, 135, 0.1);
+}
+.provider-badge--viveworker {
+  color: #9bc4ce;
+  background: rgba(155, 196, 206, 0.1);
 }
 
 .provider-filter {

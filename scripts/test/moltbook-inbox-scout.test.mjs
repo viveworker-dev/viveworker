@@ -197,10 +197,25 @@ test("auto scout can use a harness binary outside launchd PATH", async () => {
   const scoutSource = await readFile(scoutAutoPath, "utf8");
   const cliSource = await readFile(viveworkerCliPath, "utf8");
 
-  assert.match(scoutSource, /HARNESS_BIN="\$\{SCOUT_HARNESS_BIN:-\}"/);
+  assert.match(scoutSource, /CONFIGURED_HARNESS_BIN="\$\{SCOUT_HARNESS_BIN:-\}"/);
+  assert.match(scoutSource, /resolve_harness_bin "\$HARNESS" "\$CONFIGURED_HARNESS_BIN"/);
+  assert.match(scoutSource, /\/Applications\/ChatGPT\.app\/Contents\/Resources\/codex/);
+  assert.match(scoutSource, /\/Applications\/Codex\.app\/Contents\/Resources\/codex/);
   assert.match(scoutSource, /COMPOSE_ACTIVITY_LIMIT="\$\{SCOUT_COMPOSE_ACTIVITY_LIMIT:-30\}"/);
-  assert.match(scoutSource, /printf '%s' "\$COMPOSE_PROMPT" \| portable_timeout "\$DRAFT_TIMEOUT_SEC" "\$HARNESS_BIN" exec/);
+  assert.match(scoutSource, /run_harness_prompt "\$DRAFT_TIMEOUT_SEC" "\$COMPOSE_PROMPT"/);
+  assert.match(scoutSource, /-C "\$SCRIPT_DIR\/\.\."/);
+  assert.match(scoutSource, /--sandbox read-only/);
+  assert.match(scoutSource, /--ephemeral/);
   assert.match(cliSource, /SCOUT_HARNESS_BIN=\$\{shellQuote\(harness\.bin\)\}/);
+});
+
+test("auto scout does not consume candidates when harness scoring fails", async () => {
+  const source = await readFile(scoutAutoPath, "utf8");
+  const emptyScoreCheck = source.indexOf('if [ -z "$SCORE_RAW" ]');
+  const parsedScoreCheck = source.indexOf('if [ "$SCORE" -eq 0 ]');
+
+  assert.ok(emptyScoreCheck > 0, "empty harness output should be handled");
+  assert.ok(parsedScoreCheck > emptyScoreCheck, "empty output must be handled before score=0");
 });
 
 test("reply quota counts active pending reply drafts as reserved slots", async () => {

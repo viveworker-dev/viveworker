@@ -69,6 +69,26 @@ test("relay close code 4004 drops stale Noise session before reconnect", () => {
   }
 });
 
+test("relay reset during a fresh handshake does not open the reconnect circuit", () => {
+  const transport = makeTransport({
+    failureThreshold: 2,
+    circuitBreakerMs: 5_000,
+    maxCircuitBreakerMs: 5_000,
+  });
+
+  try {
+    for (let i = 0; i < 2; i++) {
+      transport._setState(STATE.HANDSHAKING);
+      transport._handleClose({ code: 4004, reason: "fresh-handshake" });
+      transport._cancelReconnectTimer();
+    }
+    assert.equal(transport._circuitDelayMs(), 0);
+    assert.equal(transport._recentFailureAtMs.length, 0);
+  } finally {
+    transport.close();
+  }
+});
+
 test("ordinary network close preserves Noise session for RESUME", () => {
   const transport = makeTransport();
   const session = fakeSession();

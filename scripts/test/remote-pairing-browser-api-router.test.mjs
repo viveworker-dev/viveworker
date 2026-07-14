@@ -200,6 +200,21 @@ function makeClock(start = 1_000_000) {
   };
 }
 
+function makeMemoryStorage(entries = {}) {
+  const values = new Map(Object.entries(entries));
+  return {
+    getItem(key) {
+      return values.has(key) ? values.get(key) : null;
+    },
+    setItem(key, value) {
+      values.set(key, String(value));
+    },
+    removeItem(key) {
+      values.delete(key);
+    },
+  };
+}
+
 /** Build a typical `opts` bag for the router under test. */
 function makeOpts(overrides = {}) {
   const clock = overrides.clock ?? makeClock();
@@ -604,6 +619,214 @@ test("bootstrap can retry LAN after a reachability probe before using relay", as
   assert.equal(rpcCalls.fetch.length, 0);
   assert.equal(__getTelemetry().lastRoute, "lan");
   assert.ok(!events.includes("remote-switching"));
+});
+
+test("cold bootstrap gives a lightweight LAN probe priority over relay", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("cold bootstrap timed out") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan-head-start"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({ fetchPair });
+
+  const res = await routedFetch("/api/bootstrap", {}, {
+    ...opts,
+    raceLanRecoveryWithRelay: true,
+    confirmLanReachabilityBeforeRelay: true,
+    retryLanAfterReachabilityProbe: true,
+    lanRecoveryTimeoutMs: 5_000,
+  });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan-head-start" });
+  assert.deepEqual(fetchCalls.map((call) => call.url), [
+    "/api/bootstrap",
+    "/health",
+    "/api/bootstrap",
+  ]);
+  assert.equal(rpcCalls.fetch.length, 0);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+});
+
+test("cold bootstrap keeps LAN recovery active while relay connects", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("cold mDNS lookup timed out") },
+    { mode: "throw", err: new TypeError("quick LAN probe still warming up") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan-recovered"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async (req) => await new Promise((resolve, reject) => {
+        const rejectAbort = () => {
+          const err = new Error("route lost");
+          err.name = "AbortError";
+          reject(err);
+        };
+        if (req.signal?.aborted) rejectAbort();
+        else req.signal?.addEventListener("abort", rejectAbort, { once: true });
+      }),
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, {
+    ...opts,
+    raceLanRecoveryWithRelay: true,
+    confirmLanReachabilityBeforeRelay: true,
+    retryLanAfterReachabilityProbe: true,
+    coldLanRecoveryMs: 0,
+    lanRecoveryTimeoutMs: 5_000,
+  });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan-recovered" });
+  assert.deepEqual(fetchCalls.map((call) => call.url), [
+    "/api/bootstrap",
+    "/health",
+    "/health",
+    "/api/bootstrap",
+  ]);
+  assert.ok(rpcCalls.fetch.length <= 1);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+});
+
+test("cold bootstrap keeps probing until a restarting LAN bridge is ready", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("bridge not listening") },
+    { mode: "throw", err: new TypeError("bridge still starting") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan-after-wait"}' },
+  ]);
+  const { opts, fetchCalls } = makeOpts({
+    clock: { now: Date.now },
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async (req) => await new Promise((resolve, reject) => {
+        const rejectAbort = () => {
+          const err = new Error("route lost");
+          err.name = "AbortError";
+          reject(err);
+        };
+        if (req.signal?.aborted) rejectAbort();
+        else req.signal?.addEventListener("abort", rejectAbort, { once: true });
+      }),
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, {
+    ...opts,
+    raceLanRecoveryWithRelay: true,
+    confirmLanReachabilityBeforeRelay: false,
+    coldLanRecoveryMs: 100,
+    coldLanRecoveryProbeIntervalMs: 1,
+  });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan-after-wait" });
+  assert.deepEqual(fetchCalls.map((call) => call.url), [
+    "/api/bootstrap",
+    "/health",
+    "/health",
+    "/api/bootstrap",
+  ]);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+});
+
+test("cold bootstrap can return relay without waiting for a hanging LAN recovery", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("LAN unavailable") },
+    { mode: "hang" },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"bootstrap":"relay"}' }),
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, {
+    ...opts,
+    raceLanRecoveryWithRelay: true,
+    coldLanRecoveryMs: 8_000,
+  });
+
+  assert.deepEqual(await res.json(), { bootstrap: "relay" });
+  assert.deepEqual(fetchCalls.map((call) => call.url), ["/api/bootstrap", "/health"]);
+  assert.equal(fetchCalls[1].init.signal.aborted, true);
+  assert.equal(rpcCalls.fetch.length, 1);
+  assert.equal(__getTelemetry().lastRoute, "relay");
+});
+
+test("cold bootstrap preserves the relay error when both routes fail", async () => {
+  const relayErr = new Error("relay handshake unavailable");
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("LAN unavailable") },
+    { mode: "throw", err: new TypeError("LAN probe unavailable") },
+  ]);
+  const { opts, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => { throw relayErr; },
+    }),
+  });
+
+  await assert.rejects(
+    routedFetch("/api/bootstrap", {}, {
+      ...opts,
+      raceLanRecoveryWithRelay: true,
+      coldLanRecoveryMs: 0,
+      preferRelayError: true,
+    }),
+    (err) => err === relayErr,
+  );
+  assert.equal(rpcCalls.fetch.length, 1);
+});
+
+test("recent persisted LAN success waits for a restarting bridge before relay", async () => {
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("bridge restarting") },
+    { mode: "ok", status: 200, body: '{"ok":true}' },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls, clock } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => makeRpcResponse({ status: 200, body: '{"bootstrap":"relay"}' }),
+    }),
+  });
+  const lanSuccessStorage = makeMemoryStorage({
+    "viveworker.remote-pairing.last-lan-ok-at-ms": String(clock.now() - 1_000),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, { ...opts, lanSuccessStorage });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan" });
+  assert.deepEqual(fetchCalls.map((call) => call.url), [
+    "/api/bootstrap",
+    "/health",
+    "/api/bootstrap",
+  ]);
+  assert.equal(rpcCalls.fetch.length, 0);
+  assert.equal(__getTelemetry().lastRoute, "lan");
+});
+
+test("LAN gets one final retry when relay fails during bridge restart", async () => {
+  const relayErr = new Error("relay handshake unavailable");
+  const fetchPair = makeFakeFetch([
+    { mode: "throw", err: new TypeError("bridge restarting") },
+    { mode: "ok", status: 200, body: '{"bootstrap":"lan-after-relay"}' },
+  ]);
+  const { opts, fetchCalls, rpcCalls } = makeOpts({
+    fetchPair,
+    rpcPair: makeFakeRpcClientCtor({
+      fetchImpl: async () => { throw relayErr; },
+    }),
+  });
+
+  const res = await routedFetch("/api/bootstrap", {}, { ...opts, preferRelayError: true });
+
+  assert.deepEqual(await res.json(), { bootstrap: "lan-after-relay" });
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(rpcCalls.fetch.length, 1);
+  assert.equal(__getTelemetry().lastRoute, "lan");
 });
 
 test("interactive GET can re-probe LAN inside sticky relay window", async () => {

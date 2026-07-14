@@ -15,7 +15,7 @@ const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice"]);
 const EXTERNAL_TARGET_TABS = new Set(["inbox", "timeline", "diff"]);
-const EXTERNAL_TARGET_INBOX_SUBTABS = new Set(["pending", "completed"]);
+const EXTERNAL_TARGET_INBOX_SUBTABS = new Set(["today", "pending", "completed"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const SCROLLABLE_CONTENT_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
@@ -27,7 +27,7 @@ const REMOTE_PAIRING_STATE_SCHEMA_VERSION = 2;
 const REMOTE_PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
 const BOOT_SPLASH_SLOW_HINT_MS = 10000;
 const BOOT_SPLASH_REMOTE_SWITCHING_MIN_MS = 650;
-const BOOTSTRAP_REMOTE_TIMEOUT_MS = 12_000;
+const BOOTSTRAP_REMOTE_TIMEOUT_MS = 50_000;
 const REMOTE_PAIRING_TOKEN_REFRESH_MS = 30 * 24 * 60 * 60 * 1000;
 const BOOT_TRACE_MAX_EVENTS = 90;
 const BOOT_TRACE_MAX_VALUE_LENGTH = 120;
@@ -52,6 +52,7 @@ const CLIENT_EVENT_REPORT_TIMEOUT_MS = 1_800;
 const TIMELINE_LIVE_REFRESH_TIMEOUT_MS = 2_000;
 const TIMELINE_LIVE_RETRY_MS = 5_000;
 const HAZBASE_ACTION_TIMEOUT_MS = 30_000;
+const TODAY_COMPLETED_ITEM_LIMIT = 6;
 const timelineImageObjectUrlCache = new Map();
 
 function wait(ms) {
@@ -92,7 +93,7 @@ const state = {
   currentDetailLoading: false,
   detailLoadingItem: null,
   detailOpen: false,
-  inboxSubtab: "pending",
+  inboxSubtab: "today",
   timelineThreadFilter: "all",
   timelineKindFilter: "all",
   providerFilter: "all",
@@ -317,6 +318,7 @@ function flushBootTrace(reason, extra = {}) {
     totalMs: Math.max(0, Math.round(bootTraceNow() - bootTraceStartPerfMs)),
     remoteRouteSeen: bootSplashRemoteRouteSeen,
     finalStage: bootSplashStatusStage,
+    origin: window.location.origin,
     userAgent: navigator.userAgent || "",
     events: bootTraceEvents,
     ...extra,
@@ -502,7 +504,6 @@ function handleBootRoutingStatus(event) {
     case "lan-checking":
       setBootSplashStatus("boot.status.checkingLan", BOOT_SPLASH_STAGE.checking);
       break;
-    case "lan-failed":
     case "remote-switching":
       showBootRemoteSwitchingStatus();
       break;
@@ -980,7 +981,7 @@ async function refreshSession() {
 }
 
 // One-shot boot fetch: hits `/api/bootstrap` which bundles session,
-// inbox (pending + completed), timeline, and devices into a single
+// inbox work-item buckets, timeline, and devices into a single
 // HTTPS round-trip. Saves 3 additional TLS handshakes versus calling
 // the four endpoints in parallel, which is the dominant boot cost on
 // iOS PWAs where connection reuse is aggressive. Leaves the diff and
@@ -990,9 +991,11 @@ async function refreshBootstrap() {
   const bootstrap = await apiGet("/api/bootstrap", {
     timeoutMs: BOOTSTRAP_REMOTE_TIMEOUT_MS,
     preferRelayError: true,
+    raceLanRecoveryWithRelay: true,
     confirmLanReachabilityBeforeRelay: true,
     retryLanAfterReachabilityProbe: true,
-    lanRecoveryTimeoutMs: 5_000,
+    lanReachabilityProbeTimeoutMs: 1_500,
+    lanRecoveryTimeoutMs: 7_000,
   });
   recordBootTraceEvent("bootstrap-response", { url: "/api/bootstrap" });
   state.session = bootstrap?.session || null;
@@ -1010,8 +1013,10 @@ async function refreshBootstrap() {
   const previousDiff = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
   state.inbox = {
     pending: Array.isArray(fastInbox.pending) ? fastInbox.pending : [],
+    inProgress: Array.isArray(fastInbox.inProgress) ? fastInbox.inProgress : [],
     completed: Array.isArray(fastInbox.completed) ? fastInbox.completed : [],
     diff: previousDiff,
+    work: fastInbox?.work && typeof fastInbox.work === "object" ? fastInbox.work : null,
   };
   syncDiffThreadFilter();
   syncCompletedThreadFilter();
@@ -1282,7 +1287,7 @@ async function getClientPushState() {
 
 async function refreshInbox(opts = {}) {
   const fast = await apiGet("/api/inbox", opts);
-  // `/api/inbox` now returns only `{ pending, completed }`. The `diff`
+  // `/api/inbox` returns fast work-item buckets without diff data. The `diff`
   // half lives at `/api/inbox/diff` because it spawns `git` subprocesses
   // server-side and was blocking first paint of the completed/pending
   // lists. Preserve whatever diff entries we already have in memory so
@@ -1290,8 +1295,10 @@ async function refreshInbox(opts = {}) {
   const previousDiff = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
   state.inbox = {
     pending: Array.isArray(fast?.pending) ? fast.pending : [],
+    inProgress: Array.isArray(fast?.inProgress) ? fast.inProgress : [],
     completed: Array.isArray(fast?.completed) ? fast.completed : [],
     diff: previousDiff,
+    work: fast?.work && typeof fast.work === "object" ? fast.work : null,
   };
   syncDiffThreadFilter();
   syncCompletedThreadFilter();
@@ -1301,11 +1308,13 @@ async function refreshInbox(opts = {}) {
 async function refreshInboxDiff() {
   try {
     const response = await apiGet("/api/inbox/diff");
-    const previous = state.inbox || { pending: [], completed: [] };
+    const previous = state.inbox || { pending: [], inProgress: [], completed: [] };
     state.inbox = {
       pending: Array.isArray(previous.pending) ? previous.pending : [],
+      inProgress: Array.isArray(previous.inProgress) ? previous.inProgress : [],
       completed: Array.isArray(previous.completed) ? previous.completed : [],
       diff: Array.isArray(response?.diff) ? response.diff : [],
+      work: previous.work && typeof previous.work === "object" ? previous.work : null,
     };
     syncDiffThreadFilter();
     syncInboxSubtab();
@@ -1688,6 +1697,7 @@ function allInboxEntries() {
   }
   return [
     ...(Array.isArray(state.inbox.pending) ? state.inbox.pending.map((item) => ({ item, status: "pending" })) : []),
+    ...(Array.isArray(state.inbox.inProgress) ? state.inbox.inProgress.map((item) => ({ item, status: "in_progress" })) : []),
     ...(Array.isArray(state.inbox.diff) ? state.inbox.diff.map((item) => ({ item, status: "diff" })) : []),
     ...(Array.isArray(state.inbox.completed) ? state.inbox.completed.map((item) => ({ item, status: "completed" })) : []),
   ];
@@ -1783,12 +1793,44 @@ function listInboxEntries() {
   if (!state.inbox) {
     return [];
   }
+  if (state.inboxSubtab === "today") {
+    return todayInboxEntries();
+  }
   if (state.inboxSubtab === "completed") {
     return filteredCompletedEntries().map((item) => ({ item, status: "completed" }));
   }
   return (Array.isArray(state.inbox.pending) ? state.inbox.pending : [])
     .filter((item) => entryMatchesProviderFilter(item))
     .map((item) => ({ item, status: "pending" }));
+}
+
+function isTodayTimestamp(value, now = new Date()) {
+  const timestamp = Number(value) || 0;
+  if (!timestamp) {
+    return false;
+  }
+  const date = new Date(timestamp);
+  return date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+}
+
+function todayInboxGroups() {
+  const pending = (Array.isArray(state.inbox?.pending) ? state.inbox.pending : [])
+    .filter((item) => entryMatchesProviderFilter(item))
+    .map((item) => ({ item, status: "pending" }));
+  const inProgress = (Array.isArray(state.inbox?.inProgress) ? state.inbox.inProgress : [])
+    .filter((item) => entryMatchesProviderFilter(item))
+    .map((item) => ({ item, status: "in_progress" }));
+  const completed = (Array.isArray(state.inbox?.completed) ? state.inbox.completed : [])
+    .filter((item) => entryMatchesProviderFilter(item) && isTodayTimestamp(item?.createdAtMs))
+    .map((item) => ({ item, status: "completed" }));
+  return { pending, inProgress, completed };
+}
+
+function todayInboxEntries() {
+  const groups = todayInboxGroups();
+  return [...groups.pending, ...groups.inProgress, ...groups.completed];
 }
 
 function normalizeProviderClient(value) {
@@ -2072,11 +2114,12 @@ function syncCompletedThreadFilter() {
 }
 
 function syncInboxSubtab() {
-  if (state.inboxSubtab === "completed") {
-    state.inboxSubtab = "completed";
-    return;
-  }
-  state.inboxSubtab = "pending";
+  state.inboxSubtab = normalizeInboxSubtab(state.inboxSubtab);
+}
+
+function normalizeInboxSubtab(value, fallback = "today") {
+  const normalized = normalizeClientText(value || "");
+  return EXTERNAL_TARGET_INBOX_SUBTABS.has(normalized) ? normalized : fallback;
 }
 
 function renderPair() {
@@ -3308,11 +3351,13 @@ function renderInboxPanel({ entries, desktop }) {
   const subtabControls = renderInboxSubtabs();
   const providerFilterHtml = renderProviderFilter();
   const threadFilterHtml = state.inboxSubtab === "completed" ? renderCompletedThreadDropdown() : "";
-  const bodyHtml = entries.length
-    ? `<div class="card-list ${desktop ? "card-list--desktop" : ""}">
-        ${entries.map((entry) => renderItemCard(entry, "inbox", desktop)).join("")}
-      </div>`
-    : renderInboxEmptyState();
+  const bodyHtml = state.inboxSubtab === "today"
+    ? renderTodayInboxBody({ desktop })
+    : entries.length
+      ? `<div class="card-list ${desktop ? "card-list--desktop" : ""}">
+          ${entries.map((entry) => renderItemCard(entry, "inbox", desktop)).join("")}
+        </div>`
+      : renderInboxEmptyState();
 
   if (!desktop) {
     return `
@@ -3381,17 +3426,94 @@ function renderInboxSubtabs() {
 
 function inboxSubtabOptions() {
   return [
+    { id: "today", label: L("inbox.subtab.today") },
     { id: "pending", label: L("inbox.subtab.pending") },
     { id: "completed", label: L("inbox.subtab.completed") },
   ];
 }
 
+function renderTodayInboxBody({ desktop }) {
+  const groups = todayInboxGroups();
+  const visibleCompleted = groups.completed.slice(0, TODAY_COMPLETED_ITEM_LIMIT);
+  const hiddenCompletedCount = Math.max(0, groups.completed.length - visibleCompleted.length);
+  const healthNotice = renderWorkHealthNotice();
+  const hasAnyItems = groups.pending.length > 0 || groups.inProgress.length > 0 || groups.completed.length > 0;
+  if (!hasAnyItems) {
+    return `${healthNotice}${renderInboxEmptyState()}`;
+  }
+
+  return `
+    ${healthNotice}
+    ${groups.pending.length === 0 ? `
+      <div class="work-caught-up" role="status">
+        <span class="work-caught-up__icon" aria-hidden="true">${renderIcon("completed")}</span>
+        <span>${escapeHtml(L("work.today.caughtUp"))}</span>
+      </div>
+    ` : ""}
+    <div class="work-sections">
+      ${renderTodayWorkSection("needs-action", L("work.section.needsAction"), groups.pending, desktop)}
+      ${renderTodayWorkSection("in-progress", L("work.section.inProgress"), groups.inProgress, desktop)}
+      ${renderTodayWorkSection("completed", L("work.section.completedToday"), visibleCompleted, desktop, {
+        hiddenCount: hiddenCompletedCount,
+      })}
+    </div>
+  `;
+}
+
+function renderTodayWorkSection(id, label, entries, desktop, { hiddenCount = 0 } = {}) {
+  if (!entries.length) {
+    return "";
+  }
+  return `
+    <section class="work-section work-section--${escapeHtml(id)}" aria-labelledby="work-section-${escapeHtml(id)}">
+      <div class="work-section__header">
+        <h3 class="work-section__title" id="work-section-${escapeHtml(id)}">${escapeHtml(label)}</h3>
+        <span class="work-section__count">${entries.length + hiddenCount}</span>
+      </div>
+      <div class="card-list ${desktop ? "card-list--desktop" : ""}">
+        ${entries.map((entry) => renderItemCard(entry, "inbox", desktop)).join("")}
+      </div>
+      ${hiddenCount > 0 ? `
+        <button class="work-section__more" type="button" data-inbox-subtab="completed">
+          <span>${escapeHtml(L("work.today.viewAllCompleted", { count: hiddenCount }))}</span>
+          <span class="work-section__more-icon" aria-hidden="true">${renderIcon("chevron-right")}</span>
+        </button>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderWorkHealthNotice() {
+  const attention = Array.isArray(state.inbox?.work?.health?.attention)
+    ? state.inbox.work.health.attention
+    : [];
+  if (!attention.length) {
+    return "";
+  }
+  const messages = attention.map((issue) => {
+    if (issue?.code === "connection-required") {
+      return L("work.health.connectionRequired", { provider: providerDisplayName(issue.source) });
+    }
+    return L("work.health.degraded");
+  });
+  return `
+    <div class="work-health" role="status">
+      <span class="work-health__icon" aria-hidden="true">${renderIcon("lock")}</span>
+      <div class="work-health__copy">
+        <strong>${escapeHtml(L("work.health.title"))}</strong>
+        ${messages.map((message) => `<span>${escapeHtml(message)}</span>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function renderInboxEmptyState() {
   const isCompletedView = state.inboxSubtab === "completed";
+  const isTodayView = state.inboxSubtab === "today";
   return `
     <div class="empty-state">
-      <p class="empty-state__title">${escapeHtml(L(isCompletedView ? "inbox.subtab.completed" : "inbox.subtab.pending"))}</p>
-      <p class="muted">${escapeHtml(L(isCompletedView ? "empty.completed" : "empty.pending"))}</p>
+      <p class="empty-state__title">${escapeHtml(L(isCompletedView ? "inbox.subtab.completed" : isTodayView ? "work.today.emptyTitle" : "inbox.subtab.pending"))}</p>
+      <p class="muted">${escapeHtml(L(isCompletedView ? "empty.completed" : isTodayView ? "work.today.emptyCopy" : "empty.pending"))}</p>
     </div>
   `;
 }
@@ -3406,6 +3528,12 @@ function providerBadgeMeta(provider) {
   }
   if (normalized === "a2a") {
     return { id: "a2a", label: "A2A", glyph: "A" };
+  }
+  if (normalized === "mcp") {
+    return { id: "mcp", label: "MCP", glyph: "M" };
+  }
+  if (normalized === "viveworker") {
+    return { id: "viveworker", label: L("common.appName"), glyph: "V" };
   }
   return { id: "codex", label: L("common.codex"), glyph: "X" };
 }
@@ -3452,7 +3580,7 @@ function renderProviderFilter() {
   `;
 }
 
-const COMPLETED_CARD_KINDS = new Set(["assistant_final", "approval", "moltbook_reply", "moltbook_draft", "a2a_task_result", "thread_share"]);
+const COMPLETED_CARD_KINDS = new Set(["completion", "assistant_final", "approval", "moltbook_reply", "moltbook_draft", "a2a_task_result", "thread_share"]);
 
 function renderItemCard(entry, sourceTab, desktop) {
   if (entry.status === "completed" && COMPLETED_CARD_KINDS.has(entry.item.kind)) {
@@ -3460,9 +3588,13 @@ function renderItemCard(entry, sourceTab, desktop) {
   }
   const kindInfo = kindMeta(entry.item.kind, entry.item);
   const cardTitle = cardTitleForEntry(entry);
-  const statusText = entry.status === "completed" ? L("common.completed") : L("common.actionNeeded");
+  const statusText = entry.status === "completed"
+    ? L("common.completed")
+    : entry.status === "in_progress"
+      ? L("common.inProgress")
+      : L("common.actionNeeded");
   const intentText = itemIntentText(entry.item.kind, entry.status, entry.item.provider);
-  const showCompletedTimestamp = entry.status === "completed" && sourceTab === "completed";
+  const showCompletedTimestamp = entry.status === "completed";
   const timestampLabel = showCompletedTimestamp ? formatTimelineTimestamp(entry.item.createdAtMs) : "";
   return `
     <button
@@ -3470,6 +3602,7 @@ function renderItemCard(entry, sourceTab, desktop) {
       data-open-item-kind="${escapeHtml(entry.item.kind)}"
       data-open-item-token="${escapeHtml(entry.item.token)}"
       data-source-tab="${escapeHtml(sourceTab)}"
+      data-source-subtab="${escapeHtml(sourceTab === "inbox" ? state.inboxSubtab : "")}"
     >
       <div class="item-card__header">
         <div class="item-card__meta">
@@ -3494,7 +3627,7 @@ function renderItemCard(entry, sourceTab, desktop) {
         </p>
         <p class="item-card__summary">${escapeHtml(entry.item.summary || fallbackSummaryForKind(entry.item.kind, entry.status, entry.item.provider))}</p>
         ${
-          !desktop && sourceTab === "inbox"
+          !desktop && sourceTab === "inbox" && state.inboxSubtab !== "today"
             ? `<p class="item-card__status-note">${escapeHtml(statusText)}</p>`
             : ""
         }
@@ -3546,7 +3679,7 @@ function renderCompletedCompletionCard(entry, sourceTab) {
       data-open-item-kind="${escapeHtml(item.kind)}"
       data-open-item-token="${escapeHtml(item.token)}"
       data-source-tab="${escapeHtml(sourceTab)}"
-      data-source-subtab="completed"
+      data-source-subtab="${escapeHtml(sourceTab === "inbox" ? state.inboxSubtab : "completed")}"
     >
       <div class="item-card__header">
         <div class="item-card__meta">
@@ -9240,7 +9373,7 @@ function bindShellInteractions() {
 
   for (const button of document.querySelectorAll("[data-inbox-subtab]")) {
     button.addEventListener("click", async () => {
-      const nextSubtab = button.dataset.inboxSubtab === "completed" ? "completed" : "pending";
+      const nextSubtab = normalizeInboxSubtab(button.dataset.inboxSubtab);
       if (nextSubtab === state.inboxSubtab) {
         return;
       }
@@ -11097,7 +11230,7 @@ function bindPartialListSurfaceInteractions(listSurface) {
 
     const subtabButton = target?.closest("[data-inbox-subtab]");
     if (subtabButton) {
-      const nextSubtab = subtabButton.dataset.inboxSubtab === "completed" ? "completed" : "pending";
+      const nextSubtab = normalizeInboxSubtab(subtabButton.dataset.inboxSubtab);
       if (nextSubtab === state.inboxSubtab) {
         return;
       }
@@ -11350,8 +11483,12 @@ function tabForItemKind(kind, fallback) {
 }
 
 function inboxSubtabForItemKind(kind, sourceSubtab = "") {
-  if (normalizeClientText(sourceSubtab || "") === "completed") {
-    return "completed";
+  const normalizedSourceSubtab = normalizeClientText(sourceSubtab || "");
+  if (EXTERNAL_TARGET_INBOX_SUBTABS.has(normalizedSourceSubtab)) {
+    return normalizedSourceSubtab;
+  }
+  if (kind === "activity_status") {
+    return "today";
   }
   const completedKinds = new Set(["completion", "assistant_final", "plan_ready", "moltbook_reply", "thread_share", "a2a_task_result"]);
   return completedKinds.has(kind) ? "completed" : "pending";
@@ -11431,6 +11568,9 @@ function renderTypePillContent(kindInfo) {
 
 function itemIntentText(kind, status = "pending", provider) {
   const vars = { provider: providerDisplayName(provider) };
+  if (status === "in_progress" || kind === "activity_status") {
+    return L("intent.inProgress", vars);
+  }
   if (kind === "diff_thread") {
     return L("intent.diffThread");
   }
@@ -11464,6 +11604,12 @@ function itemIntentText(kind, status = "pending", provider) {
       return L("intent.choice", vars);
     case "completion":
       return L("intent.completed");
+    case "moltbook_draft":
+      return L("intent.draftReview");
+    case "a2a_task":
+      return L("intent.delegationReview");
+    case "thread_share":
+      return L("intent.handoffReview");
     default:
       return L("summary.default");
   }
@@ -11471,6 +11617,9 @@ function itemIntentText(kind, status = "pending", provider) {
 
 function detailIntentText(detail) {
   const provider = detail?.provider;
+  if (detail.kind === "activity_status" || (detail.kind === "a2a_task" && ["working", "input-required"].includes(normalizeClientText(detail.taskStatus)))) {
+    return itemIntentText(detail.kind, "in_progress", provider);
+  }
   if (detail.kind === "diff_thread") {
     return itemIntentText(detail.kind, "diff", provider);
   }
@@ -11545,6 +11694,9 @@ function detailDisplayTitle(detail) {
 
 function fallbackSummaryForKind(kind, status, provider) {
   const vars = { provider: providerDisplayName(provider) };
+  if (status === "in_progress" || kind === "activity_status") {
+    return L("summary.inProgress", vars);
+  }
   if (status === "completed") {
     return L("summary.completed");
   }

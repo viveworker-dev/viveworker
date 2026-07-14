@@ -27,7 +27,52 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
 });
 
 test("build id marks the current web bundle", () => {
-  assert.match(buildIdSource, /20260525-wallet-network-count/);
+  assert.match(buildIdSource, /20260713-lan-recovery-v2/);
+});
+
+test("bridge startup does not block LAN listening on rollout label indexing", () => {
+  assert.match(bridgeSource, /const timer = setTimeout\(run, STARTUP_MAINTENANCE_DELAY_MS\)/);
+  assert.match(bridgeSource, /void buildRolloutThreadLabelIndex\(runtime\.knownFiles, runtime\.sessionIndex\)/);
+  assert.match(bridgeSource, /ROLLOUT_LABEL_METADATA_MAX_BYTES/);
+  assert.match(bridgeSource, /await yieldToEventLoop\(\)/);
+});
+
+test("bridge starts LAN listening before optional state backfills", () => {
+  const listenAt = bridgeSource.indexOf("await startHttpServer(approvalServer");
+  const maintenanceAt = bridgeSource.indexOf("scheduleStartupMaintenance({ config, runtime, state })", listenAt);
+  assert.ok(listenAt >= 0);
+  assert.ok(maintenanceAt > listenAt);
+  const stateInitStart = bridgeSource.indexOf("const initialHistoryItems");
+  const stateInitEnd = bridgeSource.indexOf("function defaultLocale", stateInitStart);
+  assert.doesNotMatch(bridgeSource.slice(stateInitStart, stateInitEnd), /await backfillPersistedTimelineImagePaths|await backfillMoltbookInboxHistory|await recoverMissingProviderStateFromBackup/);
+});
+
+test("startup scans yield to HTTPS and defer maintenance until the first scan completes", () => {
+  assert.match(bridgeSource, /lineIndex % SCAN_COOPERATIVE_YIELD_EVERY === 0/);
+  assert.match(bridgeSource, /if \(!runtime\.initialScanComplete\)[\s\S]*STARTUP_MAINTENANCE_RETRY_MS/);
+  assert.match(bridgeSource, /runtime\.initialScanComplete = true/);
+});
+
+test("apply_patch recovery uses bounded reverse lookup with negative caching", () => {
+  const start = bridgeSource.indexOf("async function findStoredApplyPatchInput");
+  const end = bridgeSource.indexOf("function diffPathForSide", start);
+  const lookupSource = bridgeSource.slice(start, end);
+  assert.match(lookupSource, /APPLY_PATCH_LOOKBACK_BYTES/);
+  assert.match(lookupSource, /applyPatchLookupMisses/);
+  assert.match(lookupSource, /lastIndexOf\("\\n"/);
+  assert.match(lookupSource, /await yieldToEventLoop\(\)/);
+  assert.doesNotMatch(lookupSource, /fs\.readFile\(/);
+  assert.doesNotMatch(lookupSource, /content\.split\(/);
+});
+
+test("Moltbook history backfill batches additions without renormalizing history per item", () => {
+  const start = bridgeSource.indexOf("async function backfillMoltbookInboxHistory");
+  const end = bridgeSource.indexOf("async function runDeferredStartupBackfills", start);
+  const backfillSource = bridgeSource.slice(start, end);
+  assert.match(backfillSource, /const additions = \[\]/);
+  assert.match(backfillSource, /mergeNormalizedHistoryItems/);
+  assert.doesNotMatch(backfillSource, /recordHistoryItem\(/);
+  assert.doesNotMatch(backfillSource, /recentHistoryItems\.some\(/);
 });
 
 test("timeline render is reported with sanitized client metadata", () => {

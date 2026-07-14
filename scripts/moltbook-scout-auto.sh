@@ -39,24 +39,87 @@ WINDOW_MS=$((WINDOW_SEC * 1000))
 MAX_SKIP=5
 
 # ── Detect harness ────────────────────────────────────────────
-HARNESS="${SCOUT_HARNESS:-}"
-HARNESS_BIN="${SCOUT_HARNESS_BIN:-}"
-if [ -z "$HARNESS" ]; then
-  if command -v claude >/dev/null 2>&1; then
-    HARNESS="claude"
-  elif command -v codex >/dev/null 2>&1; then
-    HARNESS="codex"
+resolve_harness_bin() {
+  local harness="$1"
+  local configured="${2:-}"
+  local resolved=""
+
+  if [ -n "$configured" ]; then
+    if [ -x "$configured" ]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+    resolved=$(command -v "$configured" 2>/dev/null || true)
+    if [ -n "$resolved" ] && [ -x "$resolved" ]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
   fi
-fi
-if [ -n "$HARNESS_BIN" ] && [ ! -x "$HARNESS_BIN" ]; then
-  HARNESS_BIN=""
-fi
-if [ -n "$HARNESS" ] && [ -z "$HARNESS_BIN" ]; then
-  HARNESS_BIN=$(command -v "$HARNESS" 2>/dev/null || true)
+
+  resolved=$(command -v "$harness" 2>/dev/null || true)
+  if [ -n "$resolved" ] && [ -x "$resolved" ]; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  # Desktop app updates can move the bundled Codex binary without rewriting
+  # an already-installed LaunchAgent. Resolve the current app bundle at every
+  # run so a stale absolute path does not disable scoring and drafting.
+  if [ "$harness" = "codex" ]; then
+    local candidate=""
+    for candidate in \
+      "/Applications/ChatGPT.app/Contents/Resources/codex" \
+      "/Applications/Codex.app/Contents/Resources/codex" \
+      "$HOME/Applications/ChatGPT.app/Contents/Resources/codex" \
+      "$HOME/Applications/Codex.app/Contents/Resources/codex"; do
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+HARNESS="${SCOUT_HARNESS:-}"
+CONFIGURED_HARNESS_BIN="${SCOUT_HARNESS_BIN:-}"
+HARNESS_BIN=""
+if [ -n "$HARNESS" ]; then
+  HARNESS_BIN=$(resolve_harness_bin "$HARNESS" "$CONFIGURED_HARNESS_BIN" || true)
+else
+  HARNESS_BIN=$(resolve_harness_bin "codex" "" || true)
+  if [ -n "$HARNESS_BIN" ]; then
+    HARNESS="codex"
+  else
+    HARNESS_BIN=$(resolve_harness_bin "claude" "" || true)
+    if [ -n "$HARNESS_BIN" ]; then
+      HARNESS="claude"
+    fi
+  fi
 fi
 if [ -z "${SCOUT_DRAFT_TIMEOUT:-}" ] && [ "$HARNESS" = "codex" ]; then
   DRAFT_TIMEOUT_SEC=300
 fi
+
+run_harness_prompt() {
+  local timeout_sec="$1"
+  local prompt="$2"
+
+  if [ "$HARNESS" = "claude" ]; then
+    portable_timeout "$timeout_sec" "$HARNESS_BIN" -p "$prompt" --output-format text
+  elif [ "$HARNESS" = "codex" ]; then
+    printf '%s' "$prompt" | portable_timeout "$timeout_sec" "$HARNESS_BIN" exec \
+      -C "$SCRIPT_DIR/.." \
+      --sandbox read-only \
+      --ephemeral \
+      --ignore-user-config \
+      --ignore-rules \
+      --color never
+  else
+    return 127
+  fi
+}
 
 # ── Load persona & avoid keywords ─────────────────────────────
 PERSONA=""
@@ -179,12 +242,7 @@ INTENT: (1-2 sentences in Japanese: why this reply angle fits the incoming comme
 INBOX_PROMPT_EOF
     )"
 
-    INBOX_DRAFT_TEXT=""
-    if [ "$HARNESS" = "claude" ]; then
-      INBOX_DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$INBOX_PROMPT" --output-format text 2>/dev/null) || true
-    elif [ "$HARNESS" = "codex" ]; then
-      INBOX_DRAFT_TEXT=$(printf '%s' "$INBOX_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
-    fi
+    INBOX_DRAFT_TEXT=$(run_harness_prompt "$DRAFT_TIMEOUT_SEC" "$INBOX_PROMPT" 2>/dev/null) || true
 
     if [ -z "$INBOX_DRAFT_TEXT" ]; then
       echo "[scout-auto] inbox: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
@@ -296,12 +354,7 @@ INTENT: (1-2 sentences in Japanese: why this is worth posting from this persona 
 COMPOSE_EOF
   )"
 
-  COMPOSE_DRAFT=""
-  if [ "$HARNESS" = "claude" ]; then
-    COMPOSE_DRAFT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$COMPOSE_PROMPT" --output-format text 2>/dev/null) || true
-  elif [ "$HARNESS" = "codex" ]; then
-    COMPOSE_DRAFT=$(printf '%s' "$COMPOSE_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
-  fi
+  COMPOSE_DRAFT=$(run_harness_prompt "$DRAFT_TIMEOUT_SEC" "$COMPOSE_PROMPT" 2>/dev/null) || true
 
   if [ -n "$COMPOSE_DRAFT" ]; then
     abort_if_harness_error "compose ($COMPOSE_SLOT)" "$COMPOSE_DRAFT"
@@ -415,12 +468,7 @@ PROMPT_EOF
   )"
 
   echo "[scout-auto] drafting via $HARNESS for '$BEST_TITLE'"
-  DRAFT_TEXT=""
-  if [ "$HARNESS" = "claude" ]; then
-    DRAFT_TEXT=$(portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" -p "$DRAFT_PROMPT" --output-format text 2>/dev/null) || true
-  elif [ "$HARNESS" = "codex" ]; then
-    DRAFT_TEXT=$(printf '%s' "$DRAFT_PROMPT" | portable_timeout "$DRAFT_TIMEOUT_SEC" "$HARNESS_BIN" exec 2>/dev/null) || true
-  fi
+  DRAFT_TEXT=$(run_harness_prompt "$DRAFT_TIMEOUT_SEC" "$DRAFT_PROMPT" 2>/dev/null) || true
 
   if [ -z "$DRAFT_TEXT" ]; then
     echo "[scout-auto] error: harness returned empty draft or timed out after ${DRAFT_TIMEOUT_SEC}s"
@@ -521,13 +569,14 @@ Post body (first 500 chars): ${POST_CONTENT:0:500}
 
 Reply with ONLY a number from 0 to 100. Nothing else."
 
-    SCORE_RAW=""
-    if [ "$HARNESS" = "claude" ]; then
-      SCORE_RAW=$(portable_timeout 30 "$HARNESS_BIN" -p "$SCORE_PROMPT" --output-format text 2>/dev/null) || true
-    elif [ "$HARNESS" = "codex" ]; then
-      SCORE_RAW=$(printf '%s' "$SCORE_PROMPT" | portable_timeout 30 "$HARNESS_BIN" exec 2>/dev/null) || true
-    fi
+    SCORE_RAW=$(run_harness_prompt 30 "$SCORE_PROMPT" 2>/dev/null) || true
     abort_if_harness_error "score" "$SCORE_RAW"
+
+    if [ -z "$SCORE_RAW" ]; then
+      SKIP_COUNT=$((SKIP_COUNT + 1))
+      echo "[scout-auto] skipping (score failed): $POST_TITLE (by @$POST_AUTHOR) [$SKIP_COUNT/$MAX_SKIP]"
+      continue
+    fi
 
     SCORE=$(echo "$SCORE_RAW" | tr -dc '0-9\n' | head -1)
     SCORE=${SCORE:-0}
@@ -539,11 +588,6 @@ Reply with ONLY a number from 0 to 100. Nothing else."
       continue
     fi
 
-    if [ -z "$SCORE_RAW" ]; then
-      SKIP_COUNT=$((SKIP_COUNT + 1))
-      echo "[scout-auto] skipping (score failed): $POST_TITLE (by @$POST_AUTHOR) [$SKIP_COUNT/$MAX_SKIP]"
-      continue
-    fi
   else
     SCORE=50
   fi

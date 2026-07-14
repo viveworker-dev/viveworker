@@ -105,6 +105,11 @@ const AUTO_STICKY_LAN_PROBE_TIMEOUT_MS = 900;
 const LAN_REACHABILITY_PROBE_TIMEOUT_MS = 700;
 const LAN_REACHABILITY_PROBE_PATH = "/health";
 const RECENT_LAN_OK_GRACE_MS = 60_000;
+const RECENT_LAN_RESTART_RECOVERY_MS = 5_000;
+const RECENT_LAN_RESTART_PROBE_INTERVAL_MS = 500;
+const COLD_LAN_RECOVERY_MS = 35_000;
+const COLD_LAN_RECOVERY_PROBE_INTERVAL_MS = 250;
+const COLD_LAN_RECOVERY_PROBE_TIMEOUT_MS = 1_500;
 const TRANSIENT_LAN_FAILURE_STICKY_MS = 8_000;
 const TRANSIENT_LAN_FAILURE_THRESHOLD = 2;
 // If LAN was healthy moments ago, a single timed-out local request is more
@@ -118,6 +123,7 @@ const RELAY_CIRCUIT_BREAKER_MS = 60_000;
 const PAIRING_STATE_STORAGE_KEY = "viveworker.remote-pairing.state";
 const PAIRING_STATE_SCHEMA_VERSION = 2;
 const PAIRING_STATE_LEGACY_SCHEMA_VERSION = 1;
+const LAN_SUCCESS_STORAGE_KEY = "viveworker.remote-pairing.last-lan-ok-at-ms";
 const ROUTING_STATUS_EVENT = "viveworker:remote-routing-status";
 
 // ---------------------------------------------------------------------------
@@ -148,6 +154,12 @@ let _lastSuccessfulRoute = null;
 /** Last time a LAN request completed successfully. */
 let _lastLanOkAtMs = 0;
 
+/** Whether a recent LAN success was restored after this PWA module loaded. */
+let _lastLanOkRestoredFromStorage = false;
+
+/** A bridge-restart recovery loop should run at most once per PWA module. */
+let _recentLanRestartRecoveryAttempted = false;
+
 /** Last time we tried a LAN probe while sticky relay was active. */
 let _lastStickyLanProbeAtMs = 0;
 
@@ -172,6 +184,49 @@ function newTelemetry() {
     lastRelayFailAt: 0,
     clientResets: 0,
   };
+}
+
+function lanSuccessStorage(opts = {}) {
+  if (opts.lanSuccessStorage) {
+    return opts.lanSuccessStorage;
+  }
+  try {
+    return globalThis.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function restoreRecentLanSuccess(opts = {}, now = nowMs(opts)) {
+  if (_lastLanOkAtMs > 0 || _recentLanRestartRecoveryAttempted) {
+    return;
+  }
+  const storage = lanSuccessStorage(opts);
+  if (!storage) return;
+
+  try {
+    const atMs = Number(storage.getItem(LAN_SUCCESS_STORAGE_KEY));
+    if (!Number.isFinite(atMs) || atMs <= 0 || atMs > now || now - atMs > RECENT_LAN_OK_GRACE_MS) {
+      storage.removeItem?.(LAN_SUCCESS_STORAGE_KEY);
+      return;
+    }
+    _lastLanOkAtMs = atMs;
+    _lastLanOkRestoredFromStorage = true;
+  } catch {
+    // Storage is only a restart hint; routing remains correct without it.
+  }
+}
+
+function rememberLanSuccess(atMs, opts = {}) {
+  _lastLanOkAtMs = atMs;
+  _lastLanOkRestoredFromStorage = false;
+  const storage = lanSuccessStorage(opts);
+  if (!storage) return;
+  try {
+    storage.setItem(LAN_SUCCESS_STORAGE_KEY, String(atMs));
+  } catch {
+    // Private browsing or a full storage quota should not affect LAN routing.
+  }
 }
 
 function emitRoutingStatus(phase, opts = {}, detail = {}) {
@@ -601,13 +656,15 @@ async function attemptLanFetch(url, init, opts) {
       ? await Promise.race([fetchPromise, timeoutPromise])
       : await fetchPromise;
     _telemetry.lanOk++;
-    _lastLanOkAtMs = nowMs(opts);
+    rememberLanSuccess(nowMs(opts), opts);
     _consecutiveLanFailures = 0;
     _lastSuccessfulRoute = "lan";
     _stickyRelayUntilMs = 0;
     _lastStickyLanProbeAtMs = 0;
     resetRelayFailureCircuit();
-    closeRelayClient("lan connected");
+    if (opts.keepRelayClientOnLanSuccess !== true) {
+      closeRelayClient("lan connected");
+    }
     emitRoutingStatus("lan-connected", opts, { url: String(url || "") });
     return { ok: true, response };
   } catch (err) {
@@ -710,6 +767,235 @@ async function recoverLanBeforeRelay(url, init, err, opts = {}) {
   _telemetry.lanReachableAfterFailure++;
   suppressRelayAfterRecentLanFailure(url, err, opts);
   return { recovered: false, suppressRelay: true };
+}
+
+function shouldRecoverRecentLanAfterRestart(now, opts = {}) {
+  if (opts.recoverRecentLanAfterRestart === false) return false;
+  if (!_lastLanOkRestoredFromStorage || _recentLanRestartRecoveryAttempted) return false;
+  return _lastLanOkAtMs > 0 && now - _lastLanOkAtMs <= RECENT_LAN_OK_GRACE_MS;
+}
+
+function waitForLanRecoveryDelay(ms, signal) {
+  const delayMs = Math.max(0, Number(ms) || 0);
+  if (signal?.aborted) {
+    return Promise.reject(abortError(signal));
+  }
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      reject(abortError(signal));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
+async function recoverRecentLanAfterRestart(url, init, opts = {}) {
+  const startedAtMs = nowMs(opts);
+  if (!shouldRecoverRecentLanAfterRestart(startedAtMs, opts)) {
+    return { recovered: false };
+  }
+  _recentLanRestartRecoveryAttempted = true;
+
+  const recoveryWindowMs = Math.max(
+    0,
+    Number(opts.recentLanRestartRecoveryMs ?? RECENT_LAN_RESTART_RECOVERY_MS) || 0,
+  );
+  const deadlineMs = startedAtMs + recoveryWindowMs;
+  const path = urlToRelayPath(url);
+
+  while (true) {
+    const probe = await attemptLanFetch(LAN_REACHABILITY_PROBE_PATH, {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    }, {
+      ...opts,
+      lanTimeoutMs: opts.lanReachabilityProbeTimeoutMs ?? LAN_REACHABILITY_PROBE_TIMEOUT_MS,
+    });
+    if (probe.ok) {
+      if (path === LAN_REACHABILITY_PROBE_PATH) {
+        return { recovered: true, response: probe.response };
+      }
+      const retry = await attemptLanFetch(url, init, {
+        ...opts,
+        lanTimeoutMs: opts.lanRecoveryTimeoutMs ?? opts.lanTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS,
+      });
+      if (retry.ok) {
+        return { recovered: true, response: retry.response };
+      }
+    }
+
+    const remainingMs = deadlineMs - nowMs(opts);
+    if (remainingMs <= 0) {
+      return { recovered: false };
+    }
+    await waitForLanRecoveryDelay(
+      Math.min(RECENT_LAN_RESTART_PROBE_INTERVAL_MS, remainingMs),
+      init.signal,
+    );
+  }
+}
+
+function createLinkedAbortScope(parentSignal) {
+  if (typeof AbortController === "undefined") {
+    return {
+      signal: parentSignal,
+      abort() {},
+      cleanup() {},
+    };
+  }
+
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    onParentAbort();
+  } else {
+    parentSignal?.addEventListener?.("abort", onParentAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    abort(reason) {
+      if (!controller.signal.aborted) controller.abort(reason);
+    },
+    cleanup() {
+      parentSignal?.removeEventListener?.("abort", onParentAbort);
+    },
+  };
+}
+
+function routeWinnerAbortError() {
+  const err = new Error("alternate route connected");
+  err.name = "AbortError";
+  return err;
+}
+
+async function settleRouteAttempt(route, promise) {
+  try {
+    return { route, ...(await promise) };
+  } catch (err) {
+    return { route, ok: false, err };
+  }
+}
+
+async function recoverColdLanWhileRelayConnects(url, init, initialErr, opts = {}) {
+  const startedAtMs = nowMs(opts);
+  const recoveryWindowMs = Math.max(
+    0,
+    Number(opts.coldLanRecoveryMs ?? COLD_LAN_RECOVERY_MS) || 0,
+  );
+  const deadlineMs = startedAtMs + recoveryWindowMs;
+  const path = urlToRelayPath(url);
+  let lastErr = initialErr;
+
+  while (true) {
+    const probe = await attemptLanFetch(LAN_REACHABILITY_PROBE_PATH, {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal: init.signal,
+    }, {
+      ...opts,
+      keepRelayClientOnLanSuccess: true,
+      lanTimeoutMs: opts.lanReachabilityProbeTimeoutMs ?? COLD_LAN_RECOVERY_PROBE_TIMEOUT_MS,
+    });
+    if (probe.ok) {
+      if (path === LAN_REACHABILITY_PROBE_PATH) {
+        return { ok: true, response: probe.response };
+      }
+      const retry = await attemptLanFetch(url, init, {
+        ...opts,
+        lanTimeoutMs: opts.lanRecoveryTimeoutMs ?? opts.lanTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS,
+      });
+      if (retry.ok) {
+        return { ok: true, response: retry.response };
+      }
+      lastErr = retry.err;
+    } else {
+      lastErr = probe.err;
+    }
+
+    const remainingMs = deadlineMs - nowMs(opts);
+    if (remainingMs <= 0) {
+      return { ok: false, err: lastErr };
+    }
+    await waitForLanRecoveryDelay(
+      Math.min(
+        Math.max(0, Number(opts.coldLanRecoveryProbeIntervalMs ?? COLD_LAN_RECOVERY_PROBE_INTERVAL_MS) || 0),
+        remainingMs,
+      ),
+      init.signal,
+    );
+  }
+}
+
+async function raceRelayWithColdLanRecovery(url, init, initialLanErr, opts = {}) {
+  const lanScope = createLinkedAbortScope(init.signal);
+  const relayScope = createLinkedAbortScope(init.signal);
+  const lanInit = { ...init, signal: lanScope.signal };
+  const relayInit = { ...init, signal: relayScope.signal };
+  let lanResult = null;
+  let relayResult = null;
+
+  try {
+    const lanPromise = settleRouteAttempt(
+      "lan",
+      recoverColdLanWhileRelayConnects(url, lanInit, initialLanErr, opts),
+    );
+    emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: false });
+    const relayPromise = settleRouteAttempt("relay", attemptRelayFetch(url, relayInit, opts));
+    const first = await Promise.race([lanPromise, relayPromise]);
+
+    if (first.route === "lan") lanResult = first;
+    else relayResult = first;
+
+    if (first.ok) {
+      if (first.route === "lan") {
+        relayScope.abort(routeWinnerAbortError());
+        closeRelayClient("LAN recovery won route race");
+      } else {
+        lanScope.abort(routeWinnerAbortError());
+      }
+      return { ok: true, response: first.response, route: first.route };
+    }
+
+    const second = await (first.route === "lan" ? relayPromise : lanPromise);
+    if (second.route === "lan") lanResult = second;
+    else relayResult = second;
+    if (second.ok) {
+      if (second.route === "lan") {
+        relayScope.abort(routeWinnerAbortError());
+        closeRelayClient("LAN recovery won route race");
+      } else {
+        lanScope.abort(routeWinnerAbortError());
+      }
+      return { ok: true, response: second.response, route: second.route };
+    }
+
+    return {
+      ok: false,
+      lanErr: lanResult?.err || initialLanErr,
+      relayErr: relayResult?.err || null,
+    };
+  } finally {
+    lanScope.cleanup();
+    relayScope.cleanup();
+  }
+}
+
+function throwRouteRaceFailure(result, opts = {}) {
+  if (isRemotePairingEnrollmentRequiredError(result.relayErr)) {
+    throw result.relayErr;
+  }
+  if (opts.preferRelayError && result.relayErr) {
+    throw result.relayErr;
+  }
+  throw result.lanErr || result.relayErr || new TypeError("LAN and relay unavailable");
 }
 
 async function attemptStickyLanProbe(url, init, opts) {
@@ -995,8 +1281,15 @@ function nowMs(opts) {
  *   confirmLanReachabilityBeforeRelay?: boolean,
  *   retryLanAfterReachabilityProbe?: boolean,
  *   lanRecoveryTimeoutMs?: number,
+ *   lanAfterRelayFailureTimeoutMs?: number,
  *   stickyLanProbeTimeoutMs?: number,
  *   lanReachabilityProbeTimeoutMs?: number,
+ *   recoverRecentLanAfterRestart?: boolean,
+ *   recentLanRestartRecoveryMs?: number,
+ *   raceLanRecoveryWithRelay?: boolean,
+ *   coldLanRecoveryMs?: number,
+ *   coldLanRecoveryProbeIntervalMs?: number,
+ *   lanSuccessStorage?: Storage,
  * }} [opts]
  * @returns {Promise<{
  *   ok: boolean,
@@ -1009,12 +1302,24 @@ function nowMs(opts) {
  */
 export async function routedFetch(url, init = {}, opts = {}) {
   const t = nowMs(opts);
+  restoreRecentLanSuccess(opts, t);
 
   // Sticky-relay path: LAN just failed, prefer relay for a while.
   if (_stickyRelayUntilMs > t) {
+    if (opts.raceLanRecoveryWithRelay === true) {
+      const lan = await attemptLanFetch(url, init, opts);
+      if (lan.ok) return lan.response;
+      const recovery = await recoverLanBeforeRelay(url, init, lan.err, opts);
+      if (recovery.recovered) return recovery.response;
+      const raced = await raceRelayWithColdLanRecovery(url, init, lan.err, opts);
+      if (raced.ok) return raced.response;
+      return throwRouteRaceFailure(raced, opts);
+    }
     if (shouldDelayRelayAfterRecentLanFailure(t, opts)) {
       const lan = await attemptLanFetch(url, init, opts);
       if (lan.ok) return lan.response;
+      const restartRecovery = await recoverRecentLanAfterRestart(url, init, opts);
+      if (restartRecovery.recovered) return restartRecovery.response;
       if (shouldDelayRelayAfterRecentLanFailure(nowMs(opts), opts)) {
         suppressRelayAfterRecentLanFailure(url, lan.err, opts);
         throw lan.err;
@@ -1053,6 +1358,15 @@ export async function routedFetch(url, init = {}, opts = {}) {
   // Happy path: LAN first.
   const lan = await attemptLanFetch(url, init, opts);
   if (lan.ok) return lan.response;
+  if (opts.raceLanRecoveryWithRelay === true) {
+    const recovery = await recoverLanBeforeRelay(url, init, lan.err, opts);
+    if (recovery.recovered) return recovery.response;
+    const raced = await raceRelayWithColdLanRecovery(url, init, lan.err, opts);
+    if (raced.ok) return raced.response;
+    return throwRouteRaceFailure(raced, opts);
+  }
+  const restartRecovery = await recoverRecentLanAfterRestart(url, init, opts);
+  if (restartRecovery.recovered) return restartRecovery.response;
   if (shouldDelayRelayAfterRecentLanFailure(nowMs(opts), opts)) {
     suppressRelayAfterRecentLanFailure(url, lan.err, opts);
     throw lan.err;
@@ -1067,10 +1381,18 @@ export async function routedFetch(url, init = {}, opts = {}) {
   emitRoutingStatus("remote-switching", opts, { url: String(url || ""), sticky: false });
   const r = await attemptRelayFetch(url, init, opts);
   if (r.ok) return r.response;
+  // The bridge may have finished restarting while the relay handshake was
+  // failing. Give the direct LAN route one final chance before surfacing an
+  // off-LAN error, even when this request prefers relay diagnostics.
+  const lanAfterRelay = await attemptLanFetch(url, init, {
+    ...opts,
+    lanTimeoutMs: opts.lanAfterRelayFailureTimeoutMs ?? opts.lanRecoveryTimeoutMs ?? DEFAULT_LAN_TIMEOUT_MS,
+  });
+  if (lanAfterRelay.ok) return lanAfterRelay.response;
   if (isRemotePairingEnrollmentRequiredError(r.err)) throw r.err;
   if (opts.preferRelayError && r.err) throw r.err;
 
-  throw lan.err;
+  throw lanAfterRelay.err;
 }
 
 /**
@@ -1115,6 +1437,8 @@ export function __resetForTest() {
   _lastPairingStateStatus = null;
   _lastSuccessfulRoute = null;
   _lastLanOkAtMs = 0;
+  _lastLanOkRestoredFromStorage = false;
+  _recentLanRestartRecoveryAttempted = false;
   _lastStickyLanProbeAtMs = 0;
   _consecutiveLanFailures = 0;
   _relayFailureAtMs = [];

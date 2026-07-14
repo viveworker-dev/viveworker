@@ -539,7 +539,10 @@ export class RemotePairingTransport {
     if (this._closed) return;          // user-initiated; close() already settled
     if (this._state === STATE.FAILED) return; // already terminal
 
+    const stateBeforeClose = this._state;
     const isRelayReset = Number(evt?.code) === CLOSE_RELAY_RESET_SESSION;
+    const relayResetDuringNegotiation =
+      isRelayReset && (stateBeforeClose === STATE.HANDSHAKING || stateBeforeClose === STATE.RESUMING);
     if (isRelayReset) {
       this._log.debug?.(`relay requested fresh handshake reason=${evt?.reason || ""}`);
       this._dropNoiseState();
@@ -547,7 +550,10 @@ export class RemotePairingTransport {
 
     this._log.debug?.(`ws closed code=${evt?.code} reason=${evt?.reason}`);
     this._setState(STATE.DISCONNECTED, { code: evt?.code, reason: evt?.reason });
-    if (Number(evt?.code) !== CLOSE_NORMAL) {
+    // A 4004 while handshaking/resuming is the relay coordinating a normal
+    // state reset after one peer restarted. Counting it towards the reconnect
+    // circuit turns two expected reset hops into minutes of needless outage.
+    if (Number(evt?.code) !== CLOSE_NORMAL && !relayResetDuringNegotiation) {
       this._recordReconnectFailure({
         code: Number(evt?.code) || 0,
         reason: String(evt?.reason || ""),

@@ -12,13 +12,17 @@ import process from "node:process";
 import { createInterface } from "node:readline";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import zlib from "node:zlib";
 import webPush from "web-push";
 import * as hazbaseAuth from "@hazbase/auth";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { APP_BUILD_ID as WEB_APP_BUILD_ID } from "../web/build-id.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
+import { applyJsonPatches } from "./lib/immutable-json-patch.mjs";
+import { LengthPrefixedFrameDecoder } from "./lib/length-prefixed-frame-decoder.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
+import { buildWorkItemResponse } from "./lib/work-items.mjs";
 import { buildAgentCard, handleA2ARequest, resolveA2ATaskDecision, completeA2ATask, failA2ATask } from "./a2a-handler.mjs";
 import { registerWithRelay, startRelayPolling, stopRelayPolling, postRelayResult, getRelayStatus, updatePublicTasksFlag } from "./a2a-relay-client.mjs";
 import { createMoltbookClient, readScoutState, writeScoutState, rollScoutDayIfNeeded, markPostSeen, recordComposeAttempt, writeDraft, readDraft, deleteDraft, listPendingDrafts, solveVerificationPuzzle, solvePuzzleWithLLM, recordPuzzleAttempt, listInboxItems, updateInboxStatus, getMoltbookReplyQuotaState, looksLikeProviderErrorText } from "./moltbook-api.mjs";
@@ -58,6 +62,9 @@ const historyKinds = new Set(["completion", "assistant_final", "plan_ready", "ap
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const timelineKinds = new Set([...timelineMessageKinds, "activity_status", "ambient_suggestions", "approval", "plan", "choice", "plan_ready", "file_event", "command_event", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task", "a2a_task_result"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
+const SQLITE_QUERY_BUSY_TIMEOUT_MS = 1000;
+const SQLITE_QUERY_MAX_ATTEMPTS = 3;
+const SQLITE_QUERY_RETRY_BASE_DELAY_MS = 75;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
 const PAIRING_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
@@ -73,6 +80,15 @@ const HAZBASE_METADATA_TIMEOUT_MS = 1500;
 const NPM_VERSION_CHECK_TIMEOUT_MS = 2500;
 const NPM_VERSION_CHECK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMELINE_ACTIVITY_TTL_MS = 2 * 60 * 1000;
+const STARTUP_MAINTENANCE_DELAY_MS = 15_000;
+const STARTUP_MAINTENANCE_RETRY_MS = 5_000;
+const INITIAL_SCAN_WARMUP_MS = 1_500;
+const SCAN_COOPERATIVE_YIELD_EVERY = 16;
+const APPLY_PATCH_LOOKBACK_BYTES = 8 * 1024 * 1024;
+const APPLY_PATCH_LOOKUP_MISS_LIMIT = 256;
+const IPC_LARGE_FRAME_LOG_BYTES = 8 * 1024 * 1024;
+const ROLLOUT_LABEL_METADATA_MAX_LINES = 256;
+const ROLLOUT_LABEL_METADATA_MAX_BYTES = 512 * 1024;
 const PAYMENT_NETWORKS = {
   base: { family: "evm", chainId: 8453, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base", releaseStatus: "comingSoon" },
   "base-sepolia": { family: "evm", chainId: 84532, asset: "usdc", assets: ["usdc"], scheme: "exact", label: "Base Sepolia" },
@@ -254,6 +270,7 @@ const runtime = {
     sourceFile: "",
   },
   rolloutThreadLabels: new Map(),
+  rolloutLabelIndexInFlight: false,
   rolloutThreadCwds: new Map(),
   threadStates: new Map(),
   threadOwnerClientIds: new Map(),
@@ -294,6 +311,7 @@ const runtime = {
   timelineLiveScanReasons: new Set(),
   timelineLiveClaudeFiles: new Set(),
   timelineLiveRolloutFiles: new Set(),
+  initialScanComplete: false,
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
   remotePairingHandle: null,
@@ -434,9 +452,6 @@ state.recentHistoryItems = initialHistoryItems;
 state.recentTimelineEntries = initialTimelineEntries;
 const backfilledAmbientSuggestionsStateChanged = backfillAmbientSuggestionsState({ config, runtime, state });
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
-const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
-const backfilledMoltbookInboxChanged = await backfillMoltbookInboxHistory({ config, runtime, state });
-const recoveredMissingProviderStateChanged = await recoverMissingProviderStateFromBackup({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
 runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
 
@@ -2173,6 +2188,7 @@ function rememberApplyPatchInput(fileState, payload, createdAtMs = Date.now()) {
     cwd: cleanText(fileState.cwd || ""),
     createdAtMs: Number(createdAtMs) || Date.now(),
   });
+  fileState.applyPatchLookupMisses?.delete(callId);
   while (fileState.applyPatchInputsByCallId.size > 64) {
     const oldestKey = fileState.applyPatchInputsByCallId.keys().next().value;
     if (!oldestKey) {
@@ -2225,6 +2241,9 @@ async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath })
   if (inMemory?.inputText) {
     return inMemory;
   }
+  if (fileState?.applyPatchLookupMisses instanceof Set && fileState.applyPatchLookupMisses.has(normalizedCallId)) {
+    return null;
+  }
 
   const normalizedRolloutFilePath = cleanText(rolloutFilePath || "");
   if (!normalizedRolloutFilePath) {
@@ -2233,14 +2252,40 @@ async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath })
 
   let content = "";
   try {
-    content = await fs.readFile(normalizedRolloutFilePath, "utf8");
+    const stat = await fs.stat(normalizedRolloutFilePath);
+    const length = Math.min(stat.size, APPLY_PATCH_LOOKBACK_BYTES);
+    const offset = Math.max(0, stat.size - length);
+    const buffer = Buffer.allocUnsafe(length);
+    const handle = await fs.open(normalizedRolloutFilePath, "r");
+    try {
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      content = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    if (offset > 0) {
+      const firstNewline = content.indexOf("\n");
+      content = firstNewline >= 0 ? content.slice(firstNewline + 1) : "";
+    }
   } catch {
     return null;
   }
 
-  const lines = content.split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const rawLine = lines[index];
+  let cursor = content.length;
+  let scannedLines = 0;
+  while (cursor > 0) {
+    let end = cursor;
+    if (content.charCodeAt(end - 1) === 10) {
+      end -= 1;
+    }
+    const previousNewline = content.lastIndexOf("\n", end - 1);
+    const start = previousNewline + 1;
+    const rawLine = content.slice(start, end);
+    cursor = previousNewline >= 0 ? previousNewline : 0;
+    scannedLines += 1;
+    if (scannedLines % 128 === 0) {
+      await yieldToEventLoop();
+    }
     if (!rawLine.trim()) {
       continue;
     }
@@ -2267,6 +2312,7 @@ async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath })
 
     const inputText = normalizeTimelineDiffText(payload?.input ?? "");
     if (!inputText) {
+      rememberApplyPatchLookupMiss(fileState, normalizedCallId);
       return null;
     }
 
@@ -2279,10 +2325,27 @@ async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath })
       fileState.applyPatchInputsByCallId = new Map();
     }
     fileState.applyPatchInputsByCallId.set(normalizedCallId, restored);
+    fileState.applyPatchLookupMisses?.delete(normalizedCallId);
     return restored;
   }
 
+  rememberApplyPatchLookupMiss(fileState, normalizedCallId);
   return null;
+}
+
+function rememberApplyPatchLookupMiss(fileState, callId) {
+  if (!fileState || !callId) {
+    return;
+  }
+  if (!(fileState.applyPatchLookupMisses instanceof Set)) {
+    fileState.applyPatchLookupMisses = new Set();
+  }
+  fileState.applyPatchLookupMisses.add(callId);
+  while (fileState.applyPatchLookupMisses.size > APPLY_PATCH_LOOKUP_MISS_LIMIT) {
+    const oldestKey = fileState.applyPatchLookupMisses.values().next().value;
+    if (!oldestKey) break;
+    fileState.applyPatchLookupMisses.delete(oldestKey);
+  }
 }
 
 function diffPathForSide(fileRef, side) {
@@ -3410,7 +3473,20 @@ function normalizeHistoryItems(rawItems, maxItems) {
 
   const normalized = rawItems
     .map(normalizeHistoryItem)
-    .filter(Boolean)
+    .filter(Boolean);
+  return trimNormalizedHistoryItems(normalized, maxItems);
+}
+
+function mergeNormalizedHistoryItems(rawNewItems, existingItems, maxItems) {
+  const additions = (Array.isArray(rawNewItems) ? rawNewItems : [])
+    .map(normalizeHistoryItem)
+    .filter(Boolean);
+  const existing = Array.isArray(existingItems) ? existingItems : [];
+  return trimNormalizedHistoryItems([...additions, ...existing], maxItems);
+}
+
+function trimNormalizedHistoryItems(items, maxItems) {
+  const normalized = [...items]
     .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
   const deduped = [];
   const seen = new Set();
@@ -4803,11 +4879,11 @@ async function scanOnce({ config, runtime, state }) {
     if (knownFilesChanged) {
       runtime.rolloutThreadCwds = new Map();
     }
-    runtime.rolloutThreadLabels = await buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex);
-    dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
+    refreshRolloutThreadLabelIndexInBackground({ config, runtime, state });
   }
 
-  for (const filePath of runtime.knownFiles) {
+  for (let index = 0; index < runtime.knownFiles.length; index += 1) {
+    const filePath = runtime.knownFiles[index];
     const changed = await processRolloutFile({
       filePath,
       config,
@@ -4816,6 +4892,9 @@ async function scanOnce({ config, runtime, state }) {
       now,
     });
     dirty = dirty || changed;
+    if ((index + 1) % 4 === 0) {
+      await yieldToEventLoop();
+    }
   }
 
   if (config.notifyCompletions || config.webUiEnabled) {
@@ -4839,10 +4918,14 @@ async function scanOnce({ config, runtime, state }) {
       claudeSessionTitlesChanged = await refreshClaudeSessionTitles(runtime);
       runtime.lastClaudeSessionTitleScanAt = now;
     }
-    for (const filePath of runtime.claudeKnownFiles) {
+    for (let index = 0; index < runtime.claudeKnownFiles.length; index += 1) {
+      const filePath = runtime.claudeKnownFiles[index];
       const changed = await processClaudeTranscriptFile({ filePath, config, runtime, state, now });
       claudeTranscriptChanged = claudeTranscriptChanged || changed;
       dirty = dirty || changed;
+      if ((index + 1) % 4 === 0) {
+        await yieldToEventLoop();
+      }
     }
     if (claudeTranscriptChanged || claudeSessionTitlesChanged) {
       dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
@@ -5179,7 +5262,11 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
   state.fileOffsets[filePath] = fileState.offset;
 
   let dirty = true;
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    if (lineIndex > 0 && lineIndex % SCAN_COOPERATIVE_YIELD_EVERY === 0) {
+      await yieldToEventLoop();
+    }
+    const rawLine = lines[lineIndex];
     if (!rawLine.trim()) {
       continue;
     }
@@ -5592,7 +5679,11 @@ async function processClaudeTranscriptFile({ filePath, config, runtime, state, n
   fileState.offset = newOffset;
   let dirty = false;
 
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    if (lineIndex > 0 && lineIndex % SCAN_COOPERATIVE_YIELD_EVERY === 0) {
+      await yieldToEventLoop();
+    }
+    const line = lines[lineIndex];
     const trimmed = line.trim();
     if (!trimmed) continue;
 
@@ -6183,7 +6274,11 @@ async function processHistoryTimelineFile({ config, runtime, state, now }) {
   state.historyFileSourceFile = historyFile;
   dirty = true;
 
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    if (lineIndex > 0 && lineIndex % SCAN_COOPERATIVE_YIELD_EVERY === 0) {
+      await yieldToEventLoop();
+    }
+    const rawLine = lines[lineIndex];
     if (!rawLine.trim()) {
       continue;
     }
@@ -6237,6 +6332,9 @@ async function backfillRecentTimelineEntryImages({ config, runtime, state }) {
   const nextEntries = runtime.recentTimelineEntries.map((entry) => ({ ...entry }));
 
   for (let index = 0; index < nextEntries.length; index += 1) {
+    if (index > 0 && index % SCAN_COOPERATIVE_YIELD_EVERY === 0) {
+      await yieldToEventLoop();
+    }
     const entry = nextEntries[index];
     if (
       cleanText(entry?.kind || "") !== "user_message" ||
@@ -6273,7 +6371,11 @@ async function backfillRecentTimelineEntryImages({ config, runtime, state }) {
 async function backfillPersistedTimelineImagePaths({ config, runtime, state }) {
   let changed = false;
   const nextEntries = [];
-  for (const entry of runtime.recentTimelineEntries) {
+  for (let index = 0; index < runtime.recentTimelineEntries.length; index += 1) {
+    if (index > 0 && index % SCAN_COOPERATIVE_YIELD_EVERY === 0) {
+      await yieldToEventLoop();
+    }
+    const entry = runtime.recentTimelineEntries[index];
     const nextImagePaths = await normalizePersistedTimelineImagePaths({
       config,
       state,
@@ -6310,7 +6412,8 @@ async function backfillPersistedTimelineImagePaths({ config, runtime, state }) {
 // watcher push for the same commentId replaces this entry cleanly rather than
 // creating a duplicate.
 async function backfillMoltbookInboxHistory({ config, runtime, state }) {
-  let changed = false;
+  const additions = [];
+  const knownStableIds = new Set(runtime.recentHistoryItems.map((entry) => cleanText(entry?.stableId || "")));
   try {
     const inboxItems = await listInboxItems();
     for (const inbox of inboxItems) {
@@ -6320,7 +6423,7 @@ async function backfillMoltbookInboxHistory({ config, runtime, state }) {
       if (!commentId) continue;
       const sourceId = `comment:${commentId}`;
       const stableId = `moltbook_reply:${sourceId}`;
-      if (runtime.recentHistoryItems.some((entry) => entry.stableId === stableId)) continue;
+      if (knownStableIds.has(stableId)) continue;
       const token = historyToken(`moltbook:${sourceId}`);
       const createdAtMs = Number(Date.parse(inbox.updatedAt || inbox.createdAt || "")) || Date.now();
       const postTitle = cleanText(inbox.postTitle || "");
@@ -6330,34 +6433,71 @@ async function backfillMoltbookInboxHistory({ config, runtime, state }) {
       const summary = (status === "replied" ? (replyText || contextText) : contextText).slice(0, 160);
       const titlePrefix = status === "replied" ? "replied" : "skipped";
       const title = postTitle ? `${titlePrefix} → ${postTitle}` : (status === "replied" ? "Moltbook reply" : "Moltbook skipped");
-      const recorded = recordHistoryItem({
-        config,
-        runtime,
-        state,
-        item: {
-          stableId,
-          token,
-          kind: "moltbook_reply",
-          threadId: "moltbook",
-          threadLabel: postTitle || "Moltbook",
-          title,
-          summary,
-          messageText,
-          createdAtMs,
-          readOnly: true,
-          provider: "moltbook",
-        },
+      additions.push({
+        stableId,
+        token,
+        kind: "moltbook_reply",
+        threadId: "moltbook",
+        threadLabel: postTitle || "Moltbook",
+        title,
+        summary,
+        messageText,
+        createdAtMs,
+        readOnly: true,
+        provider: "moltbook",
       });
-      if (recorded) changed = true;
+      knownStableIds.add(stableId);
     }
   } catch (error) {
     console.error(`[moltbook-inbox-backfill] ${error.message}`);
     return false;
   }
+  if (additions.length === 0) {
+    return false;
+  }
+
+  const nextItems = mergeNormalizedHistoryItems(
+    additions,
+    runtime.recentHistoryItems,
+    config.maxHistoryItems
+  );
+  const changed = timelineProjectionChanged(nextItems, runtime.recentHistoryItems, [
+    "stableId",
+    "title",
+    "createdAtMs",
+  ]);
   if (changed) {
+    runtime.recentHistoryItems = nextItems;
+    state.recentHistoryItems = nextItems;
     console.log(`[moltbook-inbox-backfill] Synthesized history entries for resolved inbox items`);
   }
   return changed;
+}
+
+async function runDeferredStartupBackfills({ config, runtime, state }) {
+  const startedAtMs = Date.now();
+  let changed = false;
+  const steps = [
+    ["timeline-images", () => backfillPersistedTimelineImagePaths({ config, runtime, state })],
+    ["moltbook-inbox", () => backfillMoltbookInboxHistory({ config, runtime, state })],
+    ["provider-recovery", () => recoverMissingProviderStateFromBackup({ config, runtime, state })],
+  ];
+
+  for (const [label, run] of steps) {
+    try {
+      changed = (await run()) || changed;
+    } catch (error) {
+      console.error(`[startup] ${label} backfill failed: ${error?.message || error}`);
+    }
+  }
+
+  if (changed && !runtime.stopping) {
+    scheduleSaveState(config, state);
+  }
+  const durationMs = Date.now() - startedAtMs;
+  if (durationMs >= 1_000) {
+    console.log(`[startup] deferred backfills ready durationMs=${durationMs}`);
+  }
 }
 
 async function backfillRecentTimelineEntryDiffs({ config, runtime, state }) {
@@ -7422,9 +7562,34 @@ async function querySqliteCompletionRows({ logsDbFile, cursorId, minTsSec = 0 })
   return runSqliteJsonQuery(logsDbFile, sql);
 }
 
+function isRetryableSqliteQueryError(error) {
+  const message = cleanText(error?.message ?? error).toLowerCase();
+  return message.includes("database is locked") || message.includes("database is busy") || /sqlite_(?:busy|locked)/u.test(message);
+}
+
+function sqliteQueryRetryDelayMs(attempt) {
+  return SQLITE_QUERY_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, Number(attempt) || 0);
+}
+
 async function runSqliteJsonQuery(dbFile, sql) {
+  let lastError = null;
+  for (let attempt = 0; attempt < SQLITE_QUERY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await runSqliteJsonQueryOnce(dbFile, sql);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableSqliteQueryError(error) || attempt + 1 >= SQLITE_QUERY_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await sleep(sqliteQueryRetryDelayMs(attempt));
+    }
+  }
+  throw lastError || new Error("sqlite-query-failed");
+}
+
+function runSqliteJsonQueryOnce(dbFile, sql) {
   return new Promise((resolve, reject) => {
-    const child = spawn("sqlite3", ["-json", dbFile, sql], {
+    const child = spawn("sqlite3", ["-readonly", "-cmd", `.timeout ${SQLITE_QUERY_BUSY_TIMEOUT_MS}`, "-json", dbFile, sql], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -9945,13 +10110,28 @@ function buildDefaultCollaborationMode(threadState) {
   return buildRequestedCollaborationMode(threadState, "default");
 }
 
+function transferableFrameBytes(frame) {
+  if (
+    frame.byteOffset === 0 &&
+    frame.byteLength === frame.buffer.byteLength &&
+    frame.buffer instanceof ArrayBuffer
+  ) {
+    return new Uint8Array(frame.buffer);
+  }
+  const owned = new Uint8Array(frame.byteLength);
+  owned.set(frame);
+  return owned;
+}
+
 class NativeIpcClient {
   constructor({ config, runtime, onThreadStateChanged, onUserInputRequested }) {
     this.config = config;
     this.runtime = runtime;
     this.onThreadStateChanged = onThreadStateChanged;
     this.onUserInputRequested = onUserInputRequested;
-    this.buffer = Buffer.alloc(0);
+    this.frameDecoder = new LengthPrefixedFrameDecoder();
+    this.frameWorker = null;
+    this.messageQueue = Promise.resolve();
     this.socket = null;
     this.clientId = null;
     this.pendingResponses = new Map();
@@ -9960,6 +10140,7 @@ class NativeIpcClient {
   }
 
   start() {
+    this.ensureFrameWorker();
     this.connect();
   }
 
@@ -9981,6 +10162,36 @@ class NativeIpcClient {
       this.socket.destroy();
       this.socket = null;
     }
+    if (this.frameWorker) {
+      void this.frameWorker.terminate();
+      this.frameWorker = null;
+    }
+  }
+
+  ensureFrameWorker() {
+    if (this.frameWorker) {
+      return this.frameWorker;
+    }
+    const worker = new Worker(new URL("./lib/ipc-frame-worker.mjs", import.meta.url), {
+      type: "module",
+    });
+    this.frameWorker = worker;
+    worker.on("message", (payload) => {
+      this.handleFrameWorkerMessage(payload);
+    });
+    worker.on("error", (error) => {
+      console.error(`[ipc-worker-error] ${error.message}`);
+    });
+    worker.on("exit", (code) => {
+      if (this.frameWorker === worker) {
+        this.frameWorker = null;
+      }
+      if (!this.stopped && code !== 0) {
+        console.error(`[ipc-worker-error] exited with code ${code}`);
+        this.socket?.destroy();
+      }
+    });
+    return worker;
   }
 
   async sendApprovalDecision(approval, decision) {
@@ -10122,11 +10333,12 @@ class NativeIpcClient {
       return;
     }
 
+    this.ensureFrameWorker();
     const socket = net.createConnection(this.config.ipcSocketPath);
     this.socket = socket;
 
     socket.on("connect", () => {
-      this.buffer = Buffer.alloc(0);
+      this.frameDecoder.reset();
       this.write({
         type: "request",
         requestId: crypto.randomUUID(),
@@ -10136,9 +10348,7 @@ class NativeIpcClient {
     });
 
     socket.on("data", (chunk) => {
-      this.handleData(chunk).catch((error) => {
-        console.error(`[ipc-error] ${error.message}`);
-      });
+      this.handleData(chunk);
     });
 
     socket.on("error", (error) => {
@@ -10172,27 +10382,51 @@ class NativeIpcClient {
     }
   }
 
-  async handleData(chunk) {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-
-    while (this.buffer.length >= 4) {
-      const frameBytes = this.buffer.readUInt32LE(0);
-      if (this.buffer.length < 4 + frameBytes) {
-        return;
-      }
-
-      const frame = this.buffer.subarray(4, 4 + frameBytes).toString("utf8");
-      this.buffer = this.buffer.subarray(4 + frameBytes);
-
-      let message;
-      try {
-        message = JSON.parse(frame);
-      } catch {
-        continue;
-      }
-
-      await this.handleMessage(message);
+  handleData(chunk) {
+    let frames;
+    try {
+      frames = this.frameDecoder.push(chunk);
+    } catch (error) {
+      console.error(`[ipc-error] ${error.message}`);
+      this.socket?.destroy();
+      return this.messageQueue;
     }
+
+    const worker = this.ensureFrameWorker();
+    for (const frame of frames) {
+      try {
+        const transferable = transferableFrameBytes(frame);
+        worker.postMessage(
+          { type: "frame", frame: transferable },
+          [transferable.buffer]
+        );
+      } catch (error) {
+        console.error(`[ipc-worker-error] ${error.message}`);
+        this.socket?.destroy();
+        break;
+      }
+    }
+    return this.messageQueue;
+  }
+
+  handleFrameWorkerMessage(payload) {
+    if (payload?.type === "error") {
+      console.error(`[ipc-worker-error] ${payload.error || "IPC frame parse failed"}`);
+      return;
+    }
+    if (payload?.type !== "message" || !payload.message) {
+      return;
+    }
+    if (Number(payload.frameBytes) >= IPC_LARGE_FRAME_LOG_BYTES) {
+      console.log(
+        `[ipc-frame] bytes=${Number(payload.frameBytes) || 0} parseMs=${Number(payload.parseMs) || 0} totalMs=${Number(payload.totalMs) || 0}`
+      );
+    }
+    this.messageQueue = this.messageQueue
+      .then(() => this.handleMessage(payload.message))
+      .catch((error) => {
+        console.error(`[ipc-error] ${error.message}`);
+      });
   }
 
   async handleMessage(message) {
@@ -10261,7 +10495,8 @@ class NativeIpcClient {
     }
 
     const previousState = this.runtime.threadStates.get(normalized.conversationId) ?? { requests: [] };
-    let nextState = cloneJson(previousState) ?? { requests: [] };
+    const previousRequests = normalizeNativeRequests(previousState.requests);
+    let nextState = previousState;
 
     if (normalized.state) {
       nextState = mergeConversationState(nextState, normalized.state);
@@ -10275,7 +10510,6 @@ class NativeIpcClient {
       nextState.requests = [];
     }
 
-    const previousRequests = normalizeNativeRequests(previousState.requests);
     const nextRequests = normalizeNativeRequests(nextState.requests);
 
     if (previousRequests.length !== nextRequests.length) {
@@ -10441,143 +10675,6 @@ function mergeConversationState(previousState, nextState) {
   }
 
   return merged;
-}
-
-function applyJsonPatches(document, patches) {
-  let next = cloneJson(document) ?? {};
-
-  for (const patch of patches) {
-    next = applyJsonPatch(next, patch);
-  }
-
-  return next;
-}
-
-function applyJsonPatch(document, patch) {
-  const operation = patch.op;
-  const pathSegments = decodeJsonPointer(patch.path);
-
-  if (pathSegments.length === 0) {
-    if (operation === "remove") {
-      return {};
-    }
-    if (operation === "add" || operation === "replace") {
-      return cloneJson(patch.value);
-    }
-    return document;
-  }
-
-  const target = cloneJson(document) ?? {};
-  if (operation === "remove") {
-    removeAtPointer(target, pathSegments);
-    return target;
-  }
-
-  if (operation === "add" || operation === "replace") {
-    setAtPointer(target, pathSegments, cloneJson(patch.value), operation === "add");
-    return target;
-  }
-
-  return target;
-}
-
-function decodeJsonPointer(pointer) {
-  if (Array.isArray(pointer)) {
-    return pointer.map((segment) => String(segment));
-  }
-
-  if (!pointer || pointer === "/") {
-    return [];
-  }
-
-  return String(pointer)
-    .split("/")
-    .slice(1)
-    .map((segment) => segment.replace(/~1/gu, "/").replace(/~0/gu, "~"));
-}
-
-function setAtPointer(target, segments, value, isAdd) {
-  let node = target;
-
-  for (let index = 0; index < segments.length - 1; index += 1) {
-    const segment = segments[index];
-    const nextSegment = segments[index + 1];
-
-    if (Array.isArray(node)) {
-      const arrayIndex = toArrayIndex(segment, node.length, true);
-      if (node[arrayIndex] == null || typeof node[arrayIndex] !== "object") {
-        node[arrayIndex] = isArrayPointerSegment(nextSegment) ? [] : {};
-      }
-      node = node[arrayIndex];
-      continue;
-    }
-
-    if (node[segment] == null || typeof node[segment] !== "object") {
-      node[segment] = isArrayPointerSegment(nextSegment) ? [] : {};
-    }
-    node = node[segment];
-  }
-
-  const finalSegment = segments.at(-1);
-  if (Array.isArray(node)) {
-    const index = toArrayIndex(finalSegment, node.length, isAdd);
-    if (isAdd && (finalSegment === "-" || index === node.length)) {
-      node.push(value);
-      return;
-    }
-    if (isAdd) {
-      node.splice(index, 0, value);
-      return;
-    }
-    node[index] = value;
-    return;
-  }
-
-  node[finalSegment] = value;
-}
-
-function removeAtPointer(target, segments) {
-  let node = target;
-
-  for (let index = 0; index < segments.length - 1; index += 1) {
-    const segment = segments[index];
-    if (Array.isArray(node)) {
-      const arrayIndex = toArrayIndex(segment, node.length, false);
-      node = node[arrayIndex];
-    } else {
-      node = node?.[segment];
-    }
-
-    if (node == null) {
-      return;
-    }
-  }
-
-  const finalSegment = segments.at(-1);
-  if (Array.isArray(node)) {
-    const arrayIndex = toArrayIndex(finalSegment, node.length, false);
-    if (arrayIndex >= 0 && arrayIndex < node.length) {
-      node.splice(arrayIndex, 1);
-    }
-    return;
-  }
-
-  delete node?.[finalSegment];
-}
-
-function toArrayIndex(segment, length, allowEnd) {
-  if (segment === "-" && allowEnd) {
-    return length;
-  }
-  const parsed = Number.parseInt(segment, 10);
-  if (Number.isFinite(parsed) && parsed >= 0) {
-    return parsed;
-  }
-  return allowEnd ? length : 0;
-}
-
-function isArrayPointerSegment(segment) {
-  return segment === "-" || /^\d+$/u.test(String(segment || ""));
 }
 
 function normalizeNativeRequests(requests) {
@@ -12980,6 +13077,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       primaryLabel: t(locale, "server.action.review"),
       createdAtMs: Number(approval.createdAtMs) || now,
       provider: normalizeProvider(approval.provider),
+      approvalKind: cleanText(approval.kind || ""),
     });
   }
 
@@ -13024,6 +13122,7 @@ function buildPendingInboxItems(runtime, state, config, locale) {
       primaryLabel: t(locale, userInputRequest.supported ? "server.action.select" : "server.action.detail"),
       createdAtMs: Number(userInputRequest.createdAtMs) || now,
       provider: "codex",
+      supported: userInputRequest.supported !== false,
     });
   }
 
@@ -13085,10 +13184,52 @@ function buildPendingInboxItems(runtime, state, config, locale) {
   return items.sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
 }
 
+function buildInProgressInboxItems(runtime, locale) {
+  const items = buildActiveTimelineActivityEntries(runtime, locale).map((entry) => ({
+    kind: "activity_status",
+    token: entry.token,
+    threadId: cleanText(entry.threadId || ""),
+    threadLabel: cleanText(entry.threadLabel || ""),
+    title: cleanText(entry.threadLabel || entry.title || ""),
+    summary: [cleanText(entry.title || ""), cleanText(entry.summary || "")].filter(Boolean).join(" · "),
+    primaryLabel: t(locale, "server.action.detail"),
+    createdAtMs: Number(entry.createdAtMs) || Date.now(),
+    provider: normalizeProvider(entry.provider),
+    activityPhase: cleanText(entry.activityPhase || "working"),
+    commandText: cleanText(entry.commandText || ""),
+    fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
+  }));
+
+  for (const task of runtime.a2aTasksByToken.values()) {
+    const status = cleanText(task?.status || "");
+    if (status !== "working" && status !== "input-required") {
+      continue;
+    }
+    const instruction = cleanText(task.instruction || "");
+    items.push({
+      kind: "a2a_task",
+      token: task.token,
+      threadId: "a2a",
+      threadLabel: instruction.slice(0, 80),
+      title: instruction.slice(0, 80) || "A2A Task",
+      summary: cleanText(task.statusMessage || instruction).slice(0, 160),
+      primaryLabel: t(locale, "server.action.detail"),
+      createdAtMs: Number(task.updatedAtMs || task.createdAtMs) || Date.now(),
+      provider: "a2a",
+      taskStatus: status,
+    });
+  }
+
+  return items.sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
+}
+
 function buildCompletedInboxItems(runtime, state, config, locale) {
   const items = normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems);
   runtime.recentHistoryItems = items;
-  const completedKinds = new Set(["assistant_final", "approval", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task_result"]);
+  // `completion` remains the notification/history format for the Codex
+  // SQLite completion scanner, so it must stay visible alongside the newer
+  // assistant_final timeline format.
+  const completedKinds = new Set(["completion", "assistant_final", "approval", "moltbook_reply", "moltbook_draft", "thread_share", "a2a_task_result"]);
 
   // Infrequent kinds (A2A, thread_share) get evicted from the fixed-size
   // history FIFO by the high volume of approval/assistant_final entries.
@@ -13131,6 +13272,8 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
       createdAtMs: item.createdAtMs,
       provider: normalizeProvider(item.provider),
       ...(item.draftType != null ? { draftType: item.draftType } : {}),
+      ...(item.taskStatus != null ? { taskStatus: item.taskStatus } : {}),
+      ...(item.outcome != null ? { outcome: item.outcome } : {}),
     }));
 }
 
@@ -13300,9 +13443,27 @@ async function buildDiffThreadGroups(runtime, state, config) {
 // is served from `/api/inbox/diff` and fetched separately by the PWA so
 // it doesn't block first paint of the inbox/completed lists.
 function buildInboxFastResponse(runtime, state, config, locale) {
-  return {
+  const normalized = buildWorkItemResponse({
     pending: buildPendingInboxItems(runtime, state, config, locale),
+    inProgress: buildInProgressInboxItems(runtime, locale),
     completed: buildCompletedInboxItems(runtime, state, config, locale),
+  });
+  const { pending, inProgress, completed, ...work } = normalized;
+  const attention = [];
+  if (pending.some((item) => item.provider === "codex") && !runtime.ipcClient?.clientId) {
+    attention.push({ source: "codex", code: "connection-required" });
+  }
+  return {
+    pending,
+    inProgress,
+    completed,
+    work: {
+      ...work,
+      health: {
+        checkedAtMs: Date.now(),
+        attention,
+      },
+    },
   };
 }
 
@@ -14163,6 +14324,28 @@ function buildTimelineMessageDetail(entry, locale, runtime = null, config = null
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
     interruptNotice: interruptedDetailNotice(entry.messageText, locale),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function buildTimelineActivityDetail(entry, locale) {
+  const detailText = [
+    cleanText(entry?.title || ""),
+    cleanText(entry?.summary || ""),
+  ].filter(Boolean).join("\n\n");
+  return {
+    kind: "activity_status",
+    token: cleanText(entry?.token || ""),
+    threadId: cleanText(entry?.threadId || ""),
+    title: cleanText(entry?.threadLabel || entry?.title || "") || kindTitle(locale, "activity_status"),
+    threadLabel: cleanText(entry?.threadLabel || ""),
+    createdAtMs: Number(entry?.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(detailText, `<p>${escapeHtml(t(locale, "server.activity.working"))}</p>`),
+    fileRefs: normalizeTimelineFileRefs(entry?.fileRefs ?? []),
+    commandText: cleanText(entry?.commandText || ""),
+    activityPhase: cleanText(entry?.activityPhase || "working"),
+    provider: normalizeProvider(entry?.provider),
     readOnly: true,
     actions: [],
   };
@@ -15542,6 +15725,11 @@ async function buildApiItemDetail({ config, runtime, state, kind, token, locale 
     const group = (await getDiffThreadGroupsCached(runtime, state, config)).find((entry) => entry.token === token);
     return group ? buildDiffThreadDetail(group, locale) : null;
   }
+  if (kind === "activity_status") {
+    const entry = buildActiveTimelineActivityEntries(runtime, locale)
+      .find((candidate) => cleanText(candidate?.token || "") === cleanText(token || ""));
+    return entry ? buildTimelineActivityDetail(entry, locale) : null;
+  }
   if (kind === "file_event") {
     const entry = timelineEntryByToken(runtime, token, kind);
     return entry ? buildTimelineFileEventDetail(entry, locale) : null;
@@ -16177,6 +16365,7 @@ function logRemotePairingBootTrace(body, session, req) {
   const traceId = cleanText(body?.traceId || "").slice(0, 80) || "unknown";
   const reason = cleanText(body?.reason || "").slice(0, 80) || "unknown";
   const appBuildId = cleanText(body?.appBuildId || "").slice(0, 80) || "unknown";
+  const origin = cleanText(body?.origin || "").slice(0, 180) || "unknown";
   const totalMs = Math.max(0, Math.min(600_000, Math.round(Number(body?.totalMs) || 0)));
   const remoteRouteSeen = body?.remoteRouteSeen === true;
   const eventList = Array.isArray(body?.events) ? body.events : [];
@@ -16201,7 +16390,7 @@ function logRemotePairingBootTrace(body, session, req) {
   console.log(
     `[remote-pairing-boot] trace=${traceId} device=${deviceId} reason=${reason} ` +
     `total=${totalMs}ms remote=${remoteRouteSeen ? 1 : 0} build=${appBuildId} ` +
-    `events=${events.length} ua=${JSON.stringify(ua)}`
+    `origin=${JSON.stringify(origin)} events=${events.length} ua=${JSON.stringify(ua)}`
   );
   if (phases) {
     console.log(`[remote-pairing-boot-phases] trace=${traceId} ${phases}`);
@@ -23068,7 +23257,15 @@ async function extractRolloutThreadMetadata(filePath) {
       crlfDelay: Infinity,
     });
 
+    let linesRead = 0;
+    let bytesRead = 0;
     for await (const line of rl) {
+      linesRead += 1;
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      if (linesRead > ROLLOUT_LABEL_METADATA_MAX_LINES || bytesRead + lineBytes > ROLLOUT_LABEL_METADATA_MAX_BYTES) {
+        break;
+      }
+      bytesRead += lineBytes;
       if (!line.trim()) {
         continue;
       }
@@ -23134,10 +23331,15 @@ async function extractRolloutThreadMetadata(filePath) {
 
 async function buildRolloutThreadLabelIndex(knownFiles, sessionIndex) {
   const entries = new Map();
-  for (const filePath of Array.isArray(knownFiles) ? knownFiles : []) {
+  const files = Array.isArray(knownFiles) ? knownFiles : [];
+  for (let index = 0; index < files.length; index += 1) {
+    const filePath = files[index];
     const metadata = await extractRolloutThreadMetadata(filePath);
     if (metadata?.threadId) {
       entries.set(metadata.threadId, metadata);
+    }
+    if ((index + 1) % 8 === 0) {
+      await yieldToEventLoop();
     }
   }
 
@@ -23196,6 +23398,48 @@ async function buildRolloutThreadLabelIndex(knownFiles, sessionIndex) {
   }
 
   return resolved;
+}
+
+function refreshRolloutThreadLabelIndexInBackground({ config, runtime, state }) {
+  if (runtime.rolloutLabelIndexInFlight || runtime.stopping) {
+    return;
+  }
+  runtime.rolloutLabelIndexInFlight = true;
+  const startedAtMs = Date.now();
+  void buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex)
+    .then((labels) => {
+      runtime.rolloutThreadLabels = labels;
+      if (!runtime.stopping && refreshResolvedThreadLabels({ config, runtime, state })) {
+        scheduleSaveState(config, state);
+      }
+      const durationMs = Date.now() - startedAtMs;
+      if (durationMs >= 1_000) {
+        console.log(`[startup] rollout labels ready count=${labels.size} durationMs=${durationMs}`);
+      }
+    })
+    .catch((error) => {
+      console.error(`[startup] rollout label index failed: ${error?.message || error}`);
+    })
+    .finally(() => {
+      runtime.rolloutLabelIndexInFlight = false;
+    });
+}
+
+function scheduleStartupMaintenance({ config, runtime, state }) {
+  const run = () => {
+    if (runtime.stopping) {
+      return;
+    }
+    if (!runtime.initialScanComplete) {
+      const retryTimer = setTimeout(run, STARTUP_MAINTENANCE_RETRY_MS);
+      retryTimer.unref?.();
+      return;
+    }
+    refreshRolloutThreadLabelIndexInBackground({ config, runtime, state });
+    void runDeferredStartupBackfills({ config, runtime, state });
+  };
+  const timer = setTimeout(run, STARTUP_MAINTENANCE_DELAY_MS);
+  timer.unref?.();
 }
 
 async function findLatestCodexLogsDbFile(codexHome) {
@@ -23821,6 +24065,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 function resolvePath(value) {
   if (!value) {
     return value;
@@ -23926,7 +24174,6 @@ async function main() {
   runtime.knownFiles = await listRolloutFiles(config.sessionsDir);
   runtime.logsDbFile = config.codexLogsDbFile || (await findLatestCodexLogsDbFile(config.codexHome)) || "";
   runtime.lastDirectoryScanAt = Date.now();
-  runtime.rolloutThreadLabels = await buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex);
 
   console.log(
     [
@@ -23999,12 +24246,9 @@ async function main() {
       normalizedTimelineStateChanged ||
       migratedPairedDevicesStateChanged ||
       restoredPendingPlanStateChanged ||
-      restoredTimelineImagePathsStateChanged ||
       backfilledAmbientSuggestionsStateChanged ||
       migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
-      backfilledMoltbookInboxChanged ||
-      recoveredMissingProviderStateChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {
       await saveState(config.stateFile, state);
@@ -24088,6 +24332,8 @@ async function main() {
       }
     }
 
+    scheduleStartupMaintenance({ config, runtime, state });
+
     timelineLiveHandle = startTimelineLiveSync({ config, runtime, state });
 
     // --- A2A Relay ---
@@ -24141,6 +24387,10 @@ async function main() {
     let lastA2aEnvCheckAt = 0;
     const A2A_ENV_CHECK_INTERVAL_MS = 30_000; // check every 30 seconds
 
+    if (approvalServer) {
+      await sleep(INITIAL_SCAN_WARMUP_MS);
+    }
+
     while (!runtime.stopping) {
       try {
         const dirty = await scanOnce({ config, runtime, state });
@@ -24158,6 +24408,8 @@ async function main() {
         }
       } catch (error) {
         console.error(`[scan-error] ${error.message}`);
+      } finally {
+        runtime.initialScanComplete = true;
       }
 
       // Hot-reload: detect a2a.env changes (new config or updated card)
