@@ -11,6 +11,7 @@ import { createInterface as createReadlineInterface } from "node:readline/promis
 import { fileURLToPath } from "node:url";
 import { DEFAULT_LOCALE, normalizeLocale, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
+import { RECOMMENDED_NODE_RELEASE, assessNodeRuntime, otherPatchedNodeReleases } from "./lib/node-runtime.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,7 +99,141 @@ try {
   process.exit(1);
 }
 
+// Commands that write this process's Node.js binary into launchd plists or
+// Claude hooks (`enable mcp` writes `npx viveworker mcp`, which MCP clients
+// resolve on the same PATH). Running them on an unpatched Node.js would pin a
+// vulnerable runtime for every later bridge / hook / Moltbook job start.
+function commandPinsNodeRuntime(cliOptions) {
+  if (cliOptions.command === "setup") {
+    return true;
+  }
+  if (cliOptions.command !== "enable") {
+    return false;
+  }
+  const target = String(cliOptions.enableTarget || "").trim().toLowerCase();
+  if (target === "scout") {
+    return !cliOptions.autoScoutUninstall;
+  }
+  if (target === "mcp") {
+    return !cliOptions.mcpDryRun;
+  }
+  return target === "claude" || target === "moltbook";
+}
+
+// Without a launchd agent, start / restart / pair / doctor --fix spawn the
+// bridge on the Node.js running this command. Checked up front so restart
+// does not stop a bridge it then refuses to start, and nothing is rewritten.
+async function commandSpawnsDetachedBridge(cliOptions) {
+  const command = cliOptions.command;
+  if (!["start", "restart", "pair"].includes(command) && !(command === "doctor" && cliOptions.doctorFix)) {
+    return false;
+  }
+  if (await fileExists(resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath))) {
+    return false;
+  }
+  if (command === "restart") {
+    return true;
+  }
+  const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+  const pid = await maybeReadPid(resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid")));
+  return !(pid && isProcessRunning(pid));
+}
+
+async function ensurePatchedNodeRuntime(cliOptions, messageKey) {
+  const runtime = assessNodeRuntime();
+  if (runtime.supported || cliOptions.allowUnpatchedNode) {
+    return;
+  }
+  const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+  const existing = await maybeReadEnvFile(resolvePath(cliOptions.envFile || path.join(configDir, "config.env")));
+  const locale = await resolveCliLocale(cliOptions, existing);
+  throw new Error([
+    formatNodeRuntimeProblem(locale, runtime),
+    t(locale, messageKey, { recommended: runtime.recommended }),
+  ].join("\n"));
+}
+
+function formatNodeRuntimeProblem(locale, runtime) {
+  const key = runtime.reason === "unpatched" ? "cli.nodeRuntime.unpatched" : "cli.nodeRuntime.unsupportedLine";
+  return t(locale, key, {
+    version: runtime.version || "unknown",
+    minimum: runtime.minimum,
+    recommended: runtime.recommended,
+    alternatives: otherPatchedNodeReleases(runtime.recommended),
+    url: runtime.advisoryUrl,
+  });
+}
+
+// Node.js binaries the installed components were pinned to at install time,
+// which are not necessarily the one running this CLI.
+async function readPinnedNodePaths(cliOptions) {
+  const readText = (filePath) => fs.readFile(filePath, "utf8").catch(() => "");
+  const launchAgentsDir = path.join(os.homedir(), "Library", "LaunchAgents");
+  const pinned = [];
+
+  const bridgePlist = await readText(resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath));
+  const bridgeMatch = bridgePlist.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/u);
+  if (bridgeMatch) {
+    pinned.push({ component: "bridge", nodePath: unescapeXml(bridgeMatch[1]).trim() });
+  }
+  const watcherPlist = unescapeXml(await readText(path.join(launchAgentsDir, "com.viveworker.moltbook-watcher.plist")));
+  const watcherMatch = watcherPlist.match(/\bexec "([^"]+)"/u);
+  if (watcherMatch) {
+    pinned.push({ component: "moltbookWatcher", nodePath: watcherMatch[1] });
+  }
+  const scoutPlist = unescapeXml(await readText(path.join(launchAgentsDir, "com.viveworker.moltbook-scout.plist")));
+  const scoutMatch = scoutPlist.match(/\bexport PATH="([^":]+):\$PATH"/u);
+  if (scoutMatch) {
+    pinned.push({ component: "moltbookScout", nodePath: path.join(scoutMatch[1], "node") });
+  }
+  let settings = null;
+  try {
+    settings = JSON.parse(await readText(resolvePath(
+      cliOptions.claudeSettingsFile || path.join(os.homedir(), ".claude", "settings.json")
+    )));
+  } catch {
+    settings = null;
+  }
+  const hookCommands = Object.values(settings?.hooks || {})
+    .flatMap((groups) => (Array.isArray(groups) ? groups : []))
+    .flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []))
+    .map((hook) => String(hook?.command || ""));
+  const hookMatch = hookCommands
+    .map((command) => command.match(/^'([^']+)' '[^']*viveworker-claude-hook\.mjs'/u))
+    .find(Boolean);
+  if (hookMatch) {
+    pinned.push({ component: "claudeHooks", nodePath: hookMatch[1] });
+  }
+  return pinned.filter((entry) => entry.nodePath);
+}
+
+async function describePinnedNodeRuntimeIssues(cliOptions, locale) {
+  const versions = new Map();
+  const issues = [];
+  for (const entry of await readPinnedNodePaths(cliOptions)) {
+    if (!versions.has(entry.nodePath)) {
+      const result = await execCommand([entry.nodePath, "-p", "process.versions.node"], { ignoreError: true });
+      versions.set(entry.nodePath, result.ok ? result.stdout.trim() : "");
+    }
+    const version = versions.get(entry.nodePath);
+    const runtime = version ? assessNodeRuntime(version) : null;
+    if (runtime && !runtime.supported) {
+      issues.push(t(locale, "cli.doctor.issue.nodeRuntimePinned", {
+        component: t(locale, `cli.doctor.component.${entry.component}`),
+        path: entry.nodePath,
+        problem: formatNodeRuntimeProblem(locale, runtime),
+      }));
+    }
+  }
+  return issues;
+}
+
 async function main(cliOptions) {
+  if (commandPinsNodeRuntime(cliOptions)) {
+    await ensurePatchedNodeRuntime(cliOptions, "cli.nodeRuntime.blocked");
+  } else if (await commandSpawnsDetachedBridge(cliOptions)) {
+    await ensurePatchedNodeRuntime(cliOptions, "cli.nodeRuntime.blockedStart");
+  }
   switch (cliOptions.command) {
     case "setup":
       await runSetup(cliOptions);
@@ -275,7 +410,7 @@ async function runSetup(cliOptions) {
     await execCommand(["launchctl", "kickstart", "-k", `gui/${process.getuid()}/${defaultLabel}`]);
   } else {
     progress.update("cli.setup.progress.startBridge");
-    await startDetachedBridge({ envFile, logFile, pidFile });
+    await startDetachedBridge({ envFile, logFile, pidFile, cliOptions });
   }
 
   progress.update("cli.setup.progress.health");
@@ -1122,6 +1257,7 @@ async function runStart(cliOptions) {
       envFile,
       logFile: resolvePath(cliOptions.logFile || defaultLogFile),
       pidFile,
+      cliOptions,
     });
   }
   progress.update("cli.start.progress.health");
@@ -1310,8 +1446,12 @@ async function runDoctor(cliOptions) {
       issues.push(t(locale, webPushEnabled ? "cli.doctor.issue.healthHttps" : "cli.doctor.issue.health"));
     }
   }
+  const runtimeIssues = await describePinnedNodeRuntimeIssues(cliOptions, locale);
+  const runtimeNext = runtimeIssues.length
+    ? t(locale, "cli.doctor.nextNodeRuntime", { recommended: RECOMMENDED_NODE_RELEASE })
+    : "";
 
-  if (issues.length === 0) {
+  if (issues.length === 0 && runtimeIssues.length === 0) {
     printCliTitle(locale, "cli.doctor.ok");
     printCliSection(locale, "cli.section.ready", [
       t(locale, "cli.status.baseUrl", { value: baseUrl || "(not configured)" }),
@@ -1321,11 +1461,14 @@ async function runDoctor(cliOptions) {
   }
 
   printCliTitle(locale, "cli.doctor.titleIssues");
-  printCliSection(locale, "cli.section.needsAttention", issues);
+  printCliSection(locale, "cli.section.needsAttention", [...issues, ...runtimeIssues]);
 
-  if (!cliOptions.doctorFix) {
+  // --fix cannot change which Node.js a component was pinned to, so a
+  // runtime-only finding neither suggests nor triggers a repair + restart.
+  if (!cliOptions.doctorFix || issues.length === 0) {
     printCliSection(locale, "cli.section.next", [
-      t(locale, "cli.doctor.nextFix"),
+      issues.length ? t(locale, "cli.doctor.nextFix") : "",
+      runtimeNext,
     ]);
     return;
   }
@@ -1341,6 +1484,7 @@ async function runDoctor(cliOptions) {
   printCliSection(locale, "cli.section.changed", appliedChanges);
   printCliSection(locale, "cli.section.next", [
     t(locale, "cli.doctor.nextRestarting"),
+    runtimeNext,
   ]);
   console.log(t(locale, "cli.doctor.fixed"));
   await runStart(cliOptions);
@@ -1418,8 +1562,12 @@ async function runUpdate(cliOptions) {
     restartedWatcher ? t(locale, "cli.update.changedWatcher") : "",
     restartedScout ? t(locale, "cli.update.changedScout") : "",
   ]);
+  // update restarts components on the Node.js they were pinned to.
+  const runtimeIssues = await describePinnedNodeRuntimeIssues(cliOptions, locale);
+  printCliSection(locale, "cli.section.needsAttention", runtimeIssues);
   printCliSection(locale, "cli.section.next", [
     t(locale, "cli.update.next"),
+    runtimeIssues.length ? t(locale, "cli.doctor.nextNodeRuntime", { recommended: RECOMMENDED_NODE_RELEASE }) : "",
   ]);
 }
 
@@ -1624,6 +1772,7 @@ function parseArgs(argv) {
     noAutoClaude: false,
     noScout: false,
     allowInsecureHttpLan: false,
+    allowUnpatchedNode: false,
     installMkcert: false,
     noLaunchd: false,
     pair: false,
@@ -1693,6 +1842,8 @@ function parseArgs(argv) {
       parsed.noScout = true;
     } else if (arg === "--allow-insecure-http-lan") {
       parsed.allowInsecureHttpLan = true;
+    } else if (arg === "--allow-unpatched-node") {
+      parsed.allowUnpatchedNode = true;
     } else if (arg === "--install-mkcert") {
       parsed.installMkcert = true;
     } else if (arg === "--mkcert-trust-stores") {
@@ -1874,6 +2025,7 @@ ${t(locale, "cli.help.commonOptions")}
   --enable-ntfy
   --no-launchd
   --pair
+  --allow-unpatched-node
 
 ${t(locale, "cli.help.featureOptions")}
   ${t(locale, "cli.help.enableClaude")}
@@ -1967,11 +2119,14 @@ function buildLaunchAgentPlist({ label, nodePath, bridgeScript, envFile, logFile
 `;
 }
 
-async function startDetachedBridge({ envFile, logFile, pidFile }) {
+async function startDetachedBridge({ envFile, logFile, pidFile, cliOptions = {} }) {
   const existingPid = await maybeReadPid(pidFile);
   if (existingPid && isProcessRunning(existingPid)) {
     return { pid: existingPid, alreadyRunning: true };
   }
+  // Callers already gate up front; this catches a bridge that exited between
+  // that check and now.
+  await ensurePatchedNodeRuntime(cliOptions, "cli.nodeRuntime.blockedStart");
 
   await fs.mkdir(path.dirname(logFile), { recursive: true });
   const logHandle = await fs.open(logFile, "a");
@@ -2777,6 +2932,14 @@ function escapeXml(value) {
     .replace(/</gu, "&lt;")
     .replace(/>/gu, "&gt;")
     .replace(/"/gu, "&quot;");
+}
+
+function unescapeXml(value) {
+  return String(value)
+    .replace(/&quot;/gu, "\"")
+    .replace(/&gt;/gu, ">")
+    .replace(/&lt;/gu, "<")
+    .replace(/&amp;/gu, "&");
 }
 
 function shellQuote(value) {

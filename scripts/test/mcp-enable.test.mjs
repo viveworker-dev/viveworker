@@ -55,8 +55,10 @@ test("enable mcp writes JSON and Codex TOML configs idempotently", async () => {
     VIVEWORKER_MCP_CURSOR_CONFIG_FILE: cursorConfig,
     VIVEWORKER_MCP_CODEX_CONFIG_FILE: codexConfig,
   };
+  // The Node.js runtime gate has its own tests (node-runtime-gate.test.mjs);
+  // bypass it here so config writing is covered on any test runtime.
   try {
-    const cursor = await runCli(["enable", "mcp", "--target", "cursor", "--yes"], env);
+    const cursor = await runCli(["enable", "mcp", "--target", "cursor", "--yes", "--allow-unpatched-node"], env);
     assert.equal(cursor.code, 0, cursor.stderr);
     const cursorJson = JSON.parse(await fs.readFile(cursorConfig, "utf8"));
     assert.deepEqual(cursorJson.mcpServers.viveworker, {
@@ -64,7 +66,7 @@ test("enable mcp writes JSON and Codex TOML configs idempotently", async () => {
       args: ["viveworker", "mcp"],
     });
 
-    const codex = await runCli(["enable", "mcp", "--target", "codex", "--yes"], env);
+    const codex = await runCli(["enable", "mcp", "--target", "codex", "--yes", "--allow-unpatched-node"], env);
     assert.equal(codex.code, 0, codex.stderr);
     const codexText = await fs.readFile(codexConfig, "utf8");
     assert.match(codexText, /model = "gpt-5\.5"/);
@@ -73,7 +75,7 @@ test("enable mcp writes JSON and Codex TOML configs idempotently", async () => {
     assert.match(codexText, /command = "npx"/);
     assert.match(codexText, /args = \["viveworker", "mcp"\]/);
 
-    const second = await runCli(["enable", "mcp", "--target", "codex", "--yes"], env);
+    const second = await runCli(["enable", "mcp", "--target", "codex", "--yes", "--allow-unpatched-node"], env);
     assert.equal(second.code, 0, second.stderr);
     assert.match(second.stdout, /already up to date/);
   } finally {

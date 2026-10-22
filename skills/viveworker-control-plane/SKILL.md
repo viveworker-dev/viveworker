@@ -23,6 +23,7 @@ Use this flow when the user asks to set up viveworker, pair a phone, install the
 2. If the bridge is not running or no local setup exists, ask for confirmation before running or recommending `npx viveworker setup`.
    - Do not auto-run setup silently. It can install local certificates, write config, register launchd services, and change agent hooks.
    - If the user explicitly asks you to execute setup, use the normal shell tool with clear confirmation, not MCP.
+   - If setup or enable stops because Node.js is unpatched or end-of-life, ask the user to install a patched Node.js (22.x ≥ 22.23.4, 24.x ≥ 24.22.1, or ≥ 26.12.1) and re-run with it. Never add `--allow-unpatched-node` yourself; accepting that risk is the user's decision. Also tell the user when `viveworker_status` reports `mcpRuntime.supported: false`.
 3. If setup exists but no phone is trusted, guide the user to run `npx viveworker pair` and open the pairing URL on the phone.
 4. Ask the user to allow notifications from the Home Screen app when prompted.
 5. Re-check with `viveworker_status`.

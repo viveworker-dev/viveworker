@@ -173,6 +173,8 @@ test("MCP server initialize, list, notify, and status", async () => {
       arguments: {},
     });
     assert.equal(status.result.structuredContent.bridge.running, true);
+    assert.equal(typeof status.result.structuredContent.mcpRuntime.supported, "boolean");
+    assert.equal(status.result.structuredContent.mcpRuntime.version, process.versions.node);
     assert.equal(bridge.events.at(-1).eventType, "status");
   } finally {
     await mcp.close();

@@ -10,6 +10,7 @@ import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { assessNodeRuntime, describeNodeRuntimeProblem } from "./lib/node-runtime.mjs";
 
 const PROTOCOL_VERSION = "2025-11-25";
 const SERVER_NAME = "viveworker";
@@ -42,6 +43,12 @@ export async function runMcpCli(args = []) {
 }
 
 async function runMcpServer() {
+  // MCP clients usually launch `npx viveworker mcp` with whatever Node.js is
+  // on PATH, so warn (stderr only — stdout is the JSON-RPC channel).
+  const runtimeProblem = describeNodeRuntimeProblem(assessNodeRuntime());
+  if (runtimeProblem) {
+    process.stderr.write(`[viveworker mcp] ${runtimeProblem}\n`);
+  }
   const server = new ViveworkerMcpServer();
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
@@ -136,8 +143,10 @@ async function callTool(params) {
   const name = String(params?.name || "");
   const args = isPlainObject(params?.arguments) ? params.arguments : {};
   switch (name) {
-    case "viveworker_status":
-      return toolOk(await bridgeEvent({ eventType: "status" }, SHORT_TIMEOUT_MS));
+    case "viveworker_status": {
+      const status = await bridgeEvent({ eventType: "status" }, SHORT_TIMEOUT_MS);
+      return toolOk(isPlainObject(status) ? { ...status, mcpRuntime: assessNodeRuntime() } : status);
+    }
     case "viveworker_stats":
       return toolOk(await toolStats(args));
     case "viveworker_share_list":
