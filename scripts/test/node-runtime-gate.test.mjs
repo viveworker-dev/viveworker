@@ -149,7 +149,9 @@ test("the MCP server warns on stderr only and keeps stdout for JSON-RPC", async 
   });
 });
 
-test("doctor reports every component pinned to an unpatched Node.js", async () => {
+test("doctor reports every component pinned to an unpatched Node.js", {
+  skip: process.platform === "win32" && "launchd diagnostic fixture requires a POSIX shell",
+}, async () => {
   await withTmp(async (tmp) => {
     const fakeNode = path.join(tmp, "bin", "node");
     await fs.mkdir(path.dirname(fakeNode), { recursive: true });

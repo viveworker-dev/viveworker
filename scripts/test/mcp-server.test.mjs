@@ -526,9 +526,12 @@ test("share_file rejects symlink escape before bridge approval", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-"));
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), "viveworker-mcp-outside-"));
   const outsideFile = path.join(outside, "report.txt");
-  const symlinkPath = path.join(tmp, "report-link.txt");
+  const linkDir = path.join(tmp, "outside-link");
+  const symlinkPath = path.join(linkDir, "report.txt");
   await fs.writeFile(outsideFile, "outside\n", "utf8");
-  await fs.symlink(outsideFile, symlinkPath);
+  // Directory junctions exercise the same containment check without requiring
+  // Windows Developer Mode or administrator rights to create a file symlink.
+  await fs.symlink(outside, linkDir, process.platform === "win32" ? "junction" : "dir");
   const mcp = startMcpServer({
     VIVEWORKER_MCP_BRIDGE_URL: bridge.baseUrl,
     VIVEWORKER_MCP_SESSION_SECRET: "test-secret",

@@ -9,6 +9,9 @@ import path from "node:path";
 import process from "node:process";
 import { createInterface as createReadlineInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { createMcpServerConfig, defaultMcpConfigPath } from "./lib/mcp-config.mjs";
+import { defaultCodexIpcEndpoint, defaultMkcertRootCaFile, findNativeExecutable } from "./lib/platform.mjs";
+import { startManagedBridge, stopManagedBridge, managedBridgeStatus } from "./lib/managed-bridge.mjs";
 import { DEFAULT_LOCALE, normalizeLocale, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { RECOMMENDED_NODE_RELEASE, assessNodeRuntime, otherPatchedNodeReleases } from "./lib/node-runtime.mjs";
@@ -128,7 +131,7 @@ async function commandSpawnsDetachedBridge(cliOptions) {
   if (!["start", "restart", "pair"].includes(command) && !(command === "doctor" && cliOptions.doctorFix)) {
     return false;
   }
-  if (await fileExists(resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath))) {
+  if (process.platform === "darwin" && await fileExists(resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath))) {
     return false;
   }
   if (command === "restart") {
@@ -170,6 +173,11 @@ async function readPinnedNodePaths(cliOptions) {
   const readText = (filePath) => fs.readFile(filePath, "utf8").catch(() => "");
   const launchAgentsDir = path.join(os.homedir(), "Library", "LaunchAgents");
   const pinned = [];
+  if (process.platform === "win32") {
+    const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+    const service = await managedBridgeStatus(resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid")));
+    return service.running && service.nodePath ? [{ component: "bridge", nodePath: service.nodePath }] : [];
+  }
 
   const bridgePlist = await readText(resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath));
   const bridgeMatch = bridgePlist.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/u);
@@ -294,7 +302,7 @@ async function runSetup(cliOptions) {
   );
   const scheme = webPushEnabled ? "https" : "http";
   const publicBaseUrl = webPushEnabled || allowInsecureHttpLan
-    ? `${scheme}://${localHostname}:${port}`
+    ? `${scheme}://${process.platform === "win32" ? chosenIp : localHostname}:${port}`
     : `http://127.0.0.1:${port}`;
   const fallbackBaseUrl = webPushEnabled || allowInsecureHttpLan
     ? `${scheme}://${chosenIp}:${port}`
@@ -344,6 +352,7 @@ async function runSetup(cliOptions) {
       })
     : null;
 
+  if (process.platform === "win32") await stopManagedBridge(pidFile);
   progress.update("cli.setup.progress.writeConfig");
   await fs.mkdir(path.dirname(envFile), { recursive: true, mode: 0o700 });
   await fs.mkdir(path.dirname(logFile), { recursive: true });
@@ -354,6 +363,8 @@ async function runSetup(cliOptions) {
     `VIVEWORKER_HOSTNAME=${hostname}`,
     `CODEX_HOME=${existing.CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), ".codex")}`,
     `STATE_FILE=${stateFile}`,
+    `CODEX_IPC_SOCKET_PATH=${existing.CODEX_IPC_SOCKET_PATH || process.env.CODEX_IPC_SOCKET_PATH || defaultCodexIpcEndpoint()}`,
+    `MKCERT_ROOT_CA_FILE=${tlsAssets?.rootCaFile || existing.MKCERT_ROOT_CA_FILE || process.env.MKCERT_ROOT_CA_FILE || defaultMkcertRootCaFile()}`,
     `NATIVE_APPROVAL_SERVER_HOST=${listenHost}`,
     `NATIVE_APPROVAL_SERVER_PORT=${port}`,
     `NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL=${publicBaseUrl}`,
@@ -394,7 +405,7 @@ async function runSetup(cliOptions) {
     codexHome: existing.CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
   });
 
-  if (!cliOptions.noLaunchd) {
+  if (process.platform === "darwin" && !cliOptions.noLaunchd) {
     progress.update("cli.setup.progress.launchd");
     const plist = buildLaunchAgentPlist({
       label: defaultLabel,
@@ -426,7 +437,7 @@ async function runSetup(cliOptions) {
 
   const pairPath = `/app?pairToken=${encodeURIComponent(pairToken)}`;
   const mkcertRootCaFile = resolvePath(
-    existing.MKCERT_ROOT_CA_FILE || process.env.MKCERT_ROOT_CA_FILE || "~/Library/Application Support/mkcert/rootCA.pem"
+    tlsAssets?.rootCaFile || existing.MKCERT_ROOT_CA_FILE || process.env.MKCERT_ROOT_CA_FILE || defaultMkcertRootCaFile()
   );
   const canShowCaDownload = webPushEnabled && await fileExists(mkcertRootCaFile);
   const caPath = "/ca/rootCA.pem";
@@ -541,6 +552,9 @@ async function runEnable(cliOptions) {
     throw new Error("Usage: viveworker enable <claude|a2a|moltbook|scout|mcp> [...]");
   }
 
+  if (process.platform === "win32" && ["claude", "moltbook", "scout"].includes(target)) {
+    throw new Error("This integration still requires macOS. On Windows, use enable mcp for now.");
+  }
   switch (target) {
     case "claude":
       await runEnableClaude(cliOptions);
@@ -568,7 +582,7 @@ async function runEnableMcp(cliOptions) {
   const target = normalizeMcpInstallTarget(cliOptions.mcpTarget || "all");
   const allTargets = target === "all" ? ["claude", "cursor", "codex"] : [target];
   const entries = [];
-  const config = mcpServerConfigSnippet();
+  const config = createMcpServerConfig({ local: cliOptions.mcpLocal });
 
   for (const item of allTargets) {
     const entry = await prepareMcpConfigChange(item, config, { explicit: target !== "all" });
@@ -632,13 +646,6 @@ function normalizeMcpInstallTarget(value) {
   throw new Error("Use --target claude, --target cursor, --target codex, or --target all.");
 }
 
-function mcpServerConfigSnippet() {
-  return {
-    command: "npx",
-    args: ["viveworker", "mcp"],
-  };
-}
-
 async function prepareMcpConfigChange(target, serverConfig, { explicit = false } = {}) {
   const descriptor = mcpConfigDescriptor(target);
   if (!descriptor) {
@@ -666,7 +673,7 @@ async function prepareMcpConfigChange(target, serverConfig, { explicit = false }
 function mcpConfigDescriptor(target) {
   if (target === "claude") {
     const override = process.env.VIVEWORKER_MCP_CLAUDE_CONFIG_FILE || "";
-    const defaultPath = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+    const defaultPath = defaultMcpConfigPath("claude");
     const configPath = resolvePath(override || defaultPath);
     return {
       kind: "json",
@@ -677,7 +684,7 @@ function mcpConfigDescriptor(target) {
   }
   if (target === "cursor") {
     const override = process.env.VIVEWORKER_MCP_CURSOR_CONFIG_FILE || "";
-    const defaultPath = path.join(os.homedir(), ".cursor", "mcp.json");
+    const defaultPath = defaultMcpConfigPath("cursor");
     const configPath = resolvePath(override || defaultPath);
     return {
       kind: "json",
@@ -688,7 +695,7 @@ function mcpConfigDescriptor(target) {
   }
   if (target === "codex") {
     const override = process.env.VIVEWORKER_MCP_CODEX_CONFIG_FILE || "";
-    const defaultPath = path.join(os.homedir(), ".codex", "config.toml");
+    const defaultPath = defaultMcpConfigPath("codex");
     const configPath = resolvePath(override || defaultPath);
     return {
       kind: "toml",
@@ -929,6 +936,7 @@ async function uninstallMoltbookScout({ suppressOutput = false } = {}) {
 }
 
 async function installMoltbookScout({ cliOptions, suppressOutput = false }) {
+  if (process.platform === "win32") throw new Error("This integration still requires macOS. Use MCP on Windows for now.");
   const moltbookEnvFile = path.join(os.homedir(), ".viveworker", "moltbook.env");
   try {
     await fs.access(moltbookEnvFile);
@@ -1057,6 +1065,7 @@ async function installMoltbookScout({ cliOptions, suppressOutput = false }) {
 }
 
 async function installMoltbookWatcher({ cliOptions, sessionSecret, port, suppressOutput = false }) {
+  if (process.platform === "win32") throw new Error("This integration still requires macOS. Use MCP on Windows for now.");
   if (!cliOptions.moltbookApiKey || !cliOptions.moltbookAgentId) {
     throw new Error(
       "--moltbook requires --moltbook-api-key and --moltbook-agent-id"
@@ -1142,6 +1151,7 @@ async function installMoltbookWatcher({ cliOptions, sessionSecret, port, suppres
 }
 
 async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret, suppressOutput = false }) {
+  if (process.platform === "win32") throw new Error("This integration still requires macOS. Use MCP on Windows for now.");
   const hookScript = path.join(packageRoot, "scripts", "viveworker-claude-hook.mjs");
   const nodePath = process.execPath;
   const settingsFile = resolvePath(
@@ -1200,6 +1210,9 @@ async function installClaudeHooks({ envFile, claudeSettingsFile, sessionSecret, 
 async function runStart(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
   const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
+  if (process.platform === "win32" && !(await fileExists(envFile))) {
+    throw new Error("Bridge configuration is missing. Run setup before start.");
+  }
   const initialLocale = await resolveCliLocale(cliOptions);
   const progress = createCliProgressReporter(initialLocale);
   progress.update("cli.start.progress.prepare");
@@ -1219,7 +1232,7 @@ async function runStart(cliOptions) {
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const healthUrl = buildLoopbackHealthUrl(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "");
-  if (await fileExists(launchAgentPath)) {
+  if (process.platform === "darwin" && await fileExists(launchAgentPath)) {
     progress.update("cli.start.progress.launchd");
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     progress.update("cli.start.progress.kickstart");
@@ -1251,11 +1264,12 @@ async function runStart(cliOptions) {
   }
 
   progress.update("cli.start.progress.bridge");
-  const alreadyHealthy = await waitForHealth(healthUrl, { attempts: 1, intervalMs: 0 });
+  if (process.platform === "win32" && rotatedPairing.rotated) await stopManagedBridge(pidFile);
+  const alreadyHealthy = process.platform !== "win32" && await waitForHealth(healthUrl, { attempts: 1, intervalMs: 0 });
   if (!alreadyHealthy) {
     await startDetachedBridge({
       envFile,
-      logFile: resolvePath(cliOptions.logFile || defaultLogFile),
+      logFile: resolvePath(cliOptions.logFile || path.join(configDir, "logs", "viveworker.log")),
       pidFile,
       cliOptions,
     });
@@ -1290,7 +1304,7 @@ async function runStop(cliOptions) {
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
   const locale = await resolveCliLocale(cliOptions);
-  if (await fileExists(launchAgentPath)) {
+  if (process.platform === "darwin" && await fileExists(launchAgentPath)) {
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     printCliTitle(locale, "cli.stop.title");
     printCliSection(locale, "cli.section.changed", [
@@ -1299,6 +1313,14 @@ async function runStop(cliOptions) {
     return;
   }
 
+  if (process.platform === "win32") {
+    const result = await stopManagedBridge(pidFile);
+    printCliTitle(locale, result.stopped ? "cli.stop.title" : "cli.stop.alreadyStopped");
+    printCliSection(locale, "cli.section.changed", [
+      result.stopped ? t(locale, "cli.stop.changedPid", { pid: result.pid }) : t(locale, "cli.stop.noProcess"),
+    ]);
+    return;
+  }
   const pid = await maybeReadPid(pidFile);
   if (!pid) {
     printCliTitle(locale, "cli.stop.alreadyStopped");
@@ -1349,13 +1371,13 @@ async function runStatus(cliOptions) {
     readyLines.push(t(locale, "cli.status.tlsCert", { value: config.TLS_CERT_FILE || "(missing)" }));
     readyLines.push(t(locale, "cli.status.tlsKey", { value: config.TLS_KEY_FILE || "(missing)" }));
   }
-  readyLines.push(
+  if (process.platform === "darwin") readyLines.push(
     t(locale, "cli.status.launchAgent", {
       value: (await fileExists(launchAgentPath)) ? launchAgentPath : "(not installed)",
     })
   );
 
-  if (await fileExists(launchAgentPath)) {
+  if (process.platform === "darwin" && await fileExists(launchAgentPath)) {
     const printed = await execCommand(
       ["launchctl", "print", `gui/${process.getuid()}/${defaultLabel}`],
       { ignoreError: true }
@@ -1366,8 +1388,9 @@ async function runStatus(cliOptions) {
       })
     );
   } else {
-    const pid = await maybeReadPid(pidFile);
-    readyLines.push(t(locale, "cli.status.pid", { value: pid || "(not running)" }));
+    const service = process.platform === "win32" ? await managedBridgeStatus(pidFile) : null;
+    const pid = process.platform === "win32" ? (service.running ? service.pid : null) : await maybeReadPid(pidFile);
+    readyLines.push(t(locale, "cli.status.pid", { value: pid || (service?.unverified ? "(unverified process; not managed)" : "(not running)") }));
   }
 
   let healthOutput = "";
@@ -1491,6 +1514,7 @@ async function runDoctor(cliOptions) {
 }
 
 async function runUpdate(cliOptions) {
+  if (process.platform === "win32") throw new Error("Windows updates are not automated yet. Update the checkout and restart the bridge.");
   const locale = await resolveCliLocale(cliOptions);
   const progress = createCliProgressReporter(locale);
 
@@ -1524,7 +1548,7 @@ async function runUpdate(cliOptions) {
   // 3. Restart bridge
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   let restartedBridge = false;
-  if (await fileExists(launchAgentPath)) {
+  if (process.platform === "darwin" && await fileExists(launchAgentPath)) {
     progress.update("cli.update.progress.restartBridge");
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
@@ -1808,6 +1832,7 @@ function parseArgs(argv) {
     autoScoutMaxDaily: 0,
     mcpTarget: "",
     mcpDryRun: false,
+    mcpLocal: false,
     yes: false,
   };
 
@@ -1969,6 +1994,8 @@ function parseArgs(argv) {
     } else if (arg === "--target") {
       parsed.mcpTarget = next;
       index += 1;
+    } else if (arg === "--local" && parsed.command === "enable" && parsed.enableTarget === "mcp") {
+      parsed.mcpLocal = true;
     } else if (arg === "--dry-run") {
       parsed.mcpDryRun = true;
     } else if (arg === "--yes" || arg === "-y") {
@@ -2002,7 +2029,7 @@ ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.doctor")}
   ${t(locale, "cli.help.update")}
   mcp           Start the stdio MCP server
-  mcp config    Print MCP client config snippets
+  mcp config [--local]    Print MCP client config snippets
 
 ${t(locale, "cli.help.commonOptions")}
   --port <n>
@@ -2032,7 +2059,7 @@ ${t(locale, "cli.help.featureOptions")}
   ${t(locale, "cli.help.enableA2a")}
   ${t(locale, "cli.help.enableMoltbook")}
   ${t(locale, "cli.help.enableScout")}
-  enable mcp --target <claude|cursor|codex|all> [--dry-run|--yes]
+  enable mcp --target <claude|cursor|codex|all> [--local] [--dry-run|--yes]
   ${t(locale, "cli.help.doctorFix")}
 `);
 }
@@ -2120,6 +2147,10 @@ function buildLaunchAgentPlist({ label, nodePath, bridgeScript, envFile, logFile
 }
 
 async function startDetachedBridge({ envFile, logFile, pidFile, cliOptions = {} }) {
+  if (process.platform === "win32") {
+    await ensurePatchedNodeRuntime(cliOptions, "cli.nodeRuntime.blockedStart");
+    return startManagedBridge({ bridgeScript, envFile, logFile, pidFile });
+  }
   const existingPid = await maybeReadPid(pidFile);
   if (existingPid && isProcessRunning(existingPid)) {
     return { pid: existingPid, alreadyRunning: true };
@@ -2143,7 +2174,8 @@ async function startDetachedBridge({ envFile, logFile, pidFile, cliOptions = {} 
 async function maybeReadPid(pidFile) {
   try {
     const raw = await fs.readFile(pidFile, "utf8");
-    const pid = Number(raw.trim());
+    const value = JSON.parse(raw.trim());
+    const pid = typeof value === "number" ? value : value?.pid;
     return Number.isFinite(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
@@ -2236,7 +2268,7 @@ async function autoConfigureProvidersDuringSetup({ cliOptions, envFile, sessionS
   const defaultClaudeSettingsFile = resolvePath(path.join(os.homedir(), ".claude", "settings.json"));
   const claudeSettingsFile = explicitClaudeSettingsFile || defaultClaudeSettingsFile;
 
-  if (!explicitClaudeSettingsFile && cliOptions.noAutoClaude) {
+  if (!explicitClaudeSettingsFile && (cliOptions.noAutoClaude || process.platform === "win32")) {
     return {
       codex,
       claude: {
@@ -2292,8 +2324,7 @@ async function autoConfigureProvidersDuringSetup({ cliOptions, envFile, sessionS
 async function detectCodexAvailability(codexHome) {
   const candidates = Array.from(new Set([
     resolvePath(codexHome || path.join(os.homedir(), ".codex")),
-    "/Applications/Codex.app",
-    path.join(os.homedir(), "Applications", "Codex.app"),
+    ...(process.platform === "darwin" ? ["/Applications/Codex.app", path.join(os.homedir(), "Applications", "Codex.app")] : []),
   ]));
   for (const candidate of candidates) {
     if (await fileExists(candidate)) {
@@ -2367,6 +2398,7 @@ async function execCommand(args, { ignoreError = false, env = null, streamOutput
     const child = spawn(args[0], args.slice(1), {
       env: env ? { ...process.env, ...env } : process.env,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
     let stdout = "";
     let stderr = "";
@@ -2750,7 +2782,7 @@ async function ensureWebPushAssets({
     }
 
     let mkcertPath = await findExecutable("mkcert");
-    if (!mkcertPath && !cliOptions.noAutoMkcert) {
+    if (!mkcertPath && !cliOptions.noAutoMkcert && process.platform === "darwin") {
       mkcertPath = await installMkcertForMac(progress, locale);
     }
     if (!mkcertPath) {
@@ -2758,8 +2790,10 @@ async function ensureWebPushAssets({
         [
           "Web Push requires HTTPS, but mkcert is not installed.",
           "Install mkcert and trust its local CA, or provide --tls-cert-file and --tls-key-file.",
-          "You can also run: npx viveworker setup --install-mkcert",
-          "Example: brew install mkcert && mkcert -install",
+          process.platform === "win32"
+            ? "Install mkcert.exe from https://github.com/FiloSottile/mkcert/releases and add its directory to PATH, then run mkcert -install."
+            : "Example: brew install mkcert && mkcert -install",
+          "For a local-only test without notifications: node scripts/viveworker.mjs setup --disable-web-push",
         ].join("\n")
       );
     }
@@ -2801,6 +2835,12 @@ async function ensureWebPushAssets({
     }
   }
 
+  let rootCaFile = existing.MKCERT_ROOT_CA_FILE || process.env.MKCERT_ROOT_CA_FILE || defaultMkcertRootCaFile();
+  const mkcertExecutable = await findExecutable("mkcert");
+  if (mkcertExecutable) {
+    const caRoot = await execCommand([mkcertExecutable, "-CAROOT"], { ignoreError: true });
+    if (caRoot.ok && caRoot.stdout.trim()) rootCaFile = path.join(caRoot.stdout.trim(), "rootCA.pem");
+  }
   const vapidPublicKey =
     cliOptions.vapidPublicKey ||
     existing.WEB_PUSH_VAPID_PUBLIC_KEY ||
@@ -2816,6 +2856,7 @@ async function ensureWebPushAssets({
       vapidPublicKey,
       vapidPrivateKey,
       ranMkcertInstall,
+      rootCaFile,
     };
   }
 
@@ -2827,6 +2868,7 @@ async function ensureWebPushAssets({
     vapidPublicKey: generated.publicKey,
     vapidPrivateKey: generated.privateKey,
     ranMkcertInstall,
+    rootCaFile,
   };
 }
 
@@ -2837,11 +2879,7 @@ async function generateVapidKeys() {
 }
 
 async function findExecutable(name) {
-  const result = await execCommand(["which", name], { ignoreError: true });
-  if (!result.ok) {
-    return "";
-  }
-  return result.stdout.trim();
+  return findNativeExecutable(name);
 }
 
 async function installMkcertForMac(progress, locale) {

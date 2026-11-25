@@ -14,6 +14,11 @@ test("timeline polling is bounded and independent from secondary probes", () => 
   assert.doesNotMatch(appSource, /refreshTimeline\(\),\s*refreshDevices\(\),\s*refreshPushStatus\(\)/);
 });
 
+test("polling is installed after boot even if the first screen is manual pairing", () => {
+  assert.ok(appSource.includes("boot().then(startAuthenticatedPolling)"));
+  assert.match(appSource, /function startAuthenticatedPolling\(\) \{\s*setInterval/);
+});
+
 test("boot local refresh also uses bounded timeline requests", () => {
   assert.match(appSource, /refreshInbox\(\{ timeoutMs: FAST_POLL_STEP_TIMEOUT_MS \}\)/);
   assert.match(appSource, /refreshTimeline\(\{ timeoutMs: TIMELINE_POLL_TIMEOUT_MS \}\)/);
@@ -27,7 +32,7 @@ test("timeline refresh reprobes LAN while sticky relay is active", () => {
 });
 
 test("build id marks the current web bundle", () => {
-  assert.match(buildIdSource, /20260713-lan-recovery-v2/);
+  assert.match(buildIdSource, /20261124-live-replies-v1/);
 });
 
 test("bridge startup does not block LAN listening on rollout label indexing", () => {

@@ -15,6 +15,9 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import zlib from "node:zlib";
 import webPush from "web-push";
+import { resolveCodexIpcEndpoint, defaultMkcertRootCaFile } from "./lib/platform.mjs";
+import { openBridgeControlServer } from "./lib/managed-bridge.mjs";
+import { querySqliteNative } from "./lib/sqlite-query.mjs";
 import * as hazbaseAuth from "@hazbase/auth";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { APP_BUILD_ID as WEB_APP_BUILD_ID } from "../web/build-id.js";
@@ -2568,6 +2571,7 @@ async function captureGitDiffText({ cwd, fileRefs }) {
     const child = spawn("git", ["diff", "--no-ext-diff", "--no-color", "-M", "--find-renames", "--", ...normalizedFileRefs], {
       cwd: normalizedCwd,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -2890,6 +2894,7 @@ async function captureGitOutput({ cwd, args }) {
     const child = spawn("git", args, {
       cwd: normalizedCwd,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -5285,6 +5290,20 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
     }
 
     if (config.webUiEnabled) {
+      if (record.type === "response_item" && record.payload?.role === "assistant") {
+        const entry = buildCodexAssistantTimelineEntry({
+          item: record.payload,
+          threadId: fileState.threadId,
+          cwd: fileState.cwd,
+          createdAtMs: Date.parse(record.timestamp) || now,
+          config,
+          runtime,
+        });
+        if (entry) {
+          dirty = recordTimelineEntry({ config, runtime, state, entry, source: "codex-rollout" }) || dirty;
+        }
+      }
+
       const timelineEntry = buildRolloutUserTimelineEntry({
         record,
         fileState,
@@ -6789,7 +6808,24 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
     return null;
   }
 
-  const item = isPlainObject(payload.item) ? payload.item : null;
+  const contextLogBody = String(row?.context_log_body ?? "");
+  const threadId = cleanText(
+    row.thread_id ||
+    extractThreadIdFromLogBody(body) ||
+    extractThreadIdFromLogBody(contextLogBody)
+  );
+
+  return buildCodexAssistantTimelineEntry({
+    item: payload.item, threadId, config, runtime,
+    createdAtMs: Number(row.ts) * 1000 || Date.now(),
+    fallbackId: row.id,
+  });
+}
+
+function buildCodexAssistantTimelineEntry({ item, threadId, config, runtime, createdAtMs, fallbackId, cwd = "" }) {
+  if (!threadId) {
+    return null;
+  }
   if (!item || item.type !== "message" || item.role !== "assistant") {
     return null;
   }
@@ -6802,16 +6838,6 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
         ? "assistant_final"
         : "";
   if (!kind) {
-    return null;
-  }
-
-  const contextLogBody = String(row?.context_log_body ?? "");
-  const threadId = cleanText(
-    row.thread_id ||
-    extractThreadIdFromLogBody(body) ||
-    extractThreadIdFromLogBody(contextLogBody)
-  );
-  if (!threadId) {
     return null;
   }
 
@@ -6834,13 +6860,8 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
     ? ambientSuggestionsSummary(config.defaultLocale, ambientSuggestions)
     : formatNotificationBody(messageText, 180) || messageText;
 
-  const createdAtMs = Math.max(0, Number(row.ts) || 0) * 1000 || Date.now();
-  const threadLabel = getNativeThreadLabel({
-    runtime,
-    conversationId: threadId,
-    cwd: "",
-  });
-  const stableId = messageTimelineStableId(entryKind, threadId, item.id || row.id, entryMessageText, createdAtMs);
+  const threadLabel = getNativeThreadLabel({ runtime, conversationId: threadId, cwd });
+  const stableId = messageTimelineStableId(entryKind, threadId, item.id || fallbackId, entryMessageText, createdAtMs);
 
   return normalizeTimelineEntry({
     stableId,
@@ -7588,9 +7609,11 @@ async function runSqliteJsonQuery(dbFile, sql) {
 }
 
 function runSqliteJsonQueryOnce(dbFile, sql) {
+  if (process.platform === "win32") return querySqliteNative(dbFile, sql, { busyTimeoutMs: SQLITE_QUERY_BUSY_TIMEOUT_MS });
   return new Promise((resolve, reject) => {
     const child = spawn("sqlite3", ["-readonly", "-cmd", `.timeout ${SQLITE_QUERY_BUSY_TIMEOUT_MS}`, "-json", dbFile, sql], {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -9826,6 +9849,7 @@ function runCurl(args) {
   return new Promise((resolve, reject) => {
     const child = spawn("curl", args, {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stderr = "";
@@ -20811,9 +20835,12 @@ function startHttpServer(server, host, port) {
   });
 }
 
-function stopHttpServer(server) {
+function stopHttpServer(server, { closeConnections = false } = {}) {
   return new Promise((resolve) => {
     server.close(() => resolve());
+    // Managed shutdown must not wait indefinitely for browser streams or
+    // incomplete requests. Closing connections also runs their cleanup hooks.
+    if (closeConnections) server.closeAllConnections();
   });
 }
 
@@ -21971,9 +21998,9 @@ function buildConfig(cli) {
     webPushVapidPrivateKey: cleanText(process.env.WEB_PUSH_VAPID_PRIVATE_KEY || ""),
     webPushSubject: cleanText(process.env.WEB_PUSH_SUBJECT || "mailto:viveworker@example.com"),
     mkcertRootCaFile: resolvePath(
-      process.env.MKCERT_ROOT_CA_FILE || "~/Library/Application Support/mkcert/rootCA.pem"
+      process.env.MKCERT_ROOT_CA_FILE || defaultMkcertRootCaFile()
     ),
-    ipcSocketPath: resolvePath(process.env.CODEX_IPC_SOCKET_PATH || defaultIpcSocketPath()),
+    ipcSocketPath: resolveCodexIpcEndpoint(process.env.CODEX_IPC_SOCKET_PATH),
     ipcReconnectMs: numberEnv("IPC_RECONNECT_MS", 1500),
     ipcRequestTimeoutMs: numberEnv("IPC_REQUEST_TIMEOUT_MS", 12000),
     completionReplyAckTimeoutMs: numberEnv(
@@ -22681,12 +22708,6 @@ function validateConfig(config) {
       throw new Error("WEB_PUSH_ENABLED=1 requires WEB_PUSH_VAPID_PUBLIC_KEY and WEB_PUSH_VAPID_PRIVATE_KEY");
     }
   }
-}
-
-function defaultIpcSocketPath() {
-  const uid = process.getuid?.();
-  const socketName = uid ? `ipc-${uid}.sock` : "ipc.sock";
-  return `${os.tmpdir()}/codex-ipc/${socketName}`;
 }
 
 function parseCliArgs(args) {
@@ -24197,6 +24218,7 @@ async function main() {
 
   let approvalServer = null;
   let timelineLiveHandle = null;
+  let controlServer = null;
 
   process.on("SIGINT", handleSignal);
   process.on("SIGTERM", handleSignal);
@@ -24332,6 +24354,7 @@ async function main() {
       }
     }
 
+    controlServer = await openBridgeControlServer({ onStop: handleSignal });
     scheduleStartupMaintenance({ config, runtime, state });
 
     timelineLiveHandle = startTimelineLiveSync({ config, runtime, state });
@@ -24495,12 +24518,16 @@ async function main() {
     }
 
     if (approvalServer) {
-      await stopHttpServer(approvalServer);
+      await stopHttpServer(approvalServer, { closeConnections: Boolean(controlServer) });
     }
 
     // Drain any state mutations that were queued via scheduleSaveState but
     // not yet written to disk — otherwise SIGINT/SIGTERM mid-debounce would
     // silently drop the last ~500 ms of settings/notification changes.
-    await flushPendingStateWrite(config, state);
+    try {
+      await flushPendingStateWrite(config, state);
+    } finally {
+      await controlServer?.close();
+    }
   }
 }

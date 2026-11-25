@@ -529,7 +529,7 @@ const initialFocusPending = params.get("focusPending") || "";
 let didReloadForServiceWorker = false;
 let lastViewportMode = isDesktopLayout();
 
-boot().catch((error) => {
+boot().then(startAuthenticatedPolling).catch((error) => {
   const message = bootErrorMessage(error);
   const hint = shouldShowNetworkHint(error, message)
     ? `<p class="muted">${escapeHtml(L("error.networkHint"))}</p>`
@@ -741,7 +741,9 @@ async function boot() {
     })
     .catch(() => {});
   syncDetectedLocalePreference().catch(() => {});
+}
 
+function startAuthenticatedPolling() {
   setInterval(async () => {
     if (!state.session?.authenticated || authenticatedPollInFlight) {
       return;
@@ -1385,8 +1387,13 @@ function syncTimelineLiveStream() {
     const stream = new EventSource("/api/timeline/stream");
     timelineLiveStream = stream;
     stream.addEventListener("hello", (event) => {
-      const data = parseTimelineLiveEvent(event);
-      lastTimelineLiveRevision = Math.max(lastTimelineLiveRevision, Number(data?.revision) || 0);
+      if (timelineLiveStream !== stream) return;
+      // Revisions start over when the bridge restarts. Fetch a snapshot to
+      // include changes made while this browser was disconnected.
+      lastTimelineLiveRevision = 0;
+      handleTimelineLiveUpdate(parseTimelineLiveEvent(event)).catch((err) => {
+        console.warn("[timeline-live]", err?.message || err);
+      });
     });
     stream.addEventListener("timeline:update", (event) => {
       const data = parseTimelineLiveEvent(event);

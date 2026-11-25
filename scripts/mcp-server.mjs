@@ -9,7 +9,8 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createMcpServerConfig } from "./lib/mcp-config.mjs";
 import { assessNodeRuntime, describeNodeRuntimeProblem } from "./lib/node-runtime.mjs";
 
 const PROTOCOL_VERSION = "2025-11-25";
@@ -29,7 +30,7 @@ const packageRoot = path.resolve(__dirname, "..");
 export async function runMcpCli(args = []) {
   const cmd = args[0] || "serve";
   if (cmd === "config") {
-    printConfigSnippets();
+    printConfigSnippets({ local: args.includes("--local") });
     return;
   }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -597,6 +598,7 @@ function runViveworkerCliText(args, timeoutMs) {
       cwd: packageRoot,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       shell: false,
     });
     let stdout = "";
@@ -908,31 +910,42 @@ function isPlainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
-function printConfigSnippets() {
+function printConfigSnippets(options = {}) {
   const snippet = {
     mcpServers: {
-      viveworker: {
-        command: "npx",
-        args: ["viveworker", "mcp"],
-      },
+      viveworker: createMcpServerConfig(options),
     },
   };
-  console.log("Automatic install:");
-  console.log("  npx viveworker enable mcp --target claude");
-  console.log("  npx viveworker enable mcp --target cursor");
-  console.log("  npx viveworker enable mcp --target codex");
+  if (options.local) {
+    console.log("Register this checkout (run from the repository directory):");
+    console.log("  node scripts/viveworker.mjs enable mcp --target codex --local");
+    console.log("Use --target claude or --target cursor for the other clients.");
+    console.log("Local entries pin this Node.js executable and checkout; re-register after moving either.");
+  } else {
+    console.log("Automatic install:");
+    console.log("  npx viveworker enable mcp --target claude");
+    console.log("  npx viveworker enable mcp --target cursor");
+    console.log("  npx viveworker enable mcp --target codex");
+    console.log("");
+    console.log("Claude Code:");
+    console.log(process.platform === "win32"
+      ? "  claude mcp add --scope user viveworker -- cmd.exe /d /c npx -y viveworker mcp"
+      : "  claude mcp add --scope user viveworker -- npx viveworker mcp");
+  }
   console.log("");
-  console.log("Claude Code:");
-  console.log("  claude mcp add --scope user viveworker -- npx viveworker mcp");
-  console.log("");
-  console.log("Claude Desktop / Cursor / Codex MCP config:");
+  console.log("Claude Desktop / Cursor MCP config:");
   console.log(JSON.stringify(snippet, null, 2));
+  console.log("");
+  console.log("Codex config.toml:");
+  console.log("[mcp_servers.viveworker]");
+  console.log(`command = ${JSON.stringify(snippet.mcpServers.viveworker.command)}`);
+  console.log(`args = ${JSON.stringify(snippet.mcpServers.viveworker.args)}`);
 }
 
 function printHelp() {
   console.log("Usage:");
   console.log("  viveworker mcp          Start the stdio MCP server");
-  console.log("  viveworker mcp config   Print MCP client config snippets");
+  console.log("  viveworker mcp config [--local]   Print MCP client config snippets");
 }
 
 const TOOLS = [
@@ -1222,7 +1235,7 @@ const PROMPTS = [
   },
 ];
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runMcpCli(process.argv.slice(2)).catch((error) => {
     console.error(error.message || String(error));
     process.exit(1);

@@ -61,10 +61,10 @@ test("enable mcp writes JSON and Codex TOML configs idempotently", async () => {
     const cursor = await runCli(["enable", "mcp", "--target", "cursor", "--yes", "--allow-unpatched-node"], env);
     assert.equal(cursor.code, 0, cursor.stderr);
     const cursorJson = JSON.parse(await fs.readFile(cursorConfig, "utf8"));
-    assert.deepEqual(cursorJson.mcpServers.viveworker, {
-      command: "npx",
-      args: ["viveworker", "mcp"],
-    });
+    const expected = process.platform === "win32"
+      ? { command: "cmd.exe", args: ["/d", "/c", "npx", "-y", "viveworker", "mcp"] }
+      : { command: "npx", args: ["viveworker", "mcp"] };
+    assert.deepEqual(cursorJson.mcpServers.viveworker, expected);
 
     const codex = await runCli(["enable", "mcp", "--target", "codex", "--yes", "--allow-unpatched-node"], env);
     assert.equal(codex.code, 0, codex.stderr);
@@ -72,8 +72,8 @@ test("enable mcp writes JSON and Codex TOML configs idempotently", async () => {
     assert.match(codexText, /model = "gpt-5\.5"/);
     assert.match(codexText, /\[mcp_servers\.docs\]/);
     assert.match(codexText, /\[mcp_servers\.viveworker\]/);
-    assert.match(codexText, /command = "npx"/);
-    assert.match(codexText, /args = \["viveworker", "mcp"\]/);
+    assert.ok(codexText.includes(`command = ${JSON.stringify(expected.command)}`));
+    assert.ok(codexText.includes(`args = [${expected.args.map((arg) => JSON.stringify(arg)).join(", ")}]`));
 
     const second = await runCli(["enable", "mcp", "--target", "codex", "--yes", "--allow-unpatched-node"], env);
     assert.equal(second.code, 0, second.stderr);

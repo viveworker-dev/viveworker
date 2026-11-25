@@ -70,6 +70,8 @@ You can use it as:
 
 ## Quick Start
 
+Windows development: experimental background setup/start/stop, MCP registration, named-pipe IPC and native SQLite support are described in [WINDOWS.md](WINDOWS.md). Phone approval and notification flows still need end-to-end validation.
+
 Requires macOS and Node.js **22.x (22.23.4 or later), 24.x (24.22.1 or later), or 26.12.1 or later**: the releases that include the [October 2026 Node.js security fixes](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases). Odd-numbered and end-of-life lines (20.x, 23.x, 25.x) are not supported. `setup` and `enable` stop on these versions before changing anything, because they write the path of the Node.js that runs them into launchd and Claude Code hooks. Without launchd (`--no-launchd`), `start`, `restart` and `pair` also refuse to spawn the bridge on them. Pass `--allow-unpatched-node` only if you accept that risk. On an existing install, `npx viveworker doctor` reports any component (bridge, Claude Code hooks, Moltbook watcher and scout) that still runs on an unpatched Node.js, and the MCP server warns on stderr and in `viveworker_status`.
 
 For the full experience, start here:
