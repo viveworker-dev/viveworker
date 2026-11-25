@@ -484,7 +484,9 @@ async function handleUpload(request, env) {
   let expiresAtMs;
   const expiresRaw = form.get("expiresDays");
   const now = Date.now();
-  if (typeof expiresRaw === "string" && expiresRaw.length > 0) {
+  if (expiresRaw === "never") {
+    expiresAtMs = null;
+  } else if (typeof expiresRaw === "string" && expiresRaw.length > 0) {
     const days = Number(expiresRaw);
     if (!Number.isFinite(days) || days <= 0 || days > MAX_EXPIRES_DAYS) {
       return jsonResponse({ error: "invalid-expiresDays", maxDays: MAX_EXPIRES_DAYS }, 400);
@@ -540,6 +542,7 @@ async function handleUpload(request, env) {
     size,
     createdAtMs,
     expiresAtMs,
+    permanent: expiresRaw === "never",
     passwordHash,
     passwordSalt,
     // Future password-protected uploads expose a short-lived bearer URL in
@@ -562,7 +565,7 @@ async function handleUpload(request, env) {
   };
 
   // Write R2 first, then KV (so we never leave metadata pointing to a missing object).
-  await env.SHARE_FILES.put(slug, bytes, {
+  await shareBucket(env, metadata).put(slug, bytes, {
     httpMetadata: { contentType: typeInfo.mime },
   });
 
@@ -784,6 +787,10 @@ async function handleList(request, env) {
 // Delete
 // ---------------------------------------------------------------------------
 
+function shareBucket(env, meta) {
+  return meta.permanent ? env.PERMANENT_FILES : env.SHARE_FILES;
+}
+
 async function handleDelete(request, env, slug) {
   const user = await authenticate(request, env);
   if (!user) return jsonResponse({ error: "unauthorized" }, 401);
@@ -799,7 +806,7 @@ async function handleDelete(request, env, slug) {
   }
 
   // R2 first, then metadata key.
-  await env.SHARE_FILES.delete(slug).catch(() => {});
+  await shareBucket(env, meta).delete(slug);
   await env.SHARE_KV.delete(`share:${slug}`);
 
   // Update user stats.
@@ -863,6 +870,7 @@ async function handlePatch(request, env, slug) {
   // (provided the R2 body survives). The check that gates revival lives
   // below, after we know whether the body supplied a new `expiresDays`.
   const wasExpired = !!(meta.expiresAtMs && Date.now() > meta.expiresAtMs);
+  const previousBucket = shareBucket(env, meta);
 
   // Rate limit check: reject early if the rolling window is full, so a burst
   // of payloads (even malformed ones) can't push past R2 re-put / KV write
@@ -1085,7 +1093,12 @@ async function handlePatch(request, env, slug) {
   // shortens the TTL). null → reset to default. number/numeric-string → set.
   if ("expiresDays" in body) {
     const val = body.expiresDays;
-    if (val === null) {
+    meta.permanent = val === "never";
+    if (meta.permanent) {
+      meta.expiresAtMs = null;
+      changed = true;
+      expiryChanged = true;
+    } else if (val === null) {
       meta.expiresAtMs = Date.now() + DEFAULT_EXPIRES_DAYS * 86400 * 1000;
       changed = true;
       expiryChanged = true;
@@ -1158,12 +1171,13 @@ async function handlePatch(request, env, slug) {
   // R2 re-put: replacing the file writes the new bytes under the existing
   // slug. Otherwise we only re-put when expiry changed, to refresh
   // `LastModified` for the bucket lifecycle rule.
+  const targetBucket = shareBucket(env, meta);
   if (fileChanged) {
-    await env.SHARE_FILES.put(slug, replacementFile.bytes, {
+    await targetBucket.put(slug, replacementFile.bytes, {
       httpMetadata: { contentType: replacementFile.typeInfo.mime },
     });
   } else if (expiryChanged) {
-    const obj = await env.SHARE_FILES.get(slug);
+    const obj = await previousBucket.get(slug);
     if (!obj) {
       // Body went missing (R2 lifecycle already reaped it, or partial
       // upload). Can't re-put without the bytes — surface a 410 instead of
@@ -1171,7 +1185,7 @@ async function handlePatch(request, env, slug) {
       return jsonResponse({ error: "object-missing" }, 410);
     }
     const bytes = await obj.arrayBuffer();
-    await env.SHARE_FILES.put(slug, bytes, {
+    await targetBucket.put(slug, bytes, {
       httpMetadata: { contentType: meta.contentType || LEGACY_CONTENT_TYPE },
     });
   }
@@ -1183,6 +1197,7 @@ async function handlePatch(request, env, slug) {
     ? { expiration: Math.floor((meta.expiresAtMs + GRACE_PERIOD_MS) / 1000) }
     : undefined;
   await env.SHARE_KV.put(`share:${slug}`, JSON.stringify(meta), kvOpts);
+  if (previousBucket !== targetBucket) await previousBucket.delete(slug);
 
   // Record this attempt in the patch rate window, regardless of whether a
   // body field actually changed anything — we already short-circuited the
@@ -1431,7 +1446,7 @@ if (meta.price && meta.paymentSalt && activePaymentOptions.length > 0) {
     return new Response(null, { status: 200, headers });
   }
 
-  const obj = await env.SHARE_FILES.get(slug);
+  const obj = await shareBucket(env, meta).get(slug);
   if (!obj) return textResponse("Gone", 410, SECURITY_HEADERS);
 
   // CSV rendered as table — parse the body (as text) and emit an HTML page.

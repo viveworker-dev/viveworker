@@ -69,7 +69,9 @@ wrangler secret put X402_BETA_ALLOWLIST
 wrangler secret put CF_ACCOUNT_ID
 wrangler secret put CF_API_TOKEN
 
-# 4. Deploy
+# 4. Create the buckets for explicit no-expiry shares (no deletion lifecycle), then deploy.
+wrangler r2 bucket create viveworker-share-permanent
+wrangler r2 bucket create viveworker-share-permanent-preview
 wrangler deploy
 
 # 5. Add the R2 lifecycle rule so orphaned objects are auto-deleted.
@@ -104,7 +106,7 @@ X-A2A-Key:  <your A2A_API_KEY from ~/.viveworker/a2a.env>
 | `price` | string | no | Decimal amount, e.g. `0.10`; must fit the selected asset decimals (6 for USDC, 18 for JPYC, 8 for USDt / L-BTC). Must be supplied with legacy `payTo` or capability-based `paymentOptions`. Min `0.01`, max `1000` asset units per share. |
 | `payTo` | string | no | Legacy single-option EVM payout address. 0x-prefixed 40-hex-char address receiving USDC on `X402_NETWORK`. Must be supplied together with `price`. |
 | `paymentOptions` | JSON string | no | Capability-based x402 options. Array of `{ network, asset, payTo, scheme?, payoutMethod? }`; currently supports `base-sepolia:usdc`, `polygon-amoy:usdc`, `polygon-amoy:jpyc`, and `liquidtestnet:usdt`. Mainnet networks are rejected until formal release. |
-| `expiresDays` | number | no | 1–**30** days; defaults to 30 when omitted. Views return 410 after expiry. Server responds with `{"error":"invalid-expiresDays","maxDays":30}` on out-of-range values. |
+| `expiresDays` | number or `never` | no | 1–30 days; defaults to 30 when omitted. Explicit `never` uses the permanent bucket and KV without expiry. |
 
 Errors:
 
@@ -219,7 +221,7 @@ Notes:
 - Changing (or setting) `price` rotates `paymentSalt`, invalidating every outstanding `share_paid` cookie for this slug — in-flight paid viewers must re-pay. Changing *only* `payTo` does **not** rotate the salt (paid sessions keep working) and is rejected on shares with no existing price gate (`payTo-without-price`).
 - Replacing the file preserves the slug and all gates. If the share has a payment gate, replacement rotates `paymentSalt` so outstanding paid sessions do not automatically unlock the new bytes.
 - `price` is mutually exclusive with `password` on v1. Attempting to add a price to a password-protected share returns `price-and-password-mutually-exclusive`.
-- `expiresDays` is always relative to *now*, so PATCH both extends and shortens the TTL.
+- Numeric `expiresDays` is relative to *now*. Set it to `"never"` for indefinite sharing, or back to a number to restore expiry under the same URL. Permanent files count toward the same quotas.
 - When `file` is supplied, the R2 object is re-`put` with the new bytes under the existing slug. When only `expiresDays` is touched, the R2 object is re-`put` with the same bytes so R2's `LastModified` advances. The bucket's 90-day lifecycle rule counts from the last modification, and `expiresDays` is capped at 30, so the re-put keeps KV validity within the R2 window even when a user chains PATCH extensions.
 - **Revival:** a share that's already past `expiresAtMs` (and therefore returns 410 on `GET /v/<slug>`) can still be resurrected via PATCH with a new `expiresDays`, provided the KV entry (grace period = 60 days past `expiresAtMs`) and the R2 body (90 days past last write) are both still alive. PATCH on an expired share **without** `expiresDays` is rejected (`expired-requires-expiresDays`, 410) — a password-only change on a share that still 410s to viewers is never what the caller wants.
 - Rate-limited to **10 patches/hour per user** (`share_stats.patchWindow`, rolling hour; separate bucket from the upload rate limit). Returns `429` with `Retry-After` on the 11th attempt.

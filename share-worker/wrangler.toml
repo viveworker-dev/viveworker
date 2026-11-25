@@ -31,6 +31,12 @@ binding = "SHARE_FILES"
 bucket_name = "viveworker-share-files"
 preview_bucket_name = "viveworker-share-files-preview"
 
+# Keep these buckets free of expiration lifecycle rules.
+[[r2_buckets]]
+binding = "PERMANENT_FILES"
+bucket_name = "viveworker-share-permanent"
+preview_bucket_name = "viveworker-share-permanent-preview"
+
 # SHARE_SECRET (HMAC key for unlock cookies) is a secret, not a var.
 # Set it with:
 #   wrangler secret put SHARE_SECRET

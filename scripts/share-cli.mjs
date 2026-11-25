@@ -122,6 +122,7 @@ function printHelp() {
   console.log("");
   console.log(`Accepted file types: ${ALLOWED_EXTENSIONS.join(" / ")}`);
   console.log("CSV files are rendered as an HTML table on view; append ?raw=1 for bytes.");
+  console.log("Expiry defaults to 30 days. Use --expires-days never to share until deleted.");
   console.log("HTML uploads are optimized by default when possible (use --no-optimize to disable).");
   console.log("");
   console.log("Paid shares (x402 — CLOSED BETA): --price 0.10 --pay-to 0x… or --price 0.10 --accept wallet-defaults");
@@ -160,10 +161,10 @@ async function handleUpload(args) {
   if (password && password.length > 256) {
     throw new Error("Password too long (max 256 chars)");
   }
-  if (expiresDays) {
+  if (expiresDays && expiresDays !== "never") {
     const n = Number(expiresDays);
     if (!Number.isFinite(n) || n <= 0 || n > 30) {
-      throw new Error("--expires-days must be a number between 1 and 30");
+      throw new Error("--expires-days must be between 1 and 30, or never");
     }
   }
 
@@ -250,6 +251,7 @@ async function handleUpload(args) {
     printPaidShareLine(body, "   ");
   }
   if (body.expiresAtMs) console.log(`   ⏱  Expires ${new Date(body.expiresAtMs).toISOString()}`);
+  else if (body.expiresAtMs === null) console.log("   No expiry");
   if (body.hasPassword || body.price || body.expiresAtMs) console.log("");
   console.log(`   Slug: ${body.slug}`);
   console.log(`   Delete: viveworker share delete ${body.slug}`);
@@ -469,7 +471,7 @@ async function handleList(args) {
       : item.price
       ? "💰"
       : "  ";
-    const expiry = item.expiresAtMs ? ` · exp ${new Date(item.expiresAtMs).toISOString().slice(0, 10)}` : "";
+    const expiry = item.expiresAtMs ? ` · exp ${new Date(item.expiresAtMs).toISOString().slice(0, 10)}` : " · no expiry";
     console.log(`  ${gateIcon} ${item.slug}  ${size.padStart(8)}  ${age.padStart(10)}${expiry}`);
     console.log(`     ${item.url}`);
     if (item.originalName) console.log(`     ${item.originalName}`);
@@ -669,10 +671,10 @@ async function handleUpdateWithFlags(flags, mode = "update") {
   if (hasExpires) {
     const raw = flags["expires-days"] || flags["expiresDays"];
     const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0 || n > 30) {
-      throw new Error("--expires-days must be a number between 1 and 30");
+    if (raw !== "never" && (!Number.isFinite(n) || n <= 0 || n > 30)) {
+      throw new Error("--expires-days must be between 1 and 30, or never");
     }
-    body.expiresDays = n;
+    body.expiresDays = raw === "never" ? raw : n;
   }
 
   const { apiKey, userId, shareUrl } = await resolveCredentials();
@@ -748,6 +750,8 @@ async function handleUpdateWithFlags(flags, mode = "update") {
   }
   if (respBody.expiresAtMs) {
     console.log(`   ⏱  Expires ${new Date(respBody.expiresAtMs).toISOString()}`);
+  } else if (respBody.expiresAtMs === null) {
+    console.log("   No expiry");
   }
   console.log("");
 }

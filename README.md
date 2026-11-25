@@ -298,6 +298,7 @@ Typical commands:
 - `npx viveworker share upload report.html`
 - `npx viveworker share upload deck_standalone.html`
 - `npx viveworker share upload report.pdf --password "hunter2" --expires-days 7`
+- `npx viveworker share upload report.pdf --expires-days never` shares until deleted. Omit the flag for the default 30 days. The same flag works with `share update` and `share replace`.
 - `npx viveworker share upload deck_standalone.html --no-optimize`
 - `npx viveworker share list`
 - `npx viveworker share replace <slug> updated-report.html`
